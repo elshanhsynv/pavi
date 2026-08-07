@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/parquet",
+    "crates/cli",
+]
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+arrow-array = "59"
+arrow-schema = "59"
+parquet = { version = "59", features = ["arrow"] }
