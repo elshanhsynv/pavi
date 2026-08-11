@@ -7,4 +7,8 @@ edition = "2024"
 anyhow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 parquet.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
