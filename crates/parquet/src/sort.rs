@@ -10,5 +10,5 @@ pub enum SortStatus {
 }
 
 pub fn unsupported_sort_message() -> String {
-    "sorting requires external sort; not implemented in this MVP".to_string()
+    format!("sorting requires external sort; not implemented yet")
 }
