@@ -11,7 +11,7 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 
-pub const DEFAULT_CELL_LIMIT: usize = 512;
+pub const DEFAULT_CELL_LIMIT: usize = 1024;
 
 pub fn format_cell(array: &dyn Array, row: usize) -> String {
     format_cell_with_limit(array, row, DEFAULT_CELL_LIMIT)

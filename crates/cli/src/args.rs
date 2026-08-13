@@ -12,7 +12,4 @@ pub struct Args {
 
     #[arg(long)]
     pub filter: Option<String>,
-
-    #[arg(long)]
-    pub sort: Option<usize>,
 }

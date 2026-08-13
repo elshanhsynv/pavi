@@ -4,13 +4,13 @@ mod output;
 use args::Args;
 use clap::Parser;
 use output::print_batch;
-use parquet_reader::{FilterExpr, ParquetSource, unsupported_sort_message};
+use parquet_reader::{FilterExpr, ParquetSource, Projection};
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let parquet = ParquetSource::open(&args.file)?;
-    let columns = parse_columns(args.columns.as_deref(), parquet.column_count())?;
+    let projection = parse_columns(args.columns.as_deref(), parquet.column_count())?;
 
     println!("Rows: {}", parquet.row_count());
     println!("Columns: {}", parquet.column_count());
@@ -27,27 +27,26 @@ fn main() -> anyhow::Result<()> {
     println!();
 
     for group in parquet.row_groups().iter().take(10) {
-        let last_row = group.first_row + group.row_count - 1;
-
-        println!(
-            "row group {:>3}: rows {}..={} ({} rows)",
-            group.index, group.first_row, last_row, group.row_count
-        );
+        if group.row_count == 0 {
+            println!("row group {:>3}: empty", group.index);
+        } else {
+            let last_row = group.first_row + group.row_count - 1;
+            println!(
+                "row group {:>3}: rows {}..={} ({} rows)",
+                group.index, group.first_row, last_row, group.row_count
+            );
+        }
     }
 
     if parquet.row_groups().len() > 10 {
         println!("...");
     }
 
-    if args.sort.is_some() {
-        anyhow::bail!("{}", unsupported_sort_message());
-    }
-
     let batch = if let Some(filter) = args.filter.as_deref() {
         let filter = FilterExpr::parse(filter)?;
-        parquet.read_filtered_window(&filter, 0, args.head, &columns)?
+        parquet.read_filtered_window(&filter, 0, args.head, &projection)?
     } else {
-        parquet.read_window(0, args.head, &columns)?
+        parquet.read_window(0, args.head, &projection)?
     };
 
     print_batch(&batch);
@@ -55,9 +54,9 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_columns(columns: Option<&str>, column_count: usize) -> anyhow::Result<Vec<usize>> {
+fn parse_columns(columns: Option<&str>, column_count: usize) -> anyhow::Result<Projection> {
     let Some(columns) = columns else {
-        return Ok((0..column_count).collect());
+        return Ok(Projection::all(column_count));
     };
 
     let mut result = Vec::new();
@@ -84,5 +83,5 @@ fn parse_columns(columns: Option<&str>, column_count: usize) -> anyhow::Result<V
         result.push(index);
     }
 
-    Ok(result)
+    Projection::columns(result, column_count)
 }

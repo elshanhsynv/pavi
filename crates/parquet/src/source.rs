@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch};
@@ -15,8 +15,8 @@ use parquet::arrow::{
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::{
-    cache::{CacheKey, WindowCache},
-    filter::FilterExpr,
+    DataPage, DatasetMetadata, PageCache, PageCacheLimits, PageKey, Projection, RowGroupInfo,
+    RowWindow, filter::FilterExpr,
 };
 
 const BATCH_SIZE: usize = 4096;
@@ -25,104 +25,98 @@ const BATCH_SIZE: usize = 4096;
 pub struct FetchRequest {
     pub first_row: u64,
     pub row_count: usize,
-    pub columns: Vec<usize>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RowGroupInfo {
-    pub index: usize,
-    pub first_row: u64,
-    pub row_count: u64,
+    pub projection: Projection,
 }
 
 pub struct ParquetSource {
     path: PathBuf,
-    schema: Arc<Schema>,
+    dataset_metadata: DatasetMetadata,
     metadata: Arc<ParquetMetaData>,
-    row_count: u64,
-    row_groups: Vec<RowGroupInfo>,
-    cache: Mutex<WindowCache>,
+    cache: Mutex<PageCache>,
 }
 
 impl ParquetSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let file = File::open(&path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
+        let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
         let schema = builder.schema().clone();
         let metadata = builder.metadata().clone();
-        let row_count = metadata.file_metadata().num_rows() as u64;
-
-        let mut first_row = 0;
-        let row_groups = (0..metadata.num_row_groups())
-            .map(|index| {
-                let row_count = metadata.row_group(index).num_rows() as u64;
-                let info = RowGroupInfo {
-                    index,
-                    first_row,
-                    row_count,
-                };
-                first_row += row_count;
-                info
-            })
-            .collect();
+        let row_group_counts =
+            (0..metadata.num_row_groups()).map(|index| metadata.row_group(index).num_rows() as u64);
+        let dataset_metadata = DatasetMetadata::new(schema, row_group_counts)
+            .with_context(|| format!("build row-group index for {}", path.display()))?;
 
         Ok(Self {
             path,
-            schema,
+            dataset_metadata,
             metadata,
-            row_count,
-            row_groups,
-            cache: Mutex::new(WindowCache::default()),
+            cache: Mutex::new(PageCache::default()),
         })
     }
 
+    pub fn metadata(&self) -> &DatasetMetadata {
+        &self.dataset_metadata
+    }
+
     pub fn schema(&self) -> Arc<Schema> {
-        self.schema.clone()
+        self.dataset_metadata.schema.clone()
     }
 
     pub fn row_count(&self) -> u64 {
-        self.row_count
+        self.dataset_metadata.row_count
     }
 
     pub fn column_count(&self) -> usize {
-        self.schema.fields().len()
+        self.dataset_metadata.column_count
     }
 
     pub fn row_groups(&self) -> &[RowGroupInfo] {
-        &self.row_groups
+        &self.dataset_metadata.row_groups
+    }
+
+    pub fn set_cache_limits(&self, limits: PageCacheLimits) -> Result<()> {
+        *self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("page cache lock poisoned"))? = PageCache::new(limits);
+        Ok(())
     }
 
     pub fn head(&self, rows: usize) -> Result<RecordBatch> {
-        let columns: Vec<_> = (0..self.column_count()).collect();
-        self.read_window(0, rows, &columns)
+        self.read_window(0, rows, &Projection::all(self.column_count()))
     }
 
     pub fn read_window(
         &self,
         first_row: u64,
         row_count: usize,
-        columns: &[usize],
+        projection: &Projection,
     ) -> Result<RecordBatch> {
-        let columns = self.normalize_columns(columns)?;
-        let row_count = self.clamped_row_count(first_row, row_count);
-        let key = CacheKey::new(first_row, row_count, &columns);
+        let batches = self.read_window_batches(first_row, row_count, projection)?;
+        self.concat_or_empty(projection, batches)
+    }
 
-        if let Some(batch) = self
+    pub fn read_page(&self, page_index: u64, projection: &Projection) -> Result<DataPage> {
+        let key = PageKey::new(page_index, projection.clone());
+        if let Some(page) = self
             .cache
             .lock()
-            .map_err(|_| anyhow!("window cache lock poisoned"))?
+            .map_err(|_| anyhow!("page cache lock poisoned"))?
             .get(&key)
         {
-            return Ok(batch);
+            return Ok(page);
         }
 
-        let batch = self.read_window_uncached(first_row, row_count, &columns)?;
+        let window = RowWindow::for_page(page_index, self.row_count());
+        let batches = self.read_window_batches(window.first_row, window.row_count, projection)?;
+        let page = DataPage::new(key, window, batches);
         self.cache
             .lock()
-            .map_err(|_| anyhow!("window cache lock poisoned"))?
-            .insert(key, batch.clone());
-        Ok(batch)
+            .map_err(|_| anyhow!("page cache lock poisoned"))?
+            .insert(page.clone());
+        Ok(page)
     }
 
     pub fn read_filtered_window(
@@ -130,28 +124,29 @@ impl ParquetSource {
         filter: &FilterExpr,
         first_match_offset: u64,
         row_count: usize,
-        columns: &[usize],
+        projection: &Projection,
     ) -> Result<RecordBatch> {
-        let output_columns = self.normalize_columns(columns)?;
         if row_count == 0 {
-            return Ok(self.empty_batch(&output_columns));
+            return Ok(self.empty_batch(projection));
         }
 
-        let filter_column = filter.column_index(&self.schema)?;
-        let mut read_columns = output_columns.clone();
+        let filter_column = filter.column_index(&self.dataset_metadata.schema)?;
+        let mut read_columns = projection.as_slice().to_vec();
         if !read_columns.contains(&filter_column) {
             read_columns.push(filter_column);
-            read_columns.sort_unstable();
         }
-
-        let filter_position = read_columns
+        let read_projection = Projection::columns(read_columns, self.column_count())?;
+        let filter_position = read_projection
+            .as_slice()
             .iter()
             .position(|column| *column == filter_column)
             .ok_or_else(|| anyhow!("filter column was not projected"))?;
-        let output_positions: Vec<_> = output_columns
+        let output_positions: Vec<_> = projection
+            .as_slice()
             .iter()
             .map(|column| {
-                read_columns
+                read_projection
+                    .as_slice()
                     .iter()
                     .position(|read_column| read_column == column)
                     .ok_or_else(|| anyhow!("output column was not projected"))
@@ -162,12 +157,12 @@ impl ParquetSource {
         let mut remaining = row_count;
         let mut batches = Vec::new();
 
-        for row_group in &self.row_groups {
+        for row_group in self.row_groups() {
             if !self.row_group_might_match(filter, row_group, filter_column) {
                 continue;
             }
 
-            let mut reader = self.reader_for(&read_columns, vec![row_group.index], None)?;
+            let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
             while let Some(batch) = reader.next().transpose()? {
                 let mask = filter.evaluate_batch(&batch, filter_position)?;
                 let filtered = filter_record_batch(&batch, &mask)?;
@@ -183,36 +178,45 @@ impl ParquetSource {
                 let start = first_match_offset.saturating_sub(skipped_matches) as usize;
                 let take = remaining.min(filtered.num_rows() - start);
                 let page = filtered.slice(start, take);
-                batches.push(project_batch(&page, &output_columns, &output_positions)?);
+                batches.push(project_batch(&page, projection, &output_positions)?);
                 remaining -= take;
                 skipped_matches += filtered.num_rows() as u64;
 
                 if remaining == 0 {
-                    return self.concat_or_empty(&output_columns, batches);
+                    return self.concat_or_empty(projection, batches);
                 }
             }
         }
 
-        self.concat_or_empty(&output_columns, batches)
+        self.concat_or_empty(projection, batches)
     }
 
-    fn read_window_uncached(
+    fn read_window_batches(
         &self,
         first_row: u64,
         row_count: usize,
-        columns: &[usize],
-    ) -> Result<RecordBatch> {
-        if row_count == 0 || first_row >= self.row_count {
-            return Ok(self.empty_batch(columns));
+        projection: &Projection,
+    ) -> Result<Vec<RecordBatch>> {
+        let row_count = self
+            .dataset_metadata
+            .validate_window(first_row, row_count)
+            .with_context(|| {
+                format!("validate row window first_row={first_row} row_count={row_count}")
+            })?;
+        if row_count == 0 {
+            return Ok(Vec::new());
         }
 
-        let selected = self.overlapping_row_groups(first_row, row_count);
-        if selected.is_empty() {
-            return Ok(self.empty_batch(columns));
+        let row_group_indexes = self
+            .dataset_metadata
+            .overlapping_row_group_indexes(first_row, row_count);
+        if row_group_indexes.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let first_selected_row = selected
+        let first_selected_row = row_group_indexes
             .first()
+            .and_then(|index| self.row_groups().get(*index))
             .map(|group| group.first_row)
             .ok_or_else(|| anyhow!("no selected row groups"))?;
         let skip_before = usize::try_from(first_row - first_selected_row)?;
@@ -222,9 +226,8 @@ impl ParquetSource {
         }
         selectors.push(RowSelector::select(row_count));
 
-        let row_group_indexes = selected.iter().map(|group| group.index).collect();
         let mut reader = self.reader_for(
-            columns,
+            projection,
             row_group_indexes,
             Some(RowSelection::from(selectors)),
         )?;
@@ -232,22 +235,25 @@ impl ParquetSource {
 
         while let Some(batch) = reader.next().transpose()? {
             if batch.num_rows() > 0 {
-                batches.push(batch);
+                batches.push(self.reorder_batch(batch, projection)?);
             }
         }
 
-        self.concat_or_empty(columns, batches)
+        Ok(batches)
     }
 
     fn reader_for(
         &self,
-        columns: &[usize],
+        projection: &Projection,
         row_groups: Vec<usize>,
         selection: Option<RowSelection>,
     ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
-        let file = File::open(&self.path)?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let projection = ProjectionMask::roots(builder.parquet_schema(), columns.iter().copied());
+        let file =
+            File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .with_context(|| format!("create Parquet reader for {}", self.path.display()))?;
+        let parquet_columns = projection.parquet_columns();
+        let projection = ProjectionMask::roots(builder.parquet_schema(), parquet_columns);
         let mut builder = builder
             .with_batch_size(BATCH_SIZE)
             .with_projection(projection)
@@ -258,40 +264,6 @@ impl ParquetSource {
         }
 
         Ok(builder.build()?)
-    }
-
-    fn overlapping_row_groups(&self, first_row: u64, row_count: usize) -> Vec<&RowGroupInfo> {
-        let end_row = first_row
-            .saturating_add(row_count as u64)
-            .min(self.row_count);
-        let start = self
-            .row_groups
-            .partition_point(|group| group.first_row + group.row_count <= first_row);
-
-        self.row_groups[start..]
-            .iter()
-            .take_while(|group| group.first_row < end_row)
-            .collect()
-    }
-
-    fn normalize_columns(&self, columns: &[usize]) -> Result<Vec<usize>> {
-        let mut columns = if columns.is_empty() {
-            (0..self.column_count()).collect()
-        } else {
-            columns.to_vec()
-        };
-
-        columns.sort_unstable();
-        columns.dedup();
-
-        if let Some(column) = columns
-            .iter()
-            .find(|column| **column >= self.column_count())
-        {
-            bail!("column index {column} out of range");
-        }
-
-        Ok(columns)
     }
 
     fn row_group_might_match(
@@ -311,17 +283,13 @@ impl ParquetSource {
             .is_none_or(|column| filter.might_match_statistics(column.statistics()))
     }
 
-    fn clamped_row_count(&self, first_row: u64, row_count: usize) -> usize {
-        if first_row >= self.row_count {
-            return 0;
-        }
-
-        row_count.min((self.row_count - first_row) as usize)
-    }
-
-    fn concat_or_empty(&self, columns: &[usize], batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    fn concat_or_empty(
+        &self,
+        projection: &Projection,
+        batches: Vec<RecordBatch>,
+    ) -> Result<RecordBatch> {
         if batches.is_empty() {
-            return Ok(self.empty_batch(columns));
+            return Ok(self.empty_batch(projection));
         }
 
         if batches.len() == 1 {
@@ -331,25 +299,43 @@ impl ParquetSource {
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     }
 
-    fn empty_batch(&self, columns: &[usize]) -> RecordBatch {
-        RecordBatch::new_empty(Arc::new(self.projected_schema(columns)))
+    fn empty_batch(&self, projection: &Projection) -> RecordBatch {
+        RecordBatch::new_empty(Arc::new(self.projected_schema(projection)))
     }
 
-    fn projected_schema(&self, columns: &[usize]) -> Schema {
-        let fields: Vec<Field> = columns
+    fn projected_schema(&self, projection: &Projection) -> Schema {
+        let fields: Vec<Field> = projection
+            .as_slice()
             .iter()
-            .map(|column| self.schema.field(*column).clone())
+            .map(|column| self.dataset_metadata.schema.field(*column).clone())
             .collect();
         Schema::new(fields)
+    }
+
+    fn reorder_batch(&self, batch: RecordBatch, projection: &Projection) -> Result<RecordBatch> {
+        let parquet_columns = projection.parquet_columns();
+        let output_positions: Vec<_> = projection
+            .as_slice()
+            .iter()
+            .map(|column| {
+                parquet_columns
+                    .iter()
+                    .position(|read_column| read_column == column)
+                    .ok_or_else(|| anyhow!("projected column {column} was not decoded"))
+            })
+            .collect::<Result<_>>()?;
+
+        project_batch(&batch, projection, &output_positions)
     }
 }
 
 fn project_batch(
     batch: &RecordBatch,
-    output_columns: &[usize],
+    projection: &Projection,
     output_positions: &[usize],
 ) -> Result<RecordBatch> {
-    let fields: Vec<Field> = output_columns
+    let fields: Vec<Field> = projection
+        .as_slice()
         .iter()
         .enumerate()
         .map(|(index, _)| batch.schema().field(output_positions[index]).clone())
@@ -442,7 +428,8 @@ mod tests {
     fn reads_window_within_one_row_group() {
         let (_dir, path) = test_file();
         let source = ParquetSource::open(path).unwrap();
-        let batch = source.read_window(1, 2, &[0]).unwrap();
+        let projection = Projection::columns(vec![0], source.column_count()).unwrap();
+        let batch = source.read_window(1, 2, &projection).unwrap();
 
         assert_eq!(ids(&batch), vec![1, 2]);
     }
@@ -451,7 +438,8 @@ mod tests {
     fn reads_window_spanning_row_groups() {
         let (_dir, path) = test_file();
         let source = ParquetSource::open(path).unwrap();
-        let batch = source.read_window(2, 3, &[0]).unwrap();
+        let projection = Projection::columns(vec![0], source.column_count()).unwrap();
+        let batch = source.read_window(2, 3, &projection).unwrap();
 
         assert_eq!(ids(&batch), vec![2, 3, 4]);
     }
@@ -460,10 +448,22 @@ mod tests {
     fn projects_requested_columns() {
         let (_dir, path) = test_file();
         let source = ParquetSource::open(path).unwrap();
-        let batch = source.read_window(0, 2, &[1]).unwrap();
+        let projection = Projection::columns(vec![1], source.column_count()).unwrap();
+        let batch = source.read_window(0, 2, &projection).unwrap();
 
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "value");
+    }
+
+    #[test]
+    fn preserves_projected_order() {
+        let (_dir, path) = test_file();
+        let source = ParquetSource::open(path).unwrap();
+        let projection = Projection::columns(vec![1, 0], source.column_count()).unwrap();
+        let batch = source.read_window(0, 2, &projection).unwrap();
+
+        assert_eq!(batch.schema().field(0).name(), "value");
+        assert_eq!(batch.schema().field(1).name(), "id");
     }
 
     #[test]
@@ -471,8 +471,38 @@ mod tests {
         let (_dir, path) = test_file();
         let source = ParquetSource::open(path).unwrap();
         let filter = FilterExpr::parse("id >= 2").unwrap();
-        let batch = source.read_filtered_window(&filter, 1, 2, &[0]).unwrap();
+        let projection = Projection::columns(vec![0], source.column_count()).unwrap();
+        let batch = source
+            .read_filtered_window(&filter, 1, 2, &projection)
+            .unwrap();
 
         assert_eq!(ids(&batch), vec![3, 4]);
+    }
+
+    #[test]
+    fn reads_fixed_pages() {
+        let (_dir, path) = test_file();
+        let source = ParquetSource::open(path).unwrap();
+        let projection = Projection::all(source.column_count());
+        let page = source.read_page(0, &projection).unwrap();
+
+        assert_eq!(page.window.first_row, 0);
+        assert_eq!(page.window.row_count, 6);
+        assert_eq!(
+            page.batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            6
+        );
+    }
+
+    #[test]
+    fn rejects_windows_starting_past_end() {
+        let (_dir, path) = test_file();
+        let source = ParquetSource::open(path).unwrap();
+        let projection = Projection::all(source.column_count());
+
+        assert!(source.read_window(7, 1, &projection).is_err());
     }
 }

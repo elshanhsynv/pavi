@@ -1,10 +1,14 @@
 pub mod cache;
 pub mod filter;
-pub mod sort;
+pub mod metadata;
+pub mod page;
+pub mod projection;
 mod source;
 pub mod value;
 
-pub use cache::{CacheKey, WindowCache};
+pub use cache::{PageCache, PageCacheLimits};
 pub use filter::{FilterExpr, FilterOp};
-pub use sort::{SortRequest, SortStatus, unsupported_sort_message};
-pub use source::{FetchRequest, ParquetSource, RowGroupInfo};
+pub use metadata::{DatasetMetadata, RowGroupInfo};
+pub use page::{DataPage, PAGE_ROWS, PageKey, RowWindow};
+pub use projection::Projection;
+pub use source::{FetchRequest, ParquetSource};

@@ -177,6 +177,10 @@ impl FilterExpr {
     }
 
     fn evaluate_bool(&self, array: &dyn Array) -> Result<BooleanArray> {
+        if !matches!(self.op, FilterOp::Eq | FilterOp::Ne) {
+            bail!("boolean columns only support == and !=");
+        }
+
         let expected = self
             .value
             .parse::<bool>()
@@ -351,6 +355,11 @@ fn string_range_might_match(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
 
     #[test]
@@ -375,5 +384,109 @@ mod tests {
     fn rejects_bad_filters() {
         assert!(FilterExpr::parse("").is_err());
         assert!(FilterExpr::parse("abc").is_err());
+    }
+
+    #[test]
+    fn evaluates_every_operator() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![
+                Some(1),
+                Some(2),
+                Some(3),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        for (filter, expected) in [
+            ("x == 2", vec![false, true, false, false]),
+            ("x != 2", vec![true, false, true, false]),
+            ("x > 2", vec![false, false, true, false]),
+            ("x >= 2", vec![false, true, true, false]),
+            ("x < 2", vec![true, false, false, false]),
+            ("x <= 2", vec![true, true, false, false]),
+        ] {
+            let actual = FilterExpr::parse(filter)
+                .unwrap()
+                .evaluate_batch(&batch, 0)
+                .unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn evaluates_contains_and_type_errors() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("b", DataType::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("alpha"), Some("beta"), None])),
+                Arc::new(BooleanArray::from(vec![true, false, true])),
+            ],
+        )
+        .unwrap();
+
+        let mask = FilterExpr::parse("s contains \"ha\"")
+            .unwrap()
+            .evaluate_batch(&batch, 0)
+            .unwrap();
+        assert_eq!(
+            mask.iter().map(|value| value.unwrap()).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        assert!(
+            FilterExpr::parse("b > true")
+                .unwrap()
+                .evaluate_batch(&batch, 1)
+                .is_err()
+        );
+        assert!(
+            FilterExpr::parse("b contains true")
+                .unwrap()
+                .evaluate_batch(&batch, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prunes_statistics_without_false_negatives() {
+        let stats = Statistics::int32(Some(10), Some(20), None, Some(0), false);
+
+        assert!(
+            !FilterExpr::parse("x == 9")
+                .unwrap()
+                .might_match_statistics(Some(&stats))
+        );
+        assert!(
+            FilterExpr::parse("x == 10")
+                .unwrap()
+                .might_match_statistics(Some(&stats))
+        );
+        assert!(
+            FilterExpr::parse("x > 19")
+                .unwrap()
+                .might_match_statistics(Some(&stats))
+        );
+        assert!(
+            !FilterExpr::parse("x > 20")
+                .unwrap()
+                .might_match_statistics(Some(&stats))
+        );
+        assert!(
+            FilterExpr::parse("x != 9")
+                .unwrap()
+                .might_match_statistics(Some(&stats))
+        );
     }
 }
