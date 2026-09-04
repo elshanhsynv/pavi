@@ -659,6 +659,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pavi_runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "parquet",
+ "parquet_reader",
+ "tempfile",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,14 @@
+[package]
+name = "pavi_runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+parquet_reader = { path = "../parquet" }
+
+[dev-dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+tempfile = "3"

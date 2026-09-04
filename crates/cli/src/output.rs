@@ -3,6 +3,7 @@ use parquet_reader::value::format_cell;
 
 const MIN_COLUMN_WIDTH: usize = 4;
 const MAX_COLUMN_WIDTH: usize = 32;
+
 pub fn print_batch(batch: &RecordBatch) {
     let rows = batch.num_rows();
     let columns = batch.num_columns();
