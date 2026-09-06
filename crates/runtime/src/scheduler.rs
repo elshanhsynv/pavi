@@ -426,18 +426,20 @@ fn worker_loop(receiver: Arc<Mutex<Receiver<Request>>>, shutdown: Arc<AtomicBool
             return;
         };
         match request {
-            Request::Open(request) => execute_open(request, shutdown.load(Ordering::Acquire)),
-            Request::Read(request) => execute(request, shutdown.load(Ordering::Acquire)),
+            Request::Open(request) => execute_open(request, &shutdown),
+            Request::Read(request) => execute(request, &shutdown),
         }
     }
 }
 
-fn execute_open(request: OpenRequest, shutting_down: bool) {
-    let outcome = if shutting_down || request.cancellation.is_cancelled() {
+fn execute_open(request: OpenRequest, shutdown: &AtomicBool) {
+    let outcome = if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() {
         OpenOutcome::Cancelled
     } else {
         match ParquetSource::open(&request.path) {
-            Ok(_) if request.cancellation.is_cancelled() => OpenOutcome::Cancelled,
+            Ok(_) if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() => {
+                OpenOutcome::Cancelled
+            }
             Ok(source) => OpenOutcome::Opened(Arc::new(source)),
             Err(error) => OpenOutcome::OpenFailed(error),
         }
@@ -449,7 +451,7 @@ fn execute_open(request: OpenRequest, shutting_down: bool) {
     });
 }
 
-fn execute(request: PageRequest, shutting_down: bool) {
+fn execute(request: PageRequest, shutdown: &AtomicBool) {
     let PageRequest {
         task_id,
         generation_id,
@@ -467,11 +469,13 @@ fn execute(request: PageRequest, shutting_down: bool) {
         before_read();
     }
 
-    let outcome = if shutting_down || cancellation.is_cancelled() {
+    let outcome = if shutdown.load(Ordering::Acquire) || cancellation.is_cancelled() {
         PageOutcome::Cancelled
     } else {
         match read_source(&source, operation, &projection) {
-            Ok(_) if cancellation.is_cancelled() => PageOutcome::Cancelled,
+            Ok(_) if shutdown.load(Ordering::Acquire) || cancellation.is_cancelled() => {
+                PageOutcome::Cancelled
+            }
             Ok(outcome) => outcome,
             Err(error) => PageOutcome::ReadFailed(error),
         }
@@ -793,10 +797,14 @@ mod tests {
         let queued = runtime
             .submit_page(source, 0, Projection::all(2), GenerationId(2))
             .unwrap();
+        let shutdown_flag = Arc::clone(&runtime.shutdown);
         let shutdown = std::thread::spawn(move || {
             let mut runtime = runtime;
             runtime.shutdown();
         });
+        while !shutdown_flag.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
         release.wait();
         shutdown.join().unwrap();
         let _ = running.recv().unwrap();

@@ -4,7 +4,8 @@ use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use parquet_reader::{DataPage, PAGE_ROWS};
 use pavi_runtime::{
-    CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, TaskId,
+    CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SubmitError,
+    TaskId,
 };
 
 use crate::{LogicalPlan, PhysicalPlan, Planner};
@@ -75,7 +76,11 @@ impl QueryEngine {
             cancelled: false,
             scheduled_reads: 0,
         };
-        execution.schedule_next()?;
+        if let Err(error) = execution.schedule_next()
+            && !is_queue_full(&error)
+        {
+            return Err(error);
+        }
         Ok(execution)
     }
 }
@@ -151,7 +156,12 @@ impl QueryExecution {
                 return Ok(QueryPoll::Finished);
             }
 
-            self.schedule_next()?;
+            if let Err(error) = self.schedule_next() {
+                if is_queue_full(&error) {
+                    return Ok(QueryPoll::Pending);
+                }
+                return Err(error);
+            }
             if self.finished {
                 return Ok(QueryPoll::Finished);
             }
@@ -254,7 +264,7 @@ impl QueryExecution {
 
         let source = Arc::clone(&self.plan.source);
         let projection = self.plan.projection.clone();
-        let (task, in_flight) = if let Some(filter) = &self.plan.filter {
+        let (task, in_flight, advance_page) = if let Some(filter) = &self.plan.filter {
             (
                 self.runtime.submit_filtered_window(
                     source,
@@ -267,6 +277,7 @@ impl QueryExecution {
                 InFlight::Filtered {
                     requested_rows: row_count,
                 },
+                false,
             )
         } else {
             let first_row = self.next_page.saturating_mul(PAGE_ROWS);
@@ -274,7 +285,6 @@ impl QueryExecution {
                 self.finished = true;
                 return Ok(());
             }
-            self.next_page += 1;
             if row_count < PAGE_ROWS as usize {
                 (
                     self.runtime.submit_window(
@@ -285,24 +295,38 @@ impl QueryExecution {
                         self.generation_id,
                     ),
                     InFlight::Window,
+                    true,
                 )
             } else {
                 (
                     self.runtime.submit_page(
                         source,
-                        self.next_page - 1,
+                        self.next_page,
                         projection,
                         self.generation_id,
                     ),
                     InFlight::Page,
+                    true,
                 )
             }
         };
-        self.pending = Some(task.context("submit query source read")?);
+        let task = task.context("submit query source read")?;
+        if advance_page {
+            self.next_page = self.next_page.saturating_add(1);
+        }
+        self.pending = Some(task);
         self.in_flight = Some(in_flight);
         self.scheduled_reads += 1;
         Ok(())
     }
+}
+
+fn is_queue_full(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SubmitError>()
+            .is_some_and(|error| *error == SubmitError::QueueFull)
+    })
 }
 
 impl QueryBatch {

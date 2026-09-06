@@ -146,8 +146,8 @@ fn format_binary(value: &[u8], limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        BinaryArray, BooleanArray, Date32Array, Float64Array, Int32Array, StringArray,
-        TimestampMillisecondArray, UInt64Array,
+        BinaryArray, BooleanArray, Date32Array, DurationSecondArray, Float64Array, Int32Array,
+        StringArray, TimestampMillisecondArray, UInt64Array,
     };
 
     use super::*;
@@ -182,5 +182,12 @@ mod tests {
 
         let binary = BinaryArray::from_vec(vec![b"abcdef"]);
         assert_eq!(format_cell_with_limit(&binary, 0, 6), "616263...");
+    }
+
+    #[test]
+    fn safely_falls_back_for_unusual_arrow_types() {
+        let duration = DurationSecondArray::from(vec![Some(1)]);
+
+        assert_eq!(format_cell(&duration, 0), "Duration(Second)");
     }
 }

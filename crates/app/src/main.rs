@@ -22,6 +22,10 @@ const MAX_UI_PAGES: usize = 8;
 const MAX_FILTERED_BATCHES: usize = 8;
 const CELL_LIMIT: usize = 256;
 
+fn ui_row_count(rows: u64) -> usize {
+    rows.min(usize::MAX as u64) as usize
+}
+
 struct Dataset {
     source: Arc<ParquetSource>,
     path: PathBuf,
@@ -133,6 +137,7 @@ impl PaviApp {
         if let Some(task) = &self.opening {
             task.cancel();
         }
+        self.opening = None;
         self.cancel_page_work();
         self.cancel_filter();
         self.dataset = None;
@@ -159,6 +164,7 @@ impl PaviApp {
             Ok(response) => response,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.opening = None;
                 self.open_error("background file open worker stopped".to_string());
                 return;
             }
@@ -417,7 +423,7 @@ impl PaviApp {
     fn cell_text(&mut self, row: u64, column: usize) -> Option<String> {
         let page_index = self.grid.page_for_row(row)?;
         self.request_page(page_index);
-        if row % parquet_reader::PAGE_ROWS == 0
+        if row.is_multiple_of(parquet_reader::PAGE_ROWS)
             && page_index.saturating_add(1) * parquet_reader::PAGE_ROWS < self.grid.rows
         {
             self.request_page(page_index.saturating_add(1));
@@ -445,13 +451,12 @@ impl PaviApp {
     fn show_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open Parquet…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                if ui.button("Open Parquet…").clicked()
+                    && let Some(path) = rfd::FileDialog::new()
                         .add_filter("Parquet", &["parquet"])
                         .pick_file()
-                    {
-                        self.begin_open(path);
-                    }
+                {
+                    self.begin_open(path);
                 }
                 ui.label("Path:");
                 let response = ui.text_edit_singleline(&mut self.path_input);
@@ -569,7 +574,7 @@ impl PaviApp {
                         }
                     })
                     .body(|body| {
-                        body.rows(ROW_HEIGHT, self.grid.rows as usize, |mut table_row| {
+                        body.rows(ROW_HEIGHT, ui_row_count(self.grid.rows), |mut table_row| {
                             let row_index = table_row.index() as u64;
                             for page in self.grid.visible_pages(row_index, row_index) {
                                 self.request_page(page);
@@ -676,7 +681,7 @@ impl PaviApp {
                         }
                     })
                     .body(|body| {
-                        body.rows(ROW_HEIGHT, rows as usize, |mut table_row| {
+                        body.rows(ROW_HEIGHT, ui_row_count(rows), |mut table_row| {
                             let row_index = table_row.index() as u64;
                             if row_index.saturating_add(1) == rows {
                                 self.request_more_filtered();
@@ -828,6 +833,28 @@ mod tests {
         panic!("filter did not become idle");
     }
 
+    fn poll_until_opened(app: &mut PaviApp) {
+        for _ in 0..1_000 {
+            app.poll_open();
+            if app.opening.is_none() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("open did not become idle");
+    }
+
+    fn poll_until_page_loaded(app: &mut PaviApp, page: u64) {
+        for _ in 0..1_000 {
+            app.poll_pages();
+            if app.pages.contains_key(&page) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("page did not load");
+    }
+
     fn filtered_ids(app: &PaviApp) -> Vec<String> {
         (0..app.grid.rows)
             .map(|row| app.filtered_cell_text(row, 0).unwrap())
@@ -961,5 +988,50 @@ mod tests {
         poll_until_idle(&mut app);
 
         assert_eq!(app.grid.rows, 0);
+    }
+
+    #[test]
+    fn opens_empty_and_replaces_active_document_work() {
+        let (_first_directory, _first_source, first_path) = source(3);
+        let (_second_directory, _second_source, second_path) = source(0);
+        let mut app = PaviApp::new(None);
+
+        app.begin_open(first_path.clone());
+        poll_until_opened(&mut app);
+        assert_eq!(app.grid.rows, 3);
+        app.request_page(0);
+        poll_until_page_loaded(&mut app, 0);
+
+        app.begin_open(second_path);
+        assert!(app.pages.is_empty());
+        assert!(app.pending_pages.is_empty());
+        poll_until_opened(&mut app);
+        assert_eq!(app.grid.rows, 0);
+        assert!(matches!(app.grid.loading, LoadState::Ready));
+
+        app.begin_open(first_path);
+        poll_until_opened(&mut app);
+        assert_eq!(app.grid.rows, 3);
+    }
+
+    #[test]
+    fn reports_malformed_open_and_releases_its_task() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("malformed.parquet");
+        std::fs::write(&path, b"not parquet").unwrap();
+        let mut app = PaviApp::new(None);
+
+        app.begin_open(path);
+        poll_until_opened(&mut app);
+
+        assert!(app.dataset.is_none());
+        assert!(app.opening.is_none());
+        assert!(matches!(app.grid.loading, LoadState::Error(_)));
+        assert!(app.status.contains("open file"));
+    }
+
+    #[test]
+    fn clamps_untrusted_row_counts_for_the_egui_row_api() {
+        assert_eq!(ui_row_count(u64::MAX), usize::MAX);
     }
 }

@@ -83,7 +83,7 @@ impl DatasetMetadata {
         Ok(if first_row == self.row_count {
             0
         } else {
-            row_count.min((self.row_count - first_row) as usize)
+            (self.row_count - first_row).min(row_count as u64) as usize
         })
     }
 }
@@ -148,5 +148,12 @@ mod tests {
     fn rejects_cumulative_overflow() {
         let result = DatasetMetadata::new(Arc::new(Schema::empty()), [u64::MAX, 1]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bounds_large_windows_without_truncating_remaining_rows() {
+        let metadata = metadata(&[u64::MAX]);
+
+        assert_eq!(metadata.validate_window(0, 1).unwrap(), 1);
     }
 }

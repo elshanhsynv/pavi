@@ -369,7 +369,7 @@ fn project_batch(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int32Array, RecordBatch};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use tempfile::TempDir;
@@ -534,5 +534,40 @@ mod tests {
         let projection = Projection::all(source.column_count());
 
         assert!(source.read_window(7, 1, &projection).is_err());
+    }
+
+    #[test]
+    fn reports_malformed_parquet_without_panicking() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("malformed.parquet");
+        std::fs::write(&path, b"not a parquet file").unwrap();
+
+        let error = ParquetSource::open(path).err().unwrap();
+        assert!(error.to_string().contains("read Parquet metadata"));
+    }
+
+    #[test]
+    fn opens_and_reads_a_wide_schema() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("wide.parquet");
+        let schema = Arc::new(Schema::new(
+            (0..64)
+                .map(|column| Field::new(format!("column_{column}"), DataType::Int32, false))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<ArrayRef> = (0..64)
+            .map(|column| Arc::new(Int32Array::from(vec![column])) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(path).unwrap();
+        let page = source
+            .read_page(0, &Projection::all(source.column_count()))
+            .unwrap();
+        assert_eq!(source.column_count(), 64);
+        assert_eq!(page.batches[0].num_columns(), 64);
     }
 }

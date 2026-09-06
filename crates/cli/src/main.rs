@@ -6,8 +6,11 @@ use clap::Parser;
 use output::print_batch;
 use parquet_reader::{FilterExpr, ParquetSource, Projection};
 
+const MAX_HEAD_ROWS: usize = 1_000;
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let head = validate_head(args.head)?;
 
     let parquet = ParquetSource::open(&args.file)?;
     let projection = parse_columns(args.columns.as_deref(), parquet.column_count())?;
@@ -44,14 +47,21 @@ fn main() -> anyhow::Result<()> {
 
     let batch = if let Some(filter) = args.filter.as_deref() {
         let filter = FilterExpr::parse(filter)?;
-        parquet.read_filtered_window(&filter, 0, args.head, &projection)?
+        parquet.read_filtered_window(&filter, 0, head, &projection)?
     } else {
-        parquet.read_window(0, args.head, &projection)?
+        parquet.read_window(0, head, &projection)?
     };
 
     print_batch(&batch);
 
     Ok(())
+}
+
+fn validate_head(head: usize) -> anyhow::Result<usize> {
+    if head > MAX_HEAD_ROWS {
+        anyhow::bail!("--head must be at most {MAX_HEAD_ROWS}");
+    }
+    Ok(head)
 }
 
 fn parse_columns(columns: Option<&str>, column_count: usize) -> anyhow::Result<Projection> {
@@ -84,4 +94,15 @@ fn parse_columns(columns: Option<&str>, column_count: usize) -> anyhow::Result<P
     }
 
     Projection::columns(result, column_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_user_requested_preview_rows() {
+        assert_eq!(validate_head(MAX_HEAD_ROWS).unwrap(), MAX_HEAD_ROWS);
+        assert!(validate_head(MAX_HEAD_ROWS + 1).is_err());
+    }
 }

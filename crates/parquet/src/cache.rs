@@ -97,10 +97,10 @@ impl PageCache {
     }
 
     fn remove(&mut self, key: &PageKey) {
-        if let Some(index) = self.entries.iter().position(|entry| &entry.key == key) {
-            if let Some(page) = self.entries.remove(index) {
-                self.bytes = self.bytes.saturating_sub(page.byte_size);
-            }
+        if let Some(index) = self.entries.iter().position(|entry| &entry.key == key)
+            && let Some(page) = self.entries.remove(index)
+        {
+            self.bytes = self.bytes.saturating_sub(page.byte_size);
         }
     }
 
