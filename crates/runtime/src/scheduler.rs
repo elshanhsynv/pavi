@@ -113,10 +113,17 @@ enum Request {
 
 /// A small, fixed worker pool for background Parquet page reads.
 pub struct Runtime {
-    sender: Option<SyncSender<Request>>,
+    submissions: Arc<Mutex<Option<SyncSender<Request>>>>,
     shutdown: Arc<AtomicBool>,
-    next_task_id: AtomicU64,
+    next_task_id: Arc<AtomicU64>,
     workers: Vec<JoinHandle<()>>,
+}
+
+/// Cloneable submission endpoint that does not own runtime worker threads.
+#[derive(Clone)]
+pub struct RuntimeHandle {
+    submissions: Arc<Mutex<Option<SyncSender<Request>>>>,
+    next_task_id: Arc<AtomicU64>,
 }
 
 impl Runtime {
@@ -152,13 +159,116 @@ impl Runtime {
         }
 
         Ok(Self {
-            sender: Some(sender),
+            submissions: Arc::new(Mutex::new(Some(sender))),
             shutdown,
-            next_task_id: AtomicU64::new(1),
+            next_task_id: Arc::new(AtomicU64::new(1)),
             workers,
         })
     }
 
+    pub fn handle(&self) -> RuntimeHandle {
+        RuntimeHandle {
+            submissions: Arc::clone(&self.submissions),
+            next_task_id: Arc::clone(&self.next_task_id),
+        }
+    }
+
+    pub fn submit_page(
+        &self,
+        source: Arc<ParquetSource>,
+        page_index: u64,
+        projection: Projection,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.handle().submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Page { page_index },
+            None,
+        )
+    }
+
+    pub fn submit_open(
+        &self,
+        path: impl Into<PathBuf>,
+        generation_id: GenerationId,
+    ) -> Result<OpenTask, SubmitError> {
+        self.handle().submit_open(path, generation_id)
+    }
+
+    pub fn submit_window(
+        &self,
+        source: Arc<ParquetSource>,
+        first_row: u64,
+        row_count: usize,
+        projection: Projection,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.handle().submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Window {
+                first_row,
+                row_count,
+            },
+            None,
+        )
+    }
+
+    pub fn submit_filtered_window(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: FilterExpr,
+        first_match_offset: u64,
+        row_count: usize,
+        projection: Projection,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.handle().submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::FilteredWindow {
+                filter,
+                first_match_offset,
+                row_count,
+            },
+            None,
+        )
+    }
+
+    pub fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(mut submissions) = self.submissions.lock() {
+            submissions.take();
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn submit_page_blocked_before_read(
+        &self,
+        source: Arc<ParquetSource>,
+        page_index: u64,
+        projection: Projection,
+        generation_id: GenerationId,
+        before_read: impl FnOnce() + Send + 'static,
+    ) -> Result<PageTask, SubmitError> {
+        self.handle().submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Page { page_index },
+            Some(Box::new(before_read)),
+        )
+    }
+}
+
+impl RuntimeHandle {
     pub fn submit_page(
         &self,
         source: Arc<ParquetSource>,
@@ -180,9 +290,7 @@ impl Runtime {
         path: impl Into<PathBuf>,
         generation_id: GenerationId,
     ) -> Result<OpenTask, SubmitError> {
-        let Some(sender) = &self.sender else {
-            return Err(SubmitError::Shutdown);
-        };
+        let sender = self.sender()?;
         let task_id = self.next_task_id()?;
         let cancellation = CancellationToken::default();
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
@@ -257,9 +365,7 @@ impl Runtime {
         #[cfg(test)] before_read: Option<Box<dyn FnOnce() + Send>>,
         #[cfg(not(test))] _before_read: Option<()>,
     ) -> Result<PageTask, SubmitError> {
-        let Some(sender) = &self.sender else {
-            return Err(SubmitError::Shutdown);
-        };
+        let sender = self.sender()?;
         let task_id = self.next_task_id()?;
         let cancellation = CancellationToken::default();
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
@@ -287,37 +393,20 @@ impl Runtime {
         }
     }
 
+    fn sender(&self) -> Result<SyncSender<Request>, SubmitError> {
+        self.submissions
+            .lock()
+            .map_err(|_| SubmitError::Shutdown)?
+            .as_ref()
+            .cloned()
+            .ok_or(SubmitError::Shutdown)
+    }
+
     fn next_task_id(&self) -> Result<TaskId, SubmitError> {
         self.next_task_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map(TaskId)
             .map_err(|_| SubmitError::TaskIdExhausted)
-    }
-
-    pub fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        self.sender.take();
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-
-    #[cfg(test)]
-    fn submit_page_blocked_before_read(
-        &self,
-        source: Arc<ParquetSource>,
-        page_index: u64,
-        projection: Projection,
-        generation_id: GenerationId,
-        before_read: impl FnOnce() + Send + 'static,
-    ) -> Result<PageTask, SubmitError> {
-        self.submit_read(
-            source,
-            projection,
-            generation_id,
-            ReadOperation::Page { page_index },
-            Some(Box::new(before_read)),
-        )
     }
 }
 
@@ -714,6 +803,19 @@ mod tests {
         assert!(matches!(
             queued.recv().unwrap().outcome,
             PageOutcome::Cancelled
+        ));
+    }
+
+    #[test]
+    fn handles_do_not_hold_shutdown_open() {
+        let runtime = runtime(1, 1);
+        let handle = runtime.handle();
+        let mut runtime = runtime;
+
+        runtime.shutdown();
+        assert!(matches!(
+            handle.submit_open("missing.parquet", GenerationId(1)),
+            Err(SubmitError::Shutdown)
         ));
     }
 }

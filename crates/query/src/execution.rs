@@ -3,16 +3,18 @@ use std::{collections::VecDeque, sync::Arc};
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use parquet_reader::{DataPage, PAGE_ROWS};
-use pavi_runtime::{CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, TaskId};
+use pavi_runtime::{
+    CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, TaskId,
+};
 
 use crate::{LogicalPlan, PhysicalPlan, Planner};
 
-pub struct QueryEngine<'runtime> {
-    runtime: &'runtime Runtime,
+pub struct QueryEngine {
+    runtime: RuntimeHandle,
 }
 
-pub struct QueryExecution<'runtime> {
-    runtime: &'runtime Runtime,
+pub struct QueryExecution {
+    runtime: RuntimeHandle,
     plan: PhysicalPlan,
     generation_id: GenerationId,
     pending: Option<PageTask>,
@@ -33,25 +35,34 @@ pub struct QueryBatch {
     pub batch: RecordBatch,
 }
 
+/// Nonblocking state returned while incrementally driving a query from an event loop.
+pub enum QueryPoll {
+    Batch(QueryBatch),
+    Pending,
+    Finished,
+}
+
 enum InFlight {
     Page,
     Window,
     Filtered { requested_rows: usize },
 }
 
-impl<'runtime> QueryEngine<'runtime> {
-    pub fn new(runtime: &'runtime Runtime) -> Self {
-        Self { runtime }
+impl QueryEngine {
+    pub fn new(runtime: &Runtime) -> Self {
+        Self {
+            runtime: runtime.handle(),
+        }
     }
 
     pub fn execute(
         &self,
         logical: &LogicalPlan,
         generation_id: GenerationId,
-    ) -> Result<QueryExecution<'runtime>> {
+    ) -> Result<QueryExecution> {
         let plan = Planner::plan(logical)?;
         let mut execution = QueryExecution {
-            runtime: self.runtime,
+            runtime: self.runtime.clone(),
             remaining: plan.limit,
             plan,
             generation_id,
@@ -69,7 +80,7 @@ impl<'runtime> QueryEngine<'runtime> {
     }
 }
 
-impl<'runtime> QueryExecution<'runtime> {
+impl QueryExecution {
     pub fn generation_id(&self) -> GenerationId {
         self.generation_id
     }
@@ -107,6 +118,58 @@ impl<'runtime> QueryExecution<'runtime> {
                 .take()
                 .context("query execution has no pending runtime task")?;
             let response = task.recv().context("receive query runtime response")?;
+            let in_flight = self
+                .in_flight
+                .take()
+                .context("query execution lost its pending read")?;
+
+            match response.outcome {
+                PageOutcome::Loaded(page) => self.buffer_page(page, in_flight, response.task_id)?,
+                PageOutcome::Batch(batch) => {
+                    self.buffer_batch(batch, in_flight, response.task_id)?
+                }
+                PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
+                PageOutcome::ReadFailed(error) => {
+                    return Err(error).context(format!("query task {} failed", response.task_id.0));
+                }
+            }
+        }
+    }
+
+    /// Polls for one next batch without waiting for a runtime response.
+    pub fn poll_next_batch(&mut self) -> Result<QueryPoll> {
+        loop {
+            if self.cancelled {
+                bail!("query execution was cancelled");
+            }
+            if let Some(batch) = self.buffered.pop_front() {
+                return Ok(self
+                    .apply_limit(batch)
+                    .map_or(QueryPoll::Finished, QueryPoll::Batch));
+            }
+            if self.finished {
+                return Ok(QueryPoll::Finished);
+            }
+
+            self.schedule_next()?;
+            if self.finished {
+                return Ok(QueryPoll::Finished);
+            }
+            let response = match self
+                .pending
+                .as_ref()
+                .context("query execution has no pending runtime task")?
+                .try_recv()
+            {
+                Ok(response) => response,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(QueryPoll::Pending),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending = None;
+                    self.in_flight = None;
+                    bail!("query runtime response channel disconnected");
+                }
+            };
+            self.pending = None;
             let in_flight = self
                 .in_flight
                 .take()
@@ -518,5 +581,28 @@ mod tests {
             .unwrap();
         assert!(batch.is_stale_for(GenerationId(8)));
         assert!(!batch.is_stale_for(GenerationId(7)));
+    }
+
+    #[test]
+    fn polls_without_waiting_for_a_runtime_response() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&LogicalPlan::scan(source).limit(1), GenerationId(3))
+            .unwrap();
+
+        let mut batch = None;
+        for _ in 0..100 {
+            match execution.poll_next_batch().unwrap() {
+                QueryPoll::Batch(result) => {
+                    batch = Some(result);
+                    break;
+                }
+                QueryPoll::Pending => std::thread::sleep(std::time::Duration::from_millis(1)),
+                QueryPoll::Finished => break,
+            }
+        }
+
+        assert_eq!(batch.unwrap().batch.num_rows(), 1);
     }
 }

@@ -87,6 +87,14 @@ impl GridState {
         self.selection = Some((row, column));
         true
     }
+
+    pub fn select_filtered(&mut self, first_result: u64, row: u64, column: usize) -> bool {
+        if row >= self.rows || column >= self.columns {
+            return false;
+        }
+        self.selection = Some((first_result.saturating_add(row), column));
+        true
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +151,15 @@ mod tests {
         assert!(state.select(1, 1));
         assert!(!state.select(2, 1));
         assert!(!state.select(1, 2));
+    }
+
+    #[test]
+    fn stores_filtered_selection_as_a_result_row() {
+        let mut state = GridState::default();
+        state.ready(2, 2);
+
+        assert!(state.select_filtered(4_096, 1, 1));
+        assert_eq!(state.selection, Some((4_097, 1)));
     }
 
     #[test]

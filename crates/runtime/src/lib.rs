@@ -11,5 +11,5 @@ mod task;
 
 pub use cancellation::CancellationToken;
 pub use response::{OpenOutcome, OpenResponse, PageOutcome, PageResponse};
-pub use scheduler::{Runtime, RuntimeConfig, RuntimeConfigError, SubmitError};
+pub use scheduler::{Runtime, RuntimeConfig, RuntimeConfigError, RuntimeHandle, SubmitError};
 pub use task::{GenerationId, OpenTask, PageTask, TaskId};

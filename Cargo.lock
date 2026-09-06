@@ -2741,11 +2741,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-schema",
  "eframe",
  "egui_extras",
+ "parquet",
  "parquet_reader",
+ "pavi_query",
  "pavi_runtime",
  "rfd",
+ "tempfile",
 ]
 
 [[package]]

@@ -11,3 +11,9 @@ egui_extras.workspace = true
 rfd.workspace = true
 parquet_reader = { path = "../parquet" }
 pavi_runtime = { path = "../runtime" }
+pavi_query = { path = "../query" }
+
+[dev-dependencies]
+arrow-schema.workspace = true
+parquet.workspace = true
+tempfile = "3"
