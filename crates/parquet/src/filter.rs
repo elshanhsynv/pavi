@@ -74,6 +74,40 @@ impl FilterExpr {
             .ok_or_else(|| anyhow!("unknown filter column '{}'", self.column))
     }
 
+    pub fn validate_schema(&self, schema: &Schema) -> Result<()> {
+        let column = self.column_index(schema)?;
+        match schema.field(column).data_type() {
+            DataType::Boolean => {
+                if !matches!(self.op, FilterOp::Eq | FilterOp::Ne) {
+                    bail!("boolean columns only support == and !=");
+                }
+                self.value
+                    .parse::<bool>()
+                    .map_err(|_| anyhow!("'{}' is not a boolean", self.value))?;
+            }
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64 => {
+                if self.op == FilterOp::Contains {
+                    bail!("contains is only supported for UTF-8 columns");
+                }
+                self.value
+                    .parse::<f64>()
+                    .map_err(|_| anyhow!("'{}' is not a number", self.value))?;
+            }
+            DataType::Utf8 | DataType::LargeUtf8 => {}
+            other => bail!("filtering is not supported for {other:?} columns"),
+        }
+        Ok(())
+    }
+
     pub fn evaluate_batch(
         &self,
         batch: &RecordBatch,

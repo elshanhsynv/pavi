@@ -8,7 +8,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use parquet_reader::{ParquetSource, Projection};
+use parquet_reader::{FilterExpr, ParquetSource, Projection};
 
 use crate::{CancellationToken, GenerationId, PageOutcome, PageResponse, PageTask, TaskId};
 
@@ -67,11 +67,26 @@ impl fmt::Display for SubmitError {
 
 impl std::error::Error for SubmitError {}
 
+enum ReadOperation {
+    Page {
+        page_index: u64,
+    },
+    Window {
+        first_row: u64,
+        row_count: usize,
+    },
+    FilteredWindow {
+        filter: FilterExpr,
+        first_match_offset: u64,
+        row_count: usize,
+    },
+}
+
 struct PageRequest {
     task_id: TaskId,
     generation_id: GenerationId,
     source: Arc<ParquetSource>,
-    page_index: u64,
+    operation: ReadOperation,
     projection: Projection,
     cancellation: CancellationToken,
     response: SyncSender<PageResponse>,
@@ -134,15 +149,63 @@ impl Runtime {
         projection: Projection,
         generation_id: GenerationId,
     ) -> Result<PageTask, SubmitError> {
-        self.submit_page_inner(source, page_index, projection, generation_id, None)
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Page { page_index },
+            None,
+        )
     }
 
-    fn submit_page_inner(
+    pub fn submit_window(
         &self,
         source: Arc<ParquetSource>,
-        page_index: u64,
+        first_row: u64,
+        row_count: usize,
         projection: Projection,
         generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Window {
+                first_row,
+                row_count,
+            },
+            None,
+        )
+    }
+
+    pub fn submit_filtered_window(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: FilterExpr,
+        first_match_offset: u64,
+        row_count: usize,
+        projection: Projection,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::FilteredWindow {
+                filter,
+                first_match_offset,
+                row_count,
+            },
+            None,
+        )
+    }
+
+    fn submit_read(
+        &self,
+        source: Arc<ParquetSource>,
+        projection: Projection,
+        generation_id: GenerationId,
+        operation: ReadOperation,
         #[cfg(test)] before_read: Option<Box<dyn FnOnce() + Send>>,
         #[cfg(not(test))] _before_read: Option<()>,
     ) -> Result<PageTask, SubmitError> {
@@ -160,7 +223,7 @@ impl Runtime {
             task_id,
             generation_id,
             source,
-            page_index,
+            operation,
             projection,
             cancellation: cancellation.clone(),
             response: response_sender,
@@ -197,11 +260,11 @@ impl Runtime {
         generation_id: GenerationId,
         before_read: impl FnOnce() + Send + 'static,
     ) -> Result<PageTask, SubmitError> {
-        self.submit_page_inner(
+        self.submit_read(
             source,
-            page_index,
             projection,
             generation_id,
+            ReadOperation::Page { page_index },
             Some(Box::new(before_read)),
         )
     }
@@ -231,7 +294,7 @@ fn execute(request: PageRequest, shutting_down: bool) {
         task_id,
         generation_id,
         source,
-        page_index,
+        operation,
         projection,
         cancellation,
         response,
@@ -247,9 +310,9 @@ fn execute(request: PageRequest, shutting_down: bool) {
     let outcome = if shutting_down || cancellation.is_cancelled() {
         PageOutcome::Cancelled
     } else {
-        match source.read_page(page_index, &projection) {
+        match read_source(&source, operation, &projection) {
             Ok(_) if cancellation.is_cancelled() => PageOutcome::Cancelled,
-            Ok(page) => PageOutcome::Loaded(page),
+            Ok(outcome) => outcome,
             Err(error) => PageOutcome::ReadFailed(error),
         }
     };
@@ -258,6 +321,31 @@ fn execute(request: PageRequest, shutting_down: bool) {
         generation_id,
         outcome,
     });
+}
+
+fn read_source(
+    source: &ParquetSource,
+    operation: ReadOperation,
+    projection: &Projection,
+) -> anyhow::Result<PageOutcome> {
+    match operation {
+        ReadOperation::Page { page_index } => source
+            .read_page(page_index, projection)
+            .map(PageOutcome::Loaded),
+        ReadOperation::Window {
+            first_row,
+            row_count,
+        } => source
+            .read_window(first_row, row_count, projection)
+            .map(PageOutcome::Batch),
+        ReadOperation::FilteredWindow {
+            filter,
+            first_match_offset,
+            row_count,
+        } => source
+            .read_filtered_window(&filter, first_match_offset, row_count, projection)
+            .map(PageOutcome::Batch),
+    }
 }
 
 #[cfg(test)]

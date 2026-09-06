@@ -1,4 +1,5 @@
 use anyhow::Error;
+use arrow_array::RecordBatch;
 use parquet_reader::DataPage;
 
 use crate::{GenerationId, TaskId};
@@ -7,6 +8,7 @@ use crate::{GenerationId, TaskId};
 #[derive(Debug)]
 pub enum PageOutcome {
     Loaded(DataPage),
+    Batch(RecordBatch),
     Cancelled,
     ReadFailed(Error),
 }

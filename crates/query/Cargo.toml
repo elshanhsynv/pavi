@@ -1,5 +1,5 @@
 [package]
-name = "pavi_runtime"
+name = "pavi_query"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,9 +7,9 @@ edition = "2024"
 anyhow.workspace = true
 arrow-array.workspace = true
 parquet_reader = { path = "../parquet" }
+pavi_runtime = { path = "../runtime" }
 
 [dev-dependencies]
-arrow-array.workspace = true
 arrow-schema.workspace = true
 parquet.workspace = true
 tempfile = "3"

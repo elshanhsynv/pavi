@@ -84,6 +84,10 @@ impl ParquetSource {
         Ok(())
     }
 
+    pub fn validate_filter(&self, filter: &FilterExpr) -> Result<()> {
+        filter.validate_schema(&self.dataset_metadata.schema)
+    }
+
     pub fn head(&self, rows: usize) -> Result<RecordBatch> {
         self.read_window(0, rows, &Projection::all(self.column_count()))
     }
@@ -164,6 +168,7 @@ impl ParquetSource {
 
             let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
             while let Some(batch) = reader.next().transpose()? {
+                let batch = self.reorder_batch(batch, &read_projection)?;
                 let mask = filter.evaluate_batch(&batch, filter_position)?;
                 let filtered = filter_record_batch(&batch, &mask)?;
                 if filtered.num_rows() == 0 {
@@ -477,6 +482,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(ids(&batch), vec![3, 4]);
+    }
+
+    #[test]
+    fn filters_with_a_projected_column_before_its_filter_column() {
+        let (_dir, path) = test_file();
+        let source = ParquetSource::open(path).unwrap();
+        let filter = FilterExpr::parse("id >= 3").unwrap();
+        let projection = Projection::columns(vec![1], source.column_count()).unwrap();
+        let batch = source
+            .read_filtered_window(&filter, 0, 2, &projection)
+            .unwrap();
+
+        assert_eq!(ids(&batch), vec![30, 40]);
     }
 
     #[test]

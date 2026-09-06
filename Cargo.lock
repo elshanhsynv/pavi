@@ -659,6 +659,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pavi_query"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "parquet",
+ "parquet_reader",
+ "pavi_runtime",
+ "tempfile",
+]
+
+[[package]]
 name = "pavi_runtime"
 version = "0.1.0"
 dependencies = [
