@@ -4,10 +4,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, anyhow};
-use arrow_array::RecordBatch;
-use arrow_schema::{Field, Schema};
-use arrow_select::{concat::concat_batches, filter::filter_record_batch};
+use anyhow::{Context, Result, anyhow, bail};
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_ord::sort::{SortColumn, lexsort_to_indices};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 use parquet::arrow::{
     ProjectionMask,
     arrow_reader::{
@@ -17,8 +18,9 @@ use parquet::arrow::{
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::{
-    DataPage, DatasetMetadata, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection,
-    RowGroupInfo, RowWindow, filter::FilterExpr,
+    DataPage, DatasetMetadata, NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey,
+    Projection, RowGroupInfo, RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr,
+    page::PAGE_ROWS,
 };
 
 const BATCH_SIZE: usize = 4096;
@@ -208,6 +210,167 @@ impl ParquetSource {
         self.concat_or_empty(projection, batches)
     }
 
+    /// Reads, sorts, and returns bounded output batches for one supported sort key.
+    ///
+    /// This intentionally rejects inputs beyond `budget`; PAVI has no external sort yet.
+    pub fn read_sorted(
+        &self,
+        filter: Option<&FilterExpr>,
+        projection: &Projection,
+        sort: SortSpec,
+        budget: SortBudget,
+    ) -> Result<Vec<RecordBatch>> {
+        self.validate_sort(sort)?;
+        if let Some(filter) = filter {
+            self.validate_filter(filter)?;
+        }
+        if self.row_count() > budget.max_rows() as u64 {
+            bail!(
+                "sort input has {} rows, exceeding the in-memory sort budget of {} rows; external sorting is unavailable",
+                self.row_count(),
+                budget.max_rows()
+            );
+        }
+
+        let filter_column = filter
+            .map(|filter| filter.column_index(&self.dataset_metadata.schema))
+            .transpose()?;
+        let mut read_columns = projection.as_slice().to_vec();
+        if !read_columns.contains(&sort.column) {
+            read_columns.push(sort.column);
+        }
+        if let Some(filter_column) = filter_column
+            && !read_columns.contains(&filter_column)
+        {
+            read_columns.push(filter_column);
+        }
+        let read_projection = Projection::columns(read_columns, self.column_count())?;
+        let sort_position = projected_position(&read_projection, sort.column, "sort")?;
+        let filter_position = filter_column
+            .map(|column| projected_position(&read_projection, column, "filter"))
+            .transpose()?;
+        let output_positions = projection
+            .as_slice()
+            .iter()
+            .map(|column| projected_position(&read_projection, *column, "output"))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut rows = 0_usize;
+        let mut bytes = 0_usize;
+        let mut batches = Vec::new();
+        for row_group in self.row_groups() {
+            if let (Some(filter), Some(filter_column)) = (filter, filter_column)
+                && !self.row_group_might_match(filter, row_group, filter_column)
+            {
+                continue;
+            }
+            let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
+            while let Some(batch) = reader.next().transpose()? {
+                let batch = self.reorder_batch(batch, &read_projection)?;
+                let batch = match (filter, filter_position) {
+                    (Some(filter), Some(filter_position)) => filter_record_batch(
+                        &batch,
+                        &filter.evaluate_batch(&batch, filter_position)?,
+                    )?,
+                    (Some(_), None) => bail!("filter column was not projected for sorting"),
+                    (None, _) => batch,
+                };
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                let next_rows = rows.saturating_add(batch.num_rows());
+                let next_bytes = bytes.saturating_add(batch.get_array_memory_size());
+                if next_rows > budget.max_rows()
+                    || next_bytes
+                        .saturating_mul(3)
+                        .saturating_add(next_rows.saturating_mul(8))
+                        > budget.max_bytes()
+                {
+                    bail!(
+                        "sort input exceeds the in-memory sort budget of {} rows / {} bytes; external sorting is unavailable",
+                        budget.max_rows(),
+                        budget.max_bytes()
+                    );
+                }
+                rows = next_rows;
+                bytes = next_bytes;
+                batches.push(batch);
+            }
+        }
+
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let input = self.concat_or_empty(&read_projection, batches)?;
+        let tie_breaker = UInt64Array::from_iter_values(0..input.num_rows() as u64);
+        let indices = lexsort_to_indices(
+            &[
+                SortColumn {
+                    values: input.column(sort_position).clone(),
+                    options: Some(SortOptions {
+                        descending: sort.direction == SortDirection::Descending,
+                        nulls_first: sort.nulls == NullOrder::First,
+                    }),
+                },
+                SortColumn {
+                    values: std::sync::Arc::new(tie_breaker),
+                    options: Some(SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    }),
+                },
+            ],
+            None,
+        )
+        .context("sort supported Arrow values")?;
+        let fields: Vec<Field> = output_positions
+            .iter()
+            .map(|position| input.schema().field(*position).clone())
+            .collect();
+        let arrays = output_positions
+            .iter()
+            .map(|position| take(input.column(*position).as_ref(), &indices, None))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let sorted = RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays)?;
+        Ok((0..sorted.num_rows())
+            .step_by(PAGE_ROWS as usize)
+            .map(|first_row| {
+                sorted.slice(
+                    first_row,
+                    (sorted.num_rows() - first_row).min(PAGE_ROWS as usize),
+                )
+            })
+            .collect())
+    }
+
+    pub fn validate_sort(&self, sort: SortSpec) -> Result<()> {
+        let field = self
+            .dataset_metadata
+            .schema
+            .fields()
+            .get(sort.column)
+            .ok_or_else(|| anyhow!("sort column {} out of range", sort.column))?;
+        match field.data_type() {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _) => Ok(()),
+            data_type => bail!("sorting is not supported for {data_type:?} columns"),
+        }
+    }
+
     fn read_window_batches(
         &self,
         first_row: u64,
@@ -365,12 +528,22 @@ fn project_batch(
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
+fn projected_position(projection: &Projection, column: usize, purpose: &str) -> Result<usize> {
+    projection
+        .as_slice()
+        .iter()
+        .position(|projected| *projected == column)
+        .ok_or_else(|| anyhow!("{purpose} column {column} was not projected"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        Array, ArrayRef, Date32Array, Int32Array, RecordBatch, TimestampMillisecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use tempfile::TempDir;
 
@@ -569,5 +742,121 @@ mod tests {
             .unwrap();
         assert_eq!(source.column_count(), 64);
         assert_eq!(page.batches[0].num_columns(), 64);
+    }
+
+    #[test]
+    fn sorts_rows_with_explicit_null_order_and_a_budget() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("sorted.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![
+                Some(3),
+                None,
+                Some(1),
+                Some(2),
+            ]))],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(path).unwrap();
+        let projection = Projection::all(source.column_count());
+        let ascending = source
+            .read_sorted(
+                None,
+                &projection,
+                SortSpec::new(0, SortDirection::Ascending, NullOrder::First),
+                SortBudget::new(10, 1_000_000).unwrap(),
+            )
+            .unwrap();
+        let ascending = ascending[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            ascending.iter().collect::<Vec<_>>(),
+            vec![None, Some(1), Some(2), Some(3)]
+        );
+
+        let descending = source
+            .read_sorted(
+                None,
+                &projection,
+                SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
+                SortBudget::new(10, 1_000_000).unwrap(),
+            )
+            .unwrap();
+        let descending = descending[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            descending.iter().collect::<Vec<_>>(),
+            vec![Some(3), Some(2), Some(1), None]
+        );
+
+        let error = source
+            .read_sorted(
+                None,
+                &projection,
+                SortSpec::new(0, SortDirection::Ascending, NullOrder::Last),
+                SortBudget::new(3, 1_000_000).unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("external sorting is unavailable")
+        );
+    }
+
+    #[test]
+    fn sorts_dates_and_timestamps() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("temporal-sort.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("date", DataType::Date32, false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(Date32Array::from(vec![3, 1, 2])),
+                Arc::new(TimestampMillisecondArray::from(vec![20, 10, 30])),
+            ],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(path).unwrap();
+        let projection = Projection::all(source.column_count());
+        for (column, direction, expected) in [
+            (1, SortDirection::Ascending, vec![1, 2, 0]),
+            (2, SortDirection::Descending, vec![2, 0, 1]),
+        ] {
+            let sorted = source
+                .read_sorted(
+                    None,
+                    &projection,
+                    SortSpec::new(column, direction, NullOrder::Last),
+                    SortBudget::new(10, 1_000_000).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(ids(&sorted[0]), expected);
+        }
     }
 }

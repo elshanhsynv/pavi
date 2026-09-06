@@ -2,7 +2,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
-use parquet_reader::{DataPage, PAGE_ROWS};
+use parquet_reader::{DataPage, PAGE_ROWS, SortBudget};
 use pavi_runtime::{
     CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SubmitError,
     TaskId,
@@ -12,10 +12,12 @@ use crate::{LogicalPlan, PhysicalPlan, Planner};
 
 pub struct QueryEngine {
     runtime: RuntimeHandle,
+    sort_budget: SortBudget,
 }
 
 pub struct QueryExecution {
     runtime: RuntimeHandle,
+    sort_budget: SortBudget,
     plan: PhysicalPlan,
     generation_id: GenerationId,
     pending: Option<PageTask>,
@@ -27,6 +29,7 @@ pub struct QueryExecution {
     finished: bool,
     cancelled: bool,
     scheduled_reads: usize,
+    sort_submitted: bool,
 }
 
 #[derive(Debug)]
@@ -47,12 +50,21 @@ enum InFlight {
     Page,
     Window,
     Filtered { requested_rows: usize },
+    Sorted,
 }
 
 impl QueryEngine {
     pub fn new(runtime: &Runtime) -> Self {
         Self {
             runtime: runtime.handle(),
+            sort_budget: SortBudget::default(),
+        }
+    }
+
+    pub fn with_sort_budget(runtime: &Runtime, sort_budget: SortBudget) -> Self {
+        Self {
+            runtime: runtime.handle(),
+            sort_budget,
         }
     }
 
@@ -64,6 +76,7 @@ impl QueryEngine {
         let plan = Planner::plan(logical)?;
         let mut execution = QueryExecution {
             runtime: self.runtime.clone(),
+            sort_budget: self.sort_budget,
             remaining: plan.limit,
             plan,
             generation_id,
@@ -75,6 +88,7 @@ impl QueryEngine {
             finished: false,
             cancelled: false,
             scheduled_reads: 0,
+            sort_submitted: false,
         };
         if let Err(error) = execution.schedule_next()
             && !is_queue_full(&error)
@@ -133,6 +147,9 @@ impl QueryExecution {
                 PageOutcome::Batch(batch) => {
                     self.buffer_batch(batch, in_flight, response.task_id)?
                 }
+                PageOutcome::Batches(batches) => {
+                    self.buffer_batches(batches, in_flight, response.task_id)?
+                }
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
                     return Err(error).context(format!("query task {} failed", response.task_id.0));
@@ -190,6 +207,9 @@ impl QueryExecution {
                 PageOutcome::Batch(batch) => {
                     self.buffer_batch(batch, in_flight, response.task_id)?
                 }
+                PageOutcome::Batches(batches) => {
+                    self.buffer_batches(batches, in_flight, response.task_id)?
+                }
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
                     return Err(error).context(format!("query task {} failed", response.task_id.0));
@@ -226,10 +246,30 @@ impl QueryExecution {
                 }
             }
             InFlight::Page => bail!("runtime returned a batch for a page query read"),
+            InFlight::Sorted => bail!("runtime returned one batch for a sorted query read"),
         }
         if batch.num_rows() > 0 {
             self.buffered.push_back((task_id, batch));
         }
+        Ok(())
+    }
+
+    fn buffer_batches(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        in_flight: InFlight,
+        task_id: TaskId,
+    ) -> Result<()> {
+        if !matches!(in_flight, InFlight::Sorted) {
+            bail!("runtime returned sorted batches for a non-sort query read");
+        }
+        self.buffered.extend(
+            batches
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .map(|batch| (task_id, batch)),
+        );
+        self.finished = true;
         Ok(())
     }
 
@@ -264,7 +304,23 @@ impl QueryExecution {
 
         let source = Arc::clone(&self.plan.source);
         let projection = self.plan.projection.clone();
-        let (task, in_flight, advance_page) = if let Some(filter) = &self.plan.filter {
+        let (task, in_flight, advance_page) = if let Some(sort) = self.plan.sort {
+            if self.sort_submitted {
+                return Ok(());
+            }
+            (
+                self.runtime.submit_sorted(
+                    source,
+                    self.plan.filter.clone(),
+                    projection,
+                    sort,
+                    self.sort_budget,
+                    self.generation_id,
+                ),
+                InFlight::Sorted,
+                false,
+            )
+        } else if let Some(filter) = &self.plan.filter {
             (
                 self.runtime.submit_filtered_window(
                     source,
@@ -314,6 +370,9 @@ impl QueryExecution {
         if advance_page {
             self.next_page = self.next_page.saturating_add(1);
         }
+        if matches!(in_flight, InFlight::Sorted) {
+            self.sort_submitted = true;
+        }
         self.pending = Some(task);
         self.in_flight = Some(in_flight);
         self.scheduled_reads += 1;
@@ -339,7 +398,7 @@ impl QueryBatch {
 mod tests {
     use std::{fs, fs::File, sync::Arc};
 
-    use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch};
+    use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use parquet_reader::ParquetSource;
@@ -347,7 +406,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::Filter;
+    use crate::{Filter, NullOrder, SortBudget, SortDirection};
 
     const ROWS: i32 = PAGE_ROWS as i32 + 10;
 
@@ -392,6 +451,44 @@ mod tests {
             queue_capacity: 2,
         })
         .unwrap()
+    }
+
+    fn sort_source() -> (TempDir, Arc<ParquetSource>) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sort.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            schema.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(2))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(Int32Array::from(vec![Some(3), None, Some(1), Some(2)])),
+                        Arc::new(StringArray::from(vec![
+                            Some("z"),
+                            Some("a"),
+                            None,
+                            Some("a"),
+                        ])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        (dir, Arc::new(ParquetSource::open(path).unwrap()))
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {
@@ -605,6 +702,137 @@ mod tests {
             .unwrap();
         assert!(batch.is_stale_for(GenerationId(8)));
         assert!(!batch.is_stale_for(GenerationId(7)));
+    }
+
+    #[test]
+    fn executes_direct_sort_with_deterministic_null_and_string_ordering() {
+        let (_dir, source) = sort_source();
+        let runtime = runtime();
+        let mut ascending = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(Arc::clone(&source)).sort(
+                    0,
+                    SortDirection::Ascending,
+                    NullOrder::Last,
+                ),
+                GenerationId(5),
+            )
+            .unwrap();
+        let batch = ascending.next_batch().unwrap().unwrap().batch;
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![Some(1), Some(2), Some(3), None]);
+
+        let mut strings = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(source).sort(1, SortDirection::Descending, NullOrder::First),
+                GenerationId(6),
+            )
+            .unwrap();
+        let batch = strings.next_batch().unwrap().unwrap().batch;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![None, Some("z"), Some("a"), Some("a")]);
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![Some(1), Some(3), None, Some(2)]);
+    }
+
+    #[test]
+    fn sorts_multiple_pages_and_applies_limit_after_ordering() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(source)
+                    .sort(0, SortDirection::Descending, NullOrder::Last)
+                    .limit(3),
+                GenerationId(12),
+            )
+            .unwrap();
+        let batch = execution.next_batch().unwrap().unwrap().batch;
+        assert_eq!(ids(&batch), vec![ROWS - 1, ROWS - 2, ROWS - 3]);
+        assert!(execution.next_batch().unwrap().is_none());
+        assert_eq!(execution.scheduled_reads(), 1);
+    }
+
+    #[test]
+    fn rejects_sort_inputs_over_the_configured_budget_without_temp_files() {
+        let (directory, source, _) = source();
+        let runtime = runtime();
+        let mut execution = QueryEngine::with_sort_budget(
+            &runtime,
+            SortBudget::new(10, SortBudget::DEFAULT_MAX_BYTES).unwrap(),
+        )
+        .execute(
+            &LogicalPlan::scan(source).sort(0, SortDirection::Ascending, NullOrder::Last),
+            GenerationId(13),
+        )
+        .unwrap();
+        let error = execution.next_batch().unwrap_err();
+        assert!(format!("{error:#}").contains("external sorting is unavailable"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sorting_preserves_cancellation_and_generation_handling() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(source).sort(0, SortDirection::Ascending, NullOrder::Last),
+                GenerationId(14),
+            )
+            .unwrap();
+        execution.cancel();
+        assert!(
+            execution
+                .next_batch()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn sorts_empty_and_single_row_inputs() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let mut empty = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(Arc::clone(&source))
+                    .filter(Filter::parse("id > 999999").unwrap())
+                    .sort(0, SortDirection::Ascending, NullOrder::Last),
+                GenerationId(15),
+            )
+            .unwrap();
+        assert!(empty.next_batch().unwrap().is_none());
+
+        let mut single = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(source)
+                    .filter(Filter::parse("id == 1").unwrap())
+                    .sort(0, SortDirection::Ascending, NullOrder::Last),
+                GenerationId(16),
+            )
+            .unwrap();
+        assert_eq!(ids(&single.next_batch().unwrap().unwrap().batch), vec![1]);
+        assert!(single.next_batch().unwrap().is_none());
     }
 
     #[test]

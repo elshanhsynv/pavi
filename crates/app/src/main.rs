@@ -9,7 +9,10 @@ use std::{
 
 use eframe::egui::{self, Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
-use parquet_reader::{DataPage, ParquetSource, Projection, value::format_cell_with_limit};
+use parquet_reader::{
+    DataPage, NullOrder, ParquetSource, Projection, SortDirection, SortSpec,
+    value::format_cell_with_limit,
+};
 use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryExecution, QueryPoll, SqlAst};
 use pavi_runtime::{OpenOutcome, OpenTask, PageOutcome, PageTask, Runtime, RuntimeConfig};
 
@@ -37,6 +40,7 @@ struct Dataset {
 enum QueryKind {
     Filter,
     Sql,
+    Sort,
 }
 
 impl QueryKind {
@@ -44,6 +48,7 @@ impl QueryKind {
         match self {
             Self::Filter => "Filter",
             Self::Sql => "SQL",
+            Self::Sort => "Sorted",
         }
     }
 
@@ -51,12 +56,15 @@ impl QueryKind {
         match self {
             Self::Filter => "No rows match the filter.",
             Self::Sql => "The query returned no rows.",
+            Self::Sort => "The dataset has no rows.",
         }
     }
 }
 
 struct FilteredGrid {
     kind: QueryKind,
+    plan: LogicalPlan,
+    sort: Option<SortSpec>,
     projected_columns: Vec<usize>,
     execution: Option<QueryExecution>,
     batches: VecDeque<arrow_array::RecordBatch>,
@@ -68,9 +76,17 @@ struct FilteredGrid {
 }
 
 impl FilteredGrid {
-    fn new(kind: QueryKind, projected_columns: Vec<usize>, execution: QueryExecution) -> Self {
+    fn new(
+        kind: QueryKind,
+        plan: LogicalPlan,
+        sort: Option<SortSpec>,
+        projected_columns: Vec<usize>,
+        execution: QueryExecution,
+    ) -> Self {
         Self {
             kind,
+            plan,
+            sort,
             projected_columns,
             execution: Some(execution),
             batches: VecDeque::new(),
@@ -269,7 +285,7 @@ impl PaviApp {
                         self.grid.requested.remove(&page_index);
                         self.status = format!("load page {page_index}: {error:#}");
                     }
-                    PageOutcome::Batch(_) | PageOutcome::Loaded(_) => {
+                    PageOutcome::Batch(_) | PageOutcome::Batches(_) | PageOutcome::Loaded(_) => {
                         self.grid.requested.remove(&page_index);
                         self.status = format!("unexpected response for page {page_index}");
                     }
@@ -328,10 +344,13 @@ impl PaviApp {
         let plan = LogicalPlan::scan(source)
             .filter(filter)
             .project(projected_columns.clone());
-        if let Err(error) = Planner::plan(&plan) {
-            self.filter_error = Some(format!("Invalid filter: {error:#}"));
-            return;
-        }
+        let sort = match Planner::plan(&plan) {
+            Ok(plan) => plan.sort(),
+            Err(error) => {
+                self.filter_error = Some(format!("Invalid filter: {error:#}"));
+                return;
+            }
+        };
         self.cancel_page_work();
         self.cancel_filter();
         let generation = self.grid.reset();
@@ -344,6 +363,8 @@ impl PaviApp {
             Ok(execution) => {
                 self.filtered = Some(FilteredGrid::new(
                     QueryKind::Filter,
+                    plan,
+                    sort,
                     projected_columns,
                     execution,
                 ));
@@ -401,8 +422,8 @@ impl PaviApp {
                 return;
             }
         };
-        let projected_columns = match Planner::plan(&plan) {
-            Ok(plan) => plan.projected_columns().to_vec(),
+        let (projected_columns, sort) = match Planner::plan(&plan) {
+            Ok(plan) => (plan.projected_columns().to_vec(), plan.sort()),
             Err(error) => {
                 self.sql_error = Some(format!("SQL error: {error:#}"));
                 return;
@@ -426,6 +447,8 @@ impl PaviApp {
             Ok(execution) => {
                 self.filtered = Some(FilteredGrid::new(
                     QueryKind::Sql,
+                    plan,
+                    sort,
                     projected_columns,
                     execution,
                 ));
@@ -457,6 +480,87 @@ impl PaviApp {
         } else {
             self.grid.generation = generation;
         }
+    }
+
+    fn toggle_sort(&mut self, column: usize) {
+        let Some(dataset) = &self.dataset else {
+            self.status = "Open a dataset before sorting".to_string();
+            return;
+        };
+        let source = Arc::clone(&dataset.source);
+        let column_count = source.column_count();
+        let column_name = dataset.column_names.get(column).cloned();
+        let Some(column_name) = column_name else {
+            self.status = format!("Sort column {column} is out of range");
+            return;
+        };
+        let (plan, kind, previous) = if let Some(filtered) = &self.filtered {
+            (filtered.plan.clone(), filtered.kind, filtered.sort)
+        } else {
+            (
+                LogicalPlan::scan(source).project((0..column_count).collect::<Vec<_>>()),
+                QueryKind::Sort,
+                None,
+            )
+        };
+        let direction = match previous {
+            Some(sort) if sort.column == column && sort.direction == SortDirection::Ascending => {
+                SortDirection::Descending
+            }
+            _ => SortDirection::Ascending,
+        };
+        let plan = plan.replace_sort(column, direction, NullOrder::Last);
+        let (projected_columns, sort) = match Planner::plan(&plan) {
+            Ok(plan) => (plan.projected_columns().to_vec(), plan.sort()),
+            Err(error) => {
+                self.status = format!("Sort error: {error:#}");
+                return;
+            }
+        };
+        if self.runtime.is_none() {
+            self.status = "Background runtime is unavailable".to_string();
+            return;
+        }
+
+        self.cancel_page_work();
+        self.cancel_filter();
+        let generation = self.grid.reset();
+        self.grid.ready(0, projected_columns.len());
+        let Some(runtime) = &self.runtime else {
+            self.status = "Background runtime is unavailable".to_string();
+            return;
+        };
+        match QueryEngine::new(runtime).execute(&plan, generation) {
+            Ok(execution) => {
+                self.filtered = Some(FilteredGrid::new(
+                    kind,
+                    plan,
+                    sort,
+                    projected_columns,
+                    execution,
+                ));
+                let arrow = match direction {
+                    SortDirection::Ascending => "↑",
+                    SortDirection::Descending => "↓",
+                };
+                self.status = format!("Sorting {column_name} {arrow} (nulls last)");
+            }
+            Err(error) => self.status = format!("Start sort: {error:#}"),
+        }
+    }
+
+    fn sort_heading(&self, column: usize, name: &str) -> String {
+        let Some(sort) = self.filtered.as_ref().and_then(|filtered| filtered.sort) else {
+            return name.to_string();
+        };
+        if sort.column != column {
+            return name.to_string();
+        }
+        let arrow = match sort.direction {
+            SortDirection::Ascending => " ↑",
+            SortDirection::Descending => " ↓",
+        };
+        format!("{name}{arrow}")
     }
 
     fn poll_filtered(&mut self) {
@@ -615,7 +719,9 @@ impl PaviApp {
                         .code_editor()
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
-                        .hint_text("SELECT column FROM dataset WHERE column >= 10 LIMIT 100"),
+                        .hint_text(
+                            "SELECT column FROM dataset WHERE column >= 10 ORDER BY column DESC LIMIT 100",
+                        ),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Run SQL").clicked() {
@@ -624,7 +730,7 @@ impl PaviApp {
                     if ui.button("Cancel SQL").clicked() {
                         self.cancel_sql();
                     }
-                    ui.label("SELECT … FROM dataset [WHERE …] [LIMIT n]");
+                    ui.label("SELECT … FROM dataset [WHERE …] [ORDER BY column] [LIMIT n]");
                     if let Some(error) = &self.sql_error {
                         ui.label(RichText::new(error).color(egui::Color32::RED));
                     }
@@ -711,9 +817,12 @@ impl PaviApp {
                         header.col(|ui| {
                             ui.strong("Row");
                         });
-                        for name in &names {
+                        for (column, name) in names.iter().enumerate() {
+                            let heading = self.sort_heading(column, name);
                             header.col(|ui| {
-                                ui.strong(name);
+                                if ui.button(heading).clicked() {
+                                    self.toggle_sort(column);
+                                }
                             });
                         }
                     })
@@ -819,9 +928,13 @@ impl PaviApp {
                         header.col(|ui| {
                             ui.strong("Result");
                         });
-                        for name in &names {
+                        for (column, name) in names.iter().enumerate() {
+                            let source_column = projected_columns[column];
+                            let heading = self.sort_heading(source_column, name);
                             header.col(|ui| {
-                                ui.strong(name);
+                                if ui.button(heading).clicked() {
+                                    self.toggle_sort(source_column);
+                                }
                             });
                         }
                     })
@@ -1149,6 +1262,15 @@ mod tests {
         assert_eq!(app.grid.rows, 2);
         assert_eq!(filtered_ids(&app), vec!["alpha", "beta"]);
         assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sql);
+
+        app.sql_input = "SELECT id FROM dataset ORDER BY id DESC LIMIT 2".to_string();
+        app.run_sql();
+        poll_until_idle(&mut app);
+        assert_eq!(filtered_ids(&app), vec!["7", "6"]);
+        assert_eq!(
+            app.filtered.as_ref().and_then(|filtered| filtered.sort),
+            Some(SortSpec::new(0, SortDirection::Descending, NullOrder::Last))
+        );
     }
 
     #[test]
@@ -1228,6 +1350,55 @@ mod tests {
         assert_eq!(app.grid.rows, 8);
         assert_eq!(app.grid.columns, 2);
         assert!(app.status.contains("cancelled"));
+    }
+
+    #[test]
+    fn sorts_grid_headers_and_toggles_direction_without_a_second_renderer() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+
+        app.toggle_sort(0);
+        poll_until_idle(&mut app);
+        assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sort);
+        assert_eq!(app.sort_heading(0, "id"), "id ↑");
+        assert_eq!(
+            filtered_ids(&app),
+            (0..8).map(|id| id.to_string()).collect::<Vec<_>>()
+        );
+
+        app.toggle_sort(0);
+        poll_until_idle(&mut app);
+        assert_eq!(app.sort_heading(0, "id"), "id ↓");
+        assert_eq!(
+            filtered_ids(&app),
+            (0..8).rev().map(|id| id.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sorts_an_active_filter_and_rejects_stale_sorted_results() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.filter_input = "id >= 2".to_string();
+        app.apply_filter();
+        let cancellation = app
+            .filtered
+            .as_ref()
+            .and_then(|filtered| filtered.execution.as_ref())
+            .and_then(QueryExecution::cancellation_token)
+            .unwrap();
+
+        app.toggle_sort(0);
+        assert!(cancellation.is_cancelled());
+        poll_until_idle(&mut app);
+        assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Filter);
+        assert_eq!(filtered_ids(&app), vec!["2", "3", "4", "5", "6", "7"]);
+
+        app.grid.generation.0 = app.grid.generation.0.saturating_add(1);
+        app.toggle_sort(0);
+        app.grid.generation.0 = app.grid.generation.0.saturating_add(1);
+        poll_until_idle(&mut app);
+        assert_eq!(app.grid.rows, 0);
     }
 
     #[test]

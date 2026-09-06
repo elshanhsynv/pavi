@@ -153,6 +153,7 @@ fn read_page(
         PageOutcome::Cancelled => bail!("page {page} was cancelled"),
         PageOutcome::ReadFailed(error) => Err(error).context(format!("read page {page}")),
         PageOutcome::Batch(_) => bail!("page {page} unexpectedly returned a record batch"),
+        PageOutcome::Batches(_) => bail!("page {page} unexpectedly returned record batches"),
     }
 }
 

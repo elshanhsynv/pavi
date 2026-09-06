@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use parquet_reader::{FilterExpr, ParquetSource};
+use parquet_reader::{FilterExpr, NullOrder, ParquetSource, SortDirection, SortSpec};
 
+#[derive(Clone)]
 pub struct Scan {
     pub(crate) source: Arc<ParquetSource>,
 }
@@ -22,6 +23,12 @@ pub struct Limit {
     pub(crate) rows: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Sort {
+    pub(crate) spec: SortSpec,
+}
+
+#[derive(Clone)]
 pub enum LogicalPlan {
     Scan(Scan),
     Projection {
@@ -35,6 +42,10 @@ pub enum LogicalPlan {
     Limit {
         input: Box<LogicalPlan>,
         limit: Limit,
+    },
+    Sort {
+        input: Box<LogicalPlan>,
+        sort: Sort,
     },
 }
 
@@ -76,6 +87,18 @@ impl Limit {
     }
 }
 
+impl Sort {
+    pub fn new(column: usize, direction: SortDirection, nulls: NullOrder) -> Self {
+        Self {
+            spec: SortSpec::new(column, direction, nulls),
+        }
+    }
+
+    pub fn spec(&self) -> SortSpec {
+        self.spec
+    }
+}
+
 impl LogicalPlan {
     pub fn scan(source: Arc<ParquetSource>) -> Self {
         Self::Scan(Scan::new(source))
@@ -99,6 +122,29 @@ impl LogicalPlan {
         Self::Limit {
             input: Box::new(self),
             limit: Limit::new(rows),
+        }
+    }
+
+    pub fn sort(self, column: usize, direction: SortDirection, nulls: NullOrder) -> Self {
+        Self::Sort {
+            input: Box::new(self),
+            sort: Sort::new(column, direction, nulls),
+        }
+    }
+
+    /// Replaces the one supported sort while keeping `Limit` outside it.
+    pub fn replace_sort(self, column: usize, direction: SortDirection, nulls: NullOrder) -> Self {
+        let sort = Sort::new(column, direction, nulls);
+        match self {
+            Self::Limit { input, limit } => Self::Limit {
+                input: Box::new(input.replace_sort(column, direction, nulls)),
+                limit,
+            },
+            Self::Sort { input, .. } => input.replace_sort(column, direction, nulls),
+            plan => Self::Sort {
+                input: Box::new(plan),
+                sort,
+            },
         }
     }
 }

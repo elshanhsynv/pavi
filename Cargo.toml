@@ -15,6 +15,7 @@ clap = { version = "4", features = ["derive"] }
 arrow-array = "59"
 arrow-schema = "59"
 arrow-select = "59"
+arrow-ord = "59"
 parquet = { version = "59", features = ["arrow"] }
 eframe = "0.31"
 egui_extras = "0.31"

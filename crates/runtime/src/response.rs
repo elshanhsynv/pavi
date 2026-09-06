@@ -10,6 +10,7 @@ use crate::{GenerationId, TaskId};
 pub enum PageOutcome {
     Loaded(DataPage),
     Batch(RecordBatch),
+    Batches(Vec<RecordBatch>),
     Cancelled,
     ReadFailed(Error),
 }

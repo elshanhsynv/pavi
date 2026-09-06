@@ -9,7 +9,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use parquet_reader::{FilterExpr, ParquetSource, Projection};
+use parquet_reader::{FilterExpr, ParquetSource, Projection, SortBudget, SortSpec};
 
 use crate::{
     CancellationToken, GenerationId, OpenOutcome, OpenResponse, OpenTask, PageOutcome,
@@ -83,6 +83,11 @@ enum ReadOperation {
         filter: FilterExpr,
         first_match_offset: u64,
         row_count: usize,
+    },
+    Sorted {
+        filter: Option<FilterExpr>,
+        sort: SortSpec,
+        budget: SortBudget,
     },
 }
 
@@ -239,6 +244,19 @@ impl Runtime {
         )
     }
 
+    pub fn submit_sorted(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: Option<FilterExpr>,
+        projection: Projection,
+        sort: SortSpec,
+        budget: SortBudget,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.handle()
+            .submit_sorted(source, filter, projection, sort, budget, generation_id)
+    }
+
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Ok(mut submissions) = self.submissions.lock() {
@@ -351,6 +369,28 @@ impl RuntimeHandle {
                 filter,
                 first_match_offset,
                 row_count,
+            },
+            None,
+        )
+    }
+
+    pub fn submit_sorted(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: Option<FilterExpr>,
+        projection: Projection,
+        sort: SortSpec,
+        budget: SortBudget,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Sorted {
+                filter,
+                sort,
+                budget,
             },
             None,
         )
@@ -509,6 +549,13 @@ fn read_source(
         } => source
             .read_filtered_window(&filter, first_match_offset, row_count, projection)
             .map(PageOutcome::Batch),
+        ReadOperation::Sorted {
+            filter,
+            sort,
+            budget,
+        } => source
+            .read_sorted(filter.as_ref(), projection, sort, budget)
+            .map(PageOutcome::Batches),
     }
 }
 

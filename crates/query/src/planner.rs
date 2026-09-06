@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use parquet_reader::{FilterExpr, ParquetSource, Projection};
+use parquet_reader::{FilterExpr, ParquetSource, Projection, SortSpec};
 
 use crate::LogicalPlan;
 
@@ -10,6 +10,7 @@ pub struct PhysicalPlan {
     pub(crate) projection: Projection,
     pub(crate) filter: Option<FilterExpr>,
     pub(crate) limit: Option<usize>,
+    pub(crate) sort: Option<SortSpec>,
 }
 
 pub struct Planner;
@@ -25,6 +26,10 @@ impl PhysicalPlan {
 
     pub fn limit(&self) -> Option<usize> {
         self.limit
+    }
+
+    pub fn sort(&self) -> Option<SortSpec> {
+        self.sort
     }
 }
 
@@ -43,11 +48,15 @@ impl Planner {
                 .validate_filter(filter)
                 .context("validate query filter")?;
         }
+        if let Some(sort) = state.sort {
+            source.validate_sort(sort).context("validate query sort")?;
+        }
         Ok(PhysicalPlan {
             source,
             projection,
             filter: state.filter,
             limit: state.limit,
+            sort: state.sort,
         })
     }
 }
@@ -58,6 +67,7 @@ struct PlanState {
     columns: Option<Vec<usize>>,
     filter: Option<FilterExpr>,
     limit: Option<usize>,
+    sort: Option<SortSpec>,
 }
 
 fn collect(plan: &LogicalPlan, state: &mut PlanState) -> Result<()> {
@@ -83,6 +93,12 @@ fn collect(plan: &LogicalPlan, state: &mut PlanState) -> Result<()> {
             collect(input, state)?;
             if state.limit.replace(limit.rows).is_some() {
                 bail!("query plan contains more than one limit");
+            }
+        }
+        LogicalPlan::Sort { input, sort } => {
+            collect(input, state)?;
+            if state.sort.replace(sort.spec()).is_some() {
+                bail!("query plan contains more than one sort");
             }
         }
     }

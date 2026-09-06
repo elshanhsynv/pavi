@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use parquet_reader::{FilterExpr, FilterOp, ParquetSource};
+use parquet_reader::{FilterExpr, FilterOp, NullOrder, ParquetSource, SortDirection};
 use sqlparser::{
     ast::{
-        BinaryOperator, Expr, GroupByExpr, SelectItem, SetExpr, Statement, TableFactor,
-        UnaryOperator,
+        BinaryOperator, Expr, GroupByExpr, OrderBy, OrderByKind, SelectItem, SetExpr, Statement,
+        TableFactor, UnaryOperator,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -18,6 +18,7 @@ use crate::{Filter, LogicalPlan, Planner};
 pub struct SqlAst {
     projection: SqlProjection,
     predicate: Option<SqlPredicate>,
+    sort: Option<SqlSort>,
     limit: Option<usize>,
 }
 
@@ -34,6 +35,13 @@ pub struct SqlPredicate {
     pub value: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlSort {
+    pub column: String,
+    pub direction: SortDirection,
+    pub nulls: NullOrder,
+}
+
 impl SqlAst {
     /// Parses one `SELECT ... FROM dataset [WHERE ...] [LIMIT ...]` statement.
     pub fn parse(sql: &str) -> Result<Self> {
@@ -48,9 +56,6 @@ impl SqlAst {
         if query.with.is_some() {
             bail!("WITH queries are not supported");
         }
-        if query.order_by.is_some() {
-            bail!("ORDER BY is not supported");
-        }
         if query.fetch.is_some() {
             bail!("FETCH is not supported; use LIMIT");
         }
@@ -60,6 +65,7 @@ impl SqlAst {
         }
 
         let limit = parse_limit(query.limit_clause.as_ref())?;
+        let sort = parse_order_by(query.order_by.as_ref())?;
         let SetExpr::Select(select) = *query.body else {
             bail!("only a single SELECT is supported");
         };
@@ -69,6 +75,7 @@ impl SqlAst {
         Ok(Self {
             projection: parse_projection(&select.projection)?,
             predicate: select.selection.as_ref().map(parse_predicate).transpose()?,
+            sort,
             limit,
         })
     }
@@ -83,6 +90,10 @@ impl SqlAst {
 
     pub fn limit(&self) -> Option<usize> {
         self.limit
+    }
+
+    pub fn sort(&self) -> Option<&SqlSort> {
+        self.sort.as_ref()
     }
 
     /// Resolves names against a single PAVI data source and produces the existing logical plan.
@@ -109,6 +120,17 @@ impl SqlAst {
                 }))
             })
             .transpose()?;
+        let sort = self
+            .sort
+            .as_ref()
+            .map(|sort| -> Result<(usize, SortDirection, NullOrder)> {
+                Ok((
+                    resolve_column(&source, &sort.column)?,
+                    sort.direction,
+                    sort.nulls,
+                ))
+            })
+            .transpose()?;
 
         let mut plan = LogicalPlan::scan(source);
         if let Some(filter) = filter {
@@ -117,12 +139,46 @@ impl SqlAst {
         if let Some(projection) = projection {
             plan = plan.project(projection);
         }
+        if let Some((column, direction, nulls)) = sort {
+            plan = plan.sort(column, direction, nulls);
+        }
         if let Some(limit) = self.limit {
             plan = plan.limit(limit);
         }
         Planner::plan(&plan).context("validate SQL query")?;
         Ok(plan)
     }
+}
+
+fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Option<SqlSort>> {
+    let Some(order_by) = order_by else {
+        return Ok(None);
+    };
+    if order_by.interpolate.is_some() {
+        bail!("ORDER BY INTERPOLATE is not supported");
+    }
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        bail!("ORDER BY ALL is not supported");
+    };
+    let [expression] = expressions.as_slice() else {
+        bail!("ORDER BY supports exactly one column");
+    };
+    if expression.with_fill.is_some() {
+        bail!("ORDER BY WITH FILL is not supported");
+    }
+    Ok(Some(SqlSort {
+        column: parse_column(&expression.expr)?,
+        direction: if expression.options.asc == Some(false) {
+            SortDirection::Descending
+        } else {
+            SortDirection::Ascending
+        },
+        nulls: if expression.options.nulls_first == Some(true) {
+            NullOrder::First
+        } else {
+            NullOrder::Last
+        },
+    }))
 }
 
 fn reject_select_clauses(select: &sqlparser::ast::Select) -> Result<()> {
@@ -441,12 +497,48 @@ mod tests {
     }
 
     #[test]
+    fn translates_single_column_order_by_through_the_runtime_path() {
+        let (_directory, order_source) = source();
+        let sql = "SELECT id FROM dataset ORDER BY id DESC NULLS LAST LIMIT 3";
+        let ast = SqlAst::parse(sql).unwrap();
+        assert_eq!(
+            ast.sort(),
+            Some(&SqlSort {
+                column: "id".to_string(),
+                direction: SortDirection::Descending,
+                nulls: NullOrder::Last,
+            })
+        );
+        let batches = execute(sql, order_source);
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values();
+        assert_eq!(ids, &[ROWS - 1, ROWS - 2, ROWS - 3]);
+
+        let (_directory, projected_source) = source();
+        let projected = execute(
+            "SELECT id FROM dataset ORDER BY name ASC LIMIT 3",
+            projected_source,
+        );
+        let ids = projected[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values();
+        assert_eq!(ids, &[0, 2, 4]);
+    }
+
+    #[test]
     fn rejects_invalid_unsupported_and_invalid_source_queries() {
         for sql in [
             "SELECT FROM dataset",
             "SELECT id FROM other",
             "SELECT id FROM dataset WHERE id = 1 AND enabled = true",
-            "SELECT id FROM dataset ORDER BY id",
+            "SELECT id FROM dataset ORDER BY id, enabled",
             "SELECT id FROM dataset LIMIT 1 OFFSET 1",
         ] {
             assert!(SqlAst::parse(sql).is_err(), "{sql}");
