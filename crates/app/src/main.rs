@@ -65,6 +65,7 @@ struct FilteredGrid {
     kind: QueryKind,
     plan: LogicalPlan,
     sort: Option<SortSpec>,
+    aggregate: bool,
     projected_columns: Vec<usize>,
     execution: Option<QueryExecution>,
     batches: VecDeque<arrow_array::RecordBatch>,
@@ -80,6 +81,7 @@ impl FilteredGrid {
         kind: QueryKind,
         plan: LogicalPlan,
         sort: Option<SortSpec>,
+        aggregate: bool,
         projected_columns: Vec<usize>,
         execution: QueryExecution,
     ) -> Self {
@@ -87,6 +89,7 @@ impl FilteredGrid {
             kind,
             plan,
             sort,
+            aggregate,
             projected_columns,
             execution: Some(execution),
             batches: VecDeque::new(),
@@ -365,6 +368,7 @@ impl PaviApp {
                     QueryKind::Filter,
                     plan,
                     sort,
+                    false,
                     projected_columns,
                     execution,
                 ));
@@ -422,8 +426,21 @@ impl PaviApp {
                 return;
             }
         };
-        let (projected_columns, sort) = match Planner::plan(&plan) {
-            Ok(plan) => (plan.projected_columns().to_vec(), plan.sort()),
+        let (projected_columns, sort, aggregate) = match Planner::plan(&plan) {
+            Ok(plan) => {
+                let aggregate = plan.aggregate();
+                (
+                    if let Some(aggregate) = aggregate {
+                        (0..aggregate.expressions().len()
+                            + usize::from(aggregate.group_by().is_some()))
+                            .collect()
+                    } else {
+                        plan.projected_columns().to_vec()
+                    },
+                    plan.sort(),
+                    aggregate.is_some(),
+                )
+            }
             Err(error) => {
                 self.sql_error = Some(format!("SQL error: {error:#}"));
                 return;
@@ -449,6 +466,7 @@ impl PaviApp {
                     QueryKind::Sql,
                     plan,
                     sort,
+                    aggregate,
                     projected_columns,
                     execution,
                 ));
@@ -536,6 +554,7 @@ impl PaviApp {
                     kind,
                     plan,
                     sort,
+                    false,
                     projected_columns,
                     execution,
                 ));
@@ -719,9 +738,7 @@ impl PaviApp {
                         .code_editor()
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
-                        .hint_text(
-                            "SELECT column FROM dataset WHERE column >= 10 ORDER BY column DESC LIMIT 100",
-                        ),
+                        .hint_text("SELECT category, COUNT(*) FROM dataset GROUP BY category"),
                 );
                 ui.horizontal(|ui| {
                     if ui.button("Run SQL").clicked() {
@@ -730,7 +747,7 @@ impl PaviApp {
                     if ui.button("Cancel SQL").clicked() {
                         self.cancel_sql();
                     }
-                    ui.label("SELECT … FROM dataset [WHERE …] [ORDER BY column] [LIMIT n]");
+                    ui.label("SELECT … FROM dataset [WHERE …] [GROUP BY column] [LIMIT n]");
                     if let Some(error) = &self.sql_error {
                         ui.label(RichText::new(error).color(egui::Color32::RED));
                     }
@@ -879,6 +896,7 @@ impl PaviApp {
         let finished = filtered.finished;
         let error = filtered.error.clone();
         let kind = filtered.kind;
+        let aggregate = filtered.aggregate;
         let projected_columns = filtered.projected_columns.clone();
         if rows == 0 {
             ui.centered_and_justified(|ui| {
@@ -894,10 +912,25 @@ impl PaviApp {
             return;
         }
 
-        let names = projected_columns
-            .iter()
-            .map(|column| dataset.column_names[*column].clone())
-            .collect::<Vec<_>>();
+        let names = if aggregate {
+            filtered
+                .batches
+                .front()
+                .map(|batch| {
+                    batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            projected_columns
+                .iter()
+                .map(|column| dataset.column_names[*column].clone())
+                .collect::<Vec<_>>()
+        };
         let columns = names.len();
         if let Some(error) = error {
             ui.label(RichText::new(error).color(egui::Color32::RED));
@@ -929,11 +962,15 @@ impl PaviApp {
                             ui.strong("Result");
                         });
                         for (column, name) in names.iter().enumerate() {
-                            let source_column = projected_columns[column];
-                            let heading = self.sort_heading(source_column, name);
                             header.col(|ui| {
-                                if ui.button(heading).clicked() {
-                                    self.toggle_sort(source_column);
+                                if aggregate {
+                                    ui.strong(name);
+                                } else {
+                                    let source_column = projected_columns[column];
+                                    let heading = self.sort_heading(source_column, name);
+                                    if ui.button(heading).clicked() {
+                                        self.toggle_sort(source_column);
+                                    }
                                 }
                             });
                         }
@@ -1271,6 +1308,29 @@ mod tests {
             app.filtered.as_ref().and_then(|filtered| filtered.sort),
             Some(SortSpec::new(0, SortDirection::Descending, NullOrder::Last))
         );
+
+        app.sql_input = "SELECT COUNT(*), SUM(id) FROM dataset".to_string();
+        app.run_sql();
+        poll_until_idle(&mut app);
+        assert!(app.sql_error.is_none());
+        assert_eq!(app.grid.columns, 2);
+        assert_eq!(app.grid.rows, 1);
+        assert_eq!(filtered_ids(&app), vec!["8"]);
+        assert_eq!(app.filtered_cell_text(0, 1).as_deref(), Some("28"));
+        assert!(app.filtered.as_ref().is_some_and(|grid| grid.aggregate));
+        let fields = app
+            .filtered
+            .as_ref()
+            .unwrap()
+            .batches
+            .front()
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(fields, vec!["COUNT(*)", "SUM(id)"]);
     }
 
     #[test]

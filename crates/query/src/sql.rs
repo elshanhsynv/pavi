@@ -4,14 +4,15 @@ use anyhow::{Context, Result, bail};
 use parquet_reader::{FilterExpr, FilterOp, NullOrder, ParquetSource, SortDirection};
 use sqlparser::{
     ast::{
-        BinaryOperator, Expr, GroupByExpr, OrderBy, OrderByKind, SelectItem, SetExpr, Statement,
-        TableFactor, UnaryOperator,
+        BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+        GroupByExpr, OrderBy, OrderByKind, SelectItem, SetExpr, Statement, TableFactor,
+        UnaryOperator,
     },
     dialect::GenericDialect,
     parser::Parser,
 };
 
-use crate::{Filter, LogicalPlan, Planner};
+use crate::{AggregateExpr, AggregateFunction, Filter, LogicalPlan, Planner};
 
 /// The deliberately small SQL shape accepted by PAVI.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +27,19 @@ pub struct SqlAst {
 pub enum SqlProjection {
     All,
     Columns(Vec<String>),
+    Aggregates(SqlAggregate),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlAggregate {
+    pub group_by: Option<String>,
+    pub expressions: Vec<SqlAggregateExpr>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlAggregateExpr {
+    pub function: AggregateFunction,
+    pub column: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,7 +87,7 @@ impl SqlAst {
         validate_from(&select.from)?;
 
         Ok(Self {
-            projection: parse_projection(&select.projection)?,
+            projection: parse_projection(&select.projection, &select.group_by)?,
             predicate: select.selection.as_ref().map(parse_predicate).transpose()?,
             sort,
             limit,
@@ -98,14 +112,47 @@ impl SqlAst {
 
     /// Resolves names against a single PAVI data source and produces the existing logical plan.
     pub fn to_logical_plan(&self, source: Arc<ParquetSource>) -> Result<LogicalPlan> {
-        let projection = match &self.projection {
-            SqlProjection::All => None,
-            SqlProjection::Columns(columns) => Some(
-                columns
-                    .iter()
-                    .map(|column| resolve_column(&source, column))
-                    .collect::<Result<Vec<_>>>()?,
+        let (projection, aggregate) = match &self.projection {
+            SqlProjection::All => (None, None),
+            SqlProjection::Columns(columns) => (
+                Some(
+                    columns
+                        .iter()
+                        .map(|column| resolve_column(&source, column))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                None,
             ),
+            SqlProjection::Aggregates(aggregate) => {
+                let expressions = aggregate
+                    .expressions
+                    .iter()
+                    .map(|expression| {
+                        let column = expression
+                            .column
+                            .as_deref()
+                            .map(|column| resolve_column(&source, column))
+                            .transpose()?;
+                        Ok(match (expression.function, column) {
+                            (AggregateFunction::Count, None) => AggregateExpr::count_all(),
+                            (AggregateFunction::Count, Some(column)) => {
+                                AggregateExpr::count(column)
+                            }
+                            (AggregateFunction::Sum, Some(column)) => AggregateExpr::sum(column),
+                            (AggregateFunction::Avg, Some(column)) => AggregateExpr::avg(column),
+                            (AggregateFunction::Min, Some(column)) => AggregateExpr::min(column),
+                            (AggregateFunction::Max, Some(column)) => AggregateExpr::max(column),
+                            (_, None) => bail!("only COUNT may use *"),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let group_by = aggregate
+                    .group_by
+                    .as_deref()
+                    .map(|column| resolve_column(&source, column))
+                    .transpose()?;
+                (None, Some((group_by, expressions)))
+            }
         };
         let filter = self
             .predicate
@@ -139,7 +186,17 @@ impl SqlAst {
         if let Some(projection) = projection {
             plan = plan.project(projection);
         }
+        if let Some((group_by, expressions)) = aggregate {
+            plan = if let Some(group_by) = group_by {
+                plan.aggregate_grouped(group_by, expressions)?
+            } else {
+                plan.aggregate(expressions)?
+            };
+        }
         if let Some((column, direction, nulls)) = sort {
+            if matches!(self.projection, SqlProjection::Aggregates(_)) {
+                bail!("ORDER BY aggregate results is not supported");
+            }
             plan = plan.sort(column, direction, nulls);
         }
         if let Some(limit) = self.limit {
@@ -198,13 +255,6 @@ fn reject_select_clauses(select: &sqlparser::ast::Select) -> Result<()> {
     {
         bail!("this SELECT clause is not supported");
     }
-    if !matches!(
-        &select.group_by,
-        GroupByExpr::Expressions(expressions, modifiers)
-            if expressions.is_empty() && modifiers.is_empty()
-    ) {
-        bail!("GROUP BY is not supported");
-    }
     Ok(())
 }
 
@@ -225,24 +275,113 @@ fn validate_from(from: &[sqlparser::ast::TableWithJoins]) -> Result<()> {
     Ok(())
 }
 
-fn parse_projection(items: &[SelectItem]) -> Result<SqlProjection> {
+fn parse_projection(items: &[SelectItem], group_by: &GroupByExpr) -> Result<SqlProjection> {
     if matches!(items, [SelectItem::Wildcard(_)]) {
+        if !matches!(group_by, GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty())
+        {
+            bail!("SELECT * cannot be combined with GROUP BY");
+        }
         return Ok(SqlProjection::All);
     }
     if items.is_empty() {
         bail!("SELECT needs at least one column");
     }
-    items
-        .iter()
-        .map(|item| match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => Ok(identifier.value.clone()),
+    let group_by = parse_group_by(group_by)?;
+    let mut columns = Vec::new();
+    let mut aggregates = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(identifier)) => {
+                columns.push(identifier.value.clone())
+            }
+            SelectItem::UnnamedExpr(Expr::Function(function)) => {
+                aggregates.push(parse_aggregate(function)?)
+            }
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 bail!("SELECT * cannot be combined with explicit columns")
             }
-            _ => bail!("SELECT items must be column names or *"),
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(SqlProjection::Columns)
+            _ => bail!("SELECT items must be column names or supported aggregates"),
+        }
+    }
+    if aggregates.is_empty() {
+        if group_by.is_some() {
+            bail!("GROUP BY requires at least one aggregate");
+        }
+        return Ok(SqlProjection::Columns(columns));
+    }
+    let Some(group_by) = group_by.or_else(|| columns.is_empty().then_some(String::new())) else {
+        bail!("aggregate SELECT cannot include ordinary columns without GROUP BY");
+    };
+    let group_by = (!group_by.is_empty()).then_some(group_by);
+    let group_matches = match (columns.first(), group_by.as_deref()) {
+        (None, None) => true,
+        (Some(column), Some(group)) => column.eq_ignore_ascii_case(group),
+        _ => false,
+    };
+    if columns.len() != usize::from(group_by.is_some()) || !group_matches {
+        bail!("SELECT may include only the GROUP BY column and aggregate expressions");
+    }
+    Ok(SqlProjection::Aggregates(SqlAggregate {
+        group_by,
+        expressions: aggregates,
+    }))
+}
+
+fn parse_group_by(group_by: &GroupByExpr) -> Result<Option<String>> {
+    match group_by {
+        GroupByExpr::Expressions(expressions, modifiers)
+            if expressions.is_empty() && modifiers.is_empty() =>
+        {
+            Ok(None)
+        }
+        GroupByExpr::Expressions(expressions, modifiers)
+            if modifiers.is_empty() && expressions.len() == 1 =>
+        {
+            let expression = &expressions[0];
+            Ok(Some(parse_column(expression)?))
+        }
+        _ => bail!("GROUP BY supports exactly one column"),
+    }
+}
+
+fn parse_aggregate(function: &Function) -> Result<SqlAggregateExpr> {
+    if function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        bail!("aggregate modifiers are not supported");
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        bail!("aggregate needs parentheses");
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        bail!("DISTINCT and aggregate argument clauses are not supported");
+    }
+    let function_name = function.name.to_string().to_ascii_uppercase();
+    let function = match function_name.as_str() {
+        "COUNT" => AggregateFunction::Count,
+        "SUM" => AggregateFunction::Sum,
+        "AVG" => AggregateFunction::Avg,
+        "MIN" => AggregateFunction::Min,
+        "MAX" => AggregateFunction::Max,
+        _ => bail!("unsupported aggregate {function_name}"),
+    };
+    let column = match arguments.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+            if function == AggregateFunction::Count =>
+        {
+            None
+        }
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expression))] => {
+            Some(parse_column(expression)?)
+        }
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => bail!("only COUNT may use *"),
+        _ => bail!("aggregate needs exactly one column argument"),
+    };
+    Ok(SqlAggregateExpr { function, column })
 }
 
 fn parse_predicate(expression: &Expr) -> Result<SqlPredicate> {
@@ -371,14 +510,17 @@ fn resolve_column(source: &ParquetSource, name: &str) -> Result<usize> {
 mod tests {
     use std::{fs::File, sync::Arc};
 
-    use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use pavi_runtime::{GenerationId, Runtime, RuntimeConfig};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::QueryEngine;
+    use crate::{AggregateExpr, QueryEngine};
 
     const ROWS: i32 = 4_100;
 
@@ -530,6 +672,126 @@ mod tests {
             .unwrap()
             .values();
         assert_eq!(ids, &[0, 2, 4]);
+    }
+
+    #[test]
+    fn translates_aggregates_and_group_by_through_the_runtime_path() {
+        let (_directory, source) = source();
+        let sql = "SELECT COUNT(*), COUNT(id), SUM(id), AVG(id), MIN(name), MAX(name) FROM dataset";
+        let ast = SqlAst::parse(sql).unwrap();
+        assert!(matches!(ast.projection(), SqlProjection::Aggregates(_)));
+        let batch = execute(sql, Arc::clone(&source)).pop().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            ROWS as u64
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            ROWS as u64
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            i64::from(ROWS - 1) * i64::from(ROWS) / 2
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            f64::from(ROWS - 1) / 2.0
+        );
+        assert_eq!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "alpha"
+        );
+        assert_eq!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "beta"
+        );
+
+        let grouped_sql = "SELECT name, COUNT(*), AVG(id) FROM dataset GROUP BY name";
+        let grouped = execute(grouped_sql, Arc::clone(&source));
+        let direct = LogicalPlan::scan(source)
+            .aggregate_grouped(1, vec![AggregateExpr::count_all(), AggregateExpr::avg(0)])
+            .unwrap();
+        let runtime = runtime();
+        let direct_batch = QueryEngine::new(&runtime)
+            .execute(&direct, GenerationId(30))
+            .unwrap()
+            .next_batch()
+            .unwrap()
+            .unwrap()
+            .batch;
+        assert_eq!(grouped, vec![direct_batch]);
+    }
+
+    #[test]
+    fn aggregates_empty_input_and_rejects_unsupported_forms() {
+        let (_directory, source) = source();
+        let empty = execute(
+            "SELECT COUNT(*), SUM(id) FROM dataset WHERE id > 999999",
+            Arc::clone(&source),
+        );
+        assert_eq!(empty.len(), 1);
+        assert_eq!(
+            empty[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+        assert!(empty[0].column(1).is_null(0));
+
+        for sql in [
+            "SELECT id, COUNT(*) FROM dataset",
+            "SELECT name, COUNT(*) FROM dataset GROUP BY id",
+            "SELECT COUNT(DISTINCT id) FROM dataset",
+            "SELECT SUM(name) FROM dataset",
+            "SELECT COUNT(*) FROM dataset GROUP BY id, name",
+        ] {
+            assert!(
+                SqlAst::parse(sql)
+                    .and_then(|parsed| parsed.to_logical_plan(Arc::clone(&source)))
+                    .is_err(),
+                "{sql}"
+            );
+        }
+        assert!(
+            SqlAst::parse("SELECT COUNT(*) FROM dataset ORDER BY id")
+                .unwrap()
+                .to_logical_plan(source)
+                .is_err()
+        );
     }
 
     #[test]

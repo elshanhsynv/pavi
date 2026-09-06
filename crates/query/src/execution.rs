@@ -2,7 +2,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
-use parquet_reader::{DataPage, PAGE_ROWS, SortBudget};
+use parquet_reader::{DataPage, GroupBudget, PAGE_ROWS, SortBudget};
 use pavi_runtime::{
     CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SubmitError,
     TaskId,
@@ -13,11 +13,13 @@ use crate::{LogicalPlan, PhysicalPlan, Planner};
 pub struct QueryEngine {
     runtime: RuntimeHandle,
     sort_budget: SortBudget,
+    group_budget: GroupBudget,
 }
 
 pub struct QueryExecution {
     runtime: RuntimeHandle,
     sort_budget: SortBudget,
+    group_budget: GroupBudget,
     plan: PhysicalPlan,
     generation_id: GenerationId,
     pending: Option<PageTask>,
@@ -30,6 +32,7 @@ pub struct QueryExecution {
     cancelled: bool,
     scheduled_reads: usize,
     sort_submitted: bool,
+    aggregate_submitted: bool,
 }
 
 #[derive(Debug)]
@@ -51,6 +54,7 @@ enum InFlight {
     Window,
     Filtered { requested_rows: usize },
     Sorted,
+    Aggregate,
 }
 
 impl QueryEngine {
@@ -58,6 +62,7 @@ impl QueryEngine {
         Self {
             runtime: runtime.handle(),
             sort_budget: SortBudget::default(),
+            group_budget: GroupBudget::default(),
         }
     }
 
@@ -65,6 +70,15 @@ impl QueryEngine {
         Self {
             runtime: runtime.handle(),
             sort_budget,
+            group_budget: GroupBudget::default(),
+        }
+    }
+
+    pub fn with_group_budget(runtime: &Runtime, group_budget: GroupBudget) -> Self {
+        Self {
+            runtime: runtime.handle(),
+            sort_budget: SortBudget::default(),
+            group_budget,
         }
     }
 
@@ -77,6 +91,7 @@ impl QueryEngine {
         let mut execution = QueryExecution {
             runtime: self.runtime.clone(),
             sort_budget: self.sort_budget,
+            group_budget: self.group_budget,
             remaining: plan.limit,
             plan,
             generation_id,
@@ -89,6 +104,7 @@ impl QueryEngine {
             cancelled: false,
             scheduled_reads: 0,
             sort_submitted: false,
+            aggregate_submitted: false,
         };
         if let Err(error) = execution.schedule_next()
             && !is_queue_full(&error)
@@ -245,6 +261,7 @@ impl QueryExecution {
                     self.finished = true;
                 }
             }
+            InFlight::Aggregate => self.finished = true,
             InFlight::Page => bail!("runtime returned a batch for a page query read"),
             InFlight::Sorted => bail!("runtime returned one batch for a sorted query read"),
         }
@@ -304,7 +321,22 @@ impl QueryExecution {
 
         let source = Arc::clone(&self.plan.source);
         let projection = self.plan.projection.clone();
-        let (task, in_flight, advance_page) = if let Some(sort) = self.plan.sort {
+        let (task, in_flight, advance_page) = if let Some(aggregate) = &self.plan.aggregate {
+            if self.aggregate_submitted {
+                return Ok(());
+            }
+            (
+                self.runtime.submit_aggregated(
+                    source,
+                    self.plan.filter.clone(),
+                    aggregate.clone(),
+                    self.group_budget,
+                    self.generation_id,
+                ),
+                InFlight::Aggregate,
+                false,
+            )
+        } else if let Some(sort) = self.plan.sort {
             if self.sort_submitted {
                 return Ok(());
             }
@@ -373,6 +405,9 @@ impl QueryExecution {
         if matches!(in_flight, InFlight::Sorted) {
             self.sort_submitted = true;
         }
+        if matches!(in_flight, InFlight::Aggregate) {
+            self.aggregate_submitted = true;
+        }
         self.pending = Some(task);
         self.in_flight = Some(in_flight);
         self.scheduled_reads += 1;
@@ -398,7 +433,10 @@ impl QueryBatch {
 mod tests {
     use std::{fs, fs::File, sync::Arc};
 
-    use arrow_array::{Array, BooleanArray, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{
+        Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use parquet_reader::ParquetSource;
@@ -406,7 +444,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{Filter, NullOrder, SortBudget, SortDirection};
+    use crate::{AggregateExpr, Filter, GroupBudget, NullOrder, SortBudget, SortDirection};
 
     const ROWS: i32 = PAGE_ROWS as i32 + 10;
 
@@ -481,6 +519,51 @@ mod tests {
                             Some("a"),
                             None,
                             Some("a"),
+                        ])),
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        (dir, Arc::new(ParquetSource::open(path).unwrap()))
+    }
+
+    fn aggregate_source() -> (TempDir, Arc<ParquetSource>) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aggregate.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, true),
+            Field::new("price", DataType::Int64, true),
+        ]));
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            schema.clone(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(2))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(StringArray::from(vec![
+                            Some("alpha"),
+                            Some("beta"),
+                            Some("alpha"),
+                            None,
+                            Some("beta"),
+                        ])),
+                        Arc::new(Int64Array::from(vec![
+                            Some(10),
+                            None,
+                            Some(20),
+                            Some(5),
+                            Some(-3),
                         ])),
                     ],
                 )
@@ -702,6 +785,288 @@ mod tests {
             .unwrap();
         assert!(batch.is_stale_for(GenerationId(8)));
         assert!(!batch.is_stale_for(GenerationId(7)));
+    }
+
+    #[test]
+    fn executes_all_aggregates_with_sql_null_semantics() {
+        let (_dir, source) = aggregate_source();
+        let runtime = runtime();
+        let logical = LogicalPlan::scan(source)
+            .aggregate(vec![
+                AggregateExpr::count_all(),
+                AggregateExpr::count(1),
+                AggregateExpr::sum(1),
+                AggregateExpr::avg(1),
+                AggregateExpr::min(1),
+                AggregateExpr::max(1),
+                AggregateExpr::min(0),
+                AggregateExpr::max(0),
+            ])
+            .unwrap();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&logical, GenerationId(20))
+            .unwrap();
+        let batch = execution.next_batch().unwrap().unwrap().batch;
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            5
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            4
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            32
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            8.0
+        );
+        assert_eq!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            -3
+        );
+        assert_eq!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            20
+        );
+        let min = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let max = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(min.value(0), "alpha");
+        assert_eq!(max.value(0), "beta");
+        assert!(execution.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn groups_incrementally_in_first_seen_order_and_obeys_its_budget() {
+        let (_dir, source) = aggregate_source();
+        let runtime = runtime();
+        let logical = LogicalPlan::scan(Arc::clone(&source))
+            .aggregate_grouped(
+                0,
+                vec![
+                    AggregateExpr::count_all(),
+                    AggregateExpr::count(1),
+                    AggregateExpr::sum(1),
+                ],
+            )
+            .unwrap();
+        let batch = QueryEngine::new(&runtime)
+            .execute(&logical, GenerationId(21))
+            .unwrap()
+            .next_batch()
+            .unwrap()
+            .unwrap()
+            .batch;
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some("alpha"), Some("beta"), None]
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values(),
+            &[2, 2, 1]
+        );
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .values(),
+            &[2, 1, 1]
+        );
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(30), Some(-3), Some(5)]
+        );
+
+        let mut limited = QueryEngine::with_group_budget(
+            &runtime,
+            GroupBudget::new(2, GroupBudget::DEFAULT_MAX_BYTES).unwrap(),
+        )
+        .execute(&logical, GenerationId(22))
+        .unwrap();
+        assert!(
+            format!("{:#}", limited.next_batch().unwrap_err()).contains("group budget of 2 groups")
+        );
+
+        let mut byte_limited =
+            QueryEngine::with_group_budget(&runtime, GroupBudget::new(10, 1).unwrap())
+                .execute(&logical, GenerationId(23))
+                .unwrap();
+        assert!(
+            format!("{:#}", byte_limited.next_batch().unwrap_err())
+                .contains("group budget of 1 bytes")
+        );
+    }
+
+    #[test]
+    fn aggregates_multi_page_input_and_preserves_generation_and_cancellation() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let logical = LogicalPlan::scan(Arc::clone(&source))
+            .aggregate(vec![
+                AggregateExpr::count_all(),
+                AggregateExpr::sum(0),
+                AggregateExpr::avg(0),
+            ])
+            .unwrap();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&logical, GenerationId(23))
+            .unwrap();
+        let batch = execution.next_batch().unwrap().unwrap();
+        assert_eq!(batch.generation_id, GenerationId(23));
+        assert!(batch.is_stale_for(GenerationId(24)));
+        let values = batch
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(values, i64::from(ROWS - 1) * i64::from(ROWS) / 2);
+        assert_eq!(execution.scheduled_reads(), 1);
+
+        let single = LogicalPlan::scan(Arc::clone(&source))
+            .filter(Filter::parse("id == 1").unwrap())
+            .aggregate(vec![AggregateExpr::count_all(), AggregateExpr::sum(0)])
+            .unwrap();
+        let batch = QueryEngine::new(&runtime)
+            .execute(&single, GenerationId(24))
+            .unwrap()
+            .next_batch()
+            .unwrap()
+            .unwrap()
+            .batch;
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+
+        let mut cancelled = QueryEngine::new(&runtime)
+            .execute(&logical, GenerationId(24))
+            .unwrap();
+        cancelled.cancel();
+        assert!(
+            cancelled
+                .next_batch()
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_overflow_and_incompatible_types() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("overflow.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(
+                &RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![i64::MAX, 1]))])
+                    .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+        let source = Arc::new(ParquetSource::open(path).unwrap());
+        let runtime = runtime();
+        let mut overflow = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(Arc::clone(&source))
+                    .aggregate(vec![AggregateExpr::sum(0)])
+                    .unwrap(),
+                GenerationId(25),
+            )
+            .unwrap();
+        assert!(format!("{:#}", overflow.next_batch().unwrap_err()).contains("overflow"));
+        assert!(
+            QueryEngine::new(&runtime)
+                .execute(
+                    &LogicalPlan::scan(source)
+                        .aggregate(vec![AggregateExpr::sum(9)])
+                        .unwrap(),
+                    GenerationId(26),
+                )
+                .is_err()
+        );
     }
 
     #[test]

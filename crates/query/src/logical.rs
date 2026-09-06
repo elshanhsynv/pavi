@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use parquet_reader::{FilterExpr, NullOrder, ParquetSource, SortDirection, SortSpec};
+use parquet_reader::{
+    AggregateExpr, AggregateSpec, FilterExpr, NullOrder, ParquetSource, SortDirection, SortSpec,
+};
 
 #[derive(Clone)]
 pub struct Scan {
@@ -28,6 +30,11 @@ pub struct Sort {
     pub(crate) spec: SortSpec,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Aggregate {
+    pub(crate) spec: AggregateSpec,
+}
+
 #[derive(Clone)]
 pub enum LogicalPlan {
     Scan(Scan),
@@ -46,6 +53,10 @@ pub enum LogicalPlan {
     Sort {
         input: Box<LogicalPlan>,
         sort: Sort,
+    },
+    Aggregate {
+        input: Box<LogicalPlan>,
+        aggregate: Aggregate,
     },
 }
 
@@ -99,6 +110,16 @@ impl Sort {
     }
 }
 
+impl Aggregate {
+    pub fn new(spec: AggregateSpec) -> Self {
+        Self { spec }
+    }
+
+    pub fn spec(&self) -> &AggregateSpec {
+        &self.spec
+    }
+}
+
 impl LogicalPlan {
     pub fn scan(source: Arc<ParquetSource>) -> Self {
         Self::Scan(Scan::new(source))
@@ -130,6 +151,24 @@ impl LogicalPlan {
             input: Box::new(self),
             sort: Sort::new(column, direction, nulls),
         }
+    }
+
+    pub fn aggregate(self, expressions: impl Into<Vec<AggregateExpr>>) -> Result<Self> {
+        Ok(Self::Aggregate {
+            input: Box::new(self),
+            aggregate: Aggregate::new(AggregateSpec::new(expressions)?),
+        })
+    }
+
+    pub fn aggregate_grouped(
+        self,
+        group_by: usize,
+        expressions: impl Into<Vec<AggregateExpr>>,
+    ) -> Result<Self> {
+        Ok(Self::Aggregate {
+            input: Box::new(self),
+            aggregate: Aggregate::new(AggregateSpec::grouped(group_by, expressions)?),
+        })
     }
 
     /// Replaces the one supported sort while keeping `Limit` outside it.

@@ -1,13 +1,19 @@
 use std::{
+    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_schema::{DataType, Field, Schema, SortOptions, TimeUnit};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
 use parquet::arrow::{
     ProjectionMask,
@@ -18,9 +24,9 @@ use parquet::arrow::{
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::{
-    DataPage, DatasetMetadata, NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey,
-    Projection, RowGroupInfo, RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr,
-    page::PAGE_ROWS,
+    AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
+    NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo,
+    RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr, page::PAGE_ROWS,
 };
 
 const BATCH_SIZE: usize = 4096;
@@ -343,6 +349,130 @@ impl ParquetSource {
             .collect())
     }
 
+    /// Computes aggregates incrementally over decoded batches without retaining input rows.
+    pub fn read_aggregated(
+        &self,
+        filter: Option<&FilterExpr>,
+        aggregate: &AggregateSpec,
+        budget: GroupBudget,
+    ) -> Result<RecordBatch> {
+        self.validate_aggregate(aggregate)?;
+        if let Some(filter) = filter {
+            self.validate_filter(filter)?;
+        }
+
+        let filter_column = filter
+            .map(|filter| filter.column_index(&self.dataset_metadata.schema))
+            .transpose()?;
+        let mut read_columns = Vec::new();
+        if let Some(group) = aggregate.group_by() {
+            read_columns.push(group);
+        }
+        for expression in aggregate.expressions() {
+            if let Some(column) = expression.column()
+                && !read_columns.contains(&column)
+            {
+                read_columns.push(column);
+            }
+        }
+        if let Some(column) = filter_column
+            && !read_columns.contains(&column)
+        {
+            read_columns.push(column);
+        }
+        if read_columns.is_empty() {
+            let mut groups = GroupCollector::new(aggregate, &self.dataset_metadata.schema, budget)?;
+            groups.update_count_all(self.row_count())?;
+            return groups.finish();
+        }
+        let read_projection = Projection::columns(read_columns, self.column_count())?;
+        let group_position = aggregate
+            .group_by()
+            .map(|column| projected_position(&read_projection, column, "group"))
+            .transpose()?;
+        let filter_position = filter_column
+            .map(|column| projected_position(&read_projection, column, "filter"))
+            .transpose()?;
+        let expression_positions = aggregate
+            .expressions()
+            .iter()
+            .map(|expression| {
+                expression
+                    .column()
+                    .map(|column| projected_position(&read_projection, column, "aggregate"))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut groups = GroupCollector::new(aggregate, &self.dataset_metadata.schema, budget)?;
+        for row_group in self.row_groups() {
+            if let (Some(filter), Some(filter_column)) = (filter, filter_column)
+                && !self.row_group_might_match(filter, row_group, filter_column)
+            {
+                continue;
+            }
+            let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
+            while let Some(batch) = reader.next().transpose()? {
+                let batch = self.reorder_batch(batch, &read_projection)?;
+                let batch = match (filter, filter_position) {
+                    (Some(filter), Some(position)) => {
+                        filter_record_batch(&batch, &filter.evaluate_batch(&batch, position)?)?
+                    }
+                    (Some(_), None) => bail!("filter column was not projected for aggregation"),
+                    (None, _) => batch,
+                };
+                groups.update_batch(&batch, group_position, &expression_positions)?;
+            }
+        }
+        groups.finish()
+    }
+
+    pub fn validate_aggregate(&self, aggregate: &AggregateSpec) -> Result<()> {
+        let schema = &self.dataset_metadata.schema;
+        if let Some(group) = aggregate.group_by() {
+            let field = schema
+                .fields()
+                .get(group)
+                .ok_or_else(|| anyhow!("group column {group} out of range"))?;
+            if !supports_grouping(field.data_type()) {
+                bail!(
+                    "GROUP BY is not supported for {:?} columns",
+                    field.data_type()
+                );
+            }
+        }
+        for expression in aggregate.expressions() {
+            let field = expression
+                .column()
+                .map(|column| {
+                    schema
+                        .fields()
+                        .get(column)
+                        .ok_or_else(|| anyhow!("aggregate column {column} out of range"))
+                })
+                .transpose()?;
+            match (expression.function(), field) {
+                (AggregateFunction::Count, _) => {}
+                (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
+                    if supports_numeric(field.data_type()) => {}
+                (AggregateFunction::Min | AggregateFunction::Max, Some(field))
+                    if supports_min_max(field.data_type()) => {}
+                (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
+                    "{:?} is not supported for {:?} columns",
+                    expression.function(),
+                    field.data_type()
+                ),
+                (AggregateFunction::Min | AggregateFunction::Max, Some(field)) => bail!(
+                    "{:?} is not supported for {:?} columns",
+                    expression.function(),
+                    field.data_type()
+                ),
+                (_, None) => bail!("only COUNT may use *"),
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_sort(&self, sort: SortSpec) -> Result<()> {
         let field = self
             .dataset_metadata
@@ -526,6 +656,725 @@ fn project_batch(
         .collect();
 
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum Scalar {
+    Null,
+    Bool(bool),
+    I64(i64),
+    U64(u64),
+    F64(u64),
+    Utf8(String),
+    Date32(i32),
+    Date64(i64),
+    Timestamp(i64),
+}
+
+impl Scalar {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Utf8(value) => 16 + value.len(),
+            _ => 16,
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    fn f64(&self) -> Result<f64> {
+        match self {
+            Self::F64(value) => Ok(f64::from_bits(*value)),
+            Self::I64(value) => Ok(*value as f64),
+            Self::U64(value) => Ok(*value as f64),
+            _ => bail!("aggregate encountered an incompatible numeric value"),
+        }
+    }
+}
+
+enum Accumulator {
+    Count(u64),
+    SumI64(Option<i64>),
+    SumU64(Option<u64>),
+    SumF64(Option<f64>),
+    Avg { sum: f64, count: u64 },
+    Min(Option<Scalar>),
+    Max(Option<Scalar>),
+}
+
+impl Accumulator {
+    fn new(expression: AggregateExpr, data_type: Option<&DataType>) -> Result<Self> {
+        match expression.function() {
+            AggregateFunction::Count => Ok(Self::Count(0)),
+            AggregateFunction::Sum => match data_type {
+                Some(data_type) if is_signed(data_type) => Ok(Self::SumI64(None)),
+                Some(data_type) if is_unsigned(data_type) => Ok(Self::SumU64(None)),
+                Some(DataType::Float32 | DataType::Float64) => Ok(Self::SumF64(None)),
+                _ => bail!("SUM needs a numeric column"),
+            },
+            AggregateFunction::Avg => Ok(Self::Avg { sum: 0.0, count: 0 }),
+            AggregateFunction::Min => Ok(Self::Min(None)),
+            AggregateFunction::Max => Ok(Self::Max(None)),
+        }
+    }
+
+    fn update(&mut self, expression: AggregateExpr, value: Option<Scalar>) -> Result<()> {
+        match self {
+            Self::Count(count) => {
+                if expression.column().is_none()
+                    || value.as_ref().is_some_and(|value| !value.is_null())
+                {
+                    *count = count.checked_add(1).context("COUNT overflow")?;
+                }
+            }
+            Self::SumI64(sum) => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let Scalar::I64(value) = value else {
+                    bail!("SUM encountered an incompatible signed value");
+                };
+                *sum = Some(
+                    sum.unwrap_or(0)
+                        .checked_add(value)
+                        .context("SUM overflow for signed integer")?,
+                );
+            }
+            Self::SumU64(sum) => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let Scalar::U64(value) = value else {
+                    bail!("SUM encountered an incompatible unsigned value");
+                };
+                *sum = Some(
+                    sum.unwrap_or(0)
+                        .checked_add(value)
+                        .context("SUM overflow for unsigned integer")?,
+                );
+            }
+            Self::SumF64(sum) => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let value = value.f64()?;
+                let next = sum.unwrap_or(0.0) + value;
+                if !next.is_finite() {
+                    bail!("SUM overflow for floating-point value");
+                }
+                *sum = Some(next);
+            }
+            Self::Avg { sum, count } => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let next = *sum + value.f64()?;
+                if !next.is_finite() {
+                    bail!("AVG overflow for numeric value");
+                }
+                *sum = next;
+                *count = count.checked_add(1).context("AVG count overflow")?;
+            }
+            Self::Min(current) => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                if current
+                    .as_ref()
+                    .is_none_or(|current| scalar_compare(&value, current).is_lt())
+                {
+                    *current = Some(value);
+                }
+            }
+            Self::Max(current) => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                if current
+                    .as_ref()
+                    .is_none_or(|current| scalar_compare(&value, current).is_gt())
+                {
+                    *current = Some(value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&self) -> Option<Scalar> {
+        match self {
+            Self::Count(value) => Some(Scalar::U64(*value)),
+            Self::SumI64(value) => value.map(Scalar::I64),
+            Self::SumU64(value) => value.map(Scalar::U64),
+            Self::SumF64(value) => value.map(|value| Scalar::F64(value.to_bits())),
+            Self::Avg { sum, count } if *count > 0 => {
+                Some(Scalar::F64((sum / *count as f64).to_bits()))
+            }
+            Self::Avg { .. } => None,
+            Self::Min(value) | Self::Max(value) => value.clone(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Min(Some(value)) | Self::Max(Some(value)) => value.bytes(),
+            _ => 16,
+        }
+    }
+}
+
+struct GroupState {
+    key: Scalar,
+    accumulators: Vec<Accumulator>,
+}
+
+impl GroupState {
+    fn new(
+        key: Scalar,
+        expressions: &[AggregateExpr],
+        input_types: &[Option<DataType>],
+    ) -> Result<Self> {
+        let accumulators = expressions
+            .iter()
+            .zip(input_types)
+            .map(|(expression, data_type)| Accumulator::new(*expression, data_type.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { key, accumulators })
+    }
+
+    fn bytes(&self) -> usize {
+        64 + self.key.bytes()
+            + self
+                .accumulators
+                .iter()
+                .map(Accumulator::bytes)
+                .sum::<usize>()
+    }
+}
+
+struct GroupCollector {
+    expressions: Vec<AggregateExpr>,
+    input_types: Vec<Option<DataType>>,
+    input_names: Vec<Option<String>>,
+    output_types: Vec<DataType>,
+    group_by: Option<(String, DataType)>,
+    groups: Vec<GroupState>,
+    indexes: HashMap<Scalar, usize>,
+    bytes: usize,
+    budget: GroupBudget,
+}
+
+impl GroupCollector {
+    fn new(aggregate: &AggregateSpec, schema: &Schema, budget: GroupBudget) -> Result<Self> {
+        let expressions = aggregate.expressions().to_vec();
+        let input_types = expressions
+            .iter()
+            .map(|expression| {
+                expression
+                    .column()
+                    .map(|column| {
+                        schema
+                            .fields()
+                            .get(column)
+                            .map(|field| field.data_type().clone())
+                            .ok_or_else(|| anyhow!("aggregate column {column} out of range"))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_types = expressions
+            .iter()
+            .zip(&input_types)
+            .map(|(expression, data_type)| aggregate_output_type(*expression, data_type.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        let input_names = expressions
+            .iter()
+            .map(|expression| {
+                expression
+                    .column()
+                    .map(|column| {
+                        schema
+                            .fields()
+                            .get(column)
+                            .map(|field| field.name().to_owned())
+                            .ok_or_else(|| anyhow!("aggregate column {column} out of range"))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let group_by = aggregate
+            .group_by()
+            .map(|column| {
+                schema
+                    .fields()
+                    .get(column)
+                    .map(|field| (field.name().to_owned(), field.data_type().clone()))
+                    .ok_or_else(|| anyhow!("group column {column} out of range"))
+            })
+            .transpose()?;
+        let mut collector = Self {
+            expressions,
+            input_types,
+            input_names,
+            output_types,
+            group_by,
+            groups: Vec::new(),
+            indexes: HashMap::new(),
+            bytes: 0,
+            budget,
+        };
+        if collector.group_by.is_none() {
+            collector.ensure_group(Scalar::Null)?;
+        }
+        Ok(collector)
+    }
+
+    fn update_batch(
+        &mut self,
+        batch: &RecordBatch,
+        group_position: Option<usize>,
+        expression_positions: &[Option<usize>],
+    ) -> Result<()> {
+        for row in 0..batch.num_rows() {
+            let key = match (&self.group_by, group_position) {
+                (Some((_, data_type)), Some(position)) => {
+                    scalar_at(batch.column(position).as_ref(), row, data_type)?
+                }
+                (None, None) => Scalar::Null,
+                _ => bail!("aggregate group projection was inconsistent"),
+            };
+            let index = self.ensure_group(key)?;
+            let before = self.groups[index].bytes();
+            for (expression_index, ((expression, input_type), position)) in self
+                .expressions
+                .iter()
+                .zip(&self.input_types)
+                .zip(expression_positions)
+                .enumerate()
+            {
+                let value = match (input_type, position) {
+                    (Some(_), Some(position))
+                        if expression.function() == AggregateFunction::Count =>
+                    {
+                        Some(if batch.column(*position).is_null(row) {
+                            Scalar::Null
+                        } else {
+                            Scalar::Bool(true)
+                        })
+                    }
+                    (Some(data_type), Some(position)) => {
+                        Some(scalar_at(batch.column(*position).as_ref(), row, data_type)?)
+                    }
+                    (None, None) => None,
+                    _ => bail!("aggregate input projection was inconsistent"),
+                };
+                let accumulator = self.groups[index]
+                    .accumulators
+                    .get_mut(expression_index)
+                    .ok_or_else(|| anyhow!("aggregate accumulator was lost"))?;
+                accumulator.update(*expression, value)?;
+            }
+            let after = self.groups[index].bytes();
+            self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+            if self.bytes > self.budget.max_bytes() {
+                bail!(
+                    "grouped aggregate exceeds the in-memory group budget of {} bytes",
+                    self.budget.max_bytes()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn update_count_all(&mut self, rows: u64) -> Result<()> {
+        for accumulator in &mut self.groups[0].accumulators {
+            let Accumulator::Count(count) = accumulator else {
+                bail!("COUNT(*) fast path received a non-count aggregate");
+            };
+            *count = count.checked_add(rows).context("COUNT overflow")?;
+        }
+        Ok(())
+    }
+
+    fn ensure_group(&mut self, key: Scalar) -> Result<usize> {
+        if let Some(index) = self.indexes.get(&key) {
+            return Ok(*index);
+        }
+        if self.groups.len() >= self.budget.max_groups() {
+            bail!(
+                "grouped aggregate exceeds the in-memory group budget of {} groups",
+                self.budget.max_groups()
+            );
+        }
+        let state = GroupState::new(key.clone(), &self.expressions, &self.input_types)?;
+        let next_bytes = self.bytes.saturating_add(state.bytes());
+        if next_bytes > self.budget.max_bytes() {
+            bail!(
+                "grouped aggregate exceeds the in-memory group budget of {} bytes",
+                self.budget.max_bytes()
+            );
+        }
+        let index = self.groups.len();
+        self.bytes = next_bytes;
+        self.indexes.insert(key, index);
+        self.groups.push(state);
+        Ok(index)
+    }
+
+    fn finish(self) -> Result<RecordBatch> {
+        let mut fields = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        if let Some((name, data_type)) = &self.group_by {
+            fields.push(Field::new(name, data_type.clone(), true));
+            arrays.push(build_array(
+                data_type,
+                &self
+                    .groups
+                    .iter()
+                    .map(|group| Some(group.key.clone()))
+                    .collect::<Vec<_>>(),
+            )?);
+        }
+        for (index, (expression, output_type)) in
+            self.expressions.iter().zip(&self.output_types).enumerate()
+        {
+            fields.push(Field::new(
+                aggregate_name(*expression, &self.input_names[index]),
+                output_type.clone(),
+                expression.function() != AggregateFunction::Count,
+            ));
+            arrays.push(build_array(
+                output_type,
+                &self
+                    .groups
+                    .iter()
+                    .map(|group| group.accumulators[index].value())
+                    .collect::<Vec<_>>(),
+            )?);
+        }
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(Into::into)
+    }
+}
+
+fn supports_numeric(data_type: &DataType) -> bool {
+    is_signed(data_type)
+        || is_unsigned(data_type)
+        || matches!(data_type, DataType::Float32 | DataType::Float64)
+}
+
+fn is_signed(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
+fn is_unsigned(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+    )
+}
+
+fn supports_min_max(data_type: &DataType) -> bool {
+    supports_numeric(data_type)
+        || matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, None)
+        )
+}
+
+fn supports_grouping(data_type: &DataType) -> bool {
+    supports_min_max(data_type)
+}
+
+fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) -> Result<DataType> {
+    match expression.function() {
+        AggregateFunction::Count => Ok(DataType::UInt64),
+        AggregateFunction::Sum if input.is_some_and(is_signed) => Ok(DataType::Int64),
+        AggregateFunction::Sum if input.is_some_and(is_unsigned) => Ok(DataType::UInt64),
+        AggregateFunction::Sum | AggregateFunction::Avg
+            if input.is_some_and(|data_type| {
+                matches!(data_type, DataType::Float32 | DataType::Float64)
+            }) =>
+        {
+            Ok(DataType::Float64)
+        }
+        AggregateFunction::Avg if input.is_some_and(supports_numeric) => Ok(DataType::Float64),
+        AggregateFunction::Min | AggregateFunction::Max => {
+            input.cloned().context("MIN/MAX needs a source column")
+        }
+        _ => bail!("aggregate expression has an unsupported input type"),
+    }
+}
+
+fn aggregate_name(expression: AggregateExpr, input: &Option<String>) -> String {
+    let function = match expression.function() {
+        AggregateFunction::Count => "COUNT",
+        AggregateFunction::Sum => "SUM",
+        AggregateFunction::Avg => "AVG",
+        AggregateFunction::Min => "MIN",
+        AggregateFunction::Max => "MAX",
+    };
+    match (expression.function(), expression.column(), input) {
+        (AggregateFunction::Count, None, _) => "COUNT(*)".to_string(),
+        (_, Some(_), Some(column)) => format!("{function}({column})"),
+        _ => function.to_string(),
+    }
+}
+
+fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scalar> {
+    if array.is_null(row) {
+        return Ok(Scalar::Null);
+    }
+    match data_type {
+        DataType::Boolean => Ok(Scalar::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("read boolean aggregate value")?
+                .value(row),
+        )),
+        DataType::Int8 => Ok(Scalar::I64(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .context("read int8 aggregate value")?
+                .value(row) as i64,
+        )),
+        DataType::Int16 => Ok(Scalar::I64(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .context("read int16 aggregate value")?
+                .value(row) as i64,
+        )),
+        DataType::Int32 => Ok(Scalar::I64(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context("read int32 aggregate value")?
+                .value(row) as i64,
+        )),
+        DataType::Int64 => Ok(Scalar::I64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("read int64 aggregate value")?
+                .value(row),
+        )),
+        DataType::UInt8 => Ok(Scalar::U64(
+            array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .context("read uint8 aggregate value")?
+                .value(row) as u64,
+        )),
+        DataType::UInt16 => Ok(Scalar::U64(
+            array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .context("read uint16 aggregate value")?
+                .value(row) as u64,
+        )),
+        DataType::UInt32 => Ok(Scalar::U64(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .context("read uint32 aggregate value")?
+                .value(row) as u64,
+        )),
+        DataType::UInt64 => Ok(Scalar::U64(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context("read uint64 aggregate value")?
+                .value(row),
+        )),
+        DataType::Float32 => Ok(Scalar::F64(
+            (array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .context("read float32 aggregate value")?
+                .value(row) as f64)
+                .to_bits(),
+        )),
+        DataType::Float64 => Ok(Scalar::F64(
+            array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .context("read float64 aggregate value")?
+                .value(row)
+                .to_bits(),
+        )),
+        DataType::Utf8 => Ok(Scalar::Utf8(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("read string aggregate value")?
+                .value(row)
+                .to_owned(),
+        )),
+        DataType::Date32 => Ok(Scalar::Date32(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .context("read date32 aggregate value")?
+                .value(row),
+        )),
+        DataType::Date64 => Ok(Scalar::Date64(
+            array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .context("read date64 aggregate value")?
+                .value(row),
+        )),
+        DataType::Timestamp(TimeUnit::Second, None) => Ok(Scalar::Timestamp(
+            array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .context("read second timestamp aggregate value")?
+                .value(row),
+        )),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => Ok(Scalar::Timestamp(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .context("read millisecond timestamp aggregate value")?
+                .value(row),
+        )),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Scalar::Timestamp(
+            array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .context("read microsecond timestamp aggregate value")?
+                .value(row),
+        )),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(Scalar::Timestamp(
+            array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .context("read nanosecond timestamp aggregate value")?
+                .value(row),
+        )),
+        _ => bail!("aggregate cannot read unsupported {data_type:?} values"),
+    }
+}
+
+fn scalar_compare(left: &Scalar, right: &Scalar) -> std::cmp::Ordering {
+    match (left, right) {
+        (Scalar::Bool(left), Scalar::Bool(right)) => left.cmp(right),
+        (Scalar::I64(left), Scalar::I64(right)) => left.cmp(right),
+        (Scalar::U64(left), Scalar::U64(right)) => left.cmp(right),
+        (Scalar::F64(left), Scalar::F64(right)) => {
+            f64::from_bits(*left).total_cmp(&f64::from_bits(*right))
+        }
+        (Scalar::Utf8(left), Scalar::Utf8(right)) => left.cmp(right),
+        (Scalar::Date32(left), Scalar::Date32(right)) => left.cmp(right),
+        (Scalar::Date64(left), Scalar::Date64(right)) => left.cmp(right),
+        (Scalar::Timestamp(left), Scalar::Timestamp(right)) => left.cmp(right),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayRef> {
+    macro_rules! values {
+        ($convert:expr) => {
+            values
+                .iter()
+                .map(|value| match value {
+                    None | Some(Scalar::Null) => Ok(None),
+                    Some(value) => Ok(Some($convert(value)?)),
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+    }
+    Ok(match data_type {
+        DataType::Boolean => Arc::new(BooleanArray::from(values!(|value: &Scalar| match value {
+            Scalar::Bool(value) => Ok(*value),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Int8 => Arc::new(Int8Array::from(values!(|value: &Scalar| match value {
+            Scalar::I64(value) => Ok(*value as i8),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Int16 => Arc::new(Int16Array::from(values!(|value: &Scalar| match value {
+            Scalar::I64(value) => Ok(*value as i16),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Int32 => Arc::new(Int32Array::from(values!(|value: &Scalar| match value {
+            Scalar::I64(value) => Ok(*value as i32),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Int64 => Arc::new(Int64Array::from(values!(|value: &Scalar| match value {
+            Scalar::I64(value) => Ok(*value),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::UInt8 => Arc::new(UInt8Array::from(values!(|value: &Scalar| match value {
+            Scalar::U64(value) => Ok(*value as u8),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::UInt16 => Arc::new(UInt16Array::from(values!(|value: &Scalar| match value {
+            Scalar::U64(value) => Ok(*value as u16),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::UInt32 => Arc::new(UInt32Array::from(values!(|value: &Scalar| match value {
+            Scalar::U64(value) => Ok(*value as u32),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::UInt64 => Arc::new(UInt64Array::from(values!(|value: &Scalar| match value {
+            Scalar::U64(value) => Ok(*value),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Float32 => Arc::new(Float32Array::from(values!(|value: &Scalar| {
+            Ok::<_, anyhow::Error>(value.f64()? as f32)
+        }))),
+        DataType::Float64 => Arc::new(Float64Array::from(values!(|value: &Scalar| {
+            value.f64()
+        }))),
+        DataType::Utf8 => Arc::new(StringArray::from(values!(|value: &Scalar| match value {
+            Scalar::Utf8(value) => Ok(value.clone()),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Date32 => Arc::new(Date32Array::from(values!(|value: &Scalar| match value {
+            Scalar::Date32(value) => Ok(*value),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Date64 => Arc::new(Date64Array::from(values!(|value: &Scalar| match value {
+            Scalar::Date64(value) => Ok(*value),
+            _ => bail!("aggregate output type mismatch"),
+        }))),
+        DataType::Timestamp(TimeUnit::Second, None) => Arc::new(TimestampSecondArray::from(
+            values!(|value: &Scalar| match value {
+                Scalar::Timestamp(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            }),
+        )),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => Arc::new(
+            TimestampMillisecondArray::from(values!(|value: &Scalar| match value {
+                Scalar::Timestamp(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            })),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Arc::new(
+            TimestampMicrosecondArray::from(values!(|value: &Scalar| match value {
+                Scalar::Timestamp(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            })),
+        ),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(
+            TimestampNanosecondArray::from(values!(|value: &Scalar| match value {
+                Scalar::Timestamp(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            })),
+        ),
+        _ => bail!("aggregate output is not supported for {data_type:?}"),
+    })
 }
 
 fn projected_position(projection: &Projection, column: usize, purpose: &str) -> Result<usize> {

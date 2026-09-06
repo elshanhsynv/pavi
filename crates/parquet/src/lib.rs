@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod cache;
 pub mod filter;
 pub mod metadata;
@@ -7,6 +8,7 @@ pub mod sort;
 mod source;
 pub mod value;
 
+pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
 pub use cache::{PageCache, PageCacheLimits, PageCacheStats};
 pub use filter::{FilterExpr, FilterOp};
 pub use metadata::{DatasetMetadata, RowGroupInfo};

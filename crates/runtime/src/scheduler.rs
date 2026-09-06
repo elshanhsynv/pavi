@@ -9,7 +9,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use parquet_reader::{FilterExpr, ParquetSource, Projection, SortBudget, SortSpec};
+use parquet_reader::{
+    AggregateSpec, FilterExpr, GroupBudget, ParquetSource, Projection, SortBudget, SortSpec,
+};
 
 use crate::{
     CancellationToken, GenerationId, OpenOutcome, OpenResponse, OpenTask, PageOutcome,
@@ -88,6 +90,11 @@ enum ReadOperation {
         filter: Option<FilterExpr>,
         sort: SortSpec,
         budget: SortBudget,
+    },
+    Aggregated {
+        filter: Option<FilterExpr>,
+        aggregate: AggregateSpec,
+        budget: GroupBudget,
     },
 }
 
@@ -257,6 +264,18 @@ impl Runtime {
             .submit_sorted(source, filter, projection, sort, budget, generation_id)
     }
 
+    pub fn submit_aggregated(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: Option<FilterExpr>,
+        aggregate: AggregateSpec,
+        budget: GroupBudget,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.handle()
+            .submit_aggregated(source, filter, aggregate, budget, generation_id)
+    }
+
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Ok(mut submissions) = self.submissions.lock() {
@@ -390,6 +409,28 @@ impl RuntimeHandle {
             ReadOperation::Sorted {
                 filter,
                 sort,
+                budget,
+            },
+            None,
+        )
+    }
+
+    pub fn submit_aggregated(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: Option<FilterExpr>,
+        aggregate: AggregateSpec,
+        budget: GroupBudget,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Aggregated {
+                filter,
+                aggregate,
                 budget,
             },
             None,
@@ -556,6 +597,13 @@ fn read_source(
         } => source
             .read_sorted(filter.as_ref(), projection, sort, budget)
             .map(PageOutcome::Batches),
+        ReadOperation::Aggregated {
+            filter,
+            aggregate,
+            budget,
+        } => source
+            .read_aggregated(filter.as_ref(), &aggregate, budget)
+            .map(PageOutcome::Batch),
     }
 }
 
