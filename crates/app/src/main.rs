@@ -10,7 +10,7 @@ use std::{
 use eframe::egui::{self, Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use parquet_reader::{DataPage, ParquetSource, Projection, value::format_cell_with_limit};
-use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryExecution, QueryPoll};
+use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryExecution, QueryPoll, SqlAst};
 use pavi_runtime::{OpenOutcome, OpenTask, PageOutcome, PageTask, Runtime, RuntimeConfig};
 
 use crate::state::{GridState, LoadState};
@@ -33,7 +33,31 @@ struct Dataset {
     column_types: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryKind {
+    Filter,
+    Sql,
+}
+
+impl QueryKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Filter => "Filter",
+            Self::Sql => "SQL",
+        }
+    }
+
+    fn empty_message(self) -> &'static str {
+        match self {
+            Self::Filter => "No rows match the filter.",
+            Self::Sql => "The query returned no rows.",
+        }
+    }
+}
+
 struct FilteredGrid {
+    kind: QueryKind,
+    projected_columns: Vec<usize>,
     execution: Option<QueryExecution>,
     batches: VecDeque<arrow_array::RecordBatch>,
     first_result: u64,
@@ -44,8 +68,10 @@ struct FilteredGrid {
 }
 
 impl FilteredGrid {
-    fn new(execution: QueryExecution) -> Self {
+    fn new(kind: QueryKind, projected_columns: Vec<usize>, execution: QueryExecution) -> Self {
         Self {
+            kind,
+            projected_columns,
             execution: Some(execution),
             batches: VecDeque::new(),
             first_result: 0,
@@ -102,6 +128,8 @@ struct PaviApp {
     path_input: String,
     filter_input: String,
     filter_error: Option<String>,
+    sql_input: String,
+    sql_error: Option<String>,
     status: String,
 }
 
@@ -122,6 +150,8 @@ impl PaviApp {
                 .map_or_else(String::new, |path| path.display().to_string()),
             filter_input: String::new(),
             filter_error: None,
+            sql_input: String::new(),
+            sql_error: None,
             status: "Choose a Parquet file to begin".to_string(),
         };
         if app.runtime.is_none() {
@@ -142,6 +172,7 @@ impl PaviApp {
         self.cancel_filter();
         self.dataset = None;
         self.filter_error = None;
+        self.sql_error = None;
         let generation = self.grid.reset();
         self.path_input = path.display().to_string();
         self.status = format!("Opening {}…", path.display());
@@ -293,10 +324,10 @@ impl PaviApp {
             return;
         };
         let source = Arc::clone(&dataset.source);
-        let columns = source.column_count();
+        let projected_columns = (0..source.column_count()).collect::<Vec<_>>();
         let plan = LogicalPlan::scan(source)
             .filter(filter)
-            .project((0..columns).collect::<Vec<_>>());
+            .project(projected_columns.clone());
         if let Err(error) = Planner::plan(&plan) {
             self.filter_error = Some(format!("Invalid filter: {error:#}"));
             return;
@@ -304,14 +335,18 @@ impl PaviApp {
         self.cancel_page_work();
         self.cancel_filter();
         let generation = self.grid.reset();
-        self.grid.ready(0, columns);
+        self.grid.ready(0, projected_columns.len());
         let Some(runtime) = &self.runtime else {
             self.filter_error = Some("Background runtime is unavailable".to_string());
             return;
         };
         match QueryEngine::new(runtime).execute(&plan, generation) {
             Ok(execution) => {
-                self.filtered = Some(FilteredGrid::new(execution));
+                self.filtered = Some(FilteredGrid::new(
+                    QueryKind::Filter,
+                    projected_columns,
+                    execution,
+                ));
                 self.filter_error = None;
                 self.status = format!("Filtering: {expression}");
             }
@@ -323,18 +358,102 @@ impl PaviApp {
     }
 
     fn clear_filter(&mut self) {
-        if self.filtered.is_none() && self.filter_error.is_none() && self.filter_input.is_empty() {
+        let filtering = self
+            .filtered
+            .as_ref()
+            .is_some_and(|filtered| filtered.kind == QueryKind::Filter);
+        if !filtering && self.filter_error.is_none() && self.filter_input.is_empty() {
+            return;
+        }
+        self.filter_input.clear();
+        self.filter_error = None;
+        if !filtering {
             return;
         }
         self.cancel_filter();
         self.cancel_page_work();
-        self.filter_input.clear();
-        self.filter_error = None;
         let generation = self.grid.reset();
         if let Some(dataset) = &self.dataset {
             self.grid
                 .ready(dataset.source.row_count(), dataset.source.column_count());
             self.status = "Filter cleared".to_string();
+        } else {
+            self.grid.generation = generation;
+        }
+    }
+
+    fn run_sql(&mut self) {
+        let sql = self.sql_input.trim();
+        if sql.is_empty() {
+            self.sql_error = Some("Enter a SELECT query before running it".to_string());
+            return;
+        }
+        let Some(dataset) = &self.dataset else {
+            self.sql_error = Some("Open a dataset before running SQL".to_string());
+            return;
+        };
+        let source = Arc::clone(&dataset.source);
+        let plan = match SqlAst::parse(sql).and_then(|ast| ast.to_logical_plan(Arc::clone(&source)))
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.sql_error = Some(format!("SQL error: {error:#}"));
+                return;
+            }
+        };
+        let projected_columns = match Planner::plan(&plan) {
+            Ok(plan) => plan.projected_columns().to_vec(),
+            Err(error) => {
+                self.sql_error = Some(format!("SQL error: {error:#}"));
+                return;
+            }
+        };
+        if self.runtime.is_none() {
+            self.sql_error = Some("Background runtime is unavailable".to_string());
+            return;
+        }
+        self.cancel_page_work();
+        self.cancel_filter();
+        let generation = self.grid.reset();
+        self.grid.ready(0, projected_columns.len());
+        let Some(runtime) = &self.runtime else {
+            self.sql_error = Some("Background runtime is unavailable".to_string());
+            self.status = "Unable to start SQL query".to_string();
+            return;
+        };
+        let execution = QueryEngine::new(runtime).execute(&plan, generation);
+        match execution {
+            Ok(execution) => {
+                self.filtered = Some(FilteredGrid::new(
+                    QueryKind::Sql,
+                    projected_columns,
+                    execution,
+                ));
+                self.sql_error = None;
+                self.status = "SQL: running".to_string();
+            }
+            Err(error) => {
+                self.sql_error = Some(format!("Start SQL query: {error:#}"));
+                self.status = "Unable to start SQL query".to_string();
+            }
+        }
+    }
+
+    fn cancel_sql(&mut self) {
+        if !self
+            .filtered
+            .as_ref()
+            .is_some_and(|filtered| filtered.kind == QueryKind::Sql)
+        {
+            return;
+        }
+        self.cancel_filter();
+        self.cancel_page_work();
+        let generation = self.grid.reset();
+        if let Some(dataset) = &self.dataset {
+            self.grid
+                .ready(dataset.source.row_count(), dataset.source.column_count());
+            self.status = "SQL query cancelled".to_string();
         } else {
             self.grid.generation = generation;
         }
@@ -355,9 +474,13 @@ impl PaviApp {
                     filtered.execution = None;
                     filtered.finished = true;
                     status = Some(if filtered.rows == 0 {
-                        "No rows match the filter".to_string()
+                        filtered.kind.empty_message().to_string()
                     } else {
-                        format!("Filtered results: {} rows loaded", filtered.received_rows())
+                        format!(
+                            "{} results: {} rows loaded",
+                            filtered.kind.label(),
+                            filtered.received_rows()
+                        )
                     });
                 }
                 Ok(QueryPoll::Batch(batch)) if batch.generation_id == self.grid.generation => {
@@ -372,7 +495,7 @@ impl PaviApp {
                 }
                 Ok(QueryPoll::Batch(_)) => {}
                 Err(error) => {
-                    let error = format!("Filter execution: {error:#}");
+                    let error = format!("{} execution: {error:#}", filtered.kind.label());
                     filtered.execution = None;
                     filtered.finished = true;
                     filtered.error = Some(error.clone());
@@ -485,6 +608,27 @@ impl PaviApp {
                 if let Some(error) = &self.filter_error {
                     ui.label(RichText::new(error).color(egui::Color32::RED));
                 }
+            });
+            ui.collapsing("SQL", |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.sql_input)
+                        .code_editor()
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("SELECT column FROM dataset WHERE column >= 10 LIMIT 100"),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Run SQL").clicked() {
+                        self.run_sql();
+                    }
+                    if ui.button("Cancel SQL").clicked() {
+                        self.cancel_sql();
+                    }
+                    ui.label("SELECT … FROM dataset [WHERE …] [LIMIT n]");
+                    if let Some(error) = &self.sql_error {
+                        ui.label(RichText::new(error).color(egui::Color32::RED));
+                    }
+                });
             });
         });
     }
@@ -618,39 +762,40 @@ impl PaviApp {
         let Some(dataset) = &self.dataset else {
             return;
         };
-        let (first_result, rows, finished, error) = self
-            .filtered
-            .as_ref()
-            .map(|filtered| {
-                (
-                    filtered.first_result,
-                    filtered.rows,
-                    filtered.finished,
-                    filtered.error.clone(),
-                )
-            })
-            .unwrap_or_default();
+        let Some(filtered) = self.filtered.as_ref() else {
+            return;
+        };
+        let first_result = filtered.first_result;
+        let rows = filtered.rows;
+        let finished = filtered.finished;
+        let error = filtered.error.clone();
+        let kind = filtered.kind;
+        let projected_columns = filtered.projected_columns.clone();
         if rows == 0 {
             ui.centered_and_justified(|ui| {
                 if let Some(error) = error {
                     ui.label(RichText::new(error).color(egui::Color32::RED));
                 } else if finished {
-                    ui.label("No rows match the filter.");
+                    ui.label(kind.empty_message());
                 } else {
                     ui.spinner();
-                    ui.label("Filtering…");
+                    ui.label(format!("{} query running…", kind.label()));
                 }
             });
             return;
         }
 
-        let names = dataset.column_names.clone();
+        let names = projected_columns
+            .iter()
+            .map(|column| dataset.column_names[*column].clone())
+            .collect::<Vec<_>>();
         let columns = names.len();
         if let Some(error) = error {
             ui.label(RichText::new(error).color(egui::Color32::RED));
         }
         ui.label(format!(
-            "Filtered rows {}–{} (bounded window)",
+            "{} rows {}–{} (bounded window)",
+            kind.label(),
             first_result + 1,
             first_result + rows
         ));
@@ -988,6 +1133,101 @@ mod tests {
         poll_until_idle(&mut app);
 
         assert_eq!(app.grid.rows, 0);
+    }
+
+    #[test]
+    fn runs_sql_through_the_existing_bounded_result_grid() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.sql_input = "SELECT name FROM dataset WHERE id >= 2 LIMIT 2".to_string();
+
+        app.run_sql();
+        poll_until_idle(&mut app);
+
+        assert!(app.sql_error.is_none());
+        assert_eq!(app.grid.columns, 1);
+        assert_eq!(app.grid.rows, 2);
+        assert_eq!(filtered_ids(&app), vec!["alpha", "beta"]);
+        assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sql);
+    }
+
+    #[test]
+    fn reports_sql_parse_and_type_errors_without_replacing_results() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        let rows = app.grid.rows;
+
+        for sql in [
+            "SELECT FROM dataset",
+            "SELECT missing FROM dataset",
+            "SELECT * FROM dataset WHERE id LIKE '%2%'",
+        ] {
+            app.sql_input = sql.to_string();
+            app.run_sql();
+            assert!(app.filtered.is_none(), "{sql}");
+            assert!(app.sql_error.is_some(), "{sql}");
+            assert_eq!(app.grid.rows, rows, "{sql}");
+        }
+    }
+
+    #[test]
+    fn replaces_and_cancels_obsolete_sql_queries() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_sql();
+        let cancellation = app
+            .filtered
+            .as_ref()
+            .and_then(|filtered| filtered.execution.as_ref())
+            .and_then(QueryExecution::cancellation_token)
+            .unwrap();
+
+        app.sql_input = "SELECT id FROM dataset WHERE id = 1".to_string();
+        app.run_sql();
+        assert!(cancellation.is_cancelled());
+        poll_until_idle(&mut app);
+        assert_eq!(filtered_ids(&app), vec!["1"]);
+        assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sql);
+    }
+
+    #[test]
+    fn rejects_stale_sql_results_and_keeps_sql_batches_bounded() {
+        let rows = (parquet_reader::PAGE_ROWS * 9 + 1) as usize;
+        let (_directory, source, path) = source(rows);
+        let mut app = make_app(source, path);
+        app.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_sql();
+        app.grid.generation.0 = app.grid.generation.0.saturating_add(1);
+        poll_until_idle(&mut app);
+        assert_eq!(app.grid.rows, 0);
+
+        app.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_sql();
+        for _ in 0..9 {
+            poll_until_idle(&mut app);
+            app.request_more_filtered();
+        }
+        poll_until_idle(&mut app);
+        let sql = app.filtered.as_ref().unwrap();
+        assert_eq!(sql.kind, QueryKind::Sql);
+        assert!(sql.batches.len() <= MAX_FILTERED_BATCHES);
+        assert!(sql.rows <= parquet_reader::PAGE_ROWS * MAX_FILTERED_BATCHES as u64);
+    }
+
+    #[test]
+    fn cancels_sql_and_returns_to_the_source_grid() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_sql();
+
+        app.cancel_sql();
+
+        assert!(app.filtered.is_none());
+        assert_eq!(app.grid.rows, 8);
+        assert_eq!(app.grid.columns, 2);
+        assert!(app.status.contains("cancelled"));
     }
 
     #[test]

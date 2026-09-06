@@ -19,3 +19,4 @@ parquet = { version = "59", features = ["arrow"] }
 eframe = "0.31"
 egui_extras = "0.31"
 rfd = "0.15"
+sqlparser = "0.62"

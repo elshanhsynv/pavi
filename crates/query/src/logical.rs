@@ -57,10 +57,12 @@ impl Projection {
 }
 
 impl Filter {
+    pub fn new(expression: FilterExpr) -> Self {
+        Self { expression }
+    }
+
     pub fn parse(expression: &str) -> Result<Self> {
-        Ok(Self {
-            expression: FilterExpr::parse(expression)?,
-        })
+        Ok(Self::new(FilterExpr::parse(expression)?))
     }
 }
 
