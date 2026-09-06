@@ -11,10 +11,30 @@ pub struct PageCacheLimits {
     pub max_bytes: usize,
 }
 
+impl Default for PageCacheLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: DEFAULT_MAX_PAGES,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+/// Observable cache counters for diagnostics and reproducible benchmarks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PageCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub entries: usize,
+    pub bytes: usize,
+}
+
 pub struct PageCache {
     limits: PageCacheLimits,
     bytes: usize,
     entries: VecDeque<DataPage>,
+    hits: u64,
+    misses: u64,
 }
 
 impl PageCache {
@@ -26,13 +46,19 @@ impl PageCache {
             },
             bytes: 0,
             entries: VecDeque::new(),
+            hits: 0,
+            misses: 0,
         }
     }
 
     pub fn get(&mut self, key: &PageKey) -> Option<DataPage> {
-        let index = self.entries.iter().position(|entry| &entry.key == key)?;
+        let Some(index) = self.entries.iter().position(|entry| &entry.key == key) else {
+            self.misses = self.misses.saturating_add(1);
+            return None;
+        };
         let page = self.entries.remove(index)?;
         self.entries.push_back(page.clone());
+        self.hits = self.hits.saturating_add(1);
         Some(page)
     }
 
@@ -61,6 +87,15 @@ impl PageCache {
         self.entries.is_empty()
     }
 
+    pub fn stats(&self) -> PageCacheStats {
+        PageCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            entries: self.len(),
+            bytes: self.bytes,
+        }
+    }
+
     fn remove(&mut self, key: &PageKey) {
         if let Some(index) = self.entries.iter().position(|entry| &entry.key == key) {
             if let Some(page) = self.entries.remove(index) {
@@ -81,10 +116,7 @@ impl PageCache {
 
 impl Default for PageCache {
     fn default() -> Self {
-        Self::new(PageCacheLimits {
-            max_pages: DEFAULT_MAX_PAGES,
-            max_bytes: DEFAULT_MAX_BYTES,
-        })
+        Self::new(PageCacheLimits::default())
     }
 }
 
@@ -165,5 +197,25 @@ mod tests {
 
         assert!(cache.get(&PageKey::new(0, first)).is_some());
         assert!(cache.get(&PageKey::new(0, second)).is_none());
+    }
+
+    #[test]
+    fn records_hits_and_misses() {
+        let projection = Projection::all(1);
+        let mut cache = PageCache::default();
+
+        assert!(cache.get(&PageKey::new(0, projection.clone())).is_none());
+        cache.insert(page(0, 1, projection.clone()));
+        assert!(cache.get(&PageKey::new(0, projection)).is_some());
+
+        assert_eq!(
+            cache.stats(),
+            PageCacheStats {
+                hits: 1,
+                misses: 1,
+                entries: 1,
+                bytes: 1,
+            }
+        );
     }
 }

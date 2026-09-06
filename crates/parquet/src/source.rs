@@ -10,13 +10,15 @@ use arrow_schema::{Field, Schema};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch};
 use parquet::arrow::{
     ProjectionMask,
-    arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+    arrow_reader::{
+        ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+    },
 };
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::{
-    DataPage, DatasetMetadata, PageCache, PageCacheLimits, PageKey, Projection, RowGroupInfo,
-    RowWindow, filter::FilterExpr,
+    DataPage, DatasetMetadata, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection,
+    RowGroupInfo, RowWindow, filter::FilterExpr,
 };
 
 const BATCH_SIZE: usize = 4096;
@@ -32,6 +34,7 @@ pub struct ParquetSource {
     path: PathBuf,
     dataset_metadata: DatasetMetadata,
     metadata: Arc<ParquetMetaData>,
+    arrow_metadata: ArrowReaderMetadata,
     cache: Mutex<PageCache>,
 }
 
@@ -39,10 +42,10 @@ impl ParquetSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        let arrow_metadata = ArrowReaderMetadata::load(&file, Default::default())
             .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
-        let schema = builder.schema().clone();
-        let metadata = builder.metadata().clone();
+        let schema = arrow_metadata.schema().clone();
+        let metadata = arrow_metadata.metadata().clone();
         let row_group_counts =
             (0..metadata.num_row_groups()).map(|index| metadata.row_group(index).num_rows() as u64);
         let dataset_metadata = DatasetMetadata::new(schema, row_group_counts)
@@ -52,6 +55,7 @@ impl ParquetSource {
             path,
             dataset_metadata,
             metadata,
+            arrow_metadata,
             cache: Mutex::new(PageCache::default()),
         })
     }
@@ -82,6 +86,14 @@ impl ParquetSource {
             .lock()
             .map_err(|_| anyhow!("page cache lock poisoned"))? = PageCache::new(limits);
         Ok(())
+    }
+
+    pub fn cache_stats(&self) -> Result<PageCacheStats> {
+        Ok(self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("page cache lock poisoned"))?
+            .stats())
     }
 
     pub fn validate_filter(&self, filter: &FilterExpr) -> Result<()> {
@@ -255,8 +267,8 @@ impl ParquetSource {
     ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
         let file =
             File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .with_context(|| format!("create Parquet reader for {}", self.path.display()))?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.arrow_metadata.clone());
         let parquet_columns = projection.parquet_columns();
         let projection = ProjectionMask::roots(builder.parquet_schema(), parquet_columns);
         let mut builder = builder

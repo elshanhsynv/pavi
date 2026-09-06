@@ -5,6 +5,7 @@ members = [
     "crates/runtime",
     "crates/query",
     "crates/app",
+    "crates/bench",
     "crates/cli",
 ]
 
