@@ -1,6 +1,6 @@
 use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
 
-use crate::{CancellationToken, PageResponse};
+use crate::{CancellationToken, OpenResponse, PageResponse};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(pub u64);
@@ -14,6 +14,14 @@ pub struct PageTask {
     generation_id: GenerationId,
     cancellation: CancellationToken,
     response: Receiver<PageResponse>,
+}
+
+/// The caller-owned control and response endpoint for a background source open.
+pub struct OpenTask {
+    id: TaskId,
+    generation_id: GenerationId,
+    cancellation: CancellationToken,
+    response: Receiver<OpenResponse>,
 }
 
 impl PageTask {
@@ -52,6 +60,46 @@ impl PageTask {
     }
 
     pub fn try_recv(&self) -> Result<PageResponse, TryRecvError> {
+        self.response.try_recv()
+    }
+}
+
+impl OpenTask {
+    pub(crate) fn new(
+        id: TaskId,
+        generation_id: GenerationId,
+        cancellation: CancellationToken,
+        response: Receiver<OpenResponse>,
+    ) -> Self {
+        Self {
+            id,
+            generation_id,
+            cancellation,
+            response,
+        }
+    }
+
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+
+    pub fn generation_id(&self) -> GenerationId {
+        self.generation_id
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub fn recv(self) -> Result<OpenResponse, RecvError> {
+        self.response.recv()
+    }
+
+    pub fn try_recv(&self) -> Result<OpenResponse, TryRecvError> {
         self.response.try_recv()
     }
 }

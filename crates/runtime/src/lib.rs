@@ -10,6 +10,6 @@ mod scheduler;
 mod task;
 
 pub use cancellation::CancellationToken;
-pub use response::{PageOutcome, PageResponse};
+pub use response::{OpenOutcome, OpenResponse, PageOutcome, PageResponse};
 pub use scheduler::{Runtime, RuntimeConfig, RuntimeConfigError, SubmitError};
-pub use task::{GenerationId, PageTask, TaskId};
+pub use task::{GenerationId, OpenTask, PageTask, TaskId};

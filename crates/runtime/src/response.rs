@@ -1,6 +1,7 @@
 use anyhow::Error;
 use arrow_array::RecordBatch;
-use parquet_reader::DataPage;
+use parquet_reader::{DataPage, ParquetSource};
+use std::sync::Arc;
 
 use crate::{GenerationId, TaskId};
 
@@ -25,4 +26,16 @@ impl PageResponse {
     pub fn is_stale_for(&self, current_generation: GenerationId) -> bool {
         self.generation_id != current_generation
     }
+}
+
+pub enum OpenOutcome {
+    Opened(Arc<ParquetSource>),
+    Cancelled,
+    OpenFailed(Error),
+}
+
+pub struct OpenResponse {
+    pub task_id: TaskId,
+    pub generation_id: GenerationId,
+    pub outcome: OpenOutcome,
 }

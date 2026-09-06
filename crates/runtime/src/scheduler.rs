@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,7 +11,10 @@ use std::{
 
 use parquet_reader::{FilterExpr, ParquetSource, Projection};
 
-use crate::{CancellationToken, GenerationId, PageOutcome, PageResponse, PageTask, TaskId};
+use crate::{
+    CancellationToken, GenerationId, OpenOutcome, OpenResponse, OpenTask, PageOutcome,
+    PageResponse, PageTask, TaskId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
@@ -94,9 +98,22 @@ struct PageRequest {
     before_read: Option<Box<dyn FnOnce() + Send>>,
 }
 
+struct OpenRequest {
+    task_id: TaskId,
+    generation_id: GenerationId,
+    path: PathBuf,
+    cancellation: CancellationToken,
+    response: SyncSender<OpenResponse>,
+}
+
+enum Request {
+    Open(OpenRequest),
+    Read(PageRequest),
+}
+
 /// A small, fixed worker pool for background Parquet page reads.
 pub struct Runtime {
-    sender: Option<SyncSender<PageRequest>>,
+    sender: Option<SyncSender<Request>>,
     shutdown: Arc<AtomicBool>,
     next_task_id: AtomicU64,
     workers: Vec<JoinHandle<()>>,
@@ -158,6 +175,37 @@ impl Runtime {
         )
     }
 
+    pub fn submit_open(
+        &self,
+        path: impl Into<PathBuf>,
+        generation_id: GenerationId,
+    ) -> Result<OpenTask, SubmitError> {
+        let Some(sender) = &self.sender else {
+            return Err(SubmitError::Shutdown);
+        };
+        let task_id = self.next_task_id()?;
+        let cancellation = CancellationToken::default();
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        let request = OpenRequest {
+            task_id,
+            generation_id,
+            path: path.into(),
+            cancellation: cancellation.clone(),
+            response: response_sender,
+        };
+
+        match sender.try_send(Request::Open(request)) {
+            Ok(()) => Ok(OpenTask::new(
+                task_id,
+                generation_id,
+                cancellation,
+                response_receiver,
+            )),
+            Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Shutdown),
+        }
+    }
+
     pub fn submit_window(
         &self,
         source: Arc<ParquetSource>,
@@ -212,11 +260,7 @@ impl Runtime {
         let Some(sender) = &self.sender else {
             return Err(SubmitError::Shutdown);
         };
-        let task_id = self
-            .next_task_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map(TaskId)
-            .map_err(|_| SubmitError::TaskIdExhausted)?;
+        let task_id = self.next_task_id()?;
         let cancellation = CancellationToken::default();
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let request = PageRequest {
@@ -231,7 +275,7 @@ impl Runtime {
             before_read,
         };
 
-        match sender.try_send(request) {
+        match sender.try_send(Request::Read(request)) {
             Ok(()) => Ok(PageTask::new(
                 task_id,
                 generation_id,
@@ -241,6 +285,13 @@ impl Runtime {
             Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Shutdown),
         }
+    }
+
+    fn next_task_id(&self) -> Result<TaskId, SubmitError> {
+        self.next_task_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map(TaskId)
+            .map_err(|_| SubmitError::TaskIdExhausted)
     }
 
     pub fn shutdown(&mut self) {
@@ -276,7 +327,7 @@ impl Drop for Runtime {
     }
 }
 
-fn worker_loop(receiver: Arc<Mutex<Receiver<PageRequest>>>, shutdown: Arc<AtomicBool>) {
+fn worker_loop(receiver: Arc<Mutex<Receiver<Request>>>, shutdown: Arc<AtomicBool>) {
     loop {
         let request = match receiver.lock() {
             Ok(receiver) => receiver.recv(),
@@ -285,8 +336,28 @@ fn worker_loop(receiver: Arc<Mutex<Receiver<PageRequest>>>, shutdown: Arc<Atomic
         let Ok(request) = request else {
             return;
         };
-        execute(request, shutdown.load(Ordering::Acquire));
+        match request {
+            Request::Open(request) => execute_open(request, shutdown.load(Ordering::Acquire)),
+            Request::Read(request) => execute(request, shutdown.load(Ordering::Acquire)),
+        }
     }
+}
+
+fn execute_open(request: OpenRequest, shutting_down: bool) {
+    let outcome = if shutting_down || request.cancellation.is_cancelled() {
+        OpenOutcome::Cancelled
+    } else {
+        match ParquetSource::open(&request.path) {
+            Ok(_) if request.cancellation.is_cancelled() => OpenOutcome::Cancelled,
+            Ok(source) => OpenOutcome::Opened(Arc::new(source)),
+            Err(error) => OpenOutcome::OpenFailed(error),
+        }
+    };
+    let _ = request.response.send(OpenResponse {
+        task_id: request.task_id,
+        generation_id: request.generation_id,
+        outcome,
+    });
 }
 
 fn execute(request: PageRequest, shutting_down: bool) {
@@ -437,6 +508,23 @@ mod tests {
                 .values(),
             &[0, 10, 20, 30, 40, 50]
         );
+    }
+
+    #[test]
+    fn opens_sources_on_the_worker_pool() {
+        let (_dir, _source, path) = test_source();
+        let runtime = runtime(1, 1);
+        let response = runtime
+            .submit_open(path, GenerationId(7))
+            .unwrap()
+            .recv()
+            .unwrap();
+
+        assert_eq!(response.generation_id, GenerationId(7));
+        let OpenOutcome::Opened(source) = response.outcome else {
+            panic!("source open did not succeed")
+        };
+        assert_eq!(source.row_count(), 6);
     }
 
     #[test]

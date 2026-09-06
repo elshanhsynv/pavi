@@ -1,0 +1,13 @@
+[package]
+name = "pavi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+arrow-array.workspace = true
+eframe.workspace = true
+egui_extras.workspace = true
+rfd.workspace = true
+parquet_reader = { path = "../parquet" }
+pavi_runtime = { path = "../runtime" }
