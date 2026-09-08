@@ -1,12 +1,13 @@
 mod chart;
 mod inspector;
+mod session;
 mod state;
 
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui::{self, Align, Layout, RichText};
@@ -24,6 +25,7 @@ use crate::chart::{
     ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartValues, MAX_INPUT_ROWS,
 };
 use crate::inspector::{CellDetails, column_summary, inspect_cell};
+use crate::session::{SessionState, SessionStore};
 use crate::state::{GridState, LoadState};
 
 const ROW_HEIGHT: f32 = 22.0;
@@ -229,13 +231,33 @@ struct PaviApp {
     sql_input: String,
     sql_error: Option<String>,
     chart: ChartState,
+    session_store: SessionStore,
+    session: SessionState,
+    running_sql: Option<RunningSql>,
+    show_inspector: bool,
     show_safe_full_selection: bool,
     status: String,
 }
 
+struct RunningSql {
+    text: String,
+    started: Instant,
+}
+
 impl PaviApp {
     fn new(initial_path: Option<PathBuf>) -> Self {
+        Self::new_with_store(
+            initial_path,
+            SessionStore::new(SessionStore::default_path()),
+        )
+    }
+
+    fn new_with_store(initial_path: Option<PathBuf>, session_store: SessionStore) -> Self {
         let runtime = Runtime::new(RuntimeConfig::default());
+        let session = session_store.load();
+        let reopened_path = initial_path.or_else(|| session.last_opened_file.clone());
+        let show_inspector = session.preferences.inspector_visible;
+        let chart_visible = session.preferences.chart_visible;
         let mut app = Self {
             runtime: runtime.ok(),
             grid: GridState::default(),
@@ -245,24 +267,55 @@ impl PaviApp {
             pages: HashMap::new(),
             page_order: VecDeque::new(),
             filtered: None,
-            path_input: initial_path
+            path_input: reopened_path
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string()),
             filter_input: String::new(),
             filter_error: None,
-            sql_input: String::new(),
+            sql_input: session.sql_input.clone(),
             sql_error: None,
-            chart: ChartState::default(),
+            chart: ChartState {
+                visible: chart_visible,
+                ..ChartState::default()
+            },
+            session_store,
+            session,
+            running_sql: None,
+            show_inspector,
             show_safe_full_selection: false,
             status: "Choose a Parquet file to begin".to_string(),
         };
         if app.runtime.is_none() {
             app.grid.loading = LoadState::Error("start background runtime".to_string());
             app.status = "Unable to start the background runtime".to_string();
-        } else if let Some(path) = initial_path {
+        } else if let Some(path) = reopened_path {
             app.begin_open(path);
         }
         app
+    }
+
+    fn persist_session(&mut self) {
+        self.session.sql_input = self.sql_input.clone();
+        self.session.preferences.inspector_visible = self.show_inspector;
+        self.session.preferences.chart_visible = self.chart.visible;
+        if let Err(error) = self.session_store.save(&self.session) {
+            self.status = format!("save session: {error}");
+        }
+    }
+
+    fn record_sql_history(&mut self, success: bool, row_count: Option<u64>) {
+        let Some(running) = self.running_sql.take() else {
+            return;
+        };
+        let duration_ms = running.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.session
+            .record_query(&running.text, duration_ms, success, row_count);
+        self.persist_session();
+    }
+
+    fn record_sql_failure(&mut self, sql: &str) {
+        self.session.record_query(sql, 0, false, None);
+        self.persist_session();
     }
 
     fn begin_open(&mut self, path: PathBuf) {
@@ -271,6 +324,7 @@ impl PaviApp {
         }
         self.opening = None;
         self.cancel_page_work();
+        self.record_sql_history(false, None);
         self.cancel_filter();
         self.chart.reset();
         self.show_safe_full_selection = false;
@@ -324,6 +378,9 @@ impl PaviApp {
                     column_names,
                 });
                 self.grid.ready(rows, columns);
+                self.session
+                    .record_recent_file(PathBuf::from(&self.path_input));
+                self.persist_session();
                 if let Some(chart_columns) =
                     self.dataset.as_ref().map(|dataset| &dataset.column_names)
                 {
@@ -341,7 +398,12 @@ impl PaviApp {
                 };
             }
             OpenOutcome::Cancelled => self.status = "File open cancelled".to_string(),
-            OpenOutcome::OpenFailed(error) => self.open_error(format!("open file: {error:#}")),
+            OpenOutcome::OpenFailed(error) => {
+                self.session
+                    .remove_recent_file(std::path::Path::new(&self.path_input));
+                self.persist_session();
+                self.open_error(format!("open file: {error:#}"));
+            }
         }
     }
 
@@ -412,10 +474,17 @@ impl PaviApp {
     }
 
     fn cancel_filter(&mut self) {
+        let is_sql = self
+            .filtered
+            .as_ref()
+            .is_some_and(|filtered| filtered.kind == QueryKind::Sql);
         if let Some(filtered) = &mut self.filtered {
             filtered.cancel();
         }
         self.filtered = None;
+        if is_sql {
+            self.record_sql_history(false, None);
+        }
     }
 
     fn apply_filter(&mut self) {
@@ -497,24 +566,26 @@ impl PaviApp {
     }
 
     fn run_sql(&mut self) {
-        let sql = self.sql_input.trim();
+        let sql = self.sql_input.trim().to_owned();
         if sql.is_empty() {
             self.sql_error = Some("Enter a SELECT query before running it".to_string());
             return;
         }
         let Some(dataset) = &self.dataset else {
             self.sql_error = Some("Open a dataset before running SQL".to_string());
+            self.record_sql_failure(&sql);
             return;
         };
         let source = Arc::clone(&dataset.source);
-        let plan = match SqlAst::parse(sql).and_then(|ast| ast.to_logical_plan(Arc::clone(&source)))
-        {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.sql_error = Some(format!("SQL error: {error:#}"));
-                return;
-            }
-        };
+        let plan =
+            match SqlAst::parse(&sql).and_then(|ast| ast.to_logical_plan(Arc::clone(&source))) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.sql_error = Some(format!("SQL error: {error:#}"));
+                    self.record_sql_failure(&sql);
+                    return;
+                }
+            };
         let (projected_columns, sort, aggregate) = match Planner::plan(&plan) {
             Ok(plan) => {
                 let aggregate = plan.aggregate();
@@ -532,6 +603,7 @@ impl PaviApp {
             }
             Err(error) => {
                 self.sql_error = Some(format!("SQL error: {error:#}"));
+                self.record_sql_failure(&sql);
                 return;
             }
         };
@@ -540,6 +612,7 @@ impl PaviApp {
             return;
         }
         self.cancel_page_work();
+        self.record_sql_history(false, None);
         self.cancel_filter();
         let generation = self.grid.reset();
         self.grid.ready(0, projected_columns.len());
@@ -560,11 +633,17 @@ impl PaviApp {
                     execution,
                 ));
                 self.sql_error = None;
+                self.running_sql = Some(RunningSql {
+                    text: sql.to_owned(),
+                    started: Instant::now(),
+                });
+                self.persist_session();
                 self.status = "SQL: running".to_string();
             }
             Err(error) => {
                 self.sql_error = Some(format!("Start SQL query: {error:#}"));
                 self.status = "Unable to start SQL query".to_string();
+                self.record_sql_failure(&sql);
             }
         }
     }
@@ -579,6 +658,7 @@ impl PaviApp {
         }
         self.cancel_filter();
         self.cancel_page_work();
+        self.record_sql_history(false, None);
         let generation = self.grid.reset();
         if let Some(dataset) = &self.dataset {
             self.grid
@@ -676,6 +756,7 @@ impl PaviApp {
             return;
         };
         let mut status = None;
+        let mut sql_history = None;
         while filtered.needs_more() {
             let Some(execution) = &mut filtered.execution else {
                 break;
@@ -694,6 +775,9 @@ impl PaviApp {
                             filtered.received_rows()
                         )
                     });
+                    if filtered.kind == QueryKind::Sql {
+                        sql_history = Some((true, Some(filtered.received_rows())));
+                    }
                 }
                 Ok(QueryPoll::Batch(batch)) if batch.generation_id == self.grid.generation => {
                     filtered.push(batch.batch);
@@ -712,12 +796,18 @@ impl PaviApp {
                     filtered.finished = true;
                     filtered.error = Some(error.clone());
                     status = Some(error);
+                    if filtered.kind == QueryKind::Sql {
+                        sql_history = Some((false, None));
+                    }
                 }
             }
         }
         self.grid.rows = filtered.rows;
         if let Some(status) = status {
             self.status = status;
+        }
+        if let Some((success, row_count)) = sql_history {
+            self.record_sql_history(success, row_count);
         }
     }
 
@@ -914,6 +1004,11 @@ impl PaviApp {
     }
 
     fn show_top_bar(&mut self, ctx: &egui::Context) {
+        let mut open_recent = None;
+        let mut rerun_history = None;
+        let mut remove_history = None;
+        let mut clear_history = false;
+        let mut preferences_changed = false;
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open Parquet…").clicked()
@@ -972,9 +1067,59 @@ impl PaviApp {
                     }
                 });
             });
+            ui.collapsing("Recent Files", |ui| {
+                if self.session.recent_files.is_empty() {
+                    ui.label("No recent available files.");
+                }
+                for path in &self.session.recent_files {
+                    if ui.button(path.display().to_string()).clicked() {
+                        open_recent = Some(path.clone());
+                    }
+                }
+            });
+            ui.collapsing("Query History", |ui| {
+                if ui.button("Clear history").clicked() {
+                    clear_history = true;
+                }
+                if self.session.query_history.is_empty() {
+                    ui.label("No completed SQL queries.");
+                }
+                for (index, entry) in self.session.query_history.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        let result = if entry.success { "ok" } else { "failed" };
+                        ui.label(format!(
+                            "{result} · {} ms{}",
+                            entry.duration_ms,
+                            entry
+                                .row_count
+                                .map_or_else(String::new, |rows| format!(" · {rows} rows"))
+                        ));
+                        if ui.button("Run").clicked() {
+                            rerun_history = Some(entry.sql.clone());
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            remove_history = Some(index);
+                        }
+                    });
+                    ui.monospace(&entry.sql);
+                    ui.separator();
+                }
+            });
             ui.horizontal(|ui| {
+                if ui
+                    .button(if self.show_inspector {
+                        "Hide Inspector"
+                    } else {
+                        "Show Inspector"
+                    })
+                    .clicked()
+                {
+                    self.show_inspector = !self.show_inspector;
+                    preferences_changed = true;
+                }
                 if ui.button("Charts…").clicked() {
                     self.chart.visible = true;
+                    preferences_changed = true;
                 }
                 if self.chart.loading() {
                     ui.spinner();
@@ -982,6 +1127,24 @@ impl PaviApp {
                 }
             });
         });
+        if let Some(path) = open_recent {
+            self.begin_open(path);
+        }
+        if let Some(sql) = rerun_history {
+            self.sql_input = sql;
+            self.run_sql();
+        }
+        if let Some(index) = remove_history {
+            self.session.remove_history(index);
+            self.persist_session();
+        }
+        if clear_history {
+            self.session.clear_history();
+            self.persist_session();
+        }
+        if preferences_changed {
+            self.persist_session();
+        }
     }
 
     fn show_chart_window(&mut self, ctx: &egui::Context) {
@@ -993,7 +1156,8 @@ impl PaviApp {
             .as_ref()
             .map(|dataset| dataset.column_names.clone())
             .unwrap_or_default();
-        let mut open = self.chart.visible;
+        let chart_was_visible = self.chart.visible;
+        let mut open = chart_was_visible;
         let mut run = false;
         let mut cancel = false;
         egui::Window::new("Charts")
@@ -1118,6 +1282,9 @@ impl PaviApp {
                 }
             });
         self.chart.visible = open;
+        if self.chart.visible != chart_was_visible {
+            self.persist_session();
+        }
         if cancel {
             self.cancel_chart();
         }
@@ -1176,6 +1343,10 @@ impl PaviApp {
     }
 
     fn show_metadata(&mut self, ctx: &egui::Context) {
+        if !self.show_inspector {
+            return;
+        }
+        let safe_value_was_visible = self.show_safe_full_selection;
         let selected_column = self.selected_source_column();
         let selected_cell = self.selected_cell_details();
         egui::SidePanel::left("inspector")
@@ -1294,6 +1465,9 @@ impl PaviApp {
                     ui.label("No file open");
                 }
             });
+        if self.show_safe_full_selection != safe_value_was_visible {
+            self.persist_session();
+        }
     }
 
     fn show_grid(&mut self, ui: &mut egui::Ui) {
@@ -1751,6 +1925,10 @@ fn draw_histogram(
 }
 
 impl eframe::App for PaviApp {
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.persist_session();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_open();
         self.poll_pages();
@@ -1849,7 +2027,8 @@ mod tests {
             .iter()
             .map(|field| field.name().to_owned())
             .collect();
-        let mut app = PaviApp::new(None);
+        let mut app =
+            PaviApp::new_with_store(None, SessionStore::new(path.with_extension("session.json")));
         app.dataset = Some(Dataset {
             source: Arc::clone(&source),
             path,
@@ -2107,13 +2286,16 @@ mod tests {
             assert!(app.sql_error.is_some(), "{sql}");
             assert_eq!(app.grid.rows, rows, "{sql}");
         }
+        assert_eq!(app.session.query_history.len(), 3);
+        assert!(app.session.query_history.iter().all(|entry| !entry.success));
     }
 
     #[test]
     fn replaces_and_cancels_obsolete_sql_queries() {
         let (_directory, source, path) = source(8);
         let mut app = make_app(source, path);
-        app.sql_input = "SELECT id FROM dataset".to_string();
+        let first_sql = "SELECT id FROM dataset";
+        app.sql_input = first_sql.to_string();
         app.run_sql();
         let cancellation = app
             .filtered
@@ -2128,6 +2310,40 @@ mod tests {
         poll_until_idle(&mut app);
         assert_eq!(filtered_ids(&app), vec!["1"]);
         assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sql);
+        assert_eq!(app.session.query_history.len(), 2);
+        assert_eq!(app.session.query_history[1].sql, first_sql);
+        assert!(!app.session.query_history[1].success);
+        assert_eq!(
+            app.session.query_history[0].sql,
+            "SELECT id FROM dataset WHERE id = 1"
+        );
+        assert!(app.session.query_history[0].success);
+    }
+
+    #[test]
+    fn restores_session_without_restoring_transient_work() {
+        let (_directory, _source, path) = source(3);
+        let store = SessionStore::new(path.with_extension("session.json"));
+        let mut session = SessionState::default();
+        session.record_recent_file(path.clone());
+        session.sql_input = "SELECT id FROM dataset LIMIT 1".to_string();
+        session.record_query(&session.sql_input.clone(), 5, true, Some(1));
+        session.preferences.inspector_visible = false;
+        session.preferences.chart_visible = true;
+        store.save(&session).unwrap();
+
+        let app = PaviApp::new_with_store(None, store);
+        assert_eq!(app.path_input, path.display().to_string());
+        assert_eq!(app.sql_input, "SELECT id FROM dataset LIMIT 1");
+        assert!(!app.show_inspector);
+        assert!(app.chart.visible);
+        assert_eq!(app.session.query_history, session.query_history);
+        assert!(app.opening.is_some());
+        assert!(app.pending_pages.is_empty());
+        assert!(app.pages.is_empty());
+        assert!(app.filtered.is_none());
+        assert!(app.running_sql.is_none());
+        assert!(app.grid.selection.is_none());
     }
 
     #[test]
@@ -2222,7 +2438,10 @@ mod tests {
     fn opens_empty_and_replaces_active_document_work() {
         let (_first_directory, _first_source, first_path) = source(3);
         let (_second_directory, _second_source, second_path) = source(0);
-        let mut app = PaviApp::new(None);
+        let mut app = PaviApp::new_with_store(
+            None,
+            SessionStore::new(first_path.with_extension("session.json")),
+        );
 
         app.begin_open(first_path.clone());
         poll_until_opened(&mut app);
@@ -2247,7 +2466,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("malformed.parquet");
         std::fs::write(&path, b"not parquet").unwrap();
-        let mut app = PaviApp::new(None);
+        let mut app =
+            PaviApp::new_with_store(None, SessionStore::new(path.with_extension("session.json")));
 
         app.begin_open(path);
         poll_until_opened(&mut app);
