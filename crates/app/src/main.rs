@@ -27,8 +27,8 @@ use crate::chart::{
 };
 use crate::export::{ExportEvent, ExportFormat, ExportInput, ExportTask};
 use crate::inspector::{CellDetails, column_summary, inspect_cell};
-use crate::session::{SessionState, SessionStore};
-use crate::state::{GridState, LoadState};
+use crate::session::{GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore};
+use crate::state::{ColumnLayout, GridState, LoadState};
 
 const ROW_HEIGHT: f32 = 22.0;
 const ROW_NUMBER_WIDTH: f32 = 72.0;
@@ -79,6 +79,7 @@ struct FilteredGrid {
     sort: Option<SortSpec>,
     aggregate: bool,
     projected_columns: Vec<usize>,
+    display_columns: Vec<(usize, usize)>,
     execution: Option<QueryExecution>,
     batches: VecDeque<arrow_array::RecordBatch>,
     first_result: u64,
@@ -103,6 +104,7 @@ impl FilteredGrid {
             sort,
             aggregate,
             projected_columns,
+            display_columns: Vec::new(),
             execution: Some(execution),
             batches: VecDeque::new(),
             first_result: 0,
@@ -144,6 +146,25 @@ impl FilteredGrid {
         if let Some(execution) = &mut self.execution {
             execution.cancel();
         }
+    }
+
+    fn refresh_display_columns(&mut self, layout: &ColumnLayout) {
+        self.display_columns = if self.aggregate {
+            (0..self.projected_columns.len())
+                .map(|column| (column, column))
+                .collect()
+        } else {
+            layout
+                .visible()
+                .iter()
+                .filter_map(|source| {
+                    self.projected_columns
+                        .iter()
+                        .position(|column| column == source)
+                        .map(|batch| (*source, batch))
+                })
+                .collect()
+        };
     }
 }
 
@@ -228,6 +249,10 @@ struct PaviApp {
     pages: HashMap<u64, DataPage>,
     page_order: VecDeque<u64>,
     filtered: Option<FilteredGrid>,
+    column_layout: ColumnLayout,
+    column_search: String,
+    jump_row_input: String,
+    jump_target: Option<u64>,
     export: Option<ExportTask>,
     export_generation: GenerationId,
     path_input: String,
@@ -272,6 +297,10 @@ impl PaviApp {
             pages: HashMap::new(),
             page_order: VecDeque::new(),
             filtered: None,
+            column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
+            column_search: String::new(),
+            jump_row_input: String::new(),
+            jump_target: None,
             export: None,
             export_generation: GenerationId(0),
             path_input: reopened_path
@@ -308,6 +337,158 @@ impl PaviApp {
         if let Err(error) = self.session_store.save(&self.session) {
             self.status = format!("save session: {error}");
         }
+    }
+
+    fn schema_key(names: &[String]) -> Option<String> {
+        (names.len() <= MAX_LAYOUT_COLUMNS).then(|| names.join("\u{1f}"))
+    }
+
+    fn restore_column_layout(&mut self) {
+        let Some(names) = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.column_names.clone())
+        else {
+            return;
+        };
+        self.column_layout = ColumnLayout::new(names.len(), INITIAL_COLUMN_WIDTH);
+        let Some(key) = Self::schema_key(&names) else {
+            return;
+        };
+        let Some(saved) = self.session.grid_layout(&key) else {
+            return;
+        };
+        let index_for = |name: &str| names.iter().position(|candidate| candidate == name);
+        let mut order = saved
+            .order
+            .iter()
+            .filter_map(|name| index_for(name))
+            .collect::<Vec<_>>();
+        let remaining = (0..names.len())
+            .filter(|index| !order.contains(index))
+            .collect::<Vec<_>>();
+        order.extend(remaining);
+        let hidden = saved
+            .hidden
+            .iter()
+            .filter_map(|name| index_for(name))
+            .collect();
+        let widths = names
+            .iter()
+            .map(|name| {
+                saved
+                    .widths
+                    .get(name)
+                    .copied()
+                    .map_or(INITIAL_COLUMN_WIDTH, f32::from)
+            })
+            .collect();
+        self.column_layout.restore(order, hidden, widths);
+    }
+
+    fn save_column_layout(&mut self) {
+        let Some(dataset) = &self.dataset else {
+            return;
+        };
+        let Some(schema_key) = Self::schema_key(&dataset.column_names) else {
+            return;
+        };
+        let mut widths = std::collections::BTreeMap::new();
+        for (source, name) in dataset.column_names.iter().enumerate() {
+            widths.insert(
+                name.clone(),
+                self.column_layout
+                    .width(source, INITIAL_COLUMN_WIDTH)
+                    .round()
+                    .clamp(72.0, 480.0) as u16,
+            );
+        }
+        self.session.save_grid_layout(GridLayoutPreference {
+            schema_key,
+            order: self
+                .column_layout
+                .order()
+                .iter()
+                .filter_map(|source| dataset.column_names.get(*source).cloned())
+                .collect(),
+            hidden: self
+                .column_layout
+                .hidden()
+                .iter()
+                .filter_map(|source| dataset.column_names.get(*source).cloned())
+                .collect(),
+            widths,
+        });
+        self.persist_session();
+    }
+
+    fn refresh_grid_columns(&mut self) {
+        if let Some(filtered) = &mut self.filtered {
+            filtered.refresh_display_columns(&self.column_layout);
+            self.grid.columns = filtered.display_columns.len();
+        } else {
+            self.grid.columns = self.column_layout.visible().len();
+        }
+    }
+
+    fn apply_column_layout_change(&mut self) {
+        self.cancel_page_work();
+        self.grid.clear_pages();
+        self.grid.selection = None;
+        self.grid.selection_range = None;
+        self.refresh_grid_columns();
+        self.save_column_layout();
+    }
+
+    fn reset_column_layout(&mut self) {
+        self.column_layout.reset(INITIAL_COLUMN_WIDTH);
+        self.apply_column_layout_change();
+    }
+
+    fn auto_fit_column(&mut self, source: usize) {
+        let Some(dataset) = &self.dataset else {
+            return;
+        };
+        let mut width = dataset
+            .column_names
+            .get(source)
+            .map_or(0.0, |name| name.chars().count() as f32 * 8.0 + 24.0);
+        let mut measure = |batch: &arrow_array::RecordBatch, position: usize| {
+            if let Some(array) = batch.columns().get(position) {
+                for row in 0..batch.num_rows().min(64) {
+                    width = width.max(
+                        format_cell_with_limit(array.as_ref(), row, CELL_LIMIT)
+                            .chars()
+                            .count() as f32
+                            * 8.0
+                            + 24.0,
+                    );
+                }
+            }
+        };
+        if let Some(filtered) = &self.filtered {
+            let Some((_, position)) = filtered
+                .display_columns
+                .iter()
+                .find(|(display_source, _)| *display_source == source)
+            else {
+                return;
+            };
+            for batch in &filtered.batches {
+                measure(batch, *position);
+            }
+        } else {
+            let Some(position) = self.column_layout.display_for_source(source) else {
+                return;
+            };
+            for page in self.pages.values() {
+                for batch in &page.batches {
+                    measure(batch, position);
+                }
+            }
+        }
+        self.column_layout.set_width(source, width);
+        self.save_column_layout();
     }
 
     fn record_sql_history(&mut self, success: bool, row_count: Option<u64>) {
@@ -385,7 +566,8 @@ impl PaviApp {
                     path: PathBuf::from(&self.path_input),
                     column_names,
                 });
-                self.grid.ready(rows, columns);
+                self.restore_column_layout();
+                self.grid.ready(rows, self.column_layout.visible().len());
                 self.session
                     .record_recent_file(PathBuf::from(&self.path_input));
                 self.persist_session();
@@ -500,6 +682,10 @@ impl PaviApp {
             let (batch, row) = self.selected_batch_row().ok_or_else(|| {
                 anyhow::anyhow!("selected row is no longer in the bounded grid window")
             })?;
+            let visible = self.visible_batch_columns();
+            let batch = batch
+                .project(&visible)
+                .map_err(|error| anyhow::anyhow!("selected layout projection: {error}"))?;
             return Ok(ExportInput::Batch(batch.slice(row, 1)));
         }
         if let Some(filtered) = &self.filtered {
@@ -664,6 +850,7 @@ impl PaviApp {
                     projected_columns,
                     execution,
                 ));
+                self.refresh_grid_columns();
                 self.filter_error = None;
                 self.status = format!("Filtering: {expression}");
             }
@@ -691,8 +878,10 @@ impl PaviApp {
         self.cancel_page_work();
         let generation = self.grid.reset();
         if let Some(dataset) = &self.dataset {
-            self.grid
-                .ready(dataset.source.row_count(), dataset.source.column_count());
+            self.grid.ready(
+                dataset.source.row_count(),
+                self.column_layout.visible().len(),
+            );
             self.status = "Filter cleared".to_string();
         } else {
             self.grid.generation = generation;
@@ -766,6 +955,7 @@ impl PaviApp {
                     projected_columns,
                     execution,
                 ));
+                self.refresh_grid_columns();
                 self.sql_error = None;
                 self.running_sql = Some(RunningSql {
                     text: sql.to_owned(),
@@ -795,8 +985,10 @@ impl PaviApp {
         self.record_sql_history(false, None);
         let generation = self.grid.reset();
         if let Some(dataset) = &self.dataset {
-            self.grid
-                .ready(dataset.source.row_count(), dataset.source.column_count());
+            self.grid.ready(
+                dataset.source.row_count(),
+                self.column_layout.visible().len(),
+            );
             self.status = "SQL query cancelled".to_string();
         } else {
             self.grid.generation = generation;
@@ -861,6 +1053,7 @@ impl PaviApp {
                     projected_columns,
                     execution,
                 ));
+                self.refresh_grid_columns();
                 let arrow = match direction {
                     SortDirection::Ascending => "↑",
                     SortDirection::Descending => "↓",
@@ -921,6 +1114,7 @@ impl PaviApp {
                         .is_some_and(|(row, _)| row < filtered.first_result)
                     {
                         self.grid.selection = None;
+                        self.grid.selection_range = None;
                     }
                 }
                 Ok(QueryPoll::Batch(_)) => {}
@@ -962,7 +1156,17 @@ impl PaviApp {
             self.grid.requested.remove(&page_index);
             return;
         };
-        let projection = Projection::all(dataset.source.column_count());
+        let projection = match Projection::columns(
+            self.column_layout.visible().to_vec(),
+            dataset.source.column_count(),
+        ) {
+            Ok(projection) => projection,
+            Err(error) => {
+                self.grid.requested.remove(&page_index);
+                self.status = format!("page projection: {error:#}");
+                return;
+            }
+        };
         match runtime.submit_page(
             Arc::clone(&dataset.source),
             page_index,
@@ -979,7 +1183,7 @@ impl PaviApp {
         }
     }
 
-    fn cell_text(&mut self, row: u64, column: usize) -> Option<String> {
+    fn cell_text(&mut self, row: u64, display_column: usize) -> Option<String> {
         let page_index = self.grid.page_for_row(row)?;
         self.request_page(page_index);
         if row.is_multiple_of(parquet_reader::PAGE_ROWS)
@@ -992,7 +1196,7 @@ impl PaviApp {
         for batch in &page.batches {
             if offset < batch.num_rows() {
                 return Some(format_cell_with_limit(
-                    batch.column(column).as_ref(),
+                    batch.column(display_column).as_ref(),
                     offset,
                     CELL_LIMIT,
                 ));
@@ -1146,6 +1350,23 @@ impl PaviApp {
         let mut export_action = None;
         let mut copy_selection = None;
         let mut cancel_export = false;
+        let mut toggle_column = None;
+        let mut move_column = None;
+        let mut resize_column = None;
+        let mut auto_fit_column = None;
+        let mut reset_columns = false;
+        let mut jump_to_row = false;
+        let column_entries = self.dataset.as_ref().map_or_else(Vec::new, |dataset| {
+            let search = self.column_search.to_lowercase();
+            dataset
+                .column_names
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| search.is_empty() || name.to_lowercase().contains(&search))
+                .take(128)
+                .map(|(source, name)| (source, name.clone()))
+                .collect::<Vec<_>>()
+        });
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open Parquet…").clicked()
@@ -1240,6 +1461,64 @@ impl PaviApp {
                     });
                     ui.monospace(&entry.sql);
                     ui.separator();
+                }
+            });
+            ui.collapsing("Columns", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Search:");
+                    ui.text_edit_singleline(&mut self.column_search);
+                    if ui.button("Reset layout").clicked() {
+                        reset_columns = true;
+                    }
+                });
+                if column_entries.is_empty() {
+                    ui.label("No matching columns.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("column_layout")
+                        .max_height(190.0)
+                        .show(ui, |ui| {
+                            for (source, name) in &column_entries {
+                                ui.horizontal(|ui| {
+                                    let mut shown = !self.column_layout.is_hidden(*source);
+                                    if ui.checkbox(&mut shown, name).changed() {
+                                        toggle_column = Some((*source, shown));
+                                    }
+                                    if ui.small_button("↑").clicked() {
+                                        move_column = Some((*source, -1));
+                                    }
+                                    if ui.small_button("↓").clicked() {
+                                        move_column = Some((*source, 1));
+                                    }
+                                    let mut width =
+                                        self.column_layout.width(*source, INITIAL_COLUMN_WIDTH);
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut width, 72.0..=480.0)
+                                                .suffix(" px"),
+                                        )
+                                        .changed()
+                                    {
+                                        resize_column = Some((*source, width));
+                                    }
+                                    if ui.small_button("Fit").clicked() {
+                                        auto_fit_column = Some(*source);
+                                    }
+                                });
+                            }
+                        });
+                    if column_entries.len() == 128 {
+                        ui.label("Showing the first 128 matching columns; narrow the search.");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Jump to row:");
+                let response = ui.text_edit_singleline(&mut self.jump_row_input);
+                if (response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                    || ui.button("Go").clicked()
+                {
+                    jump_to_row = true;
                 }
             });
             ui.horizontal(|ui| {
@@ -1354,6 +1633,60 @@ impl PaviApp {
         }
         if cancel_export {
             self.cancel_export();
+        }
+        if let Some((source, shown)) = toggle_column {
+            self.column_layout.set_hidden(source, !shown);
+            self.apply_column_layout_change();
+        }
+        if let Some((source, direction)) = move_column
+            && self.column_layout.move_source(source, direction)
+        {
+            self.apply_column_layout_change();
+        }
+        if let Some((source, width)) = resize_column {
+            self.column_layout.set_width(source, width);
+            self.save_column_layout();
+        }
+        if let Some(source) = auto_fit_column {
+            self.auto_fit_column(source);
+        }
+        if reset_columns {
+            self.reset_column_layout();
+        }
+        if jump_to_row {
+            match self.jump_row_input.trim().parse::<u64>() {
+                Ok(one_based) if one_based > 0 => {
+                    let row = one_based - 1;
+                    if let Some(filtered) = &self.filtered {
+                        if row < filtered.first_result
+                            || row >= filtered.first_result.saturating_add(filtered.rows)
+                        {
+                            self.status =
+                                "That result row is outside the current bounded window".to_string();
+                            return;
+                        }
+                        self.grid.select_filtered(
+                            filtered.first_result,
+                            row - filtered.first_result,
+                            0,
+                        );
+                    } else if row < self.grid.rows {
+                        self.grid.jump_to_row(row);
+                    } else {
+                        self.status =
+                            "Enter a row number within the current result set".to_string();
+                        return;
+                    }
+                    self.jump_target = Some(row);
+                    if self.filtered.is_none()
+                        && let Some(page) = self.grid.page_for_row(row)
+                    {
+                        self.request_page(page);
+                    }
+                    self.status = format!("Jumped to row {one_based}");
+                }
+                _ => self.status = "Enter a row number within the current result set".to_string(),
+            }
         }
     }
 
@@ -1504,24 +1837,31 @@ impl PaviApp {
     }
 
     fn selected_source_column(&self) -> Option<usize> {
-        let (_, column) = self.grid.selection?;
-        self.filtered.as_ref().map_or(Some(column), |filtered| {
-            (!filtered.aggregate)
-                .then(|| filtered.projected_columns.get(column).copied())
-                .flatten()
-        })
+        let (_, display_column) = self.grid.selection?;
+        if let Some(filtered) = &self.filtered {
+            return (!filtered.aggregate)
+                .then(|| {
+                    filtered
+                        .display_columns
+                        .get(display_column)
+                        .map(|(source, _)| *source)
+                })
+                .flatten();
+        }
+        self.column_layout.visible().get(display_column).copied()
     }
 
     fn selected_cell_details(&self) -> Option<CellDetails> {
-        let (row, column) = self.grid.selection?;
+        let (row, display_column) = self.grid.selection?;
         let dataset = self.dataset.as_ref()?;
         if let Some(filtered) = &self.filtered {
+            let (_, column) = *filtered.display_columns.get(display_column)?;
             let mut batch_offset = row.checked_sub(filtered.first_result)? as usize;
             for batch in &filtered.batches {
                 if batch_offset < batch.num_rows() {
                     return Some(inspect_cell(
                         row,
-                        column,
+                        display_column,
                         batch.schema().field(column).name(),
                         batch.column(column),
                         batch_offset,
@@ -1540,9 +1880,11 @@ impl PaviApp {
             if batch_offset < batch.num_rows() {
                 return Some(inspect_cell(
                     row,
-                    column,
-                    dataset.column_names.get(column)?,
-                    batch.column(column),
+                    display_column,
+                    dataset
+                        .column_names
+                        .get(*self.column_layout.visible().get(display_column)?)?,
+                    batch.column(display_column),
                     batch_offset,
                     self.show_safe_full_selection,
                 ));
@@ -1685,7 +2027,7 @@ impl PaviApp {
             self.show_filtered_grid(ui);
             return;
         }
-        let Some(dataset) = &self.dataset else {
+        if self.dataset.is_none() {
             match &self.grid.loading {
                 LoadState::Opening => {
                     ui.centered_and_justified(|ui| ui.spinner());
@@ -1700,39 +2042,69 @@ impl PaviApp {
                 }
             }
             return;
-        };
+        }
         if self.grid.rows == 0 {
             ui.centered_and_justified(|ui| ui.label("This dataset has no rows."));
             return;
         }
 
-        let names = dataset.column_names.clone();
-        let columns = names.len();
+        self.handle_grid_keyboard(ui.ctx(), 0);
+
+        let names = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.column_names.clone())
+            .unwrap_or_default();
+        let visible = self
+            .column_layout
+            .visible()
+            .iter()
+            .filter_map(|source| {
+                names.get(*source).map(|name| {
+                    (
+                        *source,
+                        name.clone(),
+                        self.column_layout.width(*source, INITIAL_COLUMN_WIDTH),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let columns = visible.len();
+        if columns == 0 {
+            ui.centered_and_justified(|ui| {
+                ui.label("All columns are hidden. Use Columns to show one.")
+            });
+            return;
+        }
+        let jump_target = self.jump_target.take().map(ui_row_count);
         egui::ScrollArea::horizontal()
             .id_salt("grid_horizontal")
             .show(ui, |ui| {
                 ui.set_min_width(
-                    (columns as f32 * INITIAL_COLUMN_WIDTH + ROW_NUMBER_WIDTH)
+                    (visible.iter().map(|(_, _, width)| width).sum::<f32>() + ROW_NUMBER_WIDTH)
                         .max(ui.available_width()),
                 );
-                TableBuilder::new(ui)
+                let mut table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(ROW_NUMBER_WIDTH))
-                    .columns(
-                        Column::initial(INITIAL_COLUMN_WIDTH).at_least(72.0),
-                        columns,
-                    )
+                    .column(Column::exact(ROW_NUMBER_WIDTH));
+                for (_, _, width) in &visible {
+                    table = table.column(Column::initial(*width).at_least(72.0));
+                }
+                if let Some(row) = jump_target {
+                    table = table.scroll_to_row(row, Some(Align::Center));
+                }
+                table
                     .header(ROW_HEIGHT, |mut header| {
                         header.col(|ui| {
                             ui.strong("Row");
                         });
-                        for (column, name) in names.iter().enumerate() {
-                            let heading = self.sort_heading(column, name);
+                        for (source, name, _) in &visible {
+                            let heading = self.sort_heading(*source, name);
                             header.col(|ui| {
                                 if ui.button(heading).clicked() {
-                                    self.toggle_sort(column);
+                                    self.toggle_sort(*source);
                                 }
                             });
                         }
@@ -1748,12 +2120,16 @@ impl PaviApp {
                             });
                             for column in 0..columns {
                                 table_row.col(|ui| {
-                                    let selected = self.grid.selection == Some((row_index, column));
+                                    let selected = self.grid.is_selected(row_index, column);
                                     let text = self
                                         .cell_text(row_index, column)
                                         .unwrap_or_else(|| "…".to_string());
                                     if ui.selectable_label(selected, text).clicked() {
-                                        self.grid.select(row_index, column);
+                                        if ui.input(|input| input.modifiers.shift) {
+                                            self.grid.extend_selection(row_index, column);
+                                        } else {
+                                            self.grid.select(row_index, column);
+                                        }
                                     }
                                 });
                             }
@@ -1780,6 +2156,10 @@ impl PaviApp {
 
     fn selected_batch_row(&self) -> Option<(arrow_array::RecordBatch, usize)> {
         let (selected_row, _) = self.grid.selection?;
+        self.batch_row_at(selected_row)
+    }
+
+    fn batch_row_at(&self, selected_row: u64) -> Option<(arrow_array::RecordBatch, usize)> {
         if let Some(filtered) = &self.filtered {
             let mut row = selected_row.checked_sub(filtered.first_result)? as usize;
             for batch in &filtered.batches {
@@ -1801,23 +2181,37 @@ impl PaviApp {
         None
     }
 
+    fn visible_batch_columns(&self) -> Vec<usize> {
+        if let Some(filtered) = &self.filtered {
+            return filtered
+                .display_columns
+                .iter()
+                .map(|(_, batch_column)| *batch_column)
+                .collect();
+        }
+        (0..self.column_layout.visible().len()).collect()
+    }
+
     fn copy_selection(&mut self, ctx: &egui::Context, row: bool) {
         let Some((batch, selected_row)) = self.selected_batch_row() else {
             self.status = "Selected row is no longer in the bounded grid window".to_string();
             return;
         };
-        let Some((_, selected_column)) = self.grid.selection else {
+        let Some((selected_grid_row, selected_display_column)) = self.grid.selection else {
             return;
         };
         let text = if row {
             let mut text = String::new();
-            for column in 0..batch.num_columns() {
-                let value =
-                    format_cell_with_limit(batch.column(column).as_ref(), selected_row, CELL_LIMIT);
+            for (display_column, column) in self.visible_batch_columns().into_iter().enumerate() {
+                let Some(array) = batch.columns().get(column) else {
+                    self.status = "Selected column is unavailable".to_string();
+                    return;
+                };
+                let value = format_cell_with_limit(array.as_ref(), selected_row, CELL_LIMIT);
                 if text
                     .len()
                     .saturating_add(value.len())
-                    .saturating_add(usize::from(column > 0))
+                    .saturating_add(usize::from(display_column > 0))
                     > MAX_CLIPBOARD_BYTES
                 {
                     self.status = format!(
@@ -1825,25 +2219,148 @@ impl PaviApp {
                     );
                     return;
                 }
-                if column > 0 {
+                if display_column > 0 {
                     text.push('\t');
                 }
                 text.push_str(&value);
             }
             text
         } else {
-            let Some(column) = batch.columns().get(selected_column) else {
-                self.status = "Selected column is unavailable".to_string();
-                return;
-            };
-            format_cell_with_limit(column.as_ref(), selected_row, CELL_LIMIT)
+            let range = self
+                .grid
+                .selection_range
+                .unwrap_or(crate::state::SelectionRange {
+                    anchor: (selected_grid_row, selected_display_column),
+                    focus: (selected_grid_row, selected_display_column),
+                });
+            let first_row = range.anchor.0.min(range.focus.0);
+            let last_row = range.anchor.0.max(range.focus.0);
+            let first_column = range.anchor.1.min(range.focus.1);
+            let last_column = range.anchor.1.max(range.focus.1);
+            let visible_columns = self.visible_batch_columns();
+            let mut text = String::new();
+            for row_index in first_row..=last_row {
+                let Some((range_batch, batch_row)) = self.batch_row_at(row_index) else {
+                    self.status =
+                        "Selection is outside the current bounded grid window".to_string();
+                    return;
+                };
+                for display_column in first_column..=last_column {
+                    let Some(array) = visible_columns
+                        .get(display_column)
+                        .and_then(|column| range_batch.columns().get(*column))
+                    else {
+                        self.status = "Selected column is unavailable".to_string();
+                        return;
+                    };
+                    let value = format_cell_with_limit(array.as_ref(), batch_row, CELL_LIMIT);
+                    let separator = usize::from(display_column > first_column)
+                        + usize::from(row_index > first_row && display_column == first_column);
+                    if text
+                        .len()
+                        .saturating_add(value.len())
+                        .saturating_add(separator)
+                        > MAX_CLIPBOARD_BYTES
+                    {
+                        self.status = format!(
+                            "Selection exceeds the {MAX_CLIPBOARD_BYTES}-byte clipboard limit"
+                        );
+                        return;
+                    }
+                    if display_column > first_column {
+                        text.push('\t');
+                    }
+                    if row_index > first_row && display_column == first_column {
+                        text.push('\n');
+                    }
+                    text.push_str(&value);
+                }
+            }
+            text
         };
         ctx.copy_text(text);
         self.status = if row {
             "Selected row copied to clipboard".to_string()
         } else {
-            "Selected cell copied to clipboard".to_string()
+            "Selected cells copied to clipboard".to_string()
         };
+    }
+
+    fn handle_grid_keyboard(&mut self, ctx: &egui::Context, first_row: u64) {
+        if ctx.wants_keyboard_input() || self.grid.rows == 0 || self.grid.columns == 0 {
+            return;
+        }
+        let (row_delta, column_delta, home, end, copy) = ctx.input(|input| {
+            let row_delta = if input.key_pressed(egui::Key::ArrowUp) {
+                -1
+            } else if input.key_pressed(egui::Key::ArrowDown) {
+                1
+            } else if input.key_pressed(egui::Key::PageUp) {
+                -20
+            } else if input.key_pressed(egui::Key::PageDown) {
+                20
+            } else {
+                0
+            };
+            let column_delta = if input.key_pressed(egui::Key::ArrowLeft) {
+                -1
+            } else if input.key_pressed(egui::Key::ArrowRight) {
+                1
+            } else {
+                0
+            };
+            (
+                row_delta,
+                column_delta,
+                input.key_pressed(egui::Key::Home),
+                input.key_pressed(egui::Key::End),
+                input.modifiers.command && input.key_pressed(egui::Key::C),
+            )
+        });
+        if copy {
+            self.copy_selection(ctx, false);
+            return;
+        }
+        if row_delta == 0 && column_delta == 0 && !home && !end {
+            return;
+        }
+        if self.filtered.is_none() && !home && !end {
+            self.grid.move_selection(
+                row_delta,
+                column_delta,
+                ctx.input(|input| input.modifiers.shift),
+            );
+            if let Some((row, _)) = self.grid.selection
+                && let Some(page) = self.grid.page_for_row(row)
+            {
+                self.request_page(page);
+            }
+            return;
+        }
+        let (row, column) = self.grid.selection.unwrap_or((first_row, 0));
+        let last_row = first_row.saturating_add(self.grid.rows.saturating_sub(1));
+        let target_row = if home {
+            first_row
+        } else if end {
+            last_row
+        } else {
+            row.saturating_add_signed(row_delta)
+                .clamp(first_row, last_row)
+        };
+        let target_column = column
+            .saturating_add_signed(column_delta as isize)
+            .min(self.grid.columns.saturating_sub(1));
+        let extend = ctx.input(|input| input.modifiers.shift);
+        if extend {
+            self.grid.extend_selection(target_row, target_column);
+        } else {
+            self.grid.select(target_row, target_column);
+        }
+        if self.filtered.is_none()
+            && let Some(page) = self.grid.page_for_row(target_row)
+        {
+            self.request_page(page);
+        }
     }
 
     fn show_filtered_grid(&mut self, ui: &mut egui::Ui) {
@@ -1859,7 +2376,7 @@ impl PaviApp {
         let error = filtered.error.clone();
         let kind = filtered.kind;
         let aggregate = filtered.aggregate;
-        let projected_columns = filtered.projected_columns.clone();
+        let display_columns = filtered.display_columns.clone();
         if rows == 0 {
             ui.centered_and_justified(|ui| {
                 if let Some(error) = error {
@@ -1888,12 +2405,18 @@ impl PaviApp {
                 })
                 .unwrap_or_default()
         } else {
-            projected_columns
+            display_columns
                 .iter()
-                .map(|column| dataset.column_names[*column].clone())
+                .filter_map(|(source, _)| dataset.column_names.get(*source).cloned())
                 .collect::<Vec<_>>()
         };
+        self.handle_grid_keyboard(ui.ctx(), first_result);
         let columns = names.len();
+        let jump_target = self
+            .jump_target
+            .take()
+            .and_then(|row| row.checked_sub(first_result))
+            .map(ui_row_count);
         if let Some(error) = error {
             ui.label(RichText::new(error).color(egui::Color32::RED));
         }
@@ -1907,18 +2430,36 @@ impl PaviApp {
             .id_salt("filtered_grid_horizontal")
             .show(ui, |ui| {
                 ui.set_min_width(
-                    (columns as f32 * INITIAL_COLUMN_WIDTH + ROW_NUMBER_WIDTH)
+                    ((0..columns)
+                        .map(|column| {
+                            if aggregate {
+                                INITIAL_COLUMN_WIDTH
+                            } else {
+                                self.column_layout
+                                    .width(display_columns[column].0, INITIAL_COLUMN_WIDTH)
+                            }
+                        })
+                        .sum::<f32>()
+                        + ROW_NUMBER_WIDTH)
                         .max(ui.available_width()),
                 );
-                TableBuilder::new(ui)
+                let mut table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(ROW_NUMBER_WIDTH))
-                    .columns(
-                        Column::initial(INITIAL_COLUMN_WIDTH).at_least(72.0),
-                        columns,
-                    )
+                    .column(Column::exact(ROW_NUMBER_WIDTH));
+                for (source, _) in &display_columns {
+                    let width = if aggregate {
+                        INITIAL_COLUMN_WIDTH
+                    } else {
+                        self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
+                    };
+                    table = table.column(Column::initial(width).at_least(72.0));
+                }
+                if let Some(row) = jump_target {
+                    table = table.scroll_to_row(row, Some(Align::Center));
+                }
+                table
                     .header(ROW_HEIGHT, |mut header| {
                         header.col(|ui| {
                             ui.strong("Result");
@@ -1928,7 +2469,7 @@ impl PaviApp {
                                 if aggregate {
                                     ui.strong(name);
                                 } else {
-                                    let source_column = projected_columns[column];
+                                    let source_column = display_columns[column].0;
                                     let heading = self.sort_heading(source_column, name);
                                     if ui.button(heading).clicked() {
                                         self.toggle_sort(source_column);
@@ -1947,15 +2488,22 @@ impl PaviApp {
                             table_row.col(|ui| {
                                 ui.label((result_row + 1).to_string());
                             });
-                            for column in 0..columns {
+                            for (column, (_, batch_column)) in display_columns.iter().enumerate() {
                                 table_row.col(|ui| {
-                                    let selected =
-                                        self.grid.selection == Some((result_row, column));
+                                    let selected = self.grid.is_selected(result_row, column);
                                     let text = self
-                                        .filtered_cell_text(row_index, column)
+                                        .filtered_cell_text(row_index, *batch_column)
                                         .unwrap_or_else(|| "…".to_string());
                                     if ui.selectable_label(selected, text).clicked() {
-                                        self.grid.select_filtered(first_result, row_index, column);
+                                        if ui.input(|input| input.modifiers.shift) {
+                                            self.grid.extend_selection(result_row, column);
+                                        } else {
+                                            self.grid.select_filtered(
+                                                first_result,
+                                                row_index,
+                                                column,
+                                            );
+                                        }
                                     }
                                 });
                             }
@@ -2314,7 +2862,9 @@ mod tests {
             path,
             column_names,
         });
-        app.grid.ready(source.row_count(), source.column_count());
+        app.column_layout = ColumnLayout::new(source.column_count(), INITIAL_COLUMN_WIDTH);
+        app.grid
+            .ready(source.row_count(), app.column_layout.visible().len());
         app
     }
 
@@ -2961,5 +3511,58 @@ mod tests {
         assert_eq!(model.input_rows, MAX_INPUT_ROWS);
         assert!(model.input_capped);
         assert!(model.output_len() <= DEFAULT_POINT_LIMIT);
+    }
+
+    #[test]
+    fn layout_changes_project_only_visible_columns_and_clear_page_state() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.request_page(0);
+        poll_until_page_loaded(&mut app, 0);
+        assert_eq!(app.pages.get(&0).unwrap().batches[0].num_columns(), 2);
+
+        app.column_layout.set_hidden(0, true);
+        app.apply_column_layout_change();
+        assert_eq!(app.grid.columns, 1);
+        assert!(app.pages.is_empty());
+        assert!(app.grid.selection.is_none());
+
+        app.request_page(0);
+        poll_until_page_loaded(&mut app, 0);
+        assert_eq!(app.pages.get(&0).unwrap().batches[0].num_columns(), 1);
+        assert_eq!(app.cell_text(0, 0).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn layout_persists_by_schema_without_retaining_grid_pages() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(Arc::clone(&source), path.clone());
+        app.column_layout.move_source(1, -1);
+        app.column_layout.set_hidden(0, true);
+        app.column_layout.set_width(1, 260.0);
+        app.save_column_layout();
+
+        let mut reopened = make_app(source, path);
+        reopened.restore_column_layout();
+        assert_eq!(reopened.column_layout.visible(), &[1]);
+        assert_eq!(reopened.column_layout.width(1, 0.0), 260.0);
+        assert!(reopened.pages.is_empty());
+        assert!(reopened.pending_pages.is_empty());
+    }
+
+    #[test]
+    fn filtered_layout_maps_display_columns_without_reordering_batches() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.filter_input = "id >= 0".to_string();
+        app.apply_filter();
+        poll_until_idle(&mut app);
+        app.column_layout.set_hidden(0, true);
+        app.apply_column_layout_change();
+
+        let filtered = app.filtered.as_ref().unwrap();
+        assert_eq!(filtered.display_columns, vec![(1, 1)]);
+        assert_eq!(filtered.batches.front().unwrap().num_columns(), 2);
+        assert_eq!(app.filtered_cell_text(0, 1).as_deref(), Some("alpha"));
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -11,12 +12,24 @@ pub const MAX_HISTORY_ENTRIES: usize = 50;
 pub const MAX_RECENT_FILES: usize = 12;
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 256 * 1024;
+pub const MAX_GRID_LAYOUTS: usize = 8;
+pub const MAX_LAYOUT_COLUMNS: usize = 2_048;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct GridLayoutPreference {
+    pub schema_key: String,
+    pub order: Vec<String>,
+    pub hidden: Vec<String>,
+    pub widths: BTreeMap<String, u16>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct Preferences {
     pub inspector_visible: bool,
     pub chart_visible: bool,
+    pub grid_layouts: Vec<GridLayoutPreference>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -56,6 +69,24 @@ impl Default for SessionState {
 }
 
 impl SessionState {
+    pub fn grid_layout(&self, schema_key: &str) -> Option<&GridLayoutPreference> {
+        self.preferences
+            .grid_layouts
+            .iter()
+            .find(|layout| layout.schema_key == schema_key)
+    }
+
+    pub fn save_grid_layout(&mut self, layout: GridLayoutPreference) {
+        if layout.order.len() > MAX_LAYOUT_COLUMNS {
+            return;
+        }
+        self.preferences
+            .grid_layouts
+            .retain(|existing| existing.schema_key != layout.schema_key);
+        self.preferences.grid_layouts.insert(0, layout);
+        self.preferences.grid_layouts.truncate(MAX_GRID_LAYOUTS);
+    }
+
     pub fn record_recent_file(&mut self, path: PathBuf) {
         self.recent_files.retain(|existing| existing != &path);
         self.recent_files.insert(0, path.clone());
@@ -132,6 +163,10 @@ impl SessionState {
             entry.sql = bounded_text(&entry.sql, MAX_QUERY_BYTES);
         }
         self.trim_history();
+        self.preferences.grid_layouts.retain(|layout| {
+            !layout.schema_key.is_empty() && layout.order.len() <= MAX_LAYOUT_COLUMNS
+        });
+        self.preferences.grid_layouts.truncate(MAX_GRID_LAYOUTS);
     }
 
     fn trim_history(&mut self) {
@@ -332,5 +367,24 @@ mod tests {
         assert!(!saved.contains("task_id"));
         assert!(!saved.contains("generation"));
         assert!(!saved.contains("RecordBatch"));
+    }
+
+    #[test]
+    fn keeps_a_bounded_schema_keyed_grid_layout() {
+        let mut state = SessionState::default();
+        state.save_grid_layout(GridLayoutPreference {
+            schema_key: "id|name".to_string(),
+            order: vec!["name".to_string(), "id".to_string()],
+            hidden: vec!["id".to_string()],
+            widths: BTreeMap::from([("name".to_string(), 240)]),
+        });
+        assert_eq!(state.grid_layout("id|name").unwrap().order[0], "name");
+        for index in 0..=MAX_GRID_LAYOUTS {
+            state.save_grid_layout(GridLayoutPreference {
+                schema_key: format!("schema-{index}"),
+                ..GridLayoutPreference::default()
+            });
+        }
+        assert_eq!(state.preferences.grid_layouts.len(), MAX_GRID_LAYOUTS);
     }
 }
