@@ -2,6 +2,7 @@ use std::{collections::VecDeque, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use parquet_reader::{DataPage, GroupBudget, PAGE_ROWS, SortBudget};
 use pavi_runtime::{
     CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SubmitError,
@@ -59,8 +60,13 @@ enum InFlight {
 
 impl QueryEngine {
     pub fn new(runtime: &Runtime) -> Self {
+        Self::from_handle(runtime.handle())
+    }
+
+    /// Builds a query engine for a background consumer sharing an existing runtime.
+    pub fn from_handle(runtime: RuntimeHandle) -> Self {
         Self {
-            runtime: runtime.handle(),
+            runtime,
             sort_budget: SortBudget::default(),
             group_budget: GroupBudget::default(),
         }
@@ -112,6 +118,10 @@ impl QueryEngine {
             return Err(error);
         }
         Ok(execution)
+    }
+
+    pub fn output_schema(&self, logical: &LogicalPlan) -> Result<SchemaRef> {
+        Planner::plan(logical)?.output_schema()
     }
 }
 

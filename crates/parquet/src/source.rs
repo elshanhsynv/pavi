@@ -547,6 +547,17 @@ impl ParquetSource {
         Ok(())
     }
 
+    /// Returns the schema produced by a validated aggregate without scanning data.
+    pub fn aggregate_schema(&self, aggregate: &AggregateSpec) -> Result<Arc<Schema>> {
+        self.validate_aggregate(aggregate)?;
+        Ok(GroupCollector::new(
+            aggregate,
+            &self.dataset_metadata.schema,
+            GroupBudget::default(),
+        )?
+        .output_schema())
+    }
+
     pub fn validate_sort(&self, sort: SortSpec) -> Result<()> {
         let field = self
             .dataset_metadata
@@ -1097,10 +1108,8 @@ impl GroupCollector {
     }
 
     fn finish(self) -> Result<RecordBatch> {
-        let mut fields = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
-        if let Some((name, data_type)) = &self.group_by {
-            fields.push(Field::new(name, data_type.clone(), true));
+        if let Some((_, data_type)) = &self.group_by {
             arrays.push(build_array(
                 data_type,
                 &self
@@ -1110,14 +1119,9 @@ impl GroupCollector {
                     .collect::<Vec<_>>(),
             )?);
         }
-        for (index, (expression, output_type)) in
+        for (index, (_expression, output_type)) in
             self.expressions.iter().zip(&self.output_types).enumerate()
         {
-            fields.push(Field::new(
-                aggregate_name(*expression, &self.input_names[index]),
-                output_type.clone(),
-                expression.function() != AggregateFunction::Count,
-            ));
             arrays.push(build_array(
                 output_type,
                 &self
@@ -1127,7 +1131,24 @@ impl GroupCollector {
                     .collect::<Vec<_>>(),
             )?);
         }
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(Into::into)
+        RecordBatch::try_new(self.output_schema(), arrays).map_err(Into::into)
+    }
+
+    fn output_schema(&self) -> Arc<Schema> {
+        let mut fields = Vec::new();
+        if let Some((name, data_type)) = &self.group_by {
+            fields.push(Field::new(name, data_type.clone(), true));
+        }
+        for (index, (expression, output_type)) in
+            self.expressions.iter().zip(&self.output_types).enumerate()
+        {
+            fields.push(Field::new(
+                aggregate_name(*expression, &self.input_names[index]),
+                output_type.clone(),
+                expression.function() != AggregateFunction::Count,
+            ));
+        }
+        Arc::new(Schema::new(fields))
     }
 }
 

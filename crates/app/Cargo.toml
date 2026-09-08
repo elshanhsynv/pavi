@@ -15,7 +15,7 @@ serde_json.workspace = true
 parquet_reader = { path = "../parquet" }
 pavi_runtime = { path = "../runtime" }
 pavi_query = { path = "../query" }
+parquet.workspace = true
 
 [dev-dependencies]
-parquet.workspace = true
 tempfile = "3"

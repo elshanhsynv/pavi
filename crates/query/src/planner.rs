@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use arrow_schema::{Schema, SchemaRef};
 use parquet_reader::{AggregateSpec, FilterExpr, ParquetSource, Projection, SortSpec};
 
 use crate::LogicalPlan;
@@ -17,6 +18,26 @@ pub struct PhysicalPlan {
 pub struct Planner;
 
 impl PhysicalPlan {
+    pub fn output_schema(&self) -> Result<SchemaRef> {
+        if let Some(aggregate) = &self.aggregate {
+            return self.source.aggregate_schema(aggregate);
+        }
+        let fields = self
+            .projection
+            .as_slice()
+            .iter()
+            .map(|column| {
+                self.source
+                    .schema()
+                    .fields()
+                    .get(*column)
+                    .cloned()
+                    .context("projected column is out of range")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
     pub fn projected_columns(&self) -> &[usize] {
         self.projection.as_slice()
     }

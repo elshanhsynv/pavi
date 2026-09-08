@@ -1,4 +1,5 @@
 mod chart;
+mod export;
 mod inspector;
 mod session;
 mod state;
@@ -24,6 +25,7 @@ use pavi_runtime::{
 use crate::chart::{
     ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartValues, MAX_INPUT_ROWS,
 };
+use crate::export::{ExportEvent, ExportFormat, ExportInput, ExportTask};
 use crate::inspector::{CellDetails, column_summary, inspect_cell};
 use crate::session::{SessionState, SessionStore};
 use crate::state::{GridState, LoadState};
@@ -34,6 +36,7 @@ const INITIAL_COLUMN_WIDTH: f32 = 130.0;
 const MAX_UI_PAGES: usize = 8;
 const MAX_FILTERED_BATCHES: usize = 8;
 const CELL_LIMIT: usize = 256;
+const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 
 fn ui_row_count(rows: u64) -> usize {
     rows.min(usize::MAX as u64) as usize
@@ -225,6 +228,8 @@ struct PaviApp {
     pages: HashMap<u64, DataPage>,
     page_order: VecDeque<u64>,
     filtered: Option<FilteredGrid>,
+    export: Option<ExportTask>,
+    export_generation: GenerationId,
     path_input: String,
     filter_input: String,
     filter_error: Option<String>,
@@ -267,6 +272,8 @@ impl PaviApp {
             pages: HashMap::new(),
             page_order: VecDeque::new(),
             filtered: None,
+            export: None,
+            export_generation: GenerationId(0),
             path_input: reopened_path
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string()),
@@ -324,6 +331,7 @@ impl PaviApp {
         }
         self.opening = None;
         self.cancel_page_work();
+        self.cancel_export();
         self.record_sql_history(false, None);
         self.cancel_filter();
         self.chart.reset();
@@ -335,7 +343,7 @@ impl PaviApp {
         self.path_input = path.display().to_string();
         self.status = format!("Opening {}…", path.display());
 
-        let Some(runtime) = &self.runtime else {
+        let Some(runtime) = self.runtime.as_ref().map(Runtime::handle) else {
             self.open_error("background runtime is unavailable".to_string());
             return;
         };
@@ -471,6 +479,132 @@ impl PaviApp {
         self.pending_pages.clear();
         self.pages.clear();
         self.page_order.clear();
+    }
+
+    fn next_export_generation(&mut self) -> GenerationId {
+        self.export_generation = GenerationId(self.export_generation.0.saturating_add(1));
+        self.export_generation
+    }
+
+    fn cancel_export(&mut self) {
+        if let Some(task) = &self.export {
+            task.cancel();
+            self.status = "Export cancelled".to_string();
+        }
+        self.export = None;
+        self.next_export_generation();
+    }
+
+    fn export_input(&self, selected: bool) -> anyhow::Result<ExportInput> {
+        if selected {
+            let (batch, row) = self.selected_batch_row().ok_or_else(|| {
+                anyhow::anyhow!("selected row is no longer in the bounded grid window")
+            })?;
+            return Ok(ExportInput::Batch(batch.slice(row, 1)));
+        }
+        if let Some(filtered) = &self.filtered {
+            return Ok(ExportInput::Plan(filtered.plan.clone()));
+        }
+        let dataset = self
+            .dataset
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("open a dataset before exporting"))?;
+        Ok(ExportInput::Plan(
+            LogicalPlan::scan(Arc::clone(&dataset.source))
+                .project((0..dataset.source.column_count()).collect::<Vec<_>>()),
+        ))
+    }
+
+    fn start_export(&mut self, format: ExportFormat, selected: bool) {
+        let Some(dataset) = &self.dataset else {
+            self.status = "Open a dataset before exporting".to_string();
+            return;
+        };
+        let suggested = dataset
+            .path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .map_or_else(
+                || "pavi-export".to_string(),
+                |name| format!("{name}-export"),
+            );
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(format.label(), &[format.extension()])
+            .set_file_name(format!("{suggested}.{}", format.extension()))
+            .save_file()
+        else {
+            return;
+        };
+        self.start_export_to(format, selected, path);
+    }
+
+    fn start_export_to(&mut self, format: ExportFormat, selected: bool, path: PathBuf) {
+        let input = match self.export_input(selected) {
+            Ok(input) => input,
+            Err(error) => {
+                self.status = format!("Export: {error:#}");
+                return;
+            }
+        };
+        let Some(runtime) = self.runtime.as_ref().map(Runtime::handle) else {
+            self.status = "Export: background runtime is unavailable".to_string();
+            return;
+        };
+        self.cancel_export();
+        let generation = self.next_export_generation();
+        match ExportTask::start(input, path, format, runtime, generation) {
+            Ok(task) => {
+                self.export = Some(task);
+                self.status = format!("Exporting {}…", format.label());
+            }
+            Err(error) => self.status = format!("Start export: {error}"),
+        }
+    }
+
+    fn poll_export(&mut self) {
+        let Some(task) = &self.export else {
+            return;
+        };
+        let event = match task.try_recv() {
+            Ok(Some(event)) => event,
+            Ok(None) => return,
+            Err(error) => {
+                self.export = None;
+                self.status = format!("Export: {error:#}");
+                return;
+            }
+        };
+        let generation = match &event {
+            ExportEvent::Progress { generation, .. }
+            | ExportEvent::Finished { generation, .. }
+            | ExportEvent::Cancelled { generation }
+            | ExportEvent::Failed { generation, .. } => *generation,
+        };
+        if generation != self.export_generation {
+            return;
+        }
+        match event {
+            ExportEvent::Progress { rows, .. } => {
+                self.status = format!("Exporting: {rows} rows written");
+            }
+            ExportEvent::Finished { rows, .. } => {
+                let path = self
+                    .export
+                    .as_ref()
+                    .map(|task| task.path().display().to_string())
+                    .unwrap_or_default();
+                self.export = None;
+                self.status = format!("Export complete: {rows} rows written to {path}");
+            }
+            ExportEvent::Cancelled { .. } => {
+                self.export = None;
+                self.status = "Export cancelled".to_string();
+            }
+            ExportEvent::Failed { error, .. } => {
+                self.export = None;
+                self.status = format!("Export failed: {error}");
+            }
+        }
     }
 
     fn cancel_filter(&mut self) {
@@ -1009,6 +1143,9 @@ impl PaviApp {
         let mut remove_history = None;
         let mut clear_history = false;
         let mut preferences_changed = false;
+        let mut export_action = None;
+        let mut copy_selection = None;
+        let mut cancel_export = false;
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Open Parquet…").clicked()
@@ -1106,6 +1243,70 @@ impl PaviApp {
                 }
             });
             ui.horizontal(|ui| {
+                ui.menu_button("Export", |ui| {
+                    let available = self.dataset.is_some();
+                    if ui
+                        .add_enabled(available, egui::Button::new("Current result as CSV…"))
+                        .clicked()
+                    {
+                        export_action = Some((ExportFormat::Csv, false));
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(available, egui::Button::new("Current result as Parquet…"))
+                        .clicked()
+                    {
+                        export_action = Some((ExportFormat::Parquet, false));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.selected_batch_row().is_some(),
+                            egui::Button::new("Selected row as CSV…"),
+                        )
+                        .clicked()
+                    {
+                        export_action = Some((ExportFormat::Csv, true));
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected_batch_row().is_some(),
+                            egui::Button::new("Selected row as Parquet…"),
+                        )
+                        .clicked()
+                    {
+                        export_action = Some((ExportFormat::Parquet, true));
+                        ui.close_menu();
+                    }
+                });
+                if ui
+                    .add_enabled(
+                        self.selected_batch_row().is_some(),
+                        egui::Button::new("Copy cell"),
+                    )
+                    .clicked()
+                {
+                    copy_selection = Some(false);
+                }
+                if ui
+                    .add_enabled(
+                        self.selected_batch_row().is_some(),
+                        egui::Button::new("Copy row"),
+                    )
+                    .clicked()
+                {
+                    copy_selection = Some(true);
+                }
+                if self.export.is_some() {
+                    ui.spinner();
+                    if ui.button("Cancel export").clicked() {
+                        cancel_export = true;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
                 if ui
                     .button(if self.show_inspector {
                         "Hide Inspector"
@@ -1144,6 +1345,15 @@ impl PaviApp {
         }
         if preferences_changed {
             self.persist_session();
+        }
+        if let Some((format, selected)) = export_action {
+            self.start_export(format, selected);
+        }
+        if let Some(row) = copy_selection {
+            self.copy_selection(ctx, row);
+        }
+        if cancel_export {
+            self.cancel_export();
         }
     }
 
@@ -1568,6 +1778,74 @@ impl PaviApp {
         None
     }
 
+    fn selected_batch_row(&self) -> Option<(arrow_array::RecordBatch, usize)> {
+        let (selected_row, _) = self.grid.selection?;
+        if let Some(filtered) = &self.filtered {
+            let mut row = selected_row.checked_sub(filtered.first_result)? as usize;
+            for batch in &filtered.batches {
+                if row < batch.num_rows() {
+                    return Some((batch.clone(), row));
+                }
+                row -= batch.num_rows();
+            }
+            return None;
+        }
+        let page = self.pages.get(&self.grid.page_for_row(selected_row)?)?;
+        let mut row = (selected_row - page.window.first_row) as usize;
+        for batch in &page.batches {
+            if row < batch.num_rows() {
+                return Some((batch.clone(), row));
+            }
+            row -= batch.num_rows();
+        }
+        None
+    }
+
+    fn copy_selection(&mut self, ctx: &egui::Context, row: bool) {
+        let Some((batch, selected_row)) = self.selected_batch_row() else {
+            self.status = "Selected row is no longer in the bounded grid window".to_string();
+            return;
+        };
+        let Some((_, selected_column)) = self.grid.selection else {
+            return;
+        };
+        let text = if row {
+            let mut text = String::new();
+            for column in 0..batch.num_columns() {
+                let value =
+                    format_cell_with_limit(batch.column(column).as_ref(), selected_row, CELL_LIMIT);
+                if text
+                    .len()
+                    .saturating_add(value.len())
+                    .saturating_add(usize::from(column > 0))
+                    > MAX_CLIPBOARD_BYTES
+                {
+                    self.status = format!(
+                        "Selected row exceeds the {MAX_CLIPBOARD_BYTES}-byte clipboard limit"
+                    );
+                    return;
+                }
+                if column > 0 {
+                    text.push('\t');
+                }
+                text.push_str(&value);
+            }
+            text
+        } else {
+            let Some(column) = batch.columns().get(selected_column) else {
+                self.status = "Selected column is unavailable".to_string();
+                return;
+            };
+            format_cell_with_limit(column.as_ref(), selected_row, CELL_LIMIT)
+        };
+        ctx.copy_text(text);
+        self.status = if row {
+            "Selected row copied to clipboard".to_string()
+        } else {
+            "Selected cell copied to clipboard".to_string()
+        };
+    }
+
     fn show_filtered_grid(&mut self, ui: &mut egui::Ui) {
         let Some(dataset) = &self.dataset else {
             return;
@@ -1934,6 +2212,7 @@ impl eframe::App for PaviApp {
         self.poll_pages();
         self.poll_filtered();
         self.poll_chart();
+        self.poll_export();
         self.show_top_bar(ctx);
         self.show_metadata(ctx);
         self.show_chart_window(ctx);
@@ -1955,6 +2234,7 @@ impl eframe::App for PaviApp {
             || !self.pending_pages.is_empty()
             || self.filtered.as_ref().is_some_and(FilteredGrid::needs_more)
             || self.chart.loading()
+            || self.export.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
         }

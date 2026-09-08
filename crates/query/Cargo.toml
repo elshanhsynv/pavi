@@ -6,11 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
+arrow-schema.workspace = true
 parquet_reader = { path = "../parquet" }
 pavi_runtime = { path = "../runtime" }
 sqlparser.workspace = true
 
 [dev-dependencies]
-arrow-schema.workspace = true
 parquet.workspace = true
 tempfile = "3"
