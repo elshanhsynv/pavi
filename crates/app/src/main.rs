@@ -1,3 +1,4 @@
+mod chart;
 mod state;
 
 use std::{
@@ -14,8 +15,13 @@ use parquet_reader::{
     value::format_cell_with_limit,
 };
 use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryExecution, QueryPoll, SqlAst};
-use pavi_runtime::{OpenOutcome, OpenTask, PageOutcome, PageTask, Runtime, RuntimeConfig};
+use pavi_runtime::{
+    GenerationId, OpenOutcome, OpenTask, PageOutcome, PageTask, Runtime, RuntimeConfig,
+};
 
+use crate::chart::{
+    ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartValues, MAX_INPUT_ROWS,
+};
 use crate::state::{GridState, LoadState};
 
 const ROW_HEIGHT: f32 = 22.0;
@@ -135,6 +141,78 @@ impl FilteredGrid {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChartSource {
+    Sql,
+    CurrentResult,
+}
+
+impl ChartSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sql => "Chart SQL",
+            Self::CurrentResult => "Current result window",
+        }
+    }
+}
+
+struct ChartState {
+    visible: bool,
+    source: ChartSource,
+    sql_input: String,
+    config: ChartConfig,
+    generation: GenerationId,
+    execution: Option<QueryExecution>,
+    accumulator: Option<ChartAccumulator>,
+    model: Option<ChartModel>,
+    error: Option<String>,
+    status: String,
+}
+
+impl Default for ChartState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            source: ChartSource::Sql,
+            sql_input: "SELECT * FROM dataset".to_string(),
+            config: ChartConfig::default(),
+            generation: GenerationId(0),
+            execution: None,
+            accumulator: None,
+            model: None,
+            error: None,
+            status: "Choose a chart source and columns".to_string(),
+        }
+    }
+}
+
+impl ChartState {
+    fn loading(&self) -> bool {
+        self.execution.is_some()
+    }
+
+    fn cancel(&mut self) {
+        if let Some(execution) = &mut self.execution {
+            execution.cancel();
+        }
+        self.execution = None;
+        self.accumulator = None;
+    }
+
+    fn reset(&mut self) {
+        self.cancel();
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.model = None;
+        self.error = None;
+        self.status = "Dataset changed; chart results were cleared".to_string();
+    }
+
+    fn next_generation(&mut self) -> GenerationId {
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.generation
+    }
+}
+
 struct PaviApp {
     runtime: Option<Runtime>,
     grid: GridState,
@@ -149,6 +227,7 @@ struct PaviApp {
     filter_error: Option<String>,
     sql_input: String,
     sql_error: Option<String>,
+    chart: ChartState,
     status: String,
 }
 
@@ -171,6 +250,7 @@ impl PaviApp {
             filter_error: None,
             sql_input: String::new(),
             sql_error: None,
+            chart: ChartState::default(),
             status: "Choose a Parquet file to begin".to_string(),
         };
         if app.runtime.is_none() {
@@ -189,6 +269,7 @@ impl PaviApp {
         self.opening = None;
         self.cancel_page_work();
         self.cancel_filter();
+        self.chart.reset();
         self.dataset = None;
         self.filter_error = None;
         self.sql_error = None;
@@ -245,6 +326,16 @@ impl PaviApp {
                     column_types,
                 });
                 self.grid.ready(rows, columns);
+                if let Some(chart_columns) =
+                    self.dataset.as_ref().map(|dataset| &dataset.column_names)
+                {
+                    self.chart.config.x_column = chart_columns.first().cloned().unwrap_or_default();
+                    self.chart.config.y_column = chart_columns
+                        .get(1)
+                        .or_else(|| chart_columns.first())
+                        .cloned()
+                        .unwrap_or_default();
+                }
                 self.status = if rows == 0 {
                     "Opened empty dataset".to_string()
                 } else {
@@ -694,6 +785,136 @@ impl PaviApp {
         self.status = error;
     }
 
+    fn run_chart(&mut self) {
+        let accumulator = match ChartAccumulator::new(self.chart.config.clone()) {
+            Ok(accumulator) => accumulator,
+            Err(error) => {
+                self.chart.error = Some(format!("Chart setup: {error:#}"));
+                return;
+            }
+        };
+        let Some(dataset) = &self.dataset else {
+            self.chart.error = Some("Open a dataset before running a chart".to_string());
+            return;
+        };
+        self.chart.cancel();
+        self.chart.model = None;
+        self.chart.error = None;
+        let generation = self.chart.next_generation();
+
+        if self.chart.source == ChartSource::CurrentResult {
+            let result = (|| -> anyhow::Result<ChartModel> {
+                let filtered = self
+                    .filtered
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("run a filter, SQL query, or sort first"))?;
+                let mut accumulator = accumulator;
+                for batch in &filtered.batches {
+                    if !accumulator.push_batch(batch)? {
+                        break;
+                    }
+                }
+                Ok(accumulator.finish())
+            })();
+            match result {
+                Ok(model) => {
+                    self.chart.status = chart_status(&model, "current bounded result window");
+                    self.chart.model = Some(model);
+                }
+                Err(error) => self.chart.error = Some(format!("Chart data: {error:#}")),
+            }
+            return;
+        }
+
+        let sql = self.chart.sql_input.trim();
+        let source = Arc::clone(&dataset.source);
+        let plan = match SqlAst::parse(sql).and_then(|ast| ast.to_logical_plan(source)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.chart.error = Some(format!("Chart SQL: {error:#}"));
+                return;
+            }
+        };
+        let Some(runtime) = &self.runtime else {
+            self.chart.error = Some("Background runtime is unavailable".to_string());
+            return;
+        };
+        match QueryEngine::new(runtime).execute(&plan, generation) {
+            Ok(execution) => {
+                self.chart.accumulator = Some(accumulator);
+                self.chart.execution = Some(execution);
+                self.chart.status = "Chart query running…".to_string();
+            }
+            Err(error) => self.chart.error = Some(format!("Start chart query: {error:#}")),
+        }
+    }
+
+    fn cancel_chart(&mut self) {
+        if self.chart.loading() {
+            self.chart.cancel();
+            self.chart.generation = GenerationId(self.chart.generation.0.saturating_add(1));
+            self.chart.status = "Chart query cancelled".to_string();
+        }
+    }
+
+    fn finish_chart(&mut self, source: &str) {
+        let Some(accumulator) = self.chart.accumulator.take() else {
+            return;
+        };
+        let model = accumulator.finish();
+        self.chart.status = chart_status(&model, source);
+        self.chart.model = Some(model);
+    }
+
+    fn poll_chart(&mut self) {
+        while self.chart.loading() {
+            let Some(execution) = &mut self.chart.execution else {
+                break;
+            };
+            let poll = execution.poll_next_batch();
+            match poll {
+                Ok(QueryPoll::Pending) => break,
+                Ok(QueryPoll::Finished) => {
+                    self.chart.execution = None;
+                    self.finish_chart("query result");
+                }
+                Ok(QueryPoll::Batch(batch)) if batch.generation_id == self.chart.generation => {
+                    let Some(accumulator) = &mut self.chart.accumulator else {
+                        self.chart.execution = None;
+                        self.chart.error =
+                            Some("Chart query lost its bounded accumulator".to_string());
+                        return;
+                    };
+                    let accepted = match accumulator.push_batch(&batch.batch) {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            self.chart.execution = None;
+                            self.chart.accumulator = None;
+                            self.chart.error = Some(format!("Chart data: {error:#}"));
+                            return;
+                        }
+                    };
+                    if !accepted {
+                        if let Some(execution) = &mut self.chart.execution {
+                            execution.cancel();
+                        }
+                        self.chart.execution = None;
+                        self.finish_chart("query result sample");
+                    }
+                }
+                Ok(QueryPoll::Batch(_)) => {
+                    self.chart.cancel();
+                    self.chart.status = "Ignored stale chart result".to_string();
+                }
+                Err(error) => {
+                    self.chart.execution = None;
+                    self.chart.accumulator = None;
+                    self.chart.error = Some(format!("Chart query: {error:#}"));
+                }
+            }
+        }
+    }
+
     fn show_top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -753,7 +974,158 @@ impl PaviApp {
                     }
                 });
             });
+            ui.horizontal(|ui| {
+                if ui.button("Charts…").clicked() {
+                    self.chart.visible = true;
+                }
+                if self.chart.loading() {
+                    ui.spinner();
+                    ui.label("Chart query loading");
+                }
+            });
         });
+    }
+
+    fn show_chart_window(&mut self, ctx: &egui::Context) {
+        if !self.chart.visible {
+            return;
+        }
+        let names = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.column_names.clone())
+            .unwrap_or_default();
+        let mut open = self.chart.visible;
+        let mut run = false;
+        let mut cancel = false;
+        egui::Window::new("Charts")
+            .open(&mut open)
+            .default_size([620.0, 520.0])
+            .min_size([380.0, 280.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Source:");
+                    egui::ComboBox::from_id_salt("chart_source")
+                        .selected_text(self.chart.source.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.chart.source,
+                                ChartSource::Sql,
+                                ChartSource::Sql.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.chart.source,
+                                ChartSource::CurrentResult,
+                                ChartSource::CurrentResult.label(),
+                            );
+                        });
+                    ui.label("Current result uses only its bounded grid window.");
+                });
+                if self.chart.source == ChartSource::Sql {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.chart.sql_input)
+                            .code_editor()
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("SELECT x, y FROM dataset WHERE …"),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Type:");
+                    egui::ComboBox::from_id_salt("chart_kind")
+                        .selected_text(self.chart.config.kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in ChartKind::ALL {
+                                ui.selectable_value(
+                                    &mut self.chart.config.kind,
+                                    kind,
+                                    kind.label(),
+                                );
+                            }
+                        });
+                    ui.label(if self.chart.config.kind == ChartKind::Histogram {
+                        "Value output:"
+                    } else {
+                        "X output:"
+                    });
+                    ui.text_edit_singleline(&mut self.chart.config.x_column);
+                    egui::ComboBox::from_id_salt("chart_x_column")
+                        .selected_text("Choose")
+                        .show_ui(ui, |ui| {
+                            for name in &names {
+                                ui.selectable_value(
+                                    &mut self.chart.config.x_column,
+                                    name.clone(),
+                                    name,
+                                );
+                            }
+                        });
+                });
+                if self.chart.config.kind != ChartKind::Histogram {
+                    ui.horizontal(|ui| {
+                        ui.label("Y output:");
+                        ui.text_edit_singleline(&mut self.chart.config.y_column);
+                        egui::ComboBox::from_id_salt("chart_y_column")
+                            .selected_text("Choose")
+                            .show_ui(ui, |ui| {
+                                for name in &names {
+                                    ui.selectable_value(
+                                        &mut self.chart.config.y_column,
+                                        name.clone(),
+                                        name,
+                                    );
+                                }
+                            });
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Title:");
+                    ui.text_edit_singleline(&mut self.chart.config.title);
+                    ui.label("Point limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.chart.config.point_limit)
+                            .range(2..=MAX_INPUT_ROWS)
+                            .speed(10),
+                    );
+                    if self.chart.config.kind == ChartKind::Histogram {
+                        ui.label("Bins:");
+                        ui.add(egui::DragValue::new(&mut self.chart.config.bins).range(1..=100));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Run / Refresh").clicked() {
+                        run = true;
+                    }
+                    if ui
+                        .add_enabled(self.chart.loading(), egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                    ui.label(&self.chart.status);
+                });
+                if let Some(error) = &self.chart.error {
+                    ui.label(RichText::new(error).color(egui::Color32::RED));
+                }
+                if let Some(model) = &self.chart.model {
+                    chart_notice(ui, model);
+                    draw_chart(ui, model, &self.chart.config);
+                } else if self.chart.loading() {
+                    ui.centered_and_justified(|ui| ui.spinner());
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Run a bounded SQL query or use the current result window.")
+                    });
+                }
+            });
+        self.chart.visible = open;
+        if cancel {
+            self.cancel_chart();
+        }
+        if run {
+            self.run_chart();
+        }
     }
 
     fn show_metadata(&self, ctx: &egui::Context) {
@@ -1003,13 +1375,252 @@ impl PaviApp {
     }
 }
 
+fn chart_status(model: &ChartModel, source: &str) -> String {
+    let mut status = format!(
+        "{} chart: {} values from {source}",
+        model.kind.label(),
+        model.input_rows
+    );
+    if model.input_capped {
+        status.push_str(&format!(" (input capped at {MAX_INPUT_ROWS})"));
+    }
+    if model.reduced {
+        status.push_str(&format!(" (reduced to {} points)", model.output_len()));
+    }
+    if model.skipped_rows > 0 {
+        status.push_str(&format!(
+            " ({} null/non-finite skipped)",
+            model.skipped_rows
+        ));
+    }
+    status
+}
+
+fn chart_notice(ui: &mut egui::Ui, model: &ChartModel) {
+    if model.is_empty() {
+        ui.label("No chartable non-null values were returned.");
+        return;
+    }
+    if model.input_capped || model.reduced {
+        ui.label(format!(
+            "Showing {} chart values from {} bounded input rows{}.",
+            model.output_len(),
+            model.input_rows,
+            if model.input_capped {
+                format!("; query sampling stopped at {MAX_INPUT_ROWS}")
+            } else {
+                String::new()
+            }
+        ));
+    }
+}
+
+fn draw_chart(ui: &mut egui::Ui, model: &ChartModel, config: &ChartConfig) {
+    let size = egui::vec2(
+        ui.available_width().max(240.0),
+        ui.available_height().max(220.0),
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    if model.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No chartable values",
+            egui::FontId::proportional(15.0),
+            ui.visuals().weak_text_color(),
+        );
+        return;
+    }
+    let plot = rect.shrink2(egui::vec2(48.0, 28.0));
+    painter.line_segment(
+        [plot.left_bottom(), plot.left_top()],
+        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+    );
+    painter.line_segment(
+        [plot.left_bottom(), plot.right_bottom()],
+        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+    );
+    let title = if config.title.trim().is_empty() {
+        format!("{} chart", model.kind.label())
+    } else {
+        config.title.clone()
+    };
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        title,
+        egui::FontId::proportional(15.0),
+        ui.visuals().text_color(),
+    );
+
+    let tooltip = match &model.values {
+        ChartValues::Points(points) => {
+            draw_points(&painter, plot, points, model.kind, response.hover_pos())
+        }
+        ChartValues::Bars(bars) => draw_bars(&painter, plot, bars, response.hover_pos()),
+        ChartValues::Histogram(bins) => draw_histogram(&painter, plot, bins, response.hover_pos()),
+    };
+    painter.text(
+        plot.left_bottom() + egui::vec2(0.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        &config.x_column,
+        egui::FontId::proportional(11.0),
+        ui.visuals().weak_text_color(),
+    );
+    if model.kind != ChartKind::Histogram {
+        painter.text(
+            plot.left_top() - egui::vec2(42.0, 0.0),
+            egui::Align2::LEFT_TOP,
+            &config.y_column,
+            egui::FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+    }
+    if let Some(tooltip) = tooltip {
+        response.on_hover_text_at_pointer(tooltip);
+    } else {
+        response.on_hover_text("Hover a plotted value for details");
+    }
+}
+
+fn numeric_range(values: impl Iterator<Item = f64>) -> (f64, f64) {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for value in values {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if min == max {
+        let pad = if min == 0.0 { 1.0 } else { min.abs() * 0.05 };
+        (min - pad, max + pad)
+    } else {
+        (min, max)
+    }
+}
+
+fn point_at(
+    plot: egui::Rect,
+    x: f64,
+    y: f64,
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+) -> egui::Pos2 {
+    let x = ((x - x_range.0) / (x_range.1 - x_range.0)) as f32;
+    let y = ((y - y_range.0) / (y_range.1 - y_range.0)) as f32;
+    egui::pos2(
+        egui::lerp(plot.left()..=plot.right(), x),
+        egui::lerp(plot.bottom()..=plot.top(), y),
+    )
+}
+
+fn draw_points(
+    painter: &egui::Painter,
+    plot: egui::Rect,
+    points: &[crate::chart::ChartPoint],
+    kind: ChartKind,
+    hover: Option<egui::Pos2>,
+) -> Option<String> {
+    let x_range = numeric_range(points.iter().map(|point| point.x));
+    let y_range = numeric_range(points.iter().map(|point| point.y));
+    let screen_points = points
+        .iter()
+        .map(|point| point_at(plot, point.x, point.y, x_range, y_range))
+        .collect::<Vec<_>>();
+    if kind == ChartKind::Line {
+        for pair in screen_points.windows(2) {
+            painter.line_segment(
+                [pair[0], pair[1]],
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(95, 165, 255)),
+            );
+        }
+    }
+    for point in &screen_points {
+        painter.circle_filled(
+            *point,
+            if kind == ChartKind::Scatter { 2.5 } else { 2.0 },
+            egui::Color32::from_rgb(95, 165, 255),
+        );
+    }
+    hover.and_then(|hover| {
+        screen_points
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                left.distance_sq(hover).total_cmp(&right.distance_sq(hover))
+            })
+            .and_then(|(index, point)| {
+                (point.distance(hover) <= 14.0)
+                    .then(|| format!("{}: {}\n{}: {}", "X", points[index].x, "Y", points[index].y))
+            })
+    })
+}
+
+fn draw_bars(
+    painter: &egui::Painter,
+    plot: egui::Rect,
+    bars: &[crate::chart::ChartBar],
+    hover: Option<egui::Pos2>,
+) -> Option<String> {
+    let (_, max) = numeric_range(bars.iter().map(|bar| bar.value));
+    let min = bars.iter().map(|bar| bar.value).fold(0.0_f64, f64::min);
+    let y_range = if min == max {
+        (min - 1.0, max + 1.0)
+    } else {
+        (min, max)
+    };
+    let width = plot.width() / bars.len() as f32;
+    let baseline = point_at(plot, 0.0, 0.0, (0.0, 1.0), y_range).y;
+    let mut hovered = None;
+    for (index, bar) in bars.iter().enumerate() {
+        let left = plot.left() + index as f32 * width + 1.0;
+        let y = point_at(plot, 0.0, bar.value, (0.0, 1.0), y_range).y;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(left, y.min(baseline)),
+            egui::pos2((left + width - 2.0).max(left + 1.0), y.max(baseline)),
+        );
+        painter.rect_filled(bar_rect, 1.0, egui::Color32::from_rgb(105, 190, 125));
+        if hover.is_some_and(|hover| bar_rect.expand(3.0).contains(hover)) {
+            hovered = Some(format!("{}: {}", bar.label, bar.value));
+        }
+    }
+    hovered
+}
+
+fn draw_histogram(
+    painter: &egui::Painter,
+    plot: egui::Rect,
+    bins: &[crate::chart::HistogramBin],
+    hover: Option<egui::Pos2>,
+) -> Option<String> {
+    let max = bins.iter().map(|bin| bin.count).max().unwrap_or(1).max(1) as f32;
+    let width = plot.width() / bins.len() as f32;
+    let mut hovered = None;
+    for (index, bin) in bins.iter().enumerate() {
+        let left = plot.left() + index as f32 * width + 1.0;
+        let height = plot.height() * bin.count as f32 / max;
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(left, plot.bottom() - height),
+            egui::pos2((left + width - 2.0).max(left + 1.0), plot.bottom()),
+        );
+        painter.rect_filled(bar_rect, 1.0, egui::Color32::from_rgb(235, 165, 75));
+        if hover.is_some_and(|hover| bar_rect.expand(3.0).contains(hover)) {
+            hovered = Some(format!("{}–{}: {}", bin.start, bin.end, bin.count));
+        }
+    }
+    hovered
+}
+
 impl eframe::App for PaviApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_open();
         self.poll_pages();
         self.poll_filtered();
+        self.poll_chart();
         self.show_top_bar(ctx);
         self.show_metadata(ctx);
+        self.show_chart_window(ctx);
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
@@ -1027,6 +1638,7 @@ impl eframe::App for PaviApp {
         if self.opening.is_some()
             || !self.pending_pages.is_empty()
             || self.filtered.as_ref().is_some_and(FilteredGrid::needs_more)
+            || self.chart.loading()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -1051,6 +1663,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use tempfile::TempDir;
+
+    use crate::chart::DEFAULT_POINT_LIMIT;
 
     use super::*;
 
@@ -1148,6 +1762,17 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("page did not load");
+    }
+
+    fn poll_chart_until_done(app: &mut PaviApp) {
+        for _ in 0..2_000 {
+            app.poll_chart();
+            if !app.chart.loading() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("chart did not become idle");
     }
 
     fn filtered_ids(app: &PaviApp) -> Vec<String> {
@@ -1504,5 +2129,178 @@ mod tests {
     #[test]
     fn clamps_untrusted_row_counts_for_the_egui_row_api() {
         assert_eq!(ui_row_count(u64::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn charts_execute_sql_through_the_existing_runtime_and_reduce_results() {
+        let (_directory, source, path) = source(32);
+        let mut app = make_app(source, path);
+        app.chart.config = ChartConfig {
+            kind: ChartKind::Line,
+            x_column: "id".to_string(),
+            y_column: "id".to_string(),
+            point_limit: 4,
+            bins: 4,
+            title: "IDs".to_string(),
+        };
+        app.chart.sql_input = "SELECT id FROM dataset".to_string();
+
+        app.run_chart();
+        poll_chart_until_done(&mut app);
+
+        let model = app.chart.model.as_ref().unwrap();
+        assert_eq!(model.kind, ChartKind::Line);
+        assert_eq!(model.input_rows, 32);
+        assert!(model.reduced);
+        assert_eq!(model.output_len(), 4);
+        assert!(app.chart.error.is_none());
+        assert!(app.chart.status.contains("query result"));
+    }
+
+    #[test]
+    fn charts_support_bar_scatter_and_histogram_query_results() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        for (kind, sql, x, y) in [
+            (ChartKind::Bar, "SELECT name, id FROM dataset", "name", "id"),
+            (ChartKind::Scatter, "SELECT id FROM dataset", "id", "id"),
+            (ChartKind::Histogram, "SELECT id FROM dataset", "id", ""),
+        ] {
+            app.chart.config = ChartConfig {
+                kind,
+                x_column: x.to_string(),
+                y_column: y.to_string(),
+                point_limit: 8,
+                bins: 4,
+                title: String::new(),
+            };
+            app.chart.sql_input = sql.to_string();
+            app.run_chart();
+            poll_chart_until_done(&mut app);
+            assert!(app.chart.error.is_none(), "{kind:?}");
+            assert!(
+                app.chart
+                    .model
+                    .as_ref()
+                    .is_some_and(|model| !model.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn chart_current_result_and_errors_are_bounded_and_clear() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.sql_input = "SELECT id FROM dataset LIMIT 3".to_string();
+        app.run_sql();
+        poll_until_idle(&mut app);
+
+        app.chart.source = ChartSource::CurrentResult;
+        app.chart.config = ChartConfig {
+            kind: ChartKind::Scatter,
+            x_column: "id".to_string(),
+            y_column: "id".to_string(),
+            point_limit: 2,
+            bins: 2,
+            title: String::new(),
+        };
+        app.run_chart();
+        assert_eq!(app.chart.model.as_ref().unwrap().input_rows, 3);
+        assert!(app.chart.model.as_ref().unwrap().reduced);
+
+        app.chart.source = ChartSource::Sql;
+        app.chart.config.x_column = "missing".to_string();
+        app.run_chart();
+        poll_chart_until_done(&mut app);
+        assert!(app.chart.model.is_none());
+        assert!(
+            app.chart
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("missing"))
+        );
+    }
+
+    #[test]
+    fn chart_replacement_cancellation_and_stale_results_are_safe() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.chart.config = ChartConfig {
+            kind: ChartKind::Line,
+            x_column: "id".to_string(),
+            y_column: "id".to_string(),
+            point_limit: 8,
+            bins: 2,
+            title: String::new(),
+        };
+        app.chart.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_chart();
+        let cancellation = app
+            .chart
+            .execution
+            .as_ref()
+            .and_then(QueryExecution::cancellation_token)
+            .unwrap();
+
+        app.chart.sql_input = "SELECT id FROM dataset WHERE id = 1".to_string();
+        app.run_chart();
+        assert!(cancellation.is_cancelled());
+        poll_chart_until_done(&mut app);
+        assert_eq!(app.chart.model.as_ref().unwrap().input_rows, 1);
+
+        app.chart.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_chart();
+        app.chart.generation.0 = app.chart.generation.0.saturating_add(1);
+        poll_chart_until_done(&mut app);
+        assert!(app.chart.model.is_none());
+        assert!(app.chart.status.contains("stale"));
+    }
+
+    #[test]
+    fn chart_surfaces_runtime_read_failures() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path.clone());
+        app.chart.config = ChartConfig {
+            kind: ChartKind::Line,
+            x_column: "id".to_string(),
+            y_column: "id".to_string(),
+            point_limit: 8,
+            bins: 2,
+            title: String::new(),
+        };
+        std::fs::remove_file(path).unwrap();
+        app.run_chart();
+        poll_chart_until_done(&mut app);
+
+        assert!(app.chart.model.is_none());
+        assert!(
+            app.chart
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Chart query"))
+        );
+    }
+
+    #[test]
+    fn chart_sampling_stops_at_the_configured_bounded_input_window() {
+        let rows = MAX_INPUT_ROWS + parquet_reader::PAGE_ROWS as usize;
+        let (_directory, source, path) = source(rows);
+        let mut app = make_app(source, path);
+        app.chart.config = ChartConfig {
+            kind: ChartKind::Line,
+            x_column: "id".to_string(),
+            y_column: "id".to_string(),
+            point_limit: DEFAULT_POINT_LIMIT,
+            bins: 2,
+            title: String::new(),
+        };
+        app.chart.sql_input = "SELECT id FROM dataset".to_string();
+        app.run_chart();
+        poll_chart_until_done(&mut app);
+
+        let model = app.chart.model.as_ref().unwrap();
+        assert_eq!(model.input_rows, MAX_INPUT_ROWS);
+        assert!(model.input_capped);
+        assert!(model.output_len() <= DEFAULT_POINT_LIMIT);
     }
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
+arrow-schema.workspace = true
 eframe.workspace = true
 egui_extras.workspace = true
 rfd.workspace = true
@@ -14,6 +15,5 @@ pavi_runtime = { path = "../runtime" }
 pavi_query = { path = "../query" }
 
 [dev-dependencies]
-arrow-schema.workspace = true
 parquet.workspace = true
 tempfile = "3"
