@@ -21,15 +21,88 @@ use parquet::arrow::{
         ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
     },
 };
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::{metadata::ParquetMetaData, statistics::Statistics};
 
 use crate::{
-    AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
-    NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo,
-    RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr, page::PAGE_ROWS,
+    AggregateExpr, AggregateFunction, AggregateSpec, ColumnStatistics, DataPage, DatasetMetadata,
+    GroupBudget, NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection,
+    RowGroupInfo, RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr,
+    page::PAGE_ROWS,
 };
 
 const BATCH_SIZE: usize = 4096;
+const STAT_VALUE_LIMIT: usize = 128;
+
+fn metadata_statistics(
+    metadata: &ParquetMetaData,
+    top_level_columns: usize,
+) -> Vec<Vec<Option<ColumnStatistics>>> {
+    let row_groups = metadata.num_row_groups();
+    if top_level_columns != metadata.file_metadata().schema_descr().num_columns() {
+        return vec![vec![None; row_groups]; top_level_columns];
+    }
+    (0..top_level_columns)
+        .map(|column| {
+            (0..row_groups)
+                .map(|row_group| {
+                    metadata
+                        .row_group(row_group)
+                        .columns()
+                        .get(column)
+                        .and_then(|column| column.statistics())
+                        .map(statistics_summary)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn statistics_summary(statistics: &Statistics) -> ColumnStatistics {
+    let (min, max) = match statistics {
+        Statistics::Boolean(stats) => display_pair(stats.min_opt(), stats.max_opt()),
+        Statistics::Int32(stats) => display_pair(stats.min_opt(), stats.max_opt()),
+        Statistics::Int64(stats) => display_pair(stats.min_opt(), stats.max_opt()),
+        Statistics::Int96(stats) => display_pair(stats.min_opt(), stats.max_opt()),
+        Statistics::Float(stats) => display_pair(stats.min_opt(), stats.max_opt()),
+        Statistics::Double(stats) => display_pair(stats.min_opt(), stats.max_opt()),
+        Statistics::ByteArray(_) | Statistics::FixedLenByteArray(_) => (
+            statistics.min_bytes_opt().map(format_stat_bytes),
+            statistics.max_bytes_opt().map(format_stat_bytes),
+        ),
+    };
+    ColumnStatistics {
+        min,
+        max,
+        null_count: statistics.null_count_opt(),
+        distinct_count: statistics.distinct_count_opt(),
+    }
+}
+
+fn display_pair<T: std::fmt::Display>(
+    min: Option<&T>,
+    max: Option<&T>,
+) -> (Option<String>, Option<String>) {
+    (min.map(ToString::to_string), max.map(ToString::to_string))
+}
+
+fn format_stat_bytes(value: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(value) {
+        let mut output = text.chars().take(STAT_VALUE_LIMIT).collect::<String>();
+        if output.len() < text.len() {
+            output.push_str("...");
+        }
+        return output;
+    }
+    let displayed = value.len().min(16);
+    let mut output = String::with_capacity(displayed * 2 + 24);
+    for byte in &value[..displayed] {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    if displayed < value.len() {
+        output.push_str("...");
+    }
+    format!("0x{output} ({} bytes)", value.len())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchRequest {
@@ -56,8 +129,9 @@ impl ParquetSource {
         let metadata = arrow_metadata.metadata().clone();
         let row_group_counts =
             (0..metadata.num_row_groups()).map(|index| metadata.row_group(index).num_rows() as u64);
-        let dataset_metadata = DatasetMetadata::new(schema, row_group_counts)
-            .with_context(|| format!("build row-group index for {}", path.display()))?;
+        let dataset_metadata = DatasetMetadata::new(schema.clone(), row_group_counts)
+            .with_context(|| format!("build row-group index for {}", path.display()))?
+            .with_column_statistics(metadata_statistics(&metadata, schema.fields().len()));
 
         Ok(Self {
             path,
@@ -1464,6 +1538,21 @@ mod tests {
     }
 
     #[test]
+    fn exposes_top_level_column_metadata_and_available_statistics() {
+        let (_dir, path) = test_file();
+        let source = ParquetSource::open(path).unwrap();
+        let columns = source.metadata().columns();
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "id");
+        assert!(!columns[0].nullable);
+        assert_eq!(columns[0].row_group_statistics.len(), 2);
+        let statistics = columns[0].row_group_statistics[0].as_ref().unwrap();
+        assert_eq!(statistics.min.as_deref(), Some("0"));
+        assert_eq!(statistics.max.as_deref(), Some("2"));
+    }
+
+    #[test]
     fn reads_window_within_one_row_group() {
         let (_dir, path) = test_file();
         let source = ParquetSource::open(path).unwrap();
@@ -1590,6 +1679,7 @@ mod tests {
             .read_page(0, &Projection::all(source.column_count()))
             .unwrap();
         assert_eq!(source.column_count(), 64);
+        assert_eq!(source.metadata().columns().len(), 64);
         assert_eq!(page.batches[0].num_columns(), 64);
     }
 

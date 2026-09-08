@@ -1,7 +1,25 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColumnStatistics {
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub null_count: Option<u64>,
+    pub distinct_count: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ColumnInfo {
+    pub index: usize,
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+    /// One entry per row group; `None` means Parquet supplied no usable statistics.
+    pub row_group_statistics: Vec<Option<ColumnStatistics>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct DatasetMetadata {
@@ -9,6 +27,7 @@ pub struct DatasetMetadata {
     pub row_count: u64,
     pub column_count: usize,
     pub row_groups: Vec<RowGroupInfo>,
+    pub columns: Vec<ColumnInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,10 +42,11 @@ impl DatasetMetadata {
         schema: Arc<Schema>,
         row_group_counts: impl IntoIterator<Item = u64>,
     ) -> Result<Self> {
+        let row_group_counts = row_group_counts.into_iter().collect::<Vec<_>>();
         let mut first_row = 0_u64;
         let mut row_groups = Vec::new();
 
-        for (index, row_count) in row_group_counts.into_iter().enumerate() {
+        for (index, row_count) in row_group_counts.iter().copied().enumerate() {
             row_groups.push(RowGroupInfo {
                 index,
                 first_row,
@@ -39,10 +59,38 @@ impl DatasetMetadata {
 
         Ok(Self {
             column_count: schema.fields().len(),
+            columns: schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| ColumnInfo {
+                    index,
+                    name: field.name().to_owned(),
+                    data_type: field.data_type().clone(),
+                    nullable: field.is_nullable(),
+                    row_group_statistics: vec![None; row_group_counts.len()],
+                })
+                .collect(),
             schema,
             row_count: first_row,
             row_groups,
         })
+    }
+
+    pub(crate) fn with_column_statistics(
+        mut self,
+        statistics: Vec<Vec<Option<ColumnStatistics>>>,
+    ) -> Self {
+        for (column, statistics) in self.columns.iter_mut().zip(statistics) {
+            if statistics.len() == self.row_groups.len() {
+                column.row_group_statistics = statistics;
+            }
+        }
+        self
+    }
+
+    pub fn columns(&self) -> &[ColumnInfo] {
+        &self.columns
     }
 
     pub fn row_group_for_row(&self, row: u64) -> Option<&RowGroupInfo> {

@@ -11,7 +11,7 @@ pub mod value;
 pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
 pub use cache::{PageCache, PageCacheLimits, PageCacheStats};
 pub use filter::{FilterExpr, FilterOp};
-pub use metadata::{DatasetMetadata, RowGroupInfo};
+pub use metadata::{ColumnInfo, ColumnStatistics, DatasetMetadata, RowGroupInfo};
 pub use page::{DataPage, PAGE_ROWS, PageKey, RowWindow};
 pub use projection::Projection;
 pub use sort::{NullOrder, SortBudget, SortDirection, SortSpec};

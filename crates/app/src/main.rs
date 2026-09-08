@@ -1,4 +1,5 @@
 mod chart;
+mod inspector;
 mod state;
 
 use std::{
@@ -22,6 +23,7 @@ use pavi_runtime::{
 use crate::chart::{
     ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartValues, MAX_INPUT_ROWS,
 };
+use crate::inspector::{CellDetails, column_summary, inspect_cell};
 use crate::state::{GridState, LoadState};
 
 const ROW_HEIGHT: f32 = 22.0;
@@ -39,7 +41,6 @@ struct Dataset {
     source: Arc<ParquetSource>,
     path: PathBuf,
     column_names: Vec<String>,
-    column_types: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +229,7 @@ struct PaviApp {
     sql_input: String,
     sql_error: Option<String>,
     chart: ChartState,
+    show_safe_full_selection: bool,
     status: String,
 }
 
@@ -251,6 +253,7 @@ impl PaviApp {
             sql_input: String::new(),
             sql_error: None,
             chart: ChartState::default(),
+            show_safe_full_selection: false,
             status: "Choose a Parquet file to begin".to_string(),
         };
         if app.runtime.is_none() {
@@ -270,6 +273,7 @@ impl PaviApp {
         self.cancel_page_work();
         self.cancel_filter();
         self.chart.reset();
+        self.show_safe_full_selection = false;
         self.dataset = None;
         self.filter_error = None;
         self.sql_error = None;
@@ -312,18 +316,12 @@ impl PaviApp {
                     .iter()
                     .map(|field| field.name().to_owned())
                     .collect();
-                let column_types = schema
-                    .fields()
-                    .iter()
-                    .map(|field| format!("{:?}", field.data_type()))
-                    .collect();
                 let rows = source.row_count();
                 let columns = source.column_count();
                 self.dataset = Some(Dataset {
                     source,
                     path: PathBuf::from(&self.path_input),
                     column_names,
-                    column_types,
                 });
                 self.grid.ready(rows, columns);
                 if let Some(chart_columns) =
@@ -1128,28 +1126,168 @@ impl PaviApp {
         }
     }
 
-    fn show_metadata(&self, ctx: &egui::Context) {
-        egui::SidePanel::left("metadata")
-            .default_width(230.0)
+    fn selected_source_column(&self) -> Option<usize> {
+        let (_, column) = self.grid.selection?;
+        self.filtered.as_ref().map_or(Some(column), |filtered| {
+            (!filtered.aggregate)
+                .then(|| filtered.projected_columns.get(column).copied())
+                .flatten()
+        })
+    }
+
+    fn selected_cell_details(&self) -> Option<CellDetails> {
+        let (row, column) = self.grid.selection?;
+        let dataset = self.dataset.as_ref()?;
+        if let Some(filtered) = &self.filtered {
+            let mut batch_offset = row.checked_sub(filtered.first_result)? as usize;
+            for batch in &filtered.batches {
+                if batch_offset < batch.num_rows() {
+                    return Some(inspect_cell(
+                        row,
+                        column,
+                        batch.schema().field(column).name(),
+                        batch.column(column),
+                        batch_offset,
+                        self.show_safe_full_selection,
+                    ));
+                }
+                batch_offset = batch_offset.saturating_sub(batch.num_rows());
+            }
+            return None;
+        }
+
+        let page_index = self.grid.page_for_row(row)?;
+        let page = self.pages.get(&page_index)?;
+        let mut batch_offset = (row - page.window.first_row) as usize;
+        for batch in &page.batches {
+            if batch_offset < batch.num_rows() {
+                return Some(inspect_cell(
+                    row,
+                    column,
+                    dataset.column_names.get(column)?,
+                    batch.column(column),
+                    batch_offset,
+                    self.show_safe_full_selection,
+                ));
+            }
+            batch_offset = batch_offset.saturating_sub(batch.num_rows());
+        }
+        None
+    }
+
+    fn show_metadata(&mut self, ctx: &egui::Context) {
+        let selected_column = self.selected_source_column();
+        let selected_cell = self.selected_cell_details();
+        egui::SidePanel::left("inspector")
+            .default_width(270.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("Dataset");
+                ui.heading("Inspector");
                 if let Some(dataset) = &self.dataset {
-                    ui.label(dataset.path.display().to_string());
-                    ui.separator();
-                    ui.label(format!("Rows: {}", self.grid.rows));
-                    ui.label(format!("Columns: {}", self.grid.columns));
-                    ui.label(format!("Row groups: {}", dataset.source.row_groups().len()));
-                    ui.separator();
-                    ui.heading("Schema");
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (index, (name, ty)) in dataset
-                            .column_names
-                            .iter()
-                            .zip(&dataset.column_types)
-                            .enumerate()
-                        {
-                            ui.label(format!("{index}: {name}\n  {ty}"));
+                    let metadata = dataset.source.metadata();
+                    ui.collapsing("Dataset", |ui| {
+                        ui.label(dataset.path.display().to_string());
+                        ui.label(format!("Rows: {}", metadata.row_count));
+                        ui.label(format!("Columns: {}", metadata.column_count));
+                        ui.label(format!("Row groups: {}", metadata.row_groups.len()));
+                    });
+                    ui.collapsing("Schema", |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("inspector_schema")
+                            .max_height(180.0)
+                            .show_rows(ui, 34.0, metadata.columns().len(), |ui, rows| {
+                                for index in rows {
+                                    let column = &metadata.columns()[index];
+                                    ui.label(format!(
+                                        "{}: {}\n  {:?} · {}",
+                                        column.index,
+                                        column.name,
+                                        column.data_type,
+                                        if column.nullable { "nullable" } else { "required" },
+                                    ));
+                                }
+                            });
+                    });
+                    ui.collapsing("Column", |ui| {
+                        let Some(index) = selected_column else {
+                            ui.label("Select a source-grid cell to inspect its column.");
+                            return;
+                        };
+                        let Some(column) = metadata.columns().get(index) else {
+                            ui.label("Column metadata is unavailable for this result column.");
+                            return;
+                        };
+                        let summary = column_summary(column);
+                        ui.label(format!("{}: {}", summary.index, summary.name));
+                        ui.label(&summary.data_type);
+                        ui.label(if summary.nullable { "Nullable" } else { "Required" });
+                        ui.label(format!(
+                            "Statistics: {}/{} row groups",
+                            summary.available_statistics, summary.row_groups
+                        ));
+                        match summary.null_count {
+                            Some(count) => ui.label(format!("Null count: {count}")),
+                            None => ui.label("Null count: unavailable"),
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("inspector_statistics")
+                            .max_height(150.0)
+                            .show_rows(ui, 42.0, column.row_group_statistics.len(), |ui, rows| {
+                                for row_group in rows {
+                                    match &column.row_group_statistics[row_group] {
+                                        Some(statistics) => ui.label(format!(
+                                            "Group {row_group}: min {} · max {}\nnulls: {} · distinct: {}",
+                                            statistics.min.as_deref().unwrap_or("unavailable"),
+                                            statistics.max.as_deref().unwrap_or("unavailable"),
+                                            statistics.null_count.map_or_else(|| "unavailable".to_string(), |count| count.to_string()),
+                                            statistics.distinct_count.map_or_else(|| "unavailable".to_string(), |count| count.to_string()),
+                                        )),
+                                        None => ui.label(format!("Group {row_group}: statistics unavailable")),
+                                    };
+                                }
+                            });
+                    });
+                    ui.collapsing("Row Groups", |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("inspector_row_groups")
+                            .max_height(180.0)
+                            .show_rows(ui, 20.0, metadata.row_groups.len(), |ui, rows| {
+                                for index in rows {
+                                    let group = &metadata.row_groups[index];
+                                    ui.label(format!(
+                                        "{}: rows {}–{} ({})",
+                                        group.index,
+                                        group.first_row + 1,
+                                        group.first_row.saturating_add(group.row_count),
+                                        group.row_count
+                                    ));
+                                }
+                            });
+                    });
+                    ui.collapsing("Selection", |ui| {
+                        ui.checkbox(
+                            &mut self.show_safe_full_selection,
+                            "Show safe full scalar value",
+                        );
+                        match selected_cell.as_ref() {
+                            Some(cell) => {
+                                ui.label(format!("Row {} · column {}", cell.row + 1, cell.column + 1));
+                                ui.label(format!("{} · {}", cell.name, cell.data_type));
+                                ui.label(if cell.is_null { "Null" } else { "Non-null" });
+                                ui.label(format!("Value: {}", cell.value));
+                                if self.show_safe_full_selection && cell.full_value.is_none() && !cell.is_null {
+                                    ui.label("Full value is unavailable for variable or unsupported types.");
+                                }
+                                if let Some(value) = &cell.full_value {
+                                    ui.label(format!("Full scalar: {value}"));
+                                }
+                            }
+                            None if self.grid.selection.is_some() => {
+                                ui.label("Selected value is outside the current bounded page/result window.");
+                            }
+                            None => {
+                                ui.label("Select a cell to inspect it.");
+                            }
                         }
                     });
                 } else {
@@ -1711,17 +1849,11 @@ mod tests {
             .iter()
             .map(|field| field.name().to_owned())
             .collect();
-        let column_types = schema
-            .fields()
-            .iter()
-            .map(|field| format!("{:?}", field.data_type()))
-            .collect();
         let mut app = PaviApp::new(None);
         app.dataset = Some(Dataset {
             source: Arc::clone(&source),
             path,
             column_names,
-            column_types,
         });
         app.grid.ready(source.row_count(), source.column_count());
         app
@@ -2124,6 +2256,33 @@ mod tests {
         assert!(app.opening.is_none());
         assert!(matches!(app.grid.loading, LoadState::Error(_)));
         assert!(app.status.contains("open file"));
+    }
+
+    #[test]
+    fn inspector_selection_uses_cached_values_and_document_replacement_clears_it() {
+        let (_first_directory, first_source, path) = source(3);
+        let mut app = make_app(first_source, path);
+        app.request_page(0);
+        poll_until_page_loaded(&mut app, 0);
+        assert!(app.grid.select(1, 0));
+        let detail = app.selected_cell_details().unwrap();
+        assert_eq!(detail.name, "id");
+        assert_eq!(detail.value, "1");
+
+        let (_second_directory, _second_source, second_path) = source(0);
+        app.begin_open(second_path);
+        assert!(app.grid.selection.is_none());
+        assert!(app.selected_cell_details().is_none());
+    }
+
+    #[test]
+    fn inspector_handles_empty_datasets_without_a_selection() {
+        let (_directory, source, path) = source(0);
+        let app = make_app(source, path);
+
+        assert_eq!(app.dataset.as_ref().unwrap().source.metadata().row_count, 0);
+        assert!(app.selected_cell_details().is_none());
+        assert!(app.selected_source_column().is_none());
     }
 
     #[test]
