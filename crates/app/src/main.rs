@@ -1,6 +1,7 @@
 mod chart;
 mod export;
 mod inspector;
+mod profile;
 mod session;
 mod state;
 
@@ -27,6 +28,7 @@ use crate::chart::{
 };
 use crate::export::{ExportEvent, ExportFormat, ExportInput, ExportTask};
 use crate::inspector::{CellDetails, column_summary, inspect_cell};
+use crate::profile::{ColumnProfile, ProfileEvent, ProfileTask};
 use crate::session::{GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore};
 use crate::state::{ColumnLayout, GridState, LoadState};
 
@@ -196,6 +198,55 @@ struct ChartState {
     status: String,
 }
 
+struct ProfileState {
+    generation: GenerationId,
+    task: Option<ProfileTask>,
+    column: Option<usize>,
+    result: Option<ColumnProfile>,
+    error: Option<String>,
+    status: String,
+}
+
+impl Default for ProfileState {
+    fn default() -> Self {
+        Self {
+            generation: GenerationId(0),
+            task: None,
+            column: None,
+            result: None,
+            error: None,
+            status: "Select a source column to profile".to_string(),
+        }
+    }
+}
+
+impl ProfileState {
+    fn loading(&self) -> bool {
+        self.task.is_some()
+    }
+
+    fn cancel(&mut self) {
+        if let Some(task) = &self.task {
+            task.cancel();
+        }
+        self.task = None;
+    }
+
+    fn reset(&mut self) {
+        self.cancel();
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.column = None;
+        self.result = None;
+        self.error = None;
+        self.status = "Dataset changed; profile cleared".to_string();
+    }
+
+    fn next_generation(&mut self) -> GenerationId {
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.generation
+    }
+}
+
 impl Default for ChartState {
     fn default() -> Self {
         Self {
@@ -261,6 +312,7 @@ struct PaviApp {
     sql_input: String,
     sql_error: Option<String>,
     chart: ChartState,
+    profile: ProfileState,
     session_store: SessionStore,
     session: SessionState,
     running_sql: Option<RunningSql>,
@@ -314,6 +366,7 @@ impl PaviApp {
                 visible: chart_visible,
                 ..ChartState::default()
             },
+            profile: ProfileState::default(),
             session_store,
             session,
             running_sql: None,
@@ -516,6 +569,7 @@ impl PaviApp {
         self.record_sql_history(false, None);
         self.cancel_filter();
         self.chart.reset();
+        self.profile.reset();
         self.show_safe_full_selection = false;
         self.dataset = None;
         self.filter_error = None;
@@ -1341,6 +1395,69 @@ impl PaviApp {
         }
     }
 
+    fn run_profile(&mut self, column: usize) {
+        let Some(dataset) = &self.dataset else {
+            self.profile.error = Some("Open a dataset before profiling".to_string());
+            return;
+        };
+        let Some(runtime) = self.runtime.as_ref().map(Runtime::handle) else {
+            self.profile.error = Some("Background runtime is unavailable".to_string());
+            return;
+        };
+        self.profile.cancel();
+        self.profile.result = None;
+        self.profile.error = None;
+        let generation = self.profile.next_generation();
+        match ProfileTask::start(Arc::clone(&dataset.source), column, runtime, generation) {
+            Ok(task) => {
+                self.profile.task = Some(task);
+                self.profile.column = Some(column);
+                self.profile.status = "Profiling column…".to_string();
+            }
+            Err(error) => self.profile.error = Some(format!("Start profile: {error}")),
+        }
+    }
+
+    fn cancel_profile(&mut self) {
+        if self.profile.loading() {
+            self.profile.cancel();
+            self.profile.generation = GenerationId(self.profile.generation.0.saturating_add(1));
+            self.profile.status = "Profile cancelled".to_string();
+        }
+    }
+
+    fn poll_profile(&mut self) {
+        let Some(task) = &self.profile.task else {
+            return;
+        };
+        let event = match task.try_recv() {
+            Ok(Some(event)) => event,
+            Ok(None) => return,
+            Err(error) => {
+                self.profile.task = None;
+                self.profile.error = Some(format!("Profile worker: {error:#}"));
+                return;
+            }
+        };
+        self.profile.task = None;
+        match event {
+            ProfileEvent::Finished {
+                generation,
+                profile,
+            } if generation == self.profile.generation => {
+                self.profile.status = format!("Profiled {} rows", profile.row_count);
+                self.profile.result = Some(*profile);
+            }
+            ProfileEvent::Cancelled { generation } if generation == self.profile.generation => {
+                self.profile.status = "Profile cancelled".to_string();
+            }
+            ProfileEvent::Failed { generation, error } if generation == self.profile.generation => {
+                self.profile.error = Some(format!("Profile: {error}"));
+            }
+            _ => self.profile.status = "Ignored stale profile result".to_string(),
+        }
+    }
+
     fn show_top_bar(&mut self, ctx: &egui::Context) {
         let mut open_recent = None;
         let mut rerun_history = None;
@@ -1901,6 +2018,8 @@ impl PaviApp {
         let safe_value_was_visible = self.show_safe_full_selection;
         let selected_column = self.selected_source_column();
         let selected_cell = self.selected_cell_details();
+        let mut start_profile = None;
+        let mut cancel_profile = false;
         egui::SidePanel::left("inspector")
             .default_width(270.0)
             .resizable(true)
@@ -1913,6 +2032,10 @@ impl PaviApp {
                         ui.label(format!("Rows: {}", metadata.row_count));
                         ui.label(format!("Columns: {}", metadata.column_count));
                         ui.label(format!("Row groups: {}", metadata.row_groups.len()));
+                    });
+                    ui.collapsing("Dataset Profile", |ui| {
+                        ui.label(format!("Exact row count: {} (Parquet metadata)", metadata.row_count));
+                        ui.label("Column scans run only when Profile selected column is requested.");
                     });
                     ui.collapsing("Schema", |ui| {
                         egui::ScrollArea::vertical()
@@ -1987,6 +2110,27 @@ impl PaviApp {
                                 }
                             });
                     });
+                    ui.collapsing("Profile", |ui| {
+                        if let Some(index) = selected_column {
+                            if self.profile.loading() && self.profile.column == Some(index) {
+                                ui.spinner();
+                                ui.label(&self.profile.status);
+                                if ui.button("Cancel profile").clicked() {
+                                    cancel_profile = true;
+                                }
+                            } else if ui.button("Profile selected column").clicked() {
+                                start_profile = Some(index);
+                            }
+                        } else {
+                            ui.label("Select a source column to profile it on demand.");
+                        }
+                        if let Some(error) = &self.profile.error {
+                            ui.label(RichText::new(error).color(egui::Color32::RED));
+                        }
+                        if let Some(profile) = &self.profile.result {
+                            render_profile(ui, profile);
+                        }
+                    });
                     ui.collapsing("Selection", |ui| {
                         ui.checkbox(
                             &mut self.show_safe_full_selection,
@@ -2019,6 +2163,12 @@ impl PaviApp {
             });
         if self.show_safe_full_selection != safe_value_was_visible {
             self.persist_session();
+        }
+        if cancel_profile {
+            self.cancel_profile();
+        }
+        if let Some(column) = start_profile {
+            self.run_profile(column);
         }
     }
 
@@ -2513,6 +2663,73 @@ impl PaviApp {
     }
 }
 
+fn render_profile(ui: &mut egui::Ui, profile: &ColumnProfile) {
+    ui.separator();
+    ui.strong(format!("{} ({:?})", profile.name, profile.data_type));
+    ui.label(format!(
+        "Rows: {} · null: {} ({:.2}%) · non-null: {}",
+        profile.row_count,
+        profile.null_count,
+        if profile.row_count == 0 {
+            0.0
+        } else {
+            profile.null_count as f64 * 100.0 / profile.row_count as f64
+        },
+        profile.non_null_count(),
+    ));
+    if let Some(null_count) = profile.metadata_null_count {
+        ui.label(format!("Parquet metadata null count: {null_count}"));
+    }
+    ui.label(format!(
+        "Distinct: {} (exact; within bounded profile limit)",
+        profile.distinct_count
+    ));
+    ui.label(format!(
+        "Min: {} · max: {}",
+        profile.min.as_deref().unwrap_or("none"),
+        profile.max.as_deref().unwrap_or("none")
+    ));
+    if let Some(mean) = profile.mean {
+        ui.label(format!("Mean: {mean:.4}"));
+    }
+    if let Some(lengths) = &profile.string_lengths {
+        ui.label(format!(
+            "String length: min {} · max {} · mean {:.2}",
+            lengths.min, lengths.max, lengths.mean
+        ));
+    }
+    if profile.non_finite_count > 0 {
+        ui.label(format!(
+            "{} non-finite numeric values excluded from mean/distribution",
+            profile.non_finite_count
+        ));
+    }
+    if !profile.frequent_values.is_empty() {
+        ui.label("Most frequent values:");
+        for value in &profile.frequent_values {
+            ui.label(format!("{} · {}", value.value, value.count));
+        }
+    }
+    if let Some(distribution) = &profile.distribution {
+        ui.label(if profile.distribution_sampled {
+            "Distribution: sampled first bounded numeric values"
+        } else {
+            "Distribution: all finite numeric values"
+        });
+        let config = ChartConfig {
+            kind: ChartKind::Histogram,
+            x_column: profile.name.clone(),
+            y_column: String::new(),
+            point_limit: MAX_INPUT_ROWS,
+            bins: 20,
+            title: format!("{} distribution", profile.name),
+        };
+        ui.allocate_ui(egui::vec2(ui.available_width(), 170.0), |ui| {
+            draw_chart(ui, distribution, &config);
+        });
+    }
+}
+
 fn chart_status(model: &ChartModel, source: &str) -> String {
     let mut status = format!(
         "{} chart: {} values from {source}",
@@ -2760,6 +2977,7 @@ impl eframe::App for PaviApp {
         self.poll_pages();
         self.poll_filtered();
         self.poll_chart();
+        self.poll_profile();
         self.poll_export();
         self.show_top_bar(ctx);
         self.show_metadata(ctx);
@@ -2782,6 +3000,7 @@ impl eframe::App for PaviApp {
             || !self.pending_pages.is_empty()
             || self.filtered.as_ref().is_some_and(FilteredGrid::needs_more)
             || self.chart.loading()
+            || self.profile.loading()
             || self.export.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -2914,6 +3133,17 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("chart did not become idle");
+    }
+
+    fn poll_profile_until_done(app: &mut PaviApp) {
+        for _ in 0..2_000 {
+            app.poll_profile();
+            if !app.profile.loading() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("profile did not become idle");
     }
 
     fn filtered_ids(app: &PaviApp) -> Vec<String> {
@@ -3511,6 +3741,33 @@ mod tests {
         assert_eq!(model.input_rows, MAX_INPUT_ROWS);
         assert!(model.input_capped);
         assert!(model.output_len() <= DEFAULT_POINT_LIMIT);
+    }
+
+    #[test]
+    fn profiles_selected_columns_through_the_query_runtime_path() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.run_profile(0);
+        poll_profile_until_done(&mut app);
+
+        let profile = app.profile.result.as_ref().unwrap();
+        assert_eq!(profile.column, 0);
+        assert_eq!(profile.row_count, 8);
+        assert_eq!(profile.null_count, 0);
+        assert_eq!(profile.distinct_count, 8);
+        assert!(profile.distribution.is_some());
+    }
+
+    #[test]
+    fn stale_profile_results_are_ignored_after_replacement() {
+        let (_directory, source, path) = source(8);
+        let mut app = make_app(source, path);
+        app.run_profile(0);
+        app.profile.generation = GenerationId(app.profile.generation.0.saturating_add(1));
+        poll_profile_until_done(&mut app);
+
+        assert!(app.profile.result.is_none());
+        assert!(app.profile.status.contains("stale"));
     }
 
     #[test]
