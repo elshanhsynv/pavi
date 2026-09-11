@@ -421,6 +421,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_scalar_filters_on_nested_columns_clearly() {
+        let schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]);
+        let error = FilterExpr::parse("items == 1")
+            .unwrap()
+            .validate_schema(&schema)
+            .unwrap_err();
+        assert!(error.to_string().contains("filtering is not supported"));
+    }
+
+    #[test]
     fn evaluates_every_operator() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)]));
         let batch = RecordBatch::try_new(

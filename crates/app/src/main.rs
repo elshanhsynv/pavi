@@ -27,7 +27,7 @@ use crate::chart::{
     ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartValues, MAX_INPUT_ROWS,
 };
 use crate::export::{ExportEvent, ExportFormat, ExportInput, ExportTask};
-use crate::inspector::{CellDetails, column_summary, inspect_cell};
+use crate::inspector::{CellDetails, column_summary, inspect_cell, nested_schema_preview};
 use crate::profile::{ColumnProfile, ProfileEvent, ProfileTask};
 use crate::session::{GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore};
 use crate::state::{ColumnLayout, GridState, LoadState};
@@ -318,6 +318,7 @@ struct PaviApp {
     running_sql: Option<RunningSql>,
     show_inspector: bool,
     show_safe_full_selection: bool,
+    show_nested_selection: bool,
     status: String,
 }
 
@@ -372,6 +373,7 @@ impl PaviApp {
             running_sql: None,
             show_inspector,
             show_safe_full_selection: false,
+            show_nested_selection: false,
             status: "Choose a Parquet file to begin".to_string(),
         };
         if app.runtime.is_none() {
@@ -571,6 +573,7 @@ impl PaviApp {
         self.chart.reset();
         self.profile.reset();
         self.show_safe_full_selection = false;
+        self.show_nested_selection = false;
         self.dataset = None;
         self.filter_error = None;
         self.sql_error = None;
@@ -1983,6 +1986,7 @@ impl PaviApp {
                         batch.column(column),
                         batch_offset,
                         self.show_safe_full_selection,
+                        self.show_nested_selection,
                     ));
                 }
                 batch_offset = batch_offset.saturating_sub(batch.num_rows());
@@ -2004,6 +2008,7 @@ impl PaviApp {
                     batch.column(display_column),
                     batch_offset,
                     self.show_safe_full_selection,
+                    self.show_nested_selection,
                 ));
             }
             batch_offset = batch_offset.saturating_sub(batch.num_rows());
@@ -2041,16 +2046,23 @@ impl PaviApp {
                         egui::ScrollArea::vertical()
                             .id_salt("inspector_schema")
                             .max_height(180.0)
-                            .show_rows(ui, 34.0, metadata.columns().len(), |ui, rows| {
+                            .show_rows(ui, 22.0, metadata.columns().len(), |ui, rows| {
                                 for index in rows {
                                     let column = &metadata.columns()[index];
-                                    ui.label(format!(
-                                        "{}: {}\n  {:?} · {}",
-                                        column.index,
-                                        column.name,
-                                        column.data_type,
-                                        if column.nullable { "nullable" } else { "required" },
-                                    ));
+                                    ui.collapsing(
+                                        format!("{}: {}", column.index, column.name),
+                                        |ui| {
+                                            ui.label(nested_schema_preview(
+                                                &column.name,
+                                                &column.data_type,
+                                            ));
+                                            ui.label(if column.nullable {
+                                                "nullable"
+                                            } else {
+                                                "required"
+                                            });
+                                        },
+                                    );
                                 }
                             });
                     });
@@ -2136,6 +2148,7 @@ impl PaviApp {
                             &mut self.show_safe_full_selection,
                             "Show safe full scalar value",
                         );
+                        ui.checkbox(&mut self.show_nested_selection, "Expand nested value");
                         match selected_cell.as_ref() {
                             Some(cell) => {
                                 ui.label(format!("Row {} · column {}", cell.row + 1, cell.column + 1));
@@ -2147,6 +2160,12 @@ impl PaviApp {
                                 }
                                 if let Some(value) = &cell.full_value {
                                     ui.label(format!("Full scalar: {value}"));
+                                }
+                                if self.show_nested_selection && cell.expanded_value.is_none() && !cell.is_null {
+                                    ui.label("Nested expansion is available for struct, list, large-list, and map values.");
+                                }
+                                if let Some(value) = &cell.expanded_value {
+                                    ui.label(format!("Expanded: {value}"));
                                 }
                             }
                             None if self.grid.selection.is_some() => {

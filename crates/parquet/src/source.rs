@@ -1485,7 +1485,10 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        Array, ArrayRef, Date32Array, Int32Array, RecordBatch, TimestampMillisecondArray,
+        Array, ArrayRef, Date32Array, Int32Array, LargeListArray, ListArray, RecordBatch,
+        StringArray, StructArray, TimestampMillisecondArray,
+        builder::{Int32Builder, MapBuilder, StringBuilder},
+        types::Int32Type,
     };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
@@ -1702,6 +1705,81 @@ mod tests {
         assert_eq!(source.column_count(), 64);
         assert_eq!(source.metadata().columns().len(), 64);
         assert_eq!(page.batches[0].num_columns(), 64);
+    }
+
+    #[test]
+    fn reads_projected_top_level_nested_columns_without_flattening() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("nested.parquet");
+        let list =
+            ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1), Some(2)]), None]);
+        let large_list = LargeListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(3)]),
+            Some(vec![]),
+        ]);
+        let structure = StructArray::from(vec![
+            (
+                Arc::new(Field::new("code", DataType::Int32, false)),
+                Arc::new(Int32Array::from(vec![7, 8])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("label", DataType::Utf8, true)),
+                Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef,
+            ),
+        ]);
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        map.keys().append_value("first");
+        map.values().append_value(1);
+        map.append(true).unwrap();
+        map.keys().append_value("second");
+        map.values().append_value(2);
+        map.append(true).unwrap();
+        let map = map.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("items", list.data_type().clone(), true),
+            Field::new("large_items", large_list.data_type().clone(), true),
+            Field::new("payload", structure.data_type().clone(), true),
+            Field::new("attributes", map.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(list),
+                Arc::new(large_list),
+                Arc::new(structure),
+                Arc::new(map),
+            ],
+        )
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(path).unwrap();
+        let projection = Projection::columns(vec![3, 0], source.column_count()).unwrap();
+        let nested = source.read_window(0, 2, &projection).unwrap();
+
+        assert_eq!(source.metadata().columns().len(), 4);
+        assert!(matches!(
+            source.metadata().columns()[2].data_type,
+            DataType::Struct(_)
+        ));
+        assert!(matches!(
+            source.metadata().columns()[3].data_type,
+            DataType::Map(_, _)
+        ));
+        assert!(matches!(nested.column(0).data_type(), DataType::Map(_, _)));
+        assert!(matches!(nested.column(1).data_type(), DataType::List(_)));
+        assert_eq!(nested.num_rows(), 2);
+
+        let sort_error = source
+            .validate_sort(SortSpec::new(0, SortDirection::Ascending, NullOrder::Last))
+            .unwrap_err();
+        assert!(sort_error.to_string().contains("sorting is not supported"));
+        let aggregate_error = source
+            .validate_aggregate(&AggregateSpec::new(vec![AggregateExpr::sum(0)]).unwrap())
+            .unwrap_err();
+        assert!(aggregate_error.to_string().contains("not supported"));
     }
 
     #[test]

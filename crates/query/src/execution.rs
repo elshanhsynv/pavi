@@ -444,8 +444,8 @@ mod tests {
     use std::{fs, fs::File, sync::Arc};
 
     use arrow_array::{
-        Array, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-        UInt64Array,
+        Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, RecordBatch,
+        StringArray, UInt64Array, types::Int32Type,
     };
     use arrow_schema::{DataType, Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
@@ -584,6 +584,25 @@ mod tests {
         (dir, Arc::new(ParquetSource::open(path).unwrap()))
     }
 
+    fn nested_source() -> (TempDir, Arc<ParquetSource>) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested-query.parquet");
+        let items = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![]),
+        ]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "items",
+            items.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(items)]).unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (dir, Arc::new(ParquetSource::open(path).unwrap()))
+    }
+
     fn ids(batch: &RecordBatch) -> Vec<i32> {
         batch
             .column(0)
@@ -606,6 +625,33 @@ mod tests {
         let batch = execution.next_batch().unwrap().unwrap();
         assert_eq!(batch.batch.num_rows(), PAGE_ROWS as usize);
         assert_eq!(batch.batch.num_columns(), 3);
+    }
+
+    #[test]
+    fn projects_nested_top_level_columns_through_runtime() {
+        let (_dir, source) = nested_source();
+        let runtime = runtime();
+        let batch = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(Arc::clone(&source)).project(vec![0]),
+                GenerationId(42),
+            )
+            .unwrap()
+            .next_batch()
+            .unwrap()
+            .unwrap()
+            .batch;
+        assert!(matches!(batch.column(0).data_type(), DataType::List(_)));
+        assert_eq!(batch.num_rows(), 2);
+
+        let error = match QueryEngine::new(&runtime).execute(
+            &LogicalPlan::scan(source).filter(Filter::parse("items == 1").unwrap()),
+            GenerationId(43),
+        ) {
+            Ok(_) => panic!("nested scalar filter should be rejected"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("filtering is not supported"));
     }
 
     #[test]
