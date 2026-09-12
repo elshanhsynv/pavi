@@ -3,6 +3,42 @@ use std::collections::BTreeSet;
 use parquet_reader::PAGE_ROWS;
 use pavi_runtime::GenerationId;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Workspace {
+    #[default]
+    Grid,
+    Sql,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolbarCommand {
+    Refresh,
+    Filter,
+    Sql,
+    Charts,
+    Export,
+    Inspector,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ToolbarAvailability {
+    pub has_dataset: bool,
+    pub opening: bool,
+}
+
+impl ToolbarAvailability {
+    pub fn enabled(self, command: ToolbarCommand) -> bool {
+        match command {
+            ToolbarCommand::Inspector => true,
+            ToolbarCommand::Refresh => self.has_dataset && !self.opening,
+            ToolbarCommand::Filter
+            | ToolbarCommand::Sql
+            | ToolbarCommand::Charts
+            | ToolbarCommand::Export => self.has_dataset,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoadState {
     Idle,
@@ -295,6 +331,32 @@ impl GridState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracks_workspace_and_toolbar_availability() {
+        assert_eq!(Workspace::default(), Workspace::Grid);
+        assert_ne!(Workspace::Grid, Workspace::Sql);
+
+        let closed = ToolbarAvailability::default();
+        assert!(closed.enabled(ToolbarCommand::Inspector));
+        assert!(!closed.enabled(ToolbarCommand::Refresh));
+        assert!(!closed.enabled(ToolbarCommand::Filter));
+
+        let ready = ToolbarAvailability {
+            has_dataset: true,
+            opening: false,
+        };
+        assert!(ready.enabled(ToolbarCommand::Refresh));
+        assert!(ready.enabled(ToolbarCommand::Sql));
+        assert!(ready.enabled(ToolbarCommand::Export));
+        assert!(
+            !ToolbarAvailability {
+                opening: true,
+                ..ready
+            }
+            .enabled(ToolbarCommand::Refresh)
+        );
+    }
 
     #[test]
     fn maps_visible_rows_to_logical_pages() {

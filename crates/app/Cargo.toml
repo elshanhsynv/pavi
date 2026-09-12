@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 eframe.workspace = true

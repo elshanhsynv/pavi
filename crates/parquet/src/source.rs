@@ -113,6 +113,8 @@ pub struct FetchRequest {
 
 pub struct ParquetSource {
     path: PathBuf,
+    file_info: std::fs::Metadata,
+    compression: String,
     dataset_metadata: DatasetMetadata,
     metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
@@ -123,10 +125,22 @@ impl ParquetSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let file_info = file.metadata().context("read file properties")?;
         let arrow_metadata = ArrowReaderMetadata::load(&file, Default::default())
             .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
         let schema = arrow_metadata.schema().clone();
         let metadata = arrow_metadata.metadata().clone();
+        let codecs = metadata
+            .row_groups()
+            .iter()
+            .flat_map(|group| group.columns())
+            .map(|column| column.compression().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let compression = if codecs.is_empty() {
+            "Unavailable".to_string()
+        } else {
+            codecs.into_iter().collect::<Vec<_>>().join(", ")
+        };
         let row_group_counts =
             (0..metadata.num_row_groups()).map(|index| metadata.row_group(index).num_rows() as u64);
         let dataset_metadata = DatasetMetadata::new(schema.clone(), row_group_counts)
@@ -135,6 +149,8 @@ impl ParquetSource {
 
         Ok(Self {
             path,
+            file_info,
+            compression,
             dataset_metadata,
             metadata,
             arrow_metadata,
@@ -144,6 +160,14 @@ impl ParquetSource {
 
     pub fn metadata(&self) -> &DatasetMetadata {
         &self.dataset_metadata
+    }
+
+    pub fn file_info(&self) -> &std::fs::Metadata {
+        &self.file_info
+    }
+
+    pub fn compression(&self) -> &str {
+        &self.compression
     }
 
     pub fn schema(&self) -> Arc<Schema> {

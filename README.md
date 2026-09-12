@@ -32,5 +32,7 @@ crates/
 
 ## Current limits
 
+The desktop entry point is in `crates/app/src/main.rs`; application state and background work live in `app.rs`. The `ui/` directory separates the toolbar, dataset bar, right-side inspector, virtualized grid, SQL editor, charts, tools, status bar, theme, and shared icon widgets. `ui/spacing.rs` defines the shared `Spacing` scale (0, 2, 4, 8, 12, 16 px) used for gaps and padding. Rows are 28 px high; column type labels and frozen headers can be toggled without disabling virtualization. File properties and cache metrics come from the loaded source.
+
 Pavi deliberately keeps pages, result windows, chart points, history, and export events bounded. Query/filter/export work runs through `Query → Runtime → ParquetSource`; exports stream one result batch at a time to a temporary file before finalization. CSV supports the scalar types displayed by Pavi (including strings, binary as hexadecimal, dates, and timestamps); unsupported nested values produce a clear error. Parquet export preserves Arrow batches and schema directly.
 
