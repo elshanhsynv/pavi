@@ -1,0 +1,53 @@
+[package]
+name = "pavi-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Fuzz targets for PAVI's untrusted inputs. See docs/FUZZING.md.
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arrow-array = { version = "59", features = ["chrono-tz"] }
+arrow-schema = "59"
+parquet = { version = "59", features = ["arrow"] }
+parquet_reader = { path = "../crates/parquet" }
+pavi_query = { path = "../crates/query" }
+
+# Kept out of the main workspace: it needs nightly and libFuzzer.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parquet_file"
+path = "fuzz_targets/parquet_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filter_expr"
+path = "fuzz_targets/filter_expr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_query"
+path = "fuzz_targets/sql_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seeds"
+path = "src/bin/seeds.rs"
+test = false
+doc = false
+bench = false

@@ -3,3 +3,9 @@
 data/
 docs/*
 !docs/ARCHITECTURE.md
+!docs/DESIGN.md
+!docs/PERFORMANCE.md
+!docs/TESTING.md
+!docs/FUZZING.md
+!docs/architecture/
+!docs/decisions/

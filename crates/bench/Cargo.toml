@@ -2,6 +2,7 @@
 name = "pavi_bench"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [[bin]]
 name = "pavi-bench"
@@ -13,3 +14,6 @@ arrow-array.workspace = true
 parquet_reader = { path = "../parquet" }
 pavi_query = { path = "../query" }
 pavi_runtime = { path = "../runtime" }
+
+[lints]
+workspace = true

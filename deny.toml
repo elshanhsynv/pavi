@@ -1,0 +1,55 @@
+# Dependency policy, checked by `cargo deny check` locally and in CI.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on any RustSec vulnerability or unsound advisory; warn on unmaintained crates.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+    # quick-xml 0.30 comes only from eframe's Linux accessibility stack (zbus_xml), which parses
+    # D-Bus introspection XML from the system, never user files. Remove when eframe is upgraded.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via eframe/zbus_xml; no user-controlled XML" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml via eframe/zbus_xml; no user-controlled XML" },
+]
+
+[licenses]
+# Permissive licenses only. Add one here only after checking it is compatible.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+# egui bundles fonts under their own licenses.
+exceptions = [
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+]
+
+[licenses.private]
+# Workspace crates are `publish = false` and have no license field.
+ignore = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # Architecture rule: no async runtime (see docs/decisions/0001-no-async-runtime.md).
+    { crate = "tokio", reason = "PAVI uses std threads and bounded channels, not an async runtime" },
+    { crate = "async-std", reason = "PAVI uses std threads and bounded channels, not an async runtime" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

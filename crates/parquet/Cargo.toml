@@ -2,6 +2,7 @@
 name = "parquet_reader"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -14,3 +15,8 @@ parquet.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Already in the tree via parquet; used to forge a corrupt ARROW:schema hint in a test.
+base64 = "0.23"
+
+[lints]
+workspace = true

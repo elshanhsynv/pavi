@@ -1,0 +1,50 @@
+name: Fuzz
+
+# Kept separate from CI: a fuzzer can find a new bug in a dependency at any time, which
+# should not fail unrelated pull requests. See docs/FUZZING.md.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "crates/parquet/**"
+      - "crates/query/**"
+      - "fuzz/**"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "600"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parquet_file, filter_expr, sql_query]
+    steps:
+      - uses: actions/checkout@v4
+      # Fuzzing needs nightly; the pinned toolchain is used everywhere else.
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo +nightly install cargo-fuzz --locked
+      - run: cargo +nightly run --manifest-path fuzz/Cargo.toml --bin seeds
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ inputs.seconds || '600' }}
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
