@@ -17,4 +17,4 @@ pub use metadata::{ColumnInfo, ColumnStatistics, DatasetMetadata, RowGroupInfo};
 pub use page::{DataPage, PAGE_ROWS, PageKey, RowWindow};
 pub use projection::Projection;
 pub use sort::{NullOrder, SortBudget, SortDirection, SortSpec};
-pub use source::{FetchRequest, FilteredWindow, ParquetSource};
+pub use source::{Cancelled, FetchRequest, FilteredWindow, ParquetSource};

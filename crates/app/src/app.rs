@@ -2,7 +2,7 @@
 mod ui;
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -297,6 +297,10 @@ pub(crate) struct PaviApp {
     /// The path submitted with `opening`; the path box may be edited while it loads.
     opening_path: Option<PathBuf>,
     pending_pages: HashMap<u64, PageTask>,
+    /// Pages submitted during the current frame; never cancelled as off-screen.
+    frame_page_requests: BTreeSet<u64>,
+    /// First and last page the source grid drew this frame.
+    visible_page_range: Option<(u64, u64)>,
     pages: HashMap<u64, DataPage>,
     page_order: VecDeque<u64>,
     filtered: Option<FilteredGrid>,
@@ -354,6 +358,8 @@ impl PaviApp {
             opening: None,
             opening_path: None,
             pending_pages: HashMap::new(),
+            frame_page_requests: BTreeSet::new(),
+            visible_page_range: None,
             pages: HashMap::new(),
             page_order: VecDeque::new(),
             filtered: None,
@@ -800,6 +806,37 @@ impl PaviApp {
                 self.pages.remove(&oldest);
                 self.grid.loaded.remove(&oldest);
             }
+        }
+    }
+
+    /// Records a page the source grid drew this frame.
+    fn note_visible_page(&mut self, page: u64) {
+        self.visible_page_range = Some(match self.visible_page_range {
+            Some((first, last)) => (first.min(page), last.max(page)),
+            None => (page, page),
+        });
+    }
+
+    /// Cancels pending page reads more than one page away from what the grid drew
+    /// this frame, so fast scrolling doesn't fill the runtime queue with pages that
+    /// are no longer needed. Pages requested this frame (e.g. a jump target) are kept,
+    /// and cancelled pages are requested again if they scroll back into view.
+    fn cancel_offscreen_pages(&mut self) {
+        let Some((first, last)) = self.visible_page_range.take() else {
+            return;
+        };
+        let keep = first.saturating_sub(1)..=last.saturating_add(1);
+        let offscreen = self
+            .pending_pages
+            .keys()
+            .copied()
+            .filter(|page| !keep.contains(page) && !self.frame_page_requests.contains(page))
+            .collect::<Vec<_>>();
+        for page in offscreen {
+            if let Some(task) = self.pending_pages.remove(&page) {
+                task.cancel();
+            }
+            self.grid.requested.remove(&page);
         }
     }
 
@@ -1325,6 +1362,7 @@ impl PaviApp {
         ) {
             Ok(task) => {
                 self.pending_pages.insert(page_index, task);
+                self.frame_page_requests.insert(page_index);
             }
             Err(error) => {
                 self.grid.requested.remove(&page_index);
@@ -1794,6 +1832,7 @@ impl eframe::App for PaviApp {
             ui::theme::apply(ctx);
             self.ui_initialized = true;
         }
+        self.frame_page_requests.clear();
         self.handle_global_shortcuts(ctx);
         self.poll_open();
         self.poll_pages();

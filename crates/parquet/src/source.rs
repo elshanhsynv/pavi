@@ -184,7 +184,14 @@ impl ParquetSource {
         projection: &Projection,
     ) -> Result<RecordBatch> {
         Ok(self
-            .scan_filtered(filter, 0, first_match_offset, row_count, projection)?
+            .scan_filtered(
+                filter,
+                0,
+                first_match_offset,
+                row_count,
+                projection,
+                &|| false,
+            )?
             .batch)
     }
 
@@ -192,14 +199,18 @@ impl ParquetSource {
     /// `start_row`, and returns where to resume. Paging with the returned
     /// [`FilteredWindow::next_row`] visits each row once, so reading a whole
     /// filtered result stays linear in the file size.
+    ///
+    /// `stop` is checked before each decoded batch; when it returns `true` the read
+    /// ends with a [`Cancelled`] error.
     pub fn read_filtered_from(
         &self,
         filter: &FilterExpr,
         start_row: u64,
         row_count: usize,
         projection: &Projection,
+        stop: &dyn Fn() -> bool,
     ) -> Result<FilteredWindow> {
-        self.scan_filtered(filter, start_row, 0, row_count, projection)
+        self.scan_filtered(filter, start_row, 0, row_count, projection, stop)
     }
 
     fn scan_filtered(
@@ -209,6 +220,7 @@ impl ParquetSource {
         mut skip_matches: u64,
         row_count: usize,
         projection: &Projection,
+        stop: &dyn Fn() -> bool,
     ) -> Result<FilteredWindow> {
         let total_rows = self.row_count();
         if start_row > total_rows {
@@ -253,6 +265,9 @@ impl ParquetSource {
             let mut reader = self.reader_for(&read_projection, vec![row_group.index], selection)?;
             let mut batch_first_row = row_group.first_row + skip;
             while let Some(batch) = reader.next().transpose()? {
+                if stop() {
+                    return Err(Cancelled.into());
+                }
                 let batch = self.reorder_batch(batch, &read_projection)?;
                 let batch_rows = batch.num_rows() as u64;
                 let mask = filter.evaluate_batch(&batch, filter_position)?;
@@ -299,7 +314,8 @@ impl ParquetSource {
     /// Rows that pass `filter` must fit in `budget`. With `limit` (at most
     /// `budget.max_rows()`), only the best `limit` rows are kept while scanning, so
     /// `ORDER BY … LIMIT n` works on files of any size. Ties keep file order.
-    /// PAVI has no external sort for larger inputs.
+    /// PAVI has no external sort for larger inputs. `stop` is checked before each
+    /// decoded batch; when it returns `true` the read ends with a [`Cancelled`] error.
     pub fn read_sorted(
         &self,
         filter: Option<&FilterExpr>,
@@ -307,6 +323,7 @@ impl ParquetSource {
         sort: SortSpec,
         budget: SortBudget,
         limit: Option<usize>,
+        stop: &dyn Fn() -> bool,
     ) -> Result<Vec<RecordBatch>> {
         self.validate_sort(sort)?;
         if let Some(filter) = filter {
@@ -358,6 +375,9 @@ impl ParquetSource {
             }
             let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
             while let Some(batch) = reader.next().transpose()? {
+                if stop() {
+                    return Err(Cancelled.into());
+                }
                 let batch = self.reorder_batch(batch, &read_projection)?;
                 let batch = match (filter, filter_position) {
                     (Some(filter), Some(filter_position)) => filter_record_batch(
@@ -426,11 +446,14 @@ impl ParquetSource {
     }
 
     /// Computes aggregates incrementally over decoded batches without retaining input rows.
+    /// `stop` is checked before each decoded batch; when it returns `true` the read
+    /// ends with a [`Cancelled`] error.
     pub fn read_aggregated(
         &self,
         filter: Option<&FilterExpr>,
         aggregate: &AggregateSpec,
         budget: GroupBudget,
+        stop: &dyn Fn() -> bool,
     ) -> Result<RecordBatch> {
         self.validate_aggregate(aggregate)?;
         if let Some(filter) = filter {
@@ -489,6 +512,9 @@ impl ParquetSource {
             }
             let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
             while let Some(batch) = reader.next().transpose()? {
+                if stop() {
+                    return Err(Cancelled.into());
+                }
                 let batch = self.reorder_batch(batch, &read_projection)?;
                 let batch = match (filter, filter_position) {
                     (Some(filter), Some(position)) => {
@@ -718,6 +744,18 @@ impl ParquetSource {
         project_batch(&batch, projection, &output_positions)
     }
 }
+
+/// The error a long read returns when its `stop` check asks it to end early.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("read cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 /// Matching rows from [`ParquetSource::read_filtered_from`] and where to resume.
 #[derive(Clone, Debug)]
@@ -1783,6 +1821,7 @@ mod tests {
                 )
                 .unwrap(),
                 GroupBudget::default(),
+                &|| false,
             )
             .unwrap();
         assert_eq!(cells(&grouped, 0), ["b", "a", "c"]);
@@ -1801,6 +1840,7 @@ mod tests {
                 None,
                 &AggregateSpec::new(vec![AggregateExpr::min(0)]).unwrap(),
                 GroupBudget::default(),
+                &|| false,
             )
             .unwrap();
         assert_eq!(minimum.schema().field(0).data_type(), &DataType::LargeUtf8);
@@ -1815,6 +1855,7 @@ mod tests {
                     SortSpec::new(column, direction, NullOrder::Last),
                     SortBudget::default(),
                     None,
+                    &|| false,
                 )
                 .unwrap();
             cells(&batches[0], 0)
@@ -1894,7 +1935,7 @@ mod tests {
         let mut next_row = 0;
         loop {
             let window = source
-                .read_filtered_from(&filter, next_row, 1_000, &projection)
+                .read_filtered_from(&filter, next_row, 1_000, &projection, &|| false)
                 .unwrap();
             assert!(window.next_row > next_row || window.batch.num_rows() == 0);
             seen.extend(ids(&window.batch));
@@ -1913,7 +1954,7 @@ mod tests {
 
         // Starting part-way through a row group, and after a pruned prefix.
         let middle = source
-            .read_filtered_from(&filter, 15_001, 2, &projection)
+            .read_filtered_from(&filter, 15_001, 2, &projection, &|| false)
             .unwrap();
         assert_eq!(ids(&middle.batch), [15_004, 15_011]);
         assert_eq!(middle.next_row, 15_012);
@@ -1923,13 +1964,14 @@ mod tests {
                 0,
                 3,
                 &projection,
+                &|| false,
             )
             .unwrap();
         assert_eq!(ids(&late.batch), [25_000, 25_001, 25_002]);
         assert_eq!(late.next_row, 25_003);
         assert!(
             source
-                .read_filtered_from(&filter, 30_001, 1, &projection)
+                .read_filtered_from(&filter, 30_001, 1, &projection, &|| false)
                 .is_err()
         );
     }
@@ -1944,12 +1986,12 @@ mod tests {
         // 30,000 rows exceed the 100-row budget, but LIMIT 5 keeps only the top 5;
         // equal buckets keep file order.
         let top = source
-            .read_sorted(None, &projection, by_bucket, tiny, Some(5))
+            .read_sorted(None, &projection, by_bucket, tiny, Some(5), &|| false)
             .unwrap();
         assert_eq!(ids(&top[0]), [6, 13, 20, 27, 34]);
 
         let error = source
-            .read_sorted(None, &projection, by_bucket, tiny, None)
+            .read_sorted(None, &projection, by_bucket, tiny, None, &|| false)
             .unwrap_err();
         assert!(
             error
@@ -1958,7 +2000,7 @@ mod tests {
         );
         assert!(
             source
-                .read_sorted(None, &projection, by_bucket, tiny, Some(101))
+                .read_sorted(None, &projection, by_bucket, tiny, Some(101), &|| false)
                 .is_err()
         );
 
@@ -1970,15 +2012,65 @@ mod tests {
                 SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
                 tiny,
                 None,
+                &|| false,
             )
             .unwrap();
         assert_eq!(ids(&filtered[0]), (0..50).rev().collect::<Vec<_>>());
         assert!(
             source
-                .read_sorted(None, &projection, by_bucket, tiny, Some(0))
+                .read_sorted(None, &projection, by_bucket, tiny, Some(0), &|| false)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn long_reads_stop_between_batches_when_asked() {
+        use std::cell::Cell;
+
+        // 30,000 rows in 4,096-row batches: about nine batches per full scan.
+        let (_directory, source) = numbered_file(30_000, 10_000);
+        let projection = Projection::all(2);
+        let is_cancelled = |error: anyhow::Error| error.downcast_ref::<Cancelled>().is_some();
+
+        let calls = Cell::new(0);
+        let stop_on_third = || {
+            calls.set(calls.get() + 1);
+            calls.get() >= 3
+        };
+        // Asking for more matches than exist forces a scan of every batch.
+        let filter = FilterExpr::parse("bucket == 3").unwrap();
+        let error = source
+            .read_filtered_from(&filter, 0, 30_000, &projection, &stop_on_third)
+            .unwrap_err();
+        assert!(is_cancelled(error));
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let error = source
+            .read_sorted(
+                None,
+                &projection,
+                SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
+                SortBudget::default(),
+                Some(5),
+                &stop_on_third,
+            )
+            .unwrap_err();
+        assert!(is_cancelled(error));
+        assert_eq!(calls.get(), 3);
+
+        calls.set(0);
+        let error = source
+            .read_aggregated(
+                None,
+                &AggregateSpec::new(vec![AggregateExpr::sum(0)]).unwrap(),
+                GroupBudget::default(),
+                &stop_on_third,
+            )
+            .unwrap_err();
+        assert!(is_cancelled(error));
+        assert_eq!(calls.get(), 3);
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {
@@ -2263,6 +2355,7 @@ mod tests {
                 SortSpec::new(0, SortDirection::Ascending, NullOrder::First),
                 SortBudget::new(10, 1_000_000).unwrap(),
                 None,
+                &|| false,
             )
             .unwrap();
         let ascending = ascending[0]
@@ -2282,6 +2375,7 @@ mod tests {
                 SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
                 SortBudget::new(10, 1_000_000).unwrap(),
                 None,
+                &|| false,
             )
             .unwrap();
         let descending = descending[0]
@@ -2301,6 +2395,7 @@ mod tests {
                 SortSpec::new(0, SortDirection::Ascending, NullOrder::Last),
                 SortBudget::new(3, 1_000_000).unwrap(),
                 None,
+                &|| false,
             )
             .unwrap_err();
         assert!(
@@ -2349,6 +2444,7 @@ mod tests {
                     SortSpec::new(column, direction, NullOrder::Last),
                     SortBudget::new(10, 1_000_000).unwrap(),
                     None,
+                    &|| false,
                 )
                 .unwrap();
             assert_eq!(ids(&sorted[0]), expected);
