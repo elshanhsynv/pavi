@@ -220,74 +220,6 @@ impl Runtime {
         self.handle().submit_open(path, generation_id)
     }
 
-    pub fn submit_window(
-        &self,
-        source: Arc<ParquetSource>,
-        first_row: u64,
-        row_count: usize,
-        projection: Projection,
-        generation_id: GenerationId,
-    ) -> Result<PageTask, SubmitError> {
-        self.handle().submit_read(
-            source,
-            projection,
-            generation_id,
-            ReadOperation::Window {
-                first_row,
-                row_count,
-            },
-            None,
-        )
-    }
-
-    /// Reads up to `row_count` rows matching `filter` from source row `start_row`;
-    /// the outcome is [`PageOutcome::Filtered`] with the row to resume from.
-    pub fn submit_filtered_from(
-        &self,
-        source: Arc<ParquetSource>,
-        filter: FilterExpr,
-        start_row: u64,
-        row_count: usize,
-        projection: Projection,
-        generation_id: GenerationId,
-    ) -> Result<PageTask, SubmitError> {
-        self.handle().submit_read(
-            source,
-            projection,
-            generation_id,
-            ReadOperation::FilteredFrom {
-                filter,
-                start_row,
-                row_count,
-            },
-            None,
-        )
-    }
-
-    pub fn submit_sorted(
-        &self,
-        source: Arc<ParquetSource>,
-        filter: Option<FilterExpr>,
-        projection: Projection,
-        read: SortedRead,
-        generation_id: GenerationId,
-    ) -> Result<PageTask, SubmitError> {
-        self.handle()
-            .submit_sorted(source, filter, projection, read, generation_id)
-    }
-
-    pub fn submit_aggregated(
-        &self,
-        source: Arc<ParquetSource>,
-        filter: Option<FilterExpr>,
-        aggregate: AggregateSpec,
-        budget: GroupBudget,
-        generation_id: GenerationId,
-    ) -> Result<PageTask, SubmitError> {
-        self.handle()
-            .submit_aggregated(source, filter, aggregate, budget, generation_id)
-    }
-
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         if let Ok(mut submissions) = self.submissions.lock() {
@@ -352,12 +284,7 @@ impl RuntimeHandle {
         };
 
         match sender.try_send(Request::Open(request)) {
-            Ok(()) => Ok(OpenTask::new(
-                task_id,
-                generation_id,
-                cancellation,
-                response_receiver,
-            )),
+            Ok(()) => Ok(OpenTask::new(cancellation, response_receiver)),
             Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Shutdown),
         }
@@ -477,12 +404,7 @@ impl RuntimeHandle {
         };
 
         match sender.try_send(Request::Read(request)) {
-            Ok(()) => Ok(PageTask::new(
-                task_id,
-                generation_id,
-                cancellation,
-                response_receiver,
-            )),
+            Ok(()) => Ok(PageTask::new(cancellation, response_receiver)),
             Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Shutdown),
         }
@@ -831,8 +753,7 @@ mod tests {
                 .submit_page(source, 0, Projection::all(2), GenerationId(4))
                 .unwrap(),
         );
-        assert!(response.is_stale_for(GenerationId(5)));
-        assert!(!response.is_stale_for(GenerationId(4)));
+        assert_eq!(response.generation_id, GenerationId(4));
     }
 
     #[test]

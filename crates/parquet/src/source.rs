@@ -36,13 +36,6 @@ use crate::{
 
 const BATCH_SIZE: usize = 4096;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FetchRequest {
-    pub first_row: u64,
-    pub row_count: usize,
-    pub projection: Projection,
-}
-
 pub struct ParquetSource {
     path: PathBuf,
     file_info: std::fs::Metadata,
@@ -136,10 +129,6 @@ impl ParquetSource {
 
     pub fn validate_filter(&self, filter: &FilterExpr) -> Result<()> {
         filter.validate_schema(&self.dataset_metadata.schema)
-    }
-
-    pub fn head(&self, rows: usize) -> Result<RecordBatch> {
-        self.read_window(0, rows, &Projection::all(self.column_count()))
     }
 
     pub fn read_window(

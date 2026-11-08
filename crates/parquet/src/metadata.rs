@@ -93,17 +93,6 @@ impl DatasetMetadata {
         &self.columns
     }
 
-    pub fn row_group_for_row(&self, row: u64) -> Option<&RowGroupInfo> {
-        if row >= self.row_count {
-            return None;
-        }
-
-        let index = self
-            .row_groups
-            .partition_point(|group| group.first_row + group.row_count <= row);
-        self.row_groups.get(index)
-    }
-
     pub fn overlapping_row_group_indexes(&self, first_row: u64, row_count: usize) -> Vec<usize> {
         if row_count == 0 || first_row >= self.row_count {
             return Vec::new();
@@ -171,14 +160,6 @@ mod tests {
                 }
             ]
         );
-    }
-
-    #[test]
-    fn finds_row_groups_by_binary_search() {
-        let metadata = metadata(&[3, 4]);
-        assert_eq!(metadata.row_group_for_row(0).unwrap().index, 0);
-        assert_eq!(metadata.row_group_for_row(3).unwrap().index, 1);
-        assert!(metadata.row_group_for_row(7).is_none());
     }
 
     #[test]

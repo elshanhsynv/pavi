@@ -12,7 +12,7 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
 - **The main pattern** is one central `PaviApp` (`crates/app/src/app.rs`) that coordinates the app and delegates self-contained state to its own types: `SourcePages` (page reads and cache, `pages.rs`), `FilteredGrid` (result window, `results.rs`), `ChartState`, `ProfileState` and `ExportState`. The `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (183 tests: parquet_reader 57, pavi 83, pavi_query 33, pavi_runtime 9, cli 1), using the Rust version pinned in `rust-toolchain.toml` (1.99.1). No logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (182 tests: parquet_reader 56, pavi 83, pavi_query 33, pavi_runtime 9, cli 1), using the Rust version pinned in `rust-toolchain.toml` (1.99.1). No logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -105,7 +105,7 @@ crates/parquet/src/            (parquet_reader)
 
 crates/runtime/src/            (pavi_runtime)
 ├── scheduler.rs    Runtime, RuntimeHandle, RuntimeConfig, ReadOperation, worker_loop, execute
-├── task.rs         TaskId, GenerationId, PageTask, OpenTask (receiver + cancel token)
+├── task.rs         TaskId, GenerationId, PageTask, OpenTask (receiver + cancel token; IDs arrive with the response)
 ├── response.rs     PageOutcome/PageResponse, OpenOutcome/OpenResponse
 └── cancellation.rs CancellationToken(Arc<AtomicBool>)
 
@@ -570,7 +570,7 @@ flowchart LR
 ### Abstraction boundaries
 
 There are almost no traits. The boundaries are concrete types:
-- `Arc<ParquetSource>` is the only "data source"; `LogicalPlan::Scan` hard-codes it (`logical.rs:8-11`). `arch.md` envisions a generic data-source layer, but no trait exists.
+- `Arc<ParquetSource>` is the only "data source"; `LogicalPlan::Scan` hard-codes it (`logical.rs`); there is no data-source trait.
 - `RuntimeHandle` (cloneable) is the boundary between query/app and threads.
 - `QueryPoll` / `QueryExecution::poll_next_batch` is the boundary between event-loop consumers and the engine.
 - The only trait is private: `export.rs::BatchSource` (one-batch vs query-backed input).
