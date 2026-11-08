@@ -371,6 +371,89 @@ fn streams_multiple_pages_with_a_bounded_result_window() {
     assert_eq!(app.grid.selection, None);
 }
 
+fn send_grid_key(app: &mut PaviApp, key: egui::Key, shift: bool) {
+    let modifiers = egui::Modifiers {
+        shift,
+        ..Default::default()
+    };
+    let context = egui::Context::default();
+    context.begin_pass(egui::RawInput {
+        modifiers,
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    });
+    let first_result = app
+        .filtered
+        .as_ref()
+        .map_or(0, |filtered| filtered.first_result);
+    app.handle_grid_keyboard(&context, first_result);
+    let _ = context.end_pass();
+}
+
+#[test]
+fn keyboard_and_shift_selection_work_after_the_result_window_slides() {
+    let rows = (parquet_reader::PAGE_ROWS * 20) as usize;
+    let (_directory, source, path) = source(rows);
+    let mut app = make_app(source, path);
+    app.filter_input = "id >= 0".to_string();
+    app.apply_filter();
+    for _ in 0..19 {
+        poll_until_idle(&mut app);
+        app.request_more_filtered();
+    }
+    poll_until_idle(&mut app);
+
+    let first = app.filtered.as_ref().unwrap().first_result;
+    // Past the window size, where absolute rows used to be rejected.
+    assert!(first >= parquet_reader::PAGE_ROWS * MAX_FILTERED_BATCHES as u64);
+    assert_eq!(app.grid.first_row, first);
+
+    assert!(app.grid.select_filtered(first, 10, 0));
+    send_grid_key(&mut app, egui::Key::ArrowDown, false);
+    assert_eq!(app.grid.selection, Some((first + 11, 0)));
+    send_grid_key(&mut app, egui::Key::ArrowRight, true);
+    assert_eq!(app.grid.selection, Some((first + 11, 1)));
+    assert!(app.grid.is_selected(first + 11, 0));
+    send_grid_key(&mut app, egui::Key::Home, false);
+    assert_eq!(app.grid.selection, Some((first, 1)));
+    send_grid_key(&mut app, egui::Key::ArrowUp, false);
+    assert_eq!(
+        app.grid.selection,
+        Some((first, 1)),
+        "stays inside the window"
+    );
+}
+
+#[test]
+fn records_the_opened_path_even_if_the_path_box_changes() {
+    let (directory, _source, path) = source(4);
+    let store = SessionStore::new(directory.path().join("session.json"));
+    let mut app = PaviApp::new_with_store(None, store);
+    let other = directory.path().join("typed-meanwhile.parquet");
+
+    app.begin_open(path.clone());
+    app.path_input = other.display().to_string();
+    poll_until_opened(&mut app);
+
+    assert_eq!(app.dataset.as_ref().unwrap().path, path);
+    assert_eq!(app.session.recent_files.first(), Some(&path));
+    assert!(!app.session.recent_files.contains(&other));
+
+    // A failed open removes only the path that failed, not the one being typed.
+    let missing = directory.path().join("missing.parquet");
+    app.begin_open(missing.clone());
+    app.path_input = path.display().to_string();
+    poll_until_opened(&mut app);
+    assert!(matches!(app.grid.loading, LoadState::Error(_)));
+    assert!(app.session.recent_files.contains(&path));
+}
+
 #[test]
 fn replaces_and_cancels_obsolete_filters() {
     let (_directory, source, path) = source(8);

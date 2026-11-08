@@ -1,4 +1,5 @@
 /target
 *.parquet
 data/
-docs/
+docs/*
+!docs/ARCHITECTURE.md

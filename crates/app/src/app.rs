@@ -294,6 +294,8 @@ pub(crate) struct PaviApp {
     grid: GridState,
     dataset: Option<Dataset>,
     opening: Option<OpenTask>,
+    /// The path submitted with `opening`; the path box may be edited while it loads.
+    opening_path: Option<PathBuf>,
     pending_pages: HashMap<u64, PageTask>,
     pages: HashMap<u64, DataPage>,
     page_order: VecDeque<u64>,
@@ -350,6 +352,7 @@ impl PaviApp {
             grid: GridState::default(),
             dataset: None,
             opening: None,
+            opening_path: None,
             pending_pages: HashMap::new(),
             pages: HashMap::new(),
             page_order: VecDeque::new(),
@@ -645,6 +648,7 @@ impl PaviApp {
             task.cancel();
         }
         self.opening = None;
+        self.opening_path = None;
         self.cancel_page_work();
         self.cancel_export();
         self.record_sql_history(false, None);
@@ -666,8 +670,11 @@ impl PaviApp {
             self.open_error("background runtime is unavailable".to_string());
             return;
         };
-        match runtime.submit_open(path, generation) {
-            Ok(task) => self.opening = Some(task),
+        match runtime.submit_open(path.clone(), generation) {
+            Ok(task) => {
+                self.opening = Some(task);
+                self.opening_path = Some(path);
+            }
             Err(error) => self.open_error(format!("queue file open: {error}")),
         }
     }
@@ -681,14 +688,17 @@ impl PaviApp {
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.opening = None;
+                self.opening_path = None;
                 self.open_error("background file open worker stopped".to_string());
                 return;
             }
         };
         self.opening = None;
+        let opened_path = self.opening_path.take();
         if response.generation_id != self.grid.generation {
             return;
         }
+        let path = opened_path.unwrap_or_else(|| PathBuf::from(&self.path_input));
         match response.outcome {
             OpenOutcome::Opened(source) => {
                 let schema = source.schema();
@@ -701,13 +711,12 @@ impl PaviApp {
                 let columns = source.column_count();
                 self.dataset = Some(Dataset {
                     source,
-                    path: PathBuf::from(&self.path_input),
+                    path: path.clone(),
                     column_names,
                 });
                 self.restore_column_layout();
                 self.grid.ready(rows, self.column_layout.visible().len());
-                self.session
-                    .record_recent_file(PathBuf::from(&self.path_input));
+                self.session.record_recent_file(path);
                 self.persist_session();
                 if let Some(chart_columns) =
                     self.dataset.as_ref().map(|dataset| &dataset.column_names)
@@ -727,8 +736,7 @@ impl PaviApp {
             }
             OpenOutcome::Cancelled => self.status = "File open cancelled".to_string(),
             OpenOutcome::OpenFailed(error) => {
-                self.session
-                    .remove_recent_file(std::path::Path::new(&self.path_input));
+                self.session.remove_recent_file(&path);
                 self.persist_session();
                 self.open_error(format!("open file: {error:#}"));
             }
@@ -1268,6 +1276,7 @@ impl PaviApp {
                 }
             }
         }
+        self.grid.first_row = filtered.first_result;
         self.grid.rows = filtered.rows;
         if let Some(status) = status {
             self.status = status;

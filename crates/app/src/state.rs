@@ -186,6 +186,9 @@ impl ColumnLayout {
 
 pub struct GridState {
     pub generation: GenerationId,
+    /// Absolute index of the first row in the grid; non-zero once a bounded
+    /// result window has slid forward. Selections use absolute row indexes.
+    pub first_row: u64,
     pub rows: u64,
     pub columns: usize,
     pub loading: LoadState,
@@ -199,6 +202,7 @@ impl Default for GridState {
     fn default() -> Self {
         Self {
             generation: GenerationId(0),
+            first_row: 0,
             rows: 0,
             columns: 0,
             loading: LoadState::Idle,
@@ -213,6 +217,7 @@ impl Default for GridState {
 impl GridState {
     pub fn reset(&mut self) -> GenerationId {
         self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.first_row = 0;
         self.rows = 0;
         self.columns = 0;
         self.loading = LoadState::Opening;
@@ -256,8 +261,13 @@ impl GridState {
         true
     }
 
+    fn contains_row(&self, row: u64) -> bool {
+        row.checked_sub(self.first_row)
+            .is_some_and(|offset| offset < self.rows)
+    }
+
     pub fn select(&mut self, row: u64, column: usize) -> bool {
-        if row >= self.rows || column >= self.columns {
+        if !self.contains_row(row) || column >= self.columns {
             return false;
         }
         self.selection = Some((row, column));
@@ -269,7 +279,7 @@ impl GridState {
     }
 
     pub fn extend_selection(&mut self, row: u64, column: usize) -> bool {
-        if row >= self.rows || column >= self.columns {
+        if !self.contains_row(row) || column >= self.columns {
             return false;
         }
         let anchor = self
@@ -331,6 +341,30 @@ impl GridState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_absolute_rows_inside_a_slid_window() {
+        let mut grid = GridState::default();
+        grid.ready(100, 3);
+        grid.first_row = 40_960;
+
+        assert!(grid.select_filtered(40_960, 10, 1));
+        assert_eq!(grid.selection, Some((40_970, 1)));
+        assert!(grid.select(40_971, 1));
+        assert!(grid.extend_selection(41_000, 2));
+        assert_eq!(grid.selection, Some((41_000, 2)));
+        assert!(grid.is_selected(40_980, 1));
+
+        assert!(!grid.select(40_959, 0), "row before the window");
+        assert!(!grid.select(41_060, 0), "row after the window");
+        assert!(
+            !grid.extend_selection(10, 0),
+            "relative index is not absolute"
+        );
+
+        grid.reset();
+        assert_eq!(grid.first_row, 0);
+    }
 
     #[test]
     fn tracks_workspace_and_toolbar_availability() {

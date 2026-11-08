@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use anyhow::{Result, anyhow, bail};
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -98,9 +100,8 @@ impl FilterExpr {
                 if self.op == FilterOp::Contains {
                     bail!("contains is only supported for UTF-8 columns");
                 }
-                self.value
-                    .parse::<f64>()
-                    .map_err(|_| anyhow!("'{}' is not a number", self.value))?;
+                Number::parse(&self.value)
+                    .ok_or_else(|| anyhow!("'{}' is not a number", self.value))?;
             }
             DataType::Utf8 | DataType::LargeUtf8 => {}
             other => bail!("filtering is not supported for {other:?} columns"),
@@ -117,34 +118,34 @@ impl FilterExpr {
         let mask = match array.data_type() {
             DataType::Boolean => self.evaluate_bool(array)?,
             DataType::Int8 => {
-                self.evaluate_numbers(array, |a: &Int8Array, row| a.value(row) as f64)?
+                self.evaluate_numbers(array, |a: &Int8Array, row| Number::Int(a.value(row).into()))?
             }
-            DataType::Int16 => {
-                self.evaluate_numbers(array, |a: &Int16Array, row| a.value(row) as f64)?
-            }
-            DataType::Int32 => {
-                self.evaluate_numbers(array, |a: &Int32Array, row| a.value(row) as f64)?
-            }
-            DataType::Int64 => {
-                self.evaluate_numbers(array, |a: &Int64Array, row| a.value(row) as f64)?
-            }
-            DataType::UInt8 => {
-                self.evaluate_numbers(array, |a: &UInt8Array, row| a.value(row) as f64)?
-            }
-            DataType::UInt16 => {
-                self.evaluate_numbers(array, |a: &UInt16Array, row| a.value(row) as f64)?
-            }
-            DataType::UInt32 => {
-                self.evaluate_numbers(array, |a: &UInt32Array, row| a.value(row) as f64)?
-            }
-            DataType::UInt64 => {
-                self.evaluate_numbers(array, |a: &UInt64Array, row| a.value(row) as f64)?
-            }
-            DataType::Float32 => {
-                self.evaluate_numbers(array, |a: &Float32Array, row| a.value(row) as f64)?
-            }
+            DataType::Int16 => self.evaluate_numbers(array, |a: &Int16Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::Int32 => self.evaluate_numbers(array, |a: &Int32Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::Int64 => self.evaluate_numbers(array, |a: &Int64Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::UInt8 => self.evaluate_numbers(array, |a: &UInt8Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::UInt16 => self.evaluate_numbers(array, |a: &UInt16Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::UInt32 => self.evaluate_numbers(array, |a: &UInt32Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::UInt64 => self.evaluate_numbers(array, |a: &UInt64Array, row| {
+                Number::Int(a.value(row).into())
+            })?,
+            DataType::Float32 => self.evaluate_numbers(array, |a: &Float32Array, row| {
+                Number::Float(a.value(row).into())
+            })?,
             DataType::Float64 => {
-                self.evaluate_numbers(array, |a: &Float64Array, row| a.value(row))?
+                self.evaluate_numbers(array, |a: &Float64Array, row| Number::Float(a.value(row)))?
             }
             DataType::Utf8 => self.evaluate_strings(array, |a: &StringArray, row| a.value(row))?,
             DataType::LargeUtf8 => {
@@ -156,7 +157,15 @@ impl FilterExpr {
         Ok(mask)
     }
 
-    pub fn might_match_statistics(&self, statistics: Option<&Statistics>) -> bool {
+    /// Returns `false` only when row-group statistics prove that no row can match.
+    ///
+    /// `data_type` is the Arrow type of the filtered column. Parquet stores unsigned
+    /// integers in signed physical types, so their statistics must be reinterpreted.
+    pub fn might_match_statistics(
+        &self,
+        statistics: Option<&Statistics>,
+        data_type: &DataType,
+    ) -> bool {
         let Some(statistics) = statistics else {
             return true;
         };
@@ -174,26 +183,34 @@ impl FilterExpr {
                 )
             }
             Statistics::Int32(stats) => number_range_might_match(
-                stats.min_opt().map(|value| *value as f64),
-                stats.max_opt().map(|value| *value as f64),
+                stats
+                    .min_opt()
+                    .map(|value| int32_statistic(*value, data_type)),
+                stats
+                    .max_opt()
+                    .map(|value| int32_statistic(*value, data_type)),
                 &self.value,
                 &self.op,
             ),
             Statistics::Int64(stats) => number_range_might_match(
-                stats.min_opt().map(|value| *value as f64),
-                stats.max_opt().map(|value| *value as f64),
+                stats
+                    .min_opt()
+                    .map(|value| int64_statistic(*value, data_type)),
+                stats
+                    .max_opt()
+                    .map(|value| int64_statistic(*value, data_type)),
                 &self.value,
                 &self.op,
             ),
             Statistics::Float(stats) => number_range_might_match(
-                stats.min_opt().map(|value| *value as f64),
-                stats.max_opt().map(|value| *value as f64),
+                stats.min_opt().map(|value| Number::Float((*value).into())),
+                stats.max_opt().map(|value| Number::Float((*value).into())),
                 &self.value,
                 &self.op,
             ),
             Statistics::Double(stats) => number_range_might_match(
-                stats.min_opt().copied(),
-                stats.max_opt().copied(),
+                stats.min_opt().map(|value| Number::Float(*value)),
+                stats.max_opt().map(|value| Number::Float(*value)),
                 &self.value,
                 &self.op,
             ),
@@ -232,7 +249,7 @@ impl FilterExpr {
     fn evaluate_numbers<T>(
         &self,
         array: &dyn Array,
-        value_at: impl Fn(&T, usize) -> f64,
+        value_at: impl Fn(&T, usize) -> Number,
     ) -> Result<BooleanArray>
     where
         T: Array + 'static,
@@ -241,17 +258,15 @@ impl FilterExpr {
             bail!("contains is only supported for UTF-8 columns");
         }
 
-        let expected = self
-            .value
-            .parse::<f64>()
-            .map_err(|_| anyhow!("'{}' is not a number", self.value))?;
+        let expected = Number::parse(&self.value)
+            .ok_or_else(|| anyhow!("'{}' is not a number", self.value))?;
         let array = array
             .as_any()
             .downcast_ref::<T>()
             .ok_or_else(|| anyhow!("numeric array type mismatch"))?;
 
         Ok(BooleanArray::from_iter((0..array.len()).map(|row| {
-            Some(!array.is_null(row) && compare_f64(value_at(array, row), expected, &self.op))
+            Some(!array.is_null(row) && compare_number(value_at(array, row), expected, &self.op))
         })))
     }
 
@@ -295,14 +310,61 @@ fn compare_bool(left: bool, right: bool, op: &FilterOp) -> bool {
     }
 }
 
-fn compare_f64(left: f64, right: f64, op: &FilterOp) -> bool {
+/// A filter operand: integers stay exact, everything else is compared as `f64`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Number {
+    Int(i128),
+    Float(f64),
+}
+
+impl Number {
+    fn parse(value: &str) -> Option<Self> {
+        value
+            .parse::<i128>()
+            .map(Self::Int)
+            .ok()
+            .or_else(|| value.parse::<f64>().ok().map(Self::Float))
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Int(value) => value as f64,
+            Self::Float(value) => value,
+        }
+    }
+
+    /// `None` when either side is NaN.
+    fn compare(self, other: Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Int(left), Self::Int(right)) => Some(left.cmp(&right)),
+            _ => self.as_f64().partial_cmp(&other.as_f64()),
+        }
+    }
+}
+
+fn int32_statistic(value: i32, data_type: &DataType) -> Number {
+    match data_type {
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Number::Int((value as u32).into()),
+        _ => Number::Int(value.into()),
+    }
+}
+
+fn int64_statistic(value: i64, data_type: &DataType) -> Number {
+    match data_type {
+        DataType::UInt64 => Number::Int((value as u64).into()),
+        _ => Number::Int(value.into()),
+    }
+}
+
+fn compare_number(left: Number, right: Number, op: &FilterOp) -> bool {
+    let ordering = left.compare(right);
     match op {
-        FilterOp::Eq => left == right,
-        FilterOp::Ne => left != right,
-        FilterOp::Gt => left > right,
-        FilterOp::Ge => left >= right,
-        FilterOp::Lt => left < right,
-        FilterOp::Le => left <= right,
+        FilterOp::Eq => ordering == Some(Ordering::Equal),
+        FilterOp::Ne => ordering != Some(Ordering::Equal),
+        FilterOp::Gt => ordering == Some(Ordering::Greater),
+        FilterOp::Ge => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
+        FilterOp::Lt => ordering == Some(Ordering::Less),
+        FilterOp::Le => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
         FilterOp::Contains => false,
     }
 }
@@ -335,8 +397,8 @@ fn bool_range_might_match(
 }
 
 fn number_range_might_match(
-    min: Option<f64>,
-    max: Option<f64>,
+    min: Option<Number>,
+    max: Option<Number>,
     value: &str,
     op: &FilterOp,
 ) -> bool {
@@ -344,20 +406,33 @@ fn number_range_might_match(
         return true;
     }
 
-    let Ok(value) = value.parse::<f64>() else {
+    let Some(value) = Number::parse(value) else {
         return true;
     };
     let Some((min, max)) = min.zip(max) else {
         return true;
     };
+    // Unordered statistics (e.g. from a writer using a different sort order) prove nothing.
+    if min.compare(max) == Some(Ordering::Greater) {
+        return true;
+    }
 
+    // An unknown ordering (NaN) must never prune.
+    let may = |ordering: Option<Ordering>, allowed: &[Ordering]| {
+        ordering.is_none_or(|ordering| allowed.contains(&ordering))
+    };
+    let low = min.compare(value);
+    let high = max.compare(value);
     match op {
-        FilterOp::Eq => min <= value && value <= max,
-        FilterOp::Ne => !(min == value && max == value),
-        FilterOp::Gt => max > value,
-        FilterOp::Ge => max >= value,
-        FilterOp::Lt => min < value,
-        FilterOp::Le => min <= value,
+        FilterOp::Eq => {
+            may(low, &[Ordering::Less, Ordering::Equal])
+                && may(high, &[Ordering::Greater, Ordering::Equal])
+        }
+        FilterOp::Ne => !(low == Some(Ordering::Equal) && high == Some(Ordering::Equal)),
+        FilterOp::Gt => may(high, &[Ordering::Greater]),
+        FilterOp::Ge => may(high, &[Ordering::Greater, Ordering::Equal]),
+        FilterOp::Lt => may(low, &[Ordering::Less]),
+        FilterOp::Le => may(low, &[Ordering::Less, Ordering::Equal]),
         FilterOp::Contains => true,
     }
 }
@@ -391,7 +466,7 @@ fn string_range_might_match(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{BooleanArray, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
@@ -508,33 +583,107 @@ mod tests {
     }
 
     #[test]
+    fn compares_large_integers_exactly() {
+        let base = 9_007_199_254_740_992_i64; // 2^53: the first integer f64 can't step past by 1
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![base, base + 1, base + 2]))],
+        )
+        .unwrap();
+
+        for (filter, expected) in [
+            ("x == 9007199254740993", vec![false, true, false]),
+            ("x != 9007199254740993", vec![true, false, true]),
+            ("x > 9007199254740992", vec![false, true, true]),
+            ("x <= 9007199254740993", vec![true, true, false]),
+        ] {
+            let actual = FilterExpr::parse(filter)
+                .unwrap()
+                .evaluate_batch(&batch, 0)
+                .unwrap();
+            assert_eq!(
+                actual.iter().map(Option::unwrap).collect::<Vec<_>>(),
+                expected,
+                "{filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_literals_still_work_on_integer_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let mask = FilterExpr::parse("x > 1.5")
+            .unwrap()
+            .evaluate_batch(&batch, 0)
+            .unwrap();
+        assert_eq!(
+            mask.iter().map(Option::unwrap).collect::<Vec<_>>(),
+            vec![false, true, true]
+        );
+    }
+
+    #[test]
+    fn reads_unsigned_statistics_as_unsigned() {
+        // u32 3_000_000_000 and 3_000_000_001 as stored in Parquet's signed INT32.
+        let stats = Statistics::int32(
+            Some(3_000_000_000_u32 as i32),
+            Some(3_000_000_001_u32 as i32),
+            None,
+            Some(0),
+            false,
+        );
+        let might_match = |filter: &str| {
+            FilterExpr::parse(filter)
+                .unwrap()
+                .might_match_statistics(Some(&stats), &DataType::UInt32)
+        };
+        assert!(might_match("x > 2999999999"));
+        assert!(might_match("x == 3000000001"));
+        assert!(!might_match("x < 10"));
+        assert!(!might_match("x > 3000000001"));
+
+        let stats = Statistics::int64(
+            Some(((1_u64 << 63) + 5) as i64),
+            Some(((1_u64 << 63) + 6) as i64),
+            None,
+            Some(0),
+            false,
+        );
+        let filter = FilterExpr::parse("x > 9223372036854775808").unwrap();
+        assert!(filter.might_match_statistics(Some(&stats), &DataType::UInt64));
+    }
+
+    #[test]
     fn prunes_statistics_without_false_negatives() {
         let stats = Statistics::int32(Some(10), Some(20), None, Some(0), false);
 
         assert!(
             !FilterExpr::parse("x == 9")
                 .unwrap()
-                .might_match_statistics(Some(&stats))
+                .might_match_statistics(Some(&stats), &DataType::Int32)
         );
         assert!(
             FilterExpr::parse("x == 10")
                 .unwrap()
-                .might_match_statistics(Some(&stats))
+                .might_match_statistics(Some(&stats), &DataType::Int32)
         );
         assert!(
             FilterExpr::parse("x > 19")
                 .unwrap()
-                .might_match_statistics(Some(&stats))
+                .might_match_statistics(Some(&stats), &DataType::Int32)
         );
         assert!(
             !FilterExpr::parse("x > 20")
                 .unwrap()
-                .might_match_statistics(Some(&stats))
+                .might_match_statistics(Some(&stats), &DataType::Int32)
         );
         assert!(
             FilterExpr::parse("x != 9")
                 .unwrap()
-                .might_match_statistics(Some(&stats))
+                .might_match_statistics(Some(&stats), &DataType::Int32)
         );
     }
 }
