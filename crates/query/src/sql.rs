@@ -64,7 +64,7 @@ impl SqlAst {
         if statements.len() != 1 {
             bail!("SQL input must contain exactly one statement");
         }
-        let Statement::Query(query) = statements.pop().expect("checked statement count") else {
+        let Some(Statement::Query(query)) = statements.pop() else {
             bail!("only SELECT queries are supported");
         };
         if query.with.is_some() {

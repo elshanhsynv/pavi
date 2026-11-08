@@ -1,5 +1,7 @@
 use std::{
+    any::Any,
     fmt,
+    panic::{self, AssertUnwindSafe},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -465,7 +467,7 @@ fn execute_open(request: OpenRequest, shutdown: &AtomicBool) {
     let outcome = if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() {
         OpenOutcome::Cancelled
     } else {
-        match ParquetSource::open(&request.path) {
+        match guarded(|| ParquetSource::open(&request.path)) {
             Ok(_) if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() => {
                 OpenOutcome::Cancelled
             }
@@ -493,18 +495,20 @@ fn execute(request: PageRequest, shutdown: &AtomicBool) {
         before_read,
     } = request;
 
-    #[cfg(test)]
-    if let Some(before_read) = before_read {
-        before_read();
-    }
-
     // Long scans check this between batches, so cancelling a task or shutting the
     // runtime down ends them within one batch instead of after the whole read.
     let stop = || shutdown.load(Ordering::Acquire) || cancellation.is_cancelled();
     let outcome = if stop() {
         PageOutcome::Cancelled
     } else {
-        match read_source(&source, operation, &projection, &stop) {
+        let read = guarded(|| {
+            #[cfg(test)]
+            if let Some(before_read) = before_read {
+                before_read();
+            }
+            read_source(&source, operation, &projection, &stop)
+        });
+        match read {
             Ok(_) if stop() => PageOutcome::Cancelled,
             Ok(outcome) => outcome,
             Err(error) if stop() || error.is::<Cancelled>() => PageOutcome::Cancelled,
@@ -516,6 +520,28 @@ fn execute(request: PageRequest, shutdown: &AtomicBool) {
         generation_id,
         outcome,
     });
+}
+
+/// Runs one read and turns a panic inside it into an error.
+///
+/// A malformed file can make the Parquet/Arrow decoder panic. Without this the panic
+/// would end the worker thread, the pool would shrink, and the caller would only see a
+/// closed channel. Shared state stays consistent because no lock is held while decoding.
+fn guarded<T>(read: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    panic::catch_unwind(AssertUnwindSafe(read)).unwrap_or_else(|payload| {
+        Err(anyhow::anyhow!(
+            "reader panicked: {}",
+            panic_message(&*payload)
+        ))
+    })
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
 }
 
 fn read_source(
@@ -619,6 +645,35 @@ mod tests {
         let response = task.recv().unwrap();
         assert!(matches!(response.outcome, PageOutcome::Loaded(_)));
         response
+    }
+
+    #[test]
+    fn panicking_read_is_reported_and_the_worker_keeps_running() {
+        let (_dir, source, _) = test_source();
+        // One worker: if the panic killed it, the second request would never be answered.
+        let runtime = runtime(1, 4);
+
+        let task = runtime
+            .submit_page_blocked_before_read(
+                source.clone(),
+                0,
+                Projection::all(2),
+                GenerationId(3),
+                || panic!("corrupt page"),
+            )
+            .unwrap();
+        let response = task.recv().unwrap();
+        assert_eq!(response.generation_id, GenerationId(3));
+        let PageOutcome::ReadFailed(error) = response.outcome else {
+            panic!("expected ReadFailed, got {:?}", response.outcome);
+        };
+        assert_eq!(error.to_string(), "reader panicked: corrupt page");
+
+        loaded(
+            runtime
+                .submit_page(source, 0, Projection::all(2), GenerationId(4))
+                .unwrap(),
+        );
     }
 
     #[test]

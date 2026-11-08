@@ -2,6 +2,7 @@
 name = "pavi"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 anyhow.workspace = true
@@ -20,3 +21,6 @@ parquet.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

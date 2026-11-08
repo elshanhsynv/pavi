@@ -1,6 +1,8 @@
 use std::{
+    any::Any,
     collections::HashMap,
     fs::File,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -19,7 +21,8 @@ use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::ta
 use parquet::arrow::{
     ProjectionMask,
     arrow_reader::{
-        ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
+        ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+        RowSelector,
     },
 };
 use parquet::file::metadata::ParquetMetaData;
@@ -36,6 +39,72 @@ use crate::{
 
 const BATCH_SIZE: usize = 4096;
 
+/// Loads the footer and the Arrow schema.
+///
+/// Writers may embed an Arrow schema (`ARROW:schema`) as a hint for exact Arrow types.
+/// arrow-ipc panics on some corrupt hints instead of returning an error (found by the
+/// `parquet_file` fuzz target). The hint is optional, so if decoding it panics we load
+/// again without it and derive the schema from the Parquet schema alone.
+fn load_arrow_metadata(file: &File) -> Result<ArrowReaderMetadata> {
+    let with_hint = catch_unwind(AssertUnwindSafe(|| {
+        ArrowReaderMetadata::load(file, ArrowReaderOptions::new())
+    }));
+    match with_hint {
+        Ok(result) => Ok(result?),
+        Err(_) => Ok(ArrowReaderMetadata::load(
+            file,
+            ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+        )?),
+    }
+}
+
+/// Pulls record batches from the Parquet decoder and turns a decoder panic into an error.
+///
+/// arrow-rs panics on some malformed pages instead of returning an error (for example a data
+/// page that uses dictionary encoding with no dictionary page; found by the `parquet_file`
+/// fuzz target). Guarding here protects every caller, including the CLI and bench, which do
+/// not run inside the runtime's worker guard. After a panic the decoder's state is unknown,
+/// so the reader stops.
+struct GuardedReader<R> {
+    inner: Option<R>,
+}
+
+impl<R> GuardedReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner: Some(inner) }
+    }
+}
+
+impl<R, E> Iterator for GuardedReader<R>
+where
+    R: Iterator<Item = std::result::Result<RecordBatch, E>>,
+    E: Into<anyhow::Error>,
+{
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let reader = self.inner.as_mut()?;
+        match catch_unwind(AssertUnwindSafe(|| reader.next())) {
+            Ok(item) => item.map(|batch| batch.map_err(Into::into)),
+            Err(payload) => {
+                self.inner = None;
+                Some(Err(anyhow!(
+                    "malformed Parquet data: {}",
+                    panic_message(&*payload)
+                )))
+            }
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("decoder panicked")
+}
+
 pub struct ParquetSource {
     path: PathBuf,
     file_info: std::fs::Metadata,
@@ -51,7 +120,7 @@ impl ParquetSource {
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let file_info = file.metadata().context("read file properties")?;
-        let arrow_metadata = ArrowReaderMetadata::load(&file, Default::default())
+        let arrow_metadata = load_arrow_metadata(&file)
             .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
         let schema = arrow_metadata.schema().clone();
         let metadata = arrow_metadata.metadata().clone();
@@ -647,7 +716,7 @@ impl ParquetSource {
         projection: &Projection,
         row_groups: Vec<usize>,
         selection: Option<RowSelection>,
-    ) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
+    ) -> Result<GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
         let file =
             File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
         let builder =
@@ -663,7 +732,7 @@ impl ParquetSource {
             builder = builder.with_row_selection(selection);
         }
 
-        Ok(builder.build()?)
+        Ok(GuardedReader::new(builder.build()?))
     }
 
     fn row_group_might_match(
@@ -691,14 +760,16 @@ impl ParquetSource {
     fn concat_or_empty(
         &self,
         projection: &Projection,
-        batches: Vec<RecordBatch>,
+        mut batches: Vec<RecordBatch>,
     ) -> Result<RecordBatch> {
         if batches.is_empty() {
             return Ok(self.empty_batch(projection));
         }
 
-        if batches.len() == 1 {
-            return Ok(batches.into_iter().next().unwrap());
+        if batches.len() == 1
+            && let Some(batch) = batches.pop()
+        {
+            return Ok(batch);
         }
 
         Ok(concat_batches(&batches[0].schema(), &batches)?)
@@ -1610,6 +1681,104 @@ mod tests {
 
         writer.close().unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn decoder_panics_become_errors_and_stop_the_reader() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef],
+        )
+        .unwrap();
+        let mut calls = 0;
+        let decoder = std::iter::from_fn(move || {
+            calls += 1;
+            match calls {
+                1 => Some(Ok::<_, anyhow::Error>(batch.clone())),
+                2 => panic!("Decoder for dict should have been set"),
+                _ => Some(Ok(batch.clone())),
+            }
+        });
+        let mut reader = GuardedReader::new(decoder);
+
+        assert_eq!(reader.next().unwrap().unwrap().num_rows(), 2);
+        let error = reader.next().unwrap().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "malformed Parquet data: Decoder for dict should have been set"
+        );
+        assert!(
+            reader.next().is_none(),
+            "a panicked decoder is not polled again"
+        );
+    }
+
+    /// Regression for a `parquet_file` fuzz crash: arrow-ipc panics on an embedded Arrow
+    /// schema whose integer width is invalid ("Int type with bit width of 524288").
+    #[test]
+    fn opens_files_whose_embedded_arrow_schema_is_corrupt() {
+        use arrow_array::Int16Array;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hint.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int16, false)]));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        let values: ArrayRef = Arc::new(Int16Array::from(vec![1, 2, 3]));
+        writer
+            .write(&RecordBatch::try_new(schema, vec![values]).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let metadata =
+            ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                .unwrap();
+        let hint = metadata
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.key == "ARROW:schema")
+            .and_then(|entry| entry.value.clone())
+            .unwrap();
+        let ipc = STANDARD.decode(&hint).unwrap();
+        let hint_at = original
+            .windows(hint.len())
+            .position(|window| window == hint.as_bytes())
+            .unwrap();
+
+        // Set the Int16 column's bit width to the value the fuzzer found. The hint keeps its
+        // byte length, so the footer stays valid. Keep the patch that makes arrow-ipc panic.
+        let triggers_bug = (0..ipc.len().saturating_sub(3))
+            .filter(|&at| ipc[at..at + 4] == 16_i32.to_le_bytes())
+            .any(|at| {
+                let mut forged = ipc.clone();
+                forged[at..at + 4].copy_from_slice(&524_288_i32.to_le_bytes());
+                let mut bytes = original.clone();
+                bytes[hint_at..hint_at + hint.len()]
+                    .copy_from_slice(STANDARD.encode(&forged).as_bytes());
+                std::fs::write(&path, &bytes).unwrap();
+                catch_unwind(|| {
+                    ArrowReaderMetadata::load(
+                        &File::open(&path).unwrap(),
+                        ArrowReaderOptions::new(),
+                    )
+                })
+                .is_err()
+            });
+        assert!(
+            triggers_bug,
+            "arrow-ipc no longer panics on this hint; load_arrow_metadata's fallback may be removable"
+        );
+
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(source.schema().field(0).data_type(), &DataType::Int16);
+        let batch = source.read_window(0, 3, &Projection::all(1)).unwrap();
+        assert_eq!(batch.num_rows(), 3);
     }
 
     #[test]
