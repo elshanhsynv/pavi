@@ -1,0 +1,103 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds PAVI for Windows and publishes a GitHub Release.
+# See docs/RELEASING.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag matches the workspace version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "pavi") | .version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+      - name: Changelog has a section for this version
+        run: grep -q "^## \[${GITHUB_REF_NAME#v}\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"; exit 1; }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-targets --locked
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  windows:
+    name: Build and publish (Windows x64)
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      # Signing turns on when both secrets exist (docs/RELEASING.md).
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX != '' && secrets.WINDOWS_CERT_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo build --release --locked -p pavi -p cli
+
+      - name: Sign executables
+        if: env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:CERT_PASSWORD `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            target\release\pavi.exe target\release\cli.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item $pfx
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v")
+          $name = "pavi-$version-windows-x64"
+          New-Item -ItemType Directory -Force dist\$name | Out-Null
+          Copy-Item target\release\pavi.exe, target\release\cli.exe, README.md, CHANGELOG.md dist\$name
+          Compress-Archive -Path dist\$name\* -DestinationPath dist\$name.zip -Force
+          $hash = (Get-FileHash dist\$name.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii dist\$name.zip.sha256
+          "ASSET=dist\$name.zip" >> $env:GITHUB_ENV
+
+      - name: Release notes from CHANGELOG
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v")
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String -Pattern "^## \[$([regex]::Escape($version))\]").LineNumber
+          $rest = $lines[$start..($lines.Count - 1)]
+          $end = ($rest | Select-String -Pattern "^## \[|^\[[^\]]+\]: " | Select-Object -First 1).LineNumber
+          if ($end) { $rest = $rest[0..($end - 2)] }
+          $notes = ($rest -join "`n").Trim()
+          if ($env:HAS_CERT -ne "true") { $notes += "`n`n> Unsigned build: Windows SmartScreen may warn on first launch." }
+          $notes | Out-File -Encoding utf8 dist\notes.md
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME $env:ASSET "$env:ASSET.sha256" `
+            --title "PAVI $env:GITHUB_REF_NAME" --notes-file dist\notes.md --verify-tag

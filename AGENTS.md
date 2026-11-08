@@ -57,6 +57,7 @@ Dependencies point down only: app → query → runtime → parquet_reader.
 | Tests | `docs/TESTING.md` |
 | Parsers, file reading, untrusted input | `docs/FUZZING.md` |
 | Untrusted input, dependencies | `SECURITY.md` |
+| Versions, CHANGELOG, publishing a release | `docs/RELEASING.md` |
 | "Why is it like this?" | `docs/decisions/` |
 
 ## Skills
@@ -75,6 +76,7 @@ A decision that reverses an ADR needs a new ADR. Stale docs are worse than none.
 ## Workflow
 
 - Branch from `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`); never commit directly to `main`.
+- Add a line under `## [Unreleased]` in `CHANGELOG.md` for user-visible changes.
 - Commit messages: imperative summary line describing the user-visible effect (e.g. "Resume filtered scans from a cursor").
 - For changes to reading, runtime, query or grid code, include before/after `pavi_bench` numbers in the PR (the `perf-check` skill).
 
