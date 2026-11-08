@@ -11,8 +11,8 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Shape.** A layered Cargo workspace: `parquet_reader` (all Arrow/Parquet I/O, filter, sort, aggregate, cell formatting) → `pavi_runtime` (fixed std-thread worker pool with bounded channels) → `pavi_query` (SQL parser → logical plan → flattened physical plan → incremental execution) → `pavi` (GUI). The CLI uses **only** `parquet_reader`, synchronously.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
-- **The main pattern** is a single "God struct" `PaviApp` (`crates/app/src/app.rs:292-327`) with ~35 fields; the `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (183 tests: parquet_reader 57, pavi 83, pavi_query 33, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **The main pattern** is one central `PaviApp` (`crates/app/src/app.rs`) that coordinates the app and delegates self-contained state to its own types: `SourcePages` (page reads and cache, `pages.rs`), `FilteredGrid` (result window, `results.rs`), `ChartState`, `ProfileState` and `ExportState`. The `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (183 tests: parquet_reader 57, pavi 83, pavi_query 33, pavi_runtime 9, cli 1), using the Rust version pinned in `rust-toolchain.toml` (1.99.1). No logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -54,7 +54,7 @@ PAVI opens a single local Parquet file, reads only its footer metadata up front 
 
 | Area | What's used | Where |
 |---|---|---|
-| Language | Rust **edition 2024** in every crate; no `rust-version`/MSRV declared, no `rust-toolchain.toml`. Code uses let-chains (`if let … && let …`), which need **Rust ≥ 1.88**. Built here with rustc 1.97.1. | all `crates/*/Cargo.toml` |
+| Language | Rust **edition 2024** in every crate. The toolchain is pinned to **1.99.1** with rustfmt and clippy in `rust-toolchain.toml`, used locally and by CI. No `rust-version`/MSRV is declared; the code uses let-chains, which need Rust ≥ 1.88. | `rust-toolchain.toml`, `crates/*/Cargo.toml` |
 | GUI | `eframe 0.31.1` with default features → **glow** (OpenGL) renderer, winit, accesskit. **No `persistence` feature.** `egui_extras 0.31` (`TableBuilder`) for the grid. No `egui_plot` — charts are hand-painted. | `Cargo.toml`, `crates/app/Cargo.toml` |
 | Dialogs | `rfd 0.15` synchronous `FileDialog` (open/save) | `app.rs:444`, `app.rs:855`, `ui/toolbar.rs:115` |
 | Clipboard | egui's `ctx.copy_text` (no extra crate) | `app.rs:1745`, `ui/inspector.rs:66,127` |
@@ -117,12 +117,14 @@ crates/query/src/              (pavi_query)
 
 crates/app/src/                (pavi)
 ├── main.rs         NativeOptions + eframe::run_native
-├── app.rs          PaviApp (God struct) + Dataset, FilteredGrid, ChartState, ProfileState; all actions & polling
+├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
+├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
+├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
 ├── app_tests.rs    33 tests driving PaviApp without a window
 ├── state.rs        GridState, ColumnLayout, SelectionRange, LoadState, Workspace, ToolbarCommand
-├── export.rs       ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
-├── profile.rs      ProfileTask (own thread), ProfileAccumulator
-├── chart.rs        ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning)
+├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
+├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator
+├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning)
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
 ├── session.rs      SessionState (serde), SessionStore (JSON at %LOCALAPPDATA%\PAVI\session-v1.json)
 └── ui/             (mounted via #[path = "ui/mod.rs"] inside app.rs; every file is `impl PaviApp`)
@@ -149,7 +151,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 
 ## 3. Layered architecture
 
-**Pattern actually used:** layered library crates underneath, and a **single God-struct App with direct mutation** on top. UI code calls `PaviApp` methods (`begin_open`, `apply_filter`, `run_sql`, `toggle_sort`, `start_export`, …) inline from inside rendering closures. The only "command"-like enum is `ToolbarCommand`, used solely to compute button enablement (`state.rs:13-40`), not to dispatch actions. Asynchronous work follows a consistent *submit task → keep receiver in a field → poll every frame → check generation* pattern.
+**Pattern actually used:** layered library crates underneath, and a **central `PaviApp` with direct mutation** on top, which delegates page loading, the result window, charts, profiling and export to their own state types. UI code calls `PaviApp` methods (`begin_open`, `apply_filter`, `run_sql`, `toggle_sort`, `start_export`, …) inline from inside rendering closures. The only "command"-like enum is `ToolbarCommand`, used solely to compute button enablement (`state.rs:13-40`), not to dispatch actions. Asynchronous work follows a consistent *submit task → keep receiver in a field → poll every frame → check generation* pattern.
 
 ### Entry / shell
 
@@ -177,12 +179,13 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 
 | Type | Holds | Ref |
 |---|---|---|
-| `PaviApp` | runtime, dataset, open task, `pending_pages: HashMap<u64, PageTask>`, `pages: HashMap<u64, DataPage>` + `page_order` (LRU ≤8), `filtered: Option<FilteredGrid>`, column layout, export/chart/profile state, text inputs, session, UI toggles, status string | `app.rs:292-327` |
+| `PaviApp` | runtime, dataset, open task, `pages: SourcePages`, `filtered: Option<FilteredGrid>`, column layout, grid window offsets, `export: ExportState`, chart/profile state, text inputs, session, UI toggles, status string | `app.rs` |
+| `SourcePages` | page reads in flight, loaded pages (LRU ≤8), this frame's requests and drawn page range; `poll`, `track`, `cancel_offscreen`, `clear` | `pages.rs` |
 | `Dataset` | `Arc<ParquetSource>`, path, column names | `app.rs:45-49` |
 | `GridState` | generation, `first_row` (absolute index of the first row in a slid result window), row/column counts, load state, requested/loaded page sets, selection (absolute rows) | `state.rs:198-319` |
-| `FilteredGrid` | query kind, `LogicalPlan`, running `QueryExecution`, sliding `VecDeque<RecordBatch>` (≤8), `first_result`, `rows`, `target_result` | `app.rs:76-169` |
+| `FilteredGrid` | query kind, `LogicalPlan`, running `QueryExecution`, sliding `VecDeque<RecordBatch>` (≤8), `first_result`, `rows`, `target_result` | `results.rs` |
 | `ColumnLayout` | display order, hidden set, widths (72–480 px) | `state.rs:72-196` |
-| `ChartState`, `ProfileState` | own generation, running execution/task, result, error | `app.rs:186-290` |
+| `ChartState`, `ProfileState`, `ExportState` | own generation, running execution/task, result, error. `ExportState` also drops events from replaced exports and turns events into status text | `chart.rs`, `profile.rs`, `export.rs` |
 | `SessionState` | recent files (≤12), last file, SQL input, history (≤50 / 256 KB), inspector/chart visibility, per-schema grid layouts (≤8) | `session.rs:46-53` |
 
 State changes happen by direct method calls. Every "restart" (open, filter, SQL, sort, clear) bumps `GridState.generation` via `GridState::reset()` (`state.rs:214-224`) so late responses are ignored.
@@ -277,7 +280,7 @@ sequenceDiagram
 2. For each visible row: `grid.visible_pages()` → `request_page(page)` (`app.rs:1286-1322`). `GridState::request_page` dedupes via `requested`/`loaded` sets. The projection is the **currently visible columns** in display order. `submit_page` → worker.
 3. Each visible cell calls `cell_text` (`app.rs:1324-1345`), which also prefetches the next page when the row is a page boundary, then formats the value with `format_cell_with_limit(…, 256)` **every frame** — or shows `…` if the page isn't loaded.
 4. Worker: `read_page` checks the source `PageCache` (mutex held only for lookup/insert), else `read_window_batches` decodes rows `[i·4096, (i+1)·4096)` from overlapping row groups using `RowSelection::skip/select`.
-5. `poll_pages` (`app.rs:738-781`) `try_recv`s each pending task; `insert_page` keeps ≤8 pages, evicting oldest and un-marking it as loaded so it will be re-requested.
+5. `SourcePages::poll` (`pages.rs`) `try_recv`s each pending task and keeps ≤8 loaded pages, evicting the oldest and un-marking it as loaded so it will be re-requested.
 6. Jump-to-row (`ui/dataset_bar.rs`) and keyboard navigation (`ui/grid.rs`) also call `request_page`. Jumps use `scroll_to_row`; in windowed grids they instead move the window around the target and set the scroll offset directly, which applies in the same frame.
 
 **Memory:** ≤8 UI pages × 4,096 rows × visible columns, plus ≤8 pages / 128 MB in the source cache (often the same pages → double retention of `Arc`'d arrays, mostly shared buffers).
@@ -302,7 +305,7 @@ sequenceDiagram
         W->>C: insert(DataPage)
     end
     W-->>A: PageOutcome::Loaded(page)
-    A->>A: poll_pages → insert_page (LRU ≤ 8)
+    A->>A: SourcePages::poll → cache page (LRU ≤ 8)
     G->>A: cell_text(row, col) → format_cell_with_limit (every frame)
 ```
 
@@ -486,7 +489,7 @@ All of it runs on the main thread; memory is ≤1,000 rows of the projected colu
 ### What `update()` does every frame (`app.rs:1780-1831`)
 
 1. Apply theme once; `handle_global_shortcuts` (may open a blocking rfd dialog on Ctrl+O).
-2. Poll: `poll_open`, `poll_pages` (iterates all pending page tasks), `poll_filtered` (drains available batches), `poll_chart`, `poll_profile`, `poll_export`. All are `try_recv` — no blocking waits.
+2. Poll: `poll_open`, `SourcePages::poll` (iterates all pending page tasks), `poll_filtered` (drains available batches), `poll_chart`, `poll_profile`, `poll_export`. All are `try_recv` — no blocking waits.
 3. Draw top bar, chart window, status bar, inspector, tools window, central grid/SQL workspace.
 4. If anything is pending → `request_repaint_after(16 ms)`.
 

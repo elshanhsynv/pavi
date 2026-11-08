@@ -2,7 +2,6 @@
 mod ui;
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,20 +10,20 @@ use std::{
 use eframe::egui::{self, Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use parquet_reader::{
-    DataPage, NullOrder, ParquetSource, Projection, SortDirection, SortSpec,
-    value::format_cell_with_limit,
+    NullOrder, ParquetSource, Projection, SortDirection, value::format_cell_with_limit,
 };
-use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryExecution, QueryPoll, SqlAst};
-use pavi_runtime::{
-    GenerationId, OpenOutcome, OpenTask, PageOutcome, PageTask, Runtime, RuntimeConfig,
-};
+use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryPoll, SqlAst};
+use pavi_runtime::{GenerationId, OpenOutcome, OpenTask, Runtime, RuntimeConfig};
 
 use crate::chart::{
-    ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartValues, MAX_INPUT_ROWS,
+    ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartSource, ChartState, ChartValues,
+    MAX_INPUT_ROWS,
 };
-use crate::export::{ExportEvent, ExportFormat, ExportInput, ExportTask};
+use crate::export::{ExportFormat, ExportInput, ExportState, ExportTask};
 use crate::inspector::{CellDetails, column_summary, inspect_cell, nested_schema_preview};
-use crate::profile::{ColumnProfile, ProfileEvent, ProfileTask};
+use crate::pages::SourcePages;
+use crate::profile::{ProfileEvent, ProfileState, ProfileTask};
+use crate::results::{FilteredGrid, QueryKind};
 use crate::session::{GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore};
 use crate::state::{
     ColumnLayout, GridState, LoadState, ToolbarAvailability, ToolbarCommand, Workspace,
@@ -33,8 +32,6 @@ use crate::state::{
 const ROW_HEIGHT: f32 = 28.0;
 const ROW_NUMBER_WIDTH: f32 = 58.0;
 const INITIAL_COLUMN_WIDTH: f32 = 110.0;
-const MAX_UI_PAGES: usize = 8;
-const MAX_FILTERED_BATCHES: usize = 8;
 const CELL_LIMIT: usize = 256;
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 
@@ -48,247 +45,6 @@ struct Dataset {
     column_names: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QueryKind {
-    Filter,
-    Sql,
-    Sort,
-}
-
-impl QueryKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Filter => "Filter",
-            Self::Sql => "SQL",
-            Self::Sort => "Sorted",
-        }
-    }
-
-    fn empty_message(self) -> &'static str {
-        match self {
-            Self::Filter => "No rows match the filter.",
-            Self::Sql => "The query returned no rows.",
-            Self::Sort => "The dataset has no rows.",
-        }
-    }
-}
-
-struct FilteredGrid {
-    kind: QueryKind,
-    plan: LogicalPlan,
-    sort: Option<SortSpec>,
-    aggregate: bool,
-    projected_columns: Vec<usize>,
-    display_columns: Vec<(usize, usize)>,
-    execution: Option<QueryExecution>,
-    batches: VecDeque<arrow_array::RecordBatch>,
-    first_result: u64,
-    rows: u64,
-    target_result: u64,
-    finished: bool,
-    error: Option<String>,
-}
-
-impl FilteredGrid {
-    fn new(
-        kind: QueryKind,
-        plan: LogicalPlan,
-        sort: Option<SortSpec>,
-        aggregate: bool,
-        projected_columns: Vec<usize>,
-        execution: QueryExecution,
-    ) -> Self {
-        Self {
-            kind,
-            plan,
-            sort,
-            aggregate,
-            projected_columns,
-            display_columns: Vec::new(),
-            execution: Some(execution),
-            batches: VecDeque::new(),
-            first_result: 0,
-            rows: 0,
-            target_result: parquet_reader::PAGE_ROWS,
-            finished: false,
-            error: None,
-        }
-    }
-
-    fn received_rows(&self) -> u64 {
-        self.first_result.saturating_add(self.rows)
-    }
-
-    fn needs_more(&self) -> bool {
-        !self.finished && self.received_rows() < self.target_result
-    }
-
-    fn request_more(&mut self) {
-        self.target_result = self.target_result.max(
-            self.received_rows()
-                .saturating_add(parquet_reader::PAGE_ROWS),
-        );
-    }
-
-    fn push(&mut self, batch: arrow_array::RecordBatch) {
-        self.rows = self.rows.saturating_add(batch.num_rows() as u64);
-        self.batches.push_back(batch);
-        while self.batches.len() > MAX_FILTERED_BATCHES {
-            if let Some(batch) = self.batches.pop_front() {
-                let rows = batch.num_rows() as u64;
-                self.first_result = self.first_result.saturating_add(rows);
-                self.rows = self.rows.saturating_sub(rows);
-            }
-        }
-    }
-
-    fn cancel(&mut self) {
-        if let Some(execution) = &mut self.execution {
-            execution.cancel();
-        }
-    }
-
-    fn refresh_display_columns(&mut self, layout: &ColumnLayout) {
-        self.display_columns = if self.aggregate {
-            (0..self.projected_columns.len())
-                .map(|column| (column, column))
-                .collect()
-        } else {
-            layout
-                .visible()
-                .iter()
-                .filter_map(|source| {
-                    self.projected_columns
-                        .iter()
-                        .position(|column| column == source)
-                        .map(|batch| (*source, batch))
-                })
-                .collect()
-        };
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ChartSource {
-    Sql,
-    CurrentResult,
-}
-
-impl ChartSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Sql => "Chart SQL",
-            Self::CurrentResult => "Current result window",
-        }
-    }
-}
-
-struct ChartState {
-    visible: bool,
-    source: ChartSource,
-    sql_input: String,
-    config: ChartConfig,
-    generation: GenerationId,
-    execution: Option<QueryExecution>,
-    accumulator: Option<ChartAccumulator>,
-    model: Option<ChartModel>,
-    error: Option<String>,
-    status: String,
-}
-
-struct ProfileState {
-    generation: GenerationId,
-    task: Option<ProfileTask>,
-    column: Option<usize>,
-    result: Option<ColumnProfile>,
-    error: Option<String>,
-    status: String,
-}
-
-impl Default for ProfileState {
-    fn default() -> Self {
-        Self {
-            generation: GenerationId(0),
-            task: None,
-            column: None,
-            result: None,
-            error: None,
-            status: "Select a source column to profile".to_string(),
-        }
-    }
-}
-
-impl ProfileState {
-    fn loading(&self) -> bool {
-        self.task.is_some()
-    }
-
-    fn cancel(&mut self) {
-        if let Some(task) = &self.task {
-            task.cancel();
-        }
-        self.task = None;
-    }
-
-    fn reset(&mut self) {
-        self.cancel();
-        self.generation = GenerationId(self.generation.0.saturating_add(1));
-        self.column = None;
-        self.result = None;
-        self.error = None;
-        self.status = "Dataset changed; profile cleared".to_string();
-    }
-
-    fn next_generation(&mut self) -> GenerationId {
-        self.generation = GenerationId(self.generation.0.saturating_add(1));
-        self.generation
-    }
-}
-
-impl Default for ChartState {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            source: ChartSource::Sql,
-            sql_input: "SELECT * FROM dataset".to_string(),
-            config: ChartConfig::default(),
-            generation: GenerationId(0),
-            execution: None,
-            accumulator: None,
-            model: None,
-            error: None,
-            status: "Choose a chart source and columns".to_string(),
-        }
-    }
-}
-
-impl ChartState {
-    fn loading(&self) -> bool {
-        self.execution.is_some()
-    }
-
-    fn cancel(&mut self) {
-        if let Some(execution) = &mut self.execution {
-            execution.cancel();
-        }
-        self.execution = None;
-        self.accumulator = None;
-    }
-
-    fn reset(&mut self) {
-        self.cancel();
-        self.generation = GenerationId(self.generation.0.saturating_add(1));
-        self.model = None;
-        self.error = None;
-        self.status = "Dataset changed; chart results were cleared".to_string();
-    }
-
-    fn next_generation(&mut self) -> GenerationId {
-        self.generation = GenerationId(self.generation.0.saturating_add(1));
-        self.generation
-    }
-}
-
 pub(crate) struct PaviApp {
     runtime: Option<Runtime>,
     grid: GridState,
@@ -296,24 +52,18 @@ pub(crate) struct PaviApp {
     opening: Option<OpenTask>,
     /// The path submitted with `opening`; the path box may be edited while it loads.
     opening_path: Option<PathBuf>,
-    pending_pages: HashMap<u64, PageTask>,
-    /// Pages submitted during the current frame; never cancelled as off-screen.
-    frame_page_requests: BTreeSet<u64>,
-    /// First and last page the source grid drew this frame.
-    visible_page_range: Option<(u64, u64)>,
+    /// Source-grid page reads and the small cache of loaded pages.
+    pages: SourcePages,
     /// First and last absolute row the source grid drew this frame.
     drawn_rows: Option<(u64, u64)>,
     /// Vertical offset to apply to the source grid's table on the next frame.
     grid_scroll_offset: Option<f32>,
-    pages: HashMap<u64, DataPage>,
-    page_order: VecDeque<u64>,
     filtered: Option<FilteredGrid>,
     column_layout: ColumnLayout,
     column_search: String,
     jump_row_input: String,
     jump_target: Option<u64>,
-    export: Option<ExportTask>,
-    export_generation: GenerationId,
+    export: ExportState,
     path_input: String,
     filter_input: String,
     filter_error: Option<String>,
@@ -361,20 +111,15 @@ impl PaviApp {
             dataset: None,
             opening: None,
             opening_path: None,
-            pending_pages: HashMap::new(),
-            frame_page_requests: BTreeSet::new(),
-            visible_page_range: None,
+            pages: SourcePages::default(),
             drawn_rows: None,
             grid_scroll_offset: None,
-            pages: HashMap::new(),
-            page_order: VecDeque::new(),
             filtered: None,
             column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
             column_search: String::new(),
             jump_row_input: String::new(),
             jump_target: None,
-            export: None,
-            export_generation: GenerationId(0),
+            export: ExportState::default(),
             path_input: reopened_path
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string()),
@@ -429,7 +174,7 @@ impl PaviApp {
     fn active_task_label(&self) -> Option<&'static str> {
         if self.opening.is_some() {
             Some("Opening")
-        } else if self.export.is_some() {
+        } else if self.export.is_running() {
             Some("Exporting")
         } else if self.chart.loading() {
             Some("Building chart")
@@ -437,7 +182,7 @@ impl PaviApp {
             Some("Profiling")
         } else if self.running_sql.is_some() {
             Some("Running SQL")
-        } else if !self.pending_pages.is_empty() {
+        } else if self.pages.is_loading() {
             Some("Loading pages")
         } else {
             None
@@ -630,7 +375,7 @@ impl PaviApp {
             let Some(position) = self.column_layout.display_for_source(source) else {
                 return;
             };
-            for page in self.pages.values() {
+            for page in self.pages.loaded() {
                 for batch in &page.batches {
                     measure(batch, position);
                 }
@@ -755,66 +500,6 @@ impl PaviApp {
         }
     }
 
-    fn poll_pages(&mut self) {
-        if self.filtered.is_some() {
-            return;
-        }
-        let mut completed = Vec::new();
-        for (&page, task) in &self.pending_pages {
-            match task.try_recv() {
-                Ok(response) => completed.push((page, Ok(response))),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    completed.push((page, Err("background page worker stopped".to_string())))
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            }
-        }
-
-        for (page_index, result) in completed {
-            self.pending_pages.remove(&page_index);
-            match result {
-                Ok(response) if response.generation_id != self.grid.generation => {}
-                Ok(response) => match response.outcome {
-                    PageOutcome::Loaded(page)
-                        if self.grid.accept_page(response.generation_id, page_index) =>
-                    {
-                        self.insert_page(page_index, page);
-                    }
-                    PageOutcome::Cancelled => {
-                        self.grid.requested.remove(&page_index);
-                    }
-                    PageOutcome::ReadFailed(error) => {
-                        self.grid.requested.remove(&page_index);
-                        self.status = format!("load page {page_index}: {error:#}");
-                    }
-                    PageOutcome::Batch(_)
-                    | PageOutcome::Batches(_)
-                    | PageOutcome::Filtered(_)
-                    | PageOutcome::Loaded(_) => {
-                        self.grid.requested.remove(&page_index);
-                        self.status = format!("unexpected response for page {page_index}");
-                    }
-                },
-                Err(error) => {
-                    self.grid.requested.remove(&page_index);
-                    self.status = error;
-                }
-            }
-        }
-    }
-
-    fn insert_page(&mut self, page_index: u64, page: DataPage) {
-        self.pages.insert(page_index, page);
-        self.page_order.retain(|index| *index != page_index);
-        self.page_order.push_back(page_index);
-        while self.page_order.len() > MAX_UI_PAGES {
-            if let Some(oldest) = self.page_order.pop_front() {
-                self.pages.remove(&oldest);
-                self.grid.loaded.remove(&oldest);
-            }
-        }
-    }
-
     /// Records an absolute row the source grid drew this frame.
     fn note_drawn_row(&mut self, row: u64) {
         self.drawn_rows = Some(match self.drawn_rows {
@@ -837,58 +522,15 @@ impl PaviApp {
         self.move_grid_window(base, top, header_rows);
     }
 
-    /// Records a page the source grid drew this frame.
-    fn note_visible_page(&mut self, page: u64) {
-        self.visible_page_range = Some(match self.visible_page_range {
-            Some((first, last)) => (first.min(page), last.max(page)),
-            None => (page, page),
-        });
-    }
-
-    /// Cancels pending page reads more than one page away from what the grid drew
-    /// this frame, so fast scrolling doesn't fill the runtime queue with pages that
-    /// are no longer needed. Pages requested this frame (e.g. a jump target) are kept,
-    /// and cancelled pages are requested again if they scroll back into view.
-    fn cancel_offscreen_pages(&mut self) {
-        let Some((first, last)) = self.visible_page_range.take() else {
-            return;
-        };
-        let keep = first.saturating_sub(1)..=last.saturating_add(1);
-        let offscreen = self
-            .pending_pages
-            .keys()
-            .copied()
-            .filter(|page| !keep.contains(page) && !self.frame_page_requests.contains(page))
-            .collect::<Vec<_>>();
-        for page in offscreen {
-            if let Some(task) = self.pending_pages.remove(&page) {
-                task.cancel();
-            }
-            self.grid.requested.remove(&page);
-        }
-    }
-
+    /// Cancels every page read and drops every loaded page.
     fn cancel_page_work(&mut self) {
-        for task in self.pending_pages.values() {
-            task.cancel();
-        }
-        self.pending_pages.clear();
         self.pages.clear();
-        self.page_order.clear();
-    }
-
-    fn next_export_generation(&mut self) -> GenerationId {
-        self.export_generation = GenerationId(self.export_generation.0.saturating_add(1));
-        self.export_generation
     }
 
     fn cancel_export(&mut self) {
-        if let Some(task) = &self.export {
-            task.cancel();
+        if self.export.cancel() {
             self.status = "Export cancelled".to_string();
         }
-        self.export = None;
-        self.next_export_generation();
     }
 
     fn export_input(&self, selected: bool) -> anyhow::Result<ExportInput> {
@@ -950,60 +592,18 @@ impl PaviApp {
             self.status = "Export: background runtime is unavailable".to_string();
             return;
         };
-        self.cancel_export();
-        let generation = self.next_export_generation();
-        match ExportTask::start(input, path, format, runtime, generation) {
-            Ok(task) => {
-                self.export = Some(task);
-                self.status = format!("Exporting {}…", format.label());
-            }
+        match self
+            .export
+            .start(|generation| ExportTask::start(input, path, format, runtime, generation))
+        {
+            Ok(()) => self.status = format!("Exporting {}…", format.label()),
             Err(error) => self.status = format!("Start export: {error}"),
         }
     }
 
     fn poll_export(&mut self) {
-        let Some(task) = &self.export else {
-            return;
-        };
-        let event = match task.try_recv() {
-            Ok(Some(event)) => event,
-            Ok(None) => return,
-            Err(error) => {
-                self.export = None;
-                self.status = format!("Export: {error:#}");
-                return;
-            }
-        };
-        let generation = match &event {
-            ExportEvent::Progress { generation, .. }
-            | ExportEvent::Finished { generation, .. }
-            | ExportEvent::Cancelled { generation }
-            | ExportEvent::Failed { generation, .. } => *generation,
-        };
-        if generation != self.export_generation {
-            return;
-        }
-        match event {
-            ExportEvent::Progress { rows, .. } => {
-                self.status = format!("Exporting: {rows} rows written");
-            }
-            ExportEvent::Finished { rows, .. } => {
-                let path = self
-                    .export
-                    .as_ref()
-                    .map(|task| task.path().display().to_string())
-                    .unwrap_or_default();
-                self.export = None;
-                self.status = format!("Export complete: {rows} rows written to {path}");
-            }
-            ExportEvent::Cancelled { .. } => {
-                self.export = None;
-                self.status = "Export cancelled".to_string();
-            }
-            ExportEvent::Failed { error, .. } => {
-                self.export = None;
-                self.status = format!("Export failed: {error}");
-            }
+        if let Some(status) = self.export.poll() {
+            self.status = status;
         }
     }
 
@@ -1389,8 +989,7 @@ impl PaviApp {
             self.grid.generation,
         ) {
             Ok(task) => {
-                self.pending_pages.insert(page_index, task);
-                self.frame_page_requests.insert(page_index);
+                self.pages.track(page_index, task);
             }
             Err(error) => {
                 self.grid.requested.remove(&page_index);
@@ -1407,7 +1006,7 @@ impl PaviApp {
         {
             self.request_page(page_index.saturating_add(1));
         }
-        let page = self.pages.get(&page_index)?;
+        let page = self.pages.get(page_index)?;
         let mut offset = (row - page.window.first_row) as usize;
         for batch in &page.batches {
             if offset < batch.num_rows() {
@@ -1659,7 +1258,7 @@ impl PaviApp {
         }
 
         let page_index = self.grid.page_for_row(row)?;
-        let page = self.pages.get(&page_index)?;
+        let page = self.pages.get(page_index)?;
         let mut batch_offset = (row - page.window.first_row) as usize;
         for batch in &page.batches {
             if batch_offset < batch.num_rows() {
@@ -1712,7 +1311,7 @@ impl PaviApp {
             }
             return None;
         }
-        let page = self.pages.get(&self.grid.page_for_row(selected_row)?)?;
+        let page = self.pages.get(self.grid.page_for_row(selected_row)?)?;
         let mut row = (selected_row - page.window.first_row) as usize;
         for batch in &page.batches {
             if row < batch.num_rows() {
@@ -1860,10 +1459,14 @@ impl eframe::App for PaviApp {
             ui::theme::apply(ctx);
             self.ui_initialized = true;
         }
-        self.frame_page_requests.clear();
+        self.pages.begin_frame();
         self.handle_global_shortcuts(ctx);
         self.poll_open();
-        self.poll_pages();
+        if self.filtered.is_none()
+            && let Some(status) = self.pages.poll(&mut self.grid)
+        {
+            self.status = status;
+        }
         self.poll_filtered();
         self.poll_chart();
         self.poll_profile();
@@ -1879,7 +1482,7 @@ impl eframe::App for PaviApp {
                     || self.filter_error.is_some()
                     || self.sql_error.is_some(),
                 selection: self.grid.selection,
-                cached_pages: self.pages.len(),
+                cached_pages: self.pages.loaded_count(),
                 rows: self.grid.rows,
                 path: self.dataset.as_ref().map(|dataset| dataset.path.as_path()),
                 columns: self.dataset.as_ref().map(|_| self.grid.columns),
@@ -1899,11 +1502,11 @@ impl eframe::App for PaviApp {
             });
 
         if self.opening.is_some()
-            || !self.pending_pages.is_empty()
+            || self.pages.is_loading()
             || self.filtered.as_ref().is_some_and(FilteredGrid::needs_more)
             || self.chart.loading()
             || self.profile.loading()
-            || self.export.is_some()
+            || self.export.is_running()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
         }

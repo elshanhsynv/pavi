@@ -6,6 +6,9 @@ use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use tempfile::TempDir;
 
 use crate::chart::DEFAULT_POINT_LIMIT;
+use crate::results::MAX_FILTERED_BATCHES;
+use parquet_reader::SortSpec;
+use pavi_query::QueryExecution;
 
 use super::*;
 
@@ -104,7 +107,7 @@ fn desktop_layout_keeps_grid_selection_jump_and_workspace_actions_connected() {
     let output = render(&mut app, 1448.0, vec![]);
     render(&mut app, 1448.0, click_text(&output, "Freeze Header"));
     assert!(!app.freeze_header);
-    assert!(app.pages.len() <= MAX_UI_PAGES);
+    assert!(app.pages.loaded_count() <= crate::pages::MAX_LOADED_PAGES);
     app.sql_input = "SELECT id, name FROM dataset LIMIT 5".into();
     app.run_sql();
     poll_until_idle(&mut app);
@@ -201,8 +204,8 @@ fn poll_until_opened(app: &mut PaviApp) {
 
 fn poll_until_page_loaded(app: &mut PaviApp, page: u64) {
     for _ in 0..1_000 {
-        app.poll_pages();
-        if app.pages.contains_key(&page) {
+        let _ = app.pages.poll(&mut app.grid);
+        if app.pages.get(page).is_some() {
             return;
         }
         thread::sleep(Duration::from_millis(1));
@@ -464,12 +467,14 @@ fn cancels_pending_page_reads_that_scrolled_out_of_view() {
     }
 
     // A later frame in which the grid drew only page 9.
-    app.frame_page_requests.clear();
-    app.note_visible_page(9);
-    app.cancel_offscreen_pages();
-    let mut pending = app.pending_pages.keys().copied().collect::<Vec<_>>();
-    pending.sort_unstable();
-    assert_eq!(pending, [8, 9], "keeps one page of margin");
+    app.pages.begin_frame();
+    app.pages.note_visible(9);
+    app.pages.cancel_offscreen(&mut app.grid);
+    assert_eq!(
+        app.pages.pending_pages(),
+        [8, 9],
+        "keeps one page of margin"
+    );
     assert_eq!(
         app.grid.requested.iter().copied().collect::<Vec<_>>(),
         [8, 9]
@@ -478,9 +483,9 @@ fn cancels_pending_page_reads_that_scrolled_out_of_view() {
     // A cancelled page can be requested again, and a page requested this frame
     // (like a jump target) survives even though it was not drawn.
     app.request_page(0);
-    app.note_visible_page(9);
-    app.cancel_offscreen_pages();
-    assert!(app.pending_pages.contains_key(&0));
+    app.pages.note_visible(9);
+    app.pages.cancel_offscreen(&mut app.grid);
+    assert!(app.pages.is_pending(0));
 }
 
 fn grid_frame(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
@@ -756,8 +761,8 @@ fn restores_session_without_restoring_transient_work() {
     assert!(app.chart.visible);
     assert_eq!(app.session.query_history, session.query_history);
     assert!(app.opening.is_some());
-    assert!(app.pending_pages.is_empty());
-    assert!(app.pages.is_empty());
+    assert!(!app.pages.is_loading());
+    assert_eq!(app.pages.loaded_count(), 0);
     assert!(app.filtered.is_none());
     assert!(app.running_sql.is_none());
     assert!(app.grid.selection.is_none());
@@ -869,8 +874,8 @@ fn opens_empty_and_replaces_active_document_work() {
     app.show_filter_controls = true;
 
     app.begin_open(second_path);
-    assert!(app.pages.is_empty());
-    assert!(app.pending_pages.is_empty());
+    assert_eq!(app.pages.loaded_count(), 0);
+    assert!(!app.pages.is_loading());
     assert_eq!(app.workspace, Workspace::Grid);
     assert!(!app.show_filter_controls);
     poll_until_opened(&mut app);
@@ -1137,17 +1142,17 @@ fn layout_changes_project_only_visible_columns_and_clear_page_state() {
     let mut app = make_app(source, path);
     app.request_page(0);
     poll_until_page_loaded(&mut app, 0);
-    assert_eq!(app.pages.get(&0).unwrap().batches[0].num_columns(), 2);
+    assert_eq!(app.pages.get(0).unwrap().batches[0].num_columns(), 2);
 
     app.column_layout.set_hidden(0, true);
     app.apply_column_layout_change();
     assert_eq!(app.grid.columns, 1);
-    assert!(app.pages.is_empty());
+    assert_eq!(app.pages.loaded_count(), 0);
     assert!(app.grid.selection.is_none());
 
     app.request_page(0);
     poll_until_page_loaded(&mut app, 0);
-    assert_eq!(app.pages.get(&0).unwrap().batches[0].num_columns(), 1);
+    assert_eq!(app.pages.get(0).unwrap().batches[0].num_columns(), 1);
     assert_eq!(app.cell_text(0, 0).as_deref(), Some("alpha"));
 }
 
@@ -1164,8 +1169,8 @@ fn layout_persists_by_schema_without_retaining_grid_pages() {
     reopened.restore_column_layout();
     assert_eq!(reopened.column_layout.visible(), &[1]);
     assert_eq!(reopened.column_layout.width(1, 0.0), 260.0);
-    assert!(reopened.pages.is_empty());
-    assert!(reopened.pending_pages.is_empty());
+    assert_eq!(reopened.pages.loaded_count(), 0);
+    assert!(!reopened.pages.is_loading());
 }
 
 #[test]

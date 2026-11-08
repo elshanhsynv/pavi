@@ -150,7 +150,7 @@ impl PaviApp {
                 ui.close_menu();
             }
         }
-        if self.export.is_some() && ui.button("Cancel export").clicked() {
+        if self.export.is_running() && ui.button("Cancel export").clicked() {
             self.cancel_export();
         }
     }

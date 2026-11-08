@@ -2,7 +2,9 @@ mod app;
 mod chart;
 mod export;
 mod inspector;
+mod pages;
 mod profile;
+mod results;
 mod session;
 mod state;
 

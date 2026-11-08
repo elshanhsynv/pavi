@@ -6,6 +6,8 @@ use arrow_array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
+use pavi_query::QueryExecution;
+use pavi_runtime::GenerationId;
 
 pub const DEFAULT_POINT_LIMIT: usize = 2_000;
 pub const MAX_INPUT_ROWS: usize = 16_384;
@@ -400,6 +402,79 @@ fn histogram(values: &[f64], bins: usize) -> Vec<HistogramBin> {
             count,
         })
         .collect()
+}
+
+/// Chart window state: source, settings, the running query and its result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChartSource {
+    Sql,
+    CurrentResult,
+}
+
+impl ChartSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Sql => "Chart SQL",
+            Self::CurrentResult => "Current result window",
+        }
+    }
+}
+
+pub(crate) struct ChartState {
+    pub(crate) visible: bool,
+    pub(crate) source: ChartSource,
+    pub(crate) sql_input: String,
+    pub(crate) config: ChartConfig,
+    pub(crate) generation: GenerationId,
+    pub(crate) execution: Option<QueryExecution>,
+    pub(crate) accumulator: Option<ChartAccumulator>,
+    pub(crate) model: Option<ChartModel>,
+    pub(crate) error: Option<String>,
+    pub(crate) status: String,
+}
+
+impl Default for ChartState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            source: ChartSource::Sql,
+            sql_input: "SELECT * FROM dataset".to_string(),
+            config: ChartConfig::default(),
+            generation: GenerationId(0),
+            execution: None,
+            accumulator: None,
+            model: None,
+            error: None,
+            status: "Choose a chart source and columns".to_string(),
+        }
+    }
+}
+
+impl ChartState {
+    pub(crate) fn loading(&self) -> bool {
+        self.execution.is_some()
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if let Some(execution) = &mut self.execution {
+            execution.cancel();
+        }
+        self.execution = None;
+        self.accumulator = None;
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.cancel();
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.model = None;
+        self.error = None;
+        self.status = "Dataset changed; chart results were cleared".to_string();
+    }
+
+    pub(crate) fn next_generation(&mut self) -> GenerationId {
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.generation
+    }
 }
 
 #[cfg(test)]
