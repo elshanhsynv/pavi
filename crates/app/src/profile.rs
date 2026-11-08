@@ -470,6 +470,56 @@ fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {
     }))
 }
 
+/// Inspector profile state: the running task and its result.
+pub(crate) struct ProfileState {
+    pub(crate) generation: GenerationId,
+    pub(crate) task: Option<ProfileTask>,
+    pub(crate) column: Option<usize>,
+    pub(crate) result: Option<ColumnProfile>,
+    pub(crate) error: Option<String>,
+    pub(crate) status: String,
+}
+
+impl Default for ProfileState {
+    fn default() -> Self {
+        Self {
+            generation: GenerationId(0),
+            task: None,
+            column: None,
+            result: None,
+            error: None,
+            status: "Select a source column to profile".to_string(),
+        }
+    }
+}
+
+impl ProfileState {
+    pub(crate) fn loading(&self) -> bool {
+        self.task.is_some()
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        if let Some(task) = &self.task {
+            task.cancel();
+        }
+        self.task = None;
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.cancel();
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.column = None;
+        self.result = None;
+        self.error = None;
+        self.status = "Dataset changed; profile cleared".to_string();
+    }
+
+    pub(crate) fn next_generation(&mut self) -> GenerationId {
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.generation
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs::File, sync::Arc, thread};

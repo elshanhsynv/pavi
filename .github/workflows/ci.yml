@@ -25,9 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      # Installs the version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -35,9 +34,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      # Installs the version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -51,6 +49,7 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Installs the version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets --locked

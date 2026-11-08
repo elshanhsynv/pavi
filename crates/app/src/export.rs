@@ -131,6 +131,89 @@ impl ExportTask {
     }
 }
 
+/// The app's current export, if any, and the generation that tags its events, so
+/// events from a cancelled or replaced export are ignored.
+pub(crate) struct ExportState {
+    task: Option<ExportTask>,
+    generation: GenerationId,
+}
+
+impl Default for ExportState {
+    fn default() -> Self {
+        Self {
+            task: None,
+            generation: GenerationId(0),
+        }
+    }
+}
+
+impl ExportState {
+    pub(crate) fn is_running(&self) -> bool {
+        self.task.is_some()
+    }
+
+    /// Cancels the running export, if any, and moves to a new generation.
+    /// Returns whether an export was running.
+    pub(crate) fn cancel(&mut self) -> bool {
+        let running = self.task.take().inspect(ExportTask::cancel).is_some();
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        running
+    }
+
+    /// Cancels any running export and starts a new one with a fresh generation.
+    pub(crate) fn start(
+        &mut self,
+        start: impl FnOnce(GenerationId) -> std::io::Result<ExportTask>,
+    ) -> std::io::Result<()> {
+        self.cancel();
+        self.task = Some(start(self.generation)?);
+        Ok(())
+    }
+
+    /// Handles the next event of the current export and returns the status text to
+    /// show, if any. Finished, cancelled and failed exports end the task; events
+    /// from older generations are ignored.
+    pub(crate) fn poll(&mut self) -> Option<String> {
+        let task = self.task.as_ref()?;
+        let event = match task.try_recv() {
+            Ok(Some(event)) => event,
+            Ok(None) => return None,
+            Err(error) => {
+                self.task = None;
+                return Some(format!("Export: {error:#}"));
+            }
+        };
+        let generation = match &event {
+            ExportEvent::Progress { generation, .. }
+            | ExportEvent::Finished { generation, .. }
+            | ExportEvent::Cancelled { generation }
+            | ExportEvent::Failed { generation, .. } => *generation,
+        };
+        if generation != self.generation {
+            return None;
+        }
+        Some(match event {
+            ExportEvent::Progress { rows, .. } => format!("Exporting: {rows} rows written"),
+            ExportEvent::Finished { rows, .. } => {
+                let path = self
+                    .task
+                    .take()
+                    .map(|task| task.path().display().to_string())
+                    .unwrap_or_default();
+                format!("Export complete: {rows} rows written to {path}")
+            }
+            ExportEvent::Cancelled { .. } => {
+                self.task = None;
+                "Export cancelled".to_string()
+            }
+            ExportEvent::Failed { error, .. } => {
+                self.task = None;
+                format!("Export failed: {error}")
+            }
+        })
+    }
+}
+
 fn export(
     input: ExportInput,
     path: &Path,

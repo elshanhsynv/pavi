@@ -132,7 +132,7 @@ impl PaviApp {
         }
         let base = self.grid.window_base;
         let scroll_offset = self.grid_scroll_offset.take();
-        self.visible_page_range = None;
+        self.pages.clear_visible();
         self.drawn_rows = None;
         // Large files: the table holds one window of rows and PAVI draws a scrollbar
         // for the whole file in a strip on the right.
@@ -222,7 +222,7 @@ impl PaviApp {
                                                 .is_some_and(|(row, _)| row == row_index),
                                         );
                                         for page in self.grid.visible_pages(row_index, row_index) {
-                                            self.note_visible_page(page);
+                                            self.pages.note_visible(page);
                                             self.request_page(page);
                                         }
                                         table_row.col(|ui| {
@@ -269,7 +269,7 @@ impl PaviApp {
                 ui.ctx().request_repaint();
             }
         }
-        self.cancel_offscreen_pages();
+        self.pages.cancel_offscreen(&mut self.grid);
     }
 
     pub(in crate::app) fn show_filtered_grid(&mut self, ui: &mut egui::Ui) {

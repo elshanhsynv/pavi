@@ -1,0 +1,6 @@
+# The Rust version PAVI builds, lints and tests with, locally and in CI.
+# Bump it deliberately: new releases can add lints that fail `-D warnings`.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
