@@ -7,10 +7,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use arrow_array::{
-    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
+use parquet_reader::types::{is_comparable, is_string};
 use parquet_reader::{ColumnInfo, ParquetSource};
 use pavi_query::{LogicalPlan, QueryEngine, QueryPoll};
 use pavi_runtime::{CancellationToken, GenerationId, RuntimeHandle};
@@ -186,6 +189,9 @@ struct ProfileAccumulator {
     max: Option<String>,
     numeric_min: Option<f64>,
     numeric_max: Option<f64>,
+    /// Dates and timestamps are ordered by their stored value, not their text.
+    temporal_min: Option<i64>,
+    temporal_max: Option<i64>,
     numeric_sum: f64,
     numeric_count: u64,
     non_finite_count: u64,
@@ -203,9 +209,7 @@ impl ProfileAccumulator {
         data_type: DataType,
         metadata_null_count: Option<u64>,
     ) -> Result<Self> {
-        if !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8)
-            && numeric_type(&data_type).is_none()
-        {
+        if !is_comparable(&data_type) {
             bail!("profiling does not support {data_type:?}; use Inspector metadata instead");
         }
         let chart = numeric_type(&data_type)
@@ -233,6 +237,8 @@ impl ProfileAccumulator {
             max: None,
             numeric_min: None,
             numeric_max: None,
+            temporal_min: None,
+            temporal_max: None,
             numeric_sum: 0.0,
             numeric_count: 0,
             non_finite_count: 0,
@@ -265,8 +271,10 @@ impl ProfileAccumulator {
             self.record_distinct(&value)?;
             if let Some(number) = numeric(array.as_ref(), row)? {
                 self.record_numeric(number, &value)?;
+            } else if let Some(key) = temporal_key(array.as_ref(), row)? {
+                self.record_temporal(key, &value);
             } else {
-                self.record_text(&value);
+                self.record_text(&value, is_string(&self.data_type));
             }
         }
         Ok(())
@@ -314,12 +322,27 @@ impl ProfileAccumulator {
         Ok(())
     }
 
-    fn record_text(&mut self, value: &str) {
+    fn record_temporal(&mut self, key: i64, value: &str) {
+        if self.temporal_min.is_none_or(|minimum| key < minimum) {
+            self.temporal_min = Some(key);
+            self.min = Some(value.to_owned());
+        }
+        if self.temporal_max.is_none_or(|maximum| key > maximum) {
+            self.temporal_max = Some(key);
+            self.max = Some(value.to_owned());
+        }
+    }
+
+    /// Text and booleans: min/max by text; string lengths only for text columns.
+    fn record_text(&mut self, value: &str, measure_length: bool) {
         if self.min.as_deref().is_none_or(|minimum| value < minimum) {
             self.min = Some(value.to_owned());
         }
         if self.max.as_deref().is_none_or(|maximum| value > maximum) {
             self.max = Some(value.to_owned());
+        }
+        if !measure_length {
+            return;
         }
         let length = value.chars().count();
         self.string_length_min = Some(self.string_length_min.map_or(length, |min| min.min(length)));
@@ -385,24 +408,37 @@ fn numeric_type(data_type: &DataType) -> Option<()> {
 }
 
 /// Profile text for one non-null value, from the shared scalar formatter.
-/// Profiling still accepts only numeric and UTF-8 columns.
+/// Profiling accepts the comparable types (`types::is_comparable`).
 fn scalar_text(array: &dyn Array, row: usize) -> Result<String> {
-    match array.data_type() {
-        DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Utf8
-        | DataType::LargeUtf8 => parquet_reader::value::scalar_text(array, row)?
-            .context("profile value is unexpectedly null"),
-        data_type => bail!("profiling does not support {data_type:?}"),
+    if !is_comparable(array.data_type()) {
+        bail!("profiling does not support {:?}", array.data_type());
     }
+    parquet_reader::value::scalar_text(array, row)?.context("profile value is unexpectedly null")
+}
+
+/// The stored value of a date or timestamp, for ordering; `None` for other types.
+fn temporal_key(array: &dyn Array, row: usize) -> Result<Option<i64>> {
+    macro_rules! key {
+        ($array:ty) => {
+            Some(
+                array
+                    .as_any()
+                    .downcast_ref::<$array>()
+                    .context("read temporal profile value")?
+                    .value(row)
+                    .into(),
+            )
+        };
+    }
+    Ok(match array.data_type() {
+        DataType::Date32 => key!(Date32Array),
+        DataType::Date64 => key!(Date64Array),
+        DataType::Timestamp(TimeUnit::Second, _) => key!(TimestampSecondArray),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => key!(TimestampMillisecondArray),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => key!(TimestampMicrosecondArray),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => key!(TimestampNanosecondArray),
+        _ => None,
+    })
 }
 
 fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {
@@ -429,7 +465,7 @@ fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {
         DataType::UInt64 => value!(UInt64Array),
         DataType::Float32 => value!(Float32Array),
         DataType::Float64 => value!(Float64Array),
-        DataType::Utf8 | DataType::LargeUtf8 => return Ok(None),
+        data_type if is_comparable(data_type) => return Ok(None),
         data_type => bail!("profiling does not support {data_type:?}"),
     }))
 }
@@ -601,6 +637,51 @@ mod tests {
         assert!(accumulator.record_distinct("one-too-many").is_err());
         let binary = BinaryArray::from(vec![Some(b"x".as_slice())]);
         assert!(scalar_text(&binary, 0).is_err());
+    }
+
+    fn profile_array(array: arrow_array::ArrayRef) -> ColumnProfile {
+        let data_type = array.data_type().clone();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            data_type.clone(),
+            true,
+        )]));
+        let mut accumulator =
+            ProfileAccumulator::new(0, "value".to_string(), data_type, None).unwrap();
+        accumulator
+            .push_batch(&RecordBatch::try_new(schema, vec![array]).unwrap())
+            .unwrap();
+        accumulator.finish()
+    }
+
+    #[test]
+    fn profiles_booleans_text_views_and_temporal_values_in_time_order() {
+        use arrow_array::{BooleanArray, StringViewArray, TimestampSecondArray};
+
+        // Summer time ends in Berlin on 2023-10-29: 02:30+02:00 happens before
+        // 02:15+01:00, so ordering by text would pick the wrong minimum.
+        let earlier = 1_698_539_400; // 2023-10-29T00:30:00Z
+        let later = 1_698_542_100; // 2023-10-29T01:15:00Z
+        let timestamps = profile_array(Arc::new(
+            TimestampSecondArray::from(vec![later, earlier]).with_timezone("Europe/Berlin"),
+        ));
+        assert_eq!(timestamps.min.as_deref(), Some("2023-10-29T02:30:00+02:00"));
+        assert_eq!(timestamps.max.as_deref(), Some("2023-10-29T02:15:00+01:00"));
+        assert!(timestamps.mean.is_none());
+        assert!(timestamps.string_lengths.is_none());
+
+        let flags = profile_array(Arc::new(BooleanArray::from(vec![true, false, true])));
+        assert_eq!(flags.min.as_deref(), Some("false"));
+        assert_eq!(flags.max.as_deref(), Some("true"));
+        assert_eq!(flags.distinct_count, 2);
+        assert!(flags.string_lengths.is_none());
+
+        let views = profile_array(Arc::new(StringViewArray::from(vec!["pear", "fig"])));
+        assert_eq!(views.min.as_deref(), Some("fig"));
+        assert_eq!(views.max.as_deref(), Some("pear"));
+        assert_eq!(views.string_lengths.map(|lengths| lengths.max), Some(4));
+
+        assert!(ProfileAccumulator::new(0, "b".to_string(), DataType::Binary, None).is_err());
     }
 
     #[test]
