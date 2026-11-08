@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use arrow_array::{
-    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 use parquet_reader::{ColumnInfo, ParquetSource};
@@ -384,42 +384,25 @@ fn numeric_type(data_type: &DataType) -> Option<()> {
     .then_some(())
 }
 
+/// Profile text for one non-null value, from the shared scalar formatter.
+/// Profiling still accepts only numeric and UTF-8 columns.
 fn scalar_text(array: &dyn Array, row: usize) -> Result<String> {
-    macro_rules! value {
-        ($array:ty) => {
-            array
-                .as_any()
-                .downcast_ref::<$array>()
-                .context("read profile scalar")?
-                .value(row)
-                .to_string()
-        };
-    }
-    Ok(match array.data_type() {
-        DataType::Int8 => value!(Int8Array),
-        DataType::Int16 => value!(Int16Array),
-        DataType::Int32 => value!(Int32Array),
-        DataType::Int64 => value!(Int64Array),
-        DataType::UInt8 => value!(UInt8Array),
-        DataType::UInt16 => value!(UInt16Array),
-        DataType::UInt32 => value!(UInt32Array),
-        DataType::UInt64 => value!(UInt64Array),
-        DataType::Float32 => value!(Float32Array),
-        DataType::Float64 => value!(Float64Array),
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .context("read profile string")?
-            .value(row)
-            .to_owned(),
-        DataType::LargeUtf8 => array
-            .as_any()
-            .downcast_ref::<LargeStringArray>()
-            .context("read profile string")?
-            .value(row)
-            .to_owned(),
+    match array.data_type() {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::LargeUtf8 => parquet_reader::value::scalar_text(array, row)?
+            .context("profile value is unexpectedly null"),
         data_type => bail!("profiling does not support {data_type:?}"),
-    })
+    }
 }
 
 fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {

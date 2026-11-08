@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
+arrow-cast.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-ord.workspace = true

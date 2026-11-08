@@ -21,102 +21,16 @@ use parquet::arrow::{
         ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
     },
 };
-use parquet::file::{metadata::ParquetMetaData, statistics::Statistics};
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::{
-    AggregateExpr, AggregateFunction, AggregateSpec, ColumnStatistics, DataPage, DatasetMetadata,
-    GroupBudget, NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection,
-    RowGroupInfo, RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr,
-    page::PAGE_ROWS,
+    AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
+    NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo,
+    RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr, page::PAGE_ROWS,
+    statistics::metadata_statistics,
 };
 
 const BATCH_SIZE: usize = 4096;
-const STAT_VALUE_LIMIT: usize = 128;
-
-fn metadata_statistics(
-    metadata: &ParquetMetaData,
-    schema: &Schema,
-) -> Vec<Vec<Option<ColumnStatistics>>> {
-    let top_level_columns = schema.fields().len();
-    let row_groups = metadata.num_row_groups();
-    if top_level_columns != metadata.file_metadata().schema_descr().num_columns() {
-        return vec![vec![None; row_groups]; top_level_columns];
-    }
-    (0..top_level_columns)
-        .map(|column| {
-            let data_type = schema.field(column).data_type();
-            (0..row_groups)
-                .map(|row_group| {
-                    metadata
-                        .row_group(row_group)
-                        .columns()
-                        .get(column)
-                        .and_then(|column| column.statistics())
-                        .map(|statistics| statistics_summary(statistics, data_type))
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Formats statistics for display. Parquet stores unsigned integers in signed
-/// physical types, so their min/max are reinterpreted using the Arrow type.
-fn statistics_summary(statistics: &Statistics, data_type: &DataType) -> ColumnStatistics {
-    let (min, max) = match (statistics, data_type) {
-        (Statistics::Int32(stats), DataType::UInt8 | DataType::UInt16 | DataType::UInt32) => {
-            display_pair(
-                stats.min_opt().map(|value| *value as u32).as_ref(),
-                stats.max_opt().map(|value| *value as u32).as_ref(),
-            )
-        }
-        (Statistics::Int64(stats), DataType::UInt64) => display_pair(
-            stats.min_opt().map(|value| *value as u64).as_ref(),
-            stats.max_opt().map(|value| *value as u64).as_ref(),
-        ),
-        (Statistics::Boolean(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
-        (Statistics::Int32(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
-        (Statistics::Int64(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
-        (Statistics::Int96(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
-        (Statistics::Float(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
-        (Statistics::Double(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
-        (Statistics::ByteArray(_) | Statistics::FixedLenByteArray(_), _) => (
-            statistics.min_bytes_opt().map(format_stat_bytes),
-            statistics.max_bytes_opt().map(format_stat_bytes),
-        ),
-    };
-    ColumnStatistics {
-        min,
-        max,
-        null_count: statistics.null_count_opt(),
-        distinct_count: statistics.distinct_count_opt(),
-    }
-}
-
-fn display_pair<T: std::fmt::Display>(
-    min: Option<&T>,
-    max: Option<&T>,
-) -> (Option<String>, Option<String>) {
-    (min.map(ToString::to_string), max.map(ToString::to_string))
-}
-
-fn format_stat_bytes(value: &[u8]) -> String {
-    if let Ok(text) = std::str::from_utf8(value) {
-        let mut output = text.chars().take(STAT_VALUE_LIMIT).collect::<String>();
-        if output.len() < text.len() {
-            output.push_str("...");
-        }
-        return output;
-    }
-    let displayed = value.len().min(16);
-    let mut output = String::with_capacity(displayed * 2 + 24);
-    for byte in &value[..displayed] {
-        output.push_str(&format!("{byte:02x}"));
-    }
-    if displayed < value.len() {
-        output.push_str("...");
-    }
-    format!("0x{output} ({} bytes)", value.len())
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchRequest {
@@ -1630,6 +1544,70 @@ mod tests {
         assert_eq!(statistics(0, 2).max.as_deref(), Some("3000000002"));
         assert_eq!(statistics(1, 0).min, Some(high.to_string()));
         assert_eq!(statistics(1, 2).max, Some((high + 2).to_string()));
+    }
+
+    #[test]
+    fn reports_readable_statistics_for_dates_timestamps_and_decimals() {
+        use arrow_array::Decimal128Array;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("typed-stats.parquet");
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "day",
+                Arc::new(Date32Array::from(vec![19_000, 19_010])) as ArrayRef,
+            ),
+            (
+                "at",
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![1_000, 61_000]).with_timezone("+01:00"),
+                ),
+            ),
+            (
+                // Precision 10 is stored as INT64.
+                "price",
+                Arc::new(
+                    Decimal128Array::from(vec![-5, 12_345])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+            ),
+            (
+                // Precision 25 is stored as a fixed-length byte array.
+                "big",
+                Arc::new(
+                    Decimal128Array::from(vec![-12_345, 10_i128.pow(20)])
+                        .with_precision_and_scale(25, 3)
+                        .unwrap(),
+                ),
+            ),
+        ])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(path).unwrap();
+        let range = |column: usize| {
+            let statistics = source.metadata().columns()[column].row_group_statistics[0]
+                .clone()
+                .unwrap();
+            (statistics.min.unwrap(), statistics.max.unwrap())
+        };
+        assert_eq!(range(0), ("2022-01-08".into(), "2022-01-18".into()));
+        assert_eq!(
+            range(1),
+            (
+                "1970-01-01T01:00:01+01:00".into(),
+                "1970-01-01T01:01:01+01:00".into()
+            )
+        );
+        assert_eq!(range(2), ("-0.05".into(), "123.45".into()));
+        assert_eq!(
+            range(3),
+            ("-12.345".into(), "100000000000000000.000".into())
+        );
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {

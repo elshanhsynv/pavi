@@ -7,15 +7,11 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use arrow_array::{
-    Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
+use anyhow::{Context, Result, bail};
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
 use parquet::arrow::ArrowWriter;
+use parquet_reader::value::{is_scalar_type, scalar_text};
 use pavi_query::{LogicalPlan, QueryEngine, QueryPoll};
 use pavi_runtime::{CancellationToken, GenerationId, RuntimeHandle};
 
@@ -336,107 +332,37 @@ impl<W: Write> CsvWriter<W> {
 }
 
 fn ensure_csv_type(data_type: &DataType) -> Result<()> {
-    if matches!(
-        data_type,
-        DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Timestamp(_, _)
-    ) {
+    if is_scalar_type(data_type) {
         Ok(())
     } else {
-        bail!("CSV export does not support {data_type:?}")
+        bail!("CSV export does not support nested {data_type:?} values")
     }
 }
 
+/// Writes one CSV field using the shared scalar text; nulls are empty fields and
+/// binary values keep the `0x`-prefixed hex form.
 fn write_csv_value(output: &mut impl Write, array: &dyn Array, row: usize) -> Result<()> {
-    if array.is_null(row) {
+    let Some(text) = scalar_text(array, row)? else {
+        return Ok(());
+    };
+    if is_binary(array.data_type()) {
+        output.write_all(b"0x")?;
+        output.write_all(text.as_bytes())?;
         return Ok(());
     }
-    macro_rules! number {
-        ($array:ty) => {
-            array
-                .as_any()
-                .downcast_ref::<$array>()
-                .context("read CSV scalar")?
-                .value(row)
-                .to_string()
-        };
+    write_csv_text(output, &text)
+}
+
+fn is_binary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => true,
+        DataType::Dictionary(_, values) => is_binary(values),
+        DataType::RunEndEncoded(_, values) => is_binary(values.data_type()),
+        _ => false,
     }
-    let value = match array.data_type() {
-        DataType::Boolean => number!(BooleanArray),
-        DataType::Int8 => number!(Int8Array),
-        DataType::Int16 => number!(Int16Array),
-        DataType::Int32 => number!(Int32Array),
-        DataType::Int64 => number!(Int64Array),
-        DataType::UInt8 => number!(UInt8Array),
-        DataType::UInt16 => number!(UInt16Array),
-        DataType::UInt32 => number!(UInt32Array),
-        DataType::UInt64 => number!(UInt64Array),
-        DataType::Float32 => number!(Float32Array),
-        DataType::Float64 => number!(Float64Array),
-        DataType::Date32 => number!(Date32Array),
-        DataType::Date64 => number!(Date64Array),
-        DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => number!(TimestampSecondArray),
-        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
-            number!(TimestampMillisecondArray)
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
-            number!(TimestampMicrosecondArray)
-        }
-        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
-            number!(TimestampNanosecondArray)
-        }
-        DataType::Utf8 => {
-            let value = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("read CSV string")?
-                .value(row);
-            return write_csv_text(output, value);
-        }
-        DataType::LargeUtf8 => {
-            let value = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .context("read CSV string")?
-                .value(row);
-            return write_csv_text(output, value);
-        }
-        DataType::Binary => {
-            let value = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .context("read CSV binary")?
-                .value(row);
-            return write_hex(output, value);
-        }
-        DataType::LargeBinary => {
-            let value = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .context("read CSV binary")?
-                .value(row);
-            return write_hex(output, value);
-        }
-        other => return Err(anyhow!("CSV export does not support {other:?}")),
-    };
-    output.write_all(value.as_bytes())?;
-    Ok(())
 }
 
 fn write_csv_text(output: &mut impl Write, value: &str) -> Result<()> {
@@ -455,14 +381,6 @@ fn write_csv_text(output: &mut impl Write, value: &str) -> Result<()> {
     }
     if quote {
         output.write_all(b"\"")?;
-    }
-    Ok(())
-}
-
-fn write_hex(output: &mut impl Write, value: &[u8]) -> Result<()> {
-    output.write_all(b"0x")?;
-    for byte in value {
-        write!(output, "{byte:02x}")?;
     }
     Ok(())
 }
@@ -677,12 +595,71 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_csv_values_before_writing_rows() {
+    fn rejects_nested_csv_values_before_writing_rows() {
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "duration",
-            DataType::Duration(arrow_schema::TimeUnit::Second),
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             true,
         )]));
         assert!(CsvWriter::new(Vec::new(), schema).is_err());
+    }
+
+    #[test]
+    fn writes_readable_temporal_decimal_dictionary_and_binary_csv_values() {
+        use arrow_array::{
+            BinaryArray, Date32Array, Decimal128Array, DictionaryArray, DurationSecondArray,
+            TimestampMillisecondArray, types::Int32Type,
+        };
+
+        let dictionary: DictionaryArray<Int32Type> =
+            vec![Some("red, green"), None].into_iter().collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "date",
+                Arc::new(Date32Array::from(vec![Some(19_000), None])) as arrow_array::ArrayRef,
+            ),
+            (
+                "naive",
+                Arc::new(TimestampMillisecondArray::from(vec![Some(1_000), None])),
+            ),
+            (
+                "zoned",
+                Arc::new(
+                    TimestampMillisecondArray::from(vec![Some(1_000), None])
+                        .with_timezone("+01:00"),
+                ),
+            ),
+            (
+                "amount",
+                Arc::new(
+                    Decimal128Array::from(vec![Some(12_345), None])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+            ),
+            ("label", Arc::new(dictionary)),
+            (
+                "elapsed",
+                Arc::new(DurationSecondArray::from(vec![Some(90), None])),
+            ),
+            (
+                "bytes",
+                Arc::new(BinaryArray::from(vec![Some(&[0xab_u8, 0x01][..]), None])),
+            ),
+        ])
+        .unwrap();
+        let mut output = Vec::new();
+        let mut writer = CsvWriter::new(&mut output, batch.schema()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            concat!(
+                "date,naive,zoned,amount,label,elapsed,bytes\n",
+                "2022-01-08,1970-01-01T00:00:01,1970-01-01T01:00:01+01:00,123.45,",
+                "\"red, green\",PT90S,0xab01\n",
+                ",,,,,,\n",
+            )
+        );
     }
 }
