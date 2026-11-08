@@ -1,6 +1,6 @@
 use anyhow::Error;
 use arrow_array::RecordBatch;
-use parquet_reader::{DataPage, ParquetSource};
+use parquet_reader::{DataPage, FilteredWindow, ParquetSource};
 use std::sync::Arc;
 
 use crate::{GenerationId, TaskId};
@@ -11,6 +11,8 @@ pub enum PageOutcome {
     Loaded(DataPage),
     Batch(RecordBatch),
     Batches(Vec<RecordBatch>),
+    /// Filtered rows plus the source row to resume scanning from.
+    Filtered(FilteredWindow),
     Cancelled,
     ReadFailed(Error),
 }

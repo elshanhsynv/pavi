@@ -12,7 +12,7 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
 - **The main pattern** is a single "God struct" `PaviApp` (`crates/app/src/app.rs:292-327`) with ~35 fields; the `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (174 tests: parquet_reader 54, pavi 79, pavi_query 31, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (178 tests: parquet_reader 56, pavi 79, pavi_query 33, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -206,8 +206,9 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 | `reader_for` | **Re-opens the file** for every read, builds a `ParquetRecordBatchReader` with `ProjectionMask::roots`, row groups, optional `RowSelection`, batch size 4096 | `source.rs:664-686` |
 | `read_window_batches` / `read_window` | Rows `[first, first+n)` → overlapping row groups + skip/select `RowSelection` | `source.rs:613-662` |
 | `read_page` | `read_window` for page `i` through the `Mutex<PageCache>` | `source.rs:223-242` |
-| `read_filtered_window` | Scan row groups from the start (stats-pruned), filter each batch, skip `first_match_offset` matches, return ≤n | `source.rs:244-315` |
-| `read_sorted` | Load all (filtered) rows into memory under budget, `lexsort_to_indices` with a row-number tie-breaker, `take`, split into 4,096-row batches | `source.rs:320-448` |
+| `read_filtered_from` | From source row `start_row` (stats-pruned row groups; the first group is entered with a `RowSelection` skip), filter each batch, return ≤n matches plus `next_row`, the row after the last match taken (`FilteredWindow`). Paging with `next_row` reads each row once | `source.rs` (`scan_filtered`) |
+| `read_filtered_window` | Offset-based variant (skip the first N matches, scanning from row 0); used by the CLI | `source.rs` |
+| `read_sorted` | Rows that pass the filter are buffered with a sequence-number column (stable tie-breaker). Without a limit they must fit the budget; with `limit` ≤ budget rows the buffer is cut back to the best `limit` rows every ~32k rows (top-N). Then `lexsort_to_indices`, `take`, split into 4,096-row batches | `source.rs` |
 | `read_aggregated` | Streaming row-by-row accumulation into `GroupCollector` (hash map of `Scalar` keys) | `source.rs:451-526`, `965-1177` |
 | Export writers | `CsvWriter` (hand-rolled) and `parquet::arrow::ArrowWriter` to `<name>.pavi-<gen>.tmp`, then `fs::rename` | `crates/app/src/export.rs` |
 
@@ -305,13 +306,13 @@ sequenceDiagram
 ### 4.3 Filter (toolbar filter box)
 
 1. `apply_filter` (`app.rs:948-1000`): `Filter::parse` (text grammar, `filter.rs:28-60`) → `LogicalPlan::scan().filter().project(all)` → `Planner::plan` validates column/type → cancel pages & previous filter → `grid.reset()` → `QueryEngine::execute`.
-2. `execute` (`execution.rs:91-120`) schedules the first read: `submit_filtered_window(filter, offset 0, 4096 rows)`.
-3. Worker: `read_filtered_window` (`source.rs:244-315`) iterates row groups **from the first one**, skips groups whose statistics can't match (`row_group_might_match`, `source.rs:688-703`), decodes `projection ∪ filter column`, evaluates a `BooleanArray` mask, skips the first `first_match_offset` matches, returns up to 4,096.
+2. `execute` (`execution.rs:91-120`) schedules the first read: `submit_filtered_from(filter, start_row 0, 4096 rows)`.
+3. Worker: `read_filtered_from` starts at `start_row`, skips row groups whose statistics can't match (`row_group_might_match`), decodes `projection ∪ filter column`, evaluates a `BooleanArray` mask, and returns up to 4,096 matches as `PageOutcome::Filtered` with `next_row`.
 4. UI `poll_filtered` (`app.rs:1219-1278`) calls `poll_next_batch()` while `needs_more()`; batches go into `FilteredGrid.push`, which keeps only the last 8 batches and advances `first_result`. `grid.rows` is set to the **window size**, not the total.
-5. When the last window row is rendered, `request_more_filtered` raises `target_result` by 4,096 (`ui/grid.rs:347-349`), causing the next `submit_filtered_window` with `next_filter_offset` = rows received so far — which **rescans from row group 0** again.
-6. `Finished` when a window returns fewer rows than requested.
+5. When the last window row is rendered, `request_more_filtered` raises `target_result` by 4,096 (`ui/grid.rs:347-349`), causing the next `submit_filtered_from` at `next_filter_row`, the cursor returned by the previous read.
+6. `Finished` when `next_row` reaches the file's row count.
 
-**Memory:** ≤8 batches (≈32k rows) in the UI; each worker request decodes all row groups up to the current offset.
+**Memory:** ≤8 batches (≈32k rows) in the UI. Each worker request decodes only from the cursor onward, so reading a whole filtered result (scrolling to the end, export) touches each row once.
 **Errors:** parse/validation errors → red text under the filter box (`filter_error`); execution errors → `FilteredGrid.error` shown in the grid + status.
 
 ```mermaid
@@ -322,28 +323,28 @@ sequenceDiagram
     participant W as Worker
     UI->>UI: apply_filter(): parse, plan, grid.reset()
     UI->>Q: QueryEngine.execute(plan, gen)
-    Q->>RT: submit_filtered_window(offset=0, 4096)
-    RT->>W: read_filtered_window
-    W->>W: for rg in row groups (from rg 0): prune by stats, decode, mask, skip offset
-    W-->>Q: PageOutcome::Batch(≤4096)
+    Q->>RT: submit_filtered_from(start_row=0, 4096)
+    RT->>W: read_filtered_from
+    W->>W: from start_row: prune row groups by stats, decode, mask
+    W-->>Q: PageOutcome::Filtered(batch ≤4096, next_row)
     loop each frame while needs_more
         UI->>Q: poll_next_batch()
         Q-->>UI: Batch / Pending / Finished
         UI->>UI: FilteredGrid.push (keep last 8 batches)
     end
     UI->>UI: last row rendered → request_more()
-    Q->>RT: submit_filtered_window(offset=received, 4096) (rescan from rg 0)
+    Q->>RT: submit_filtered_from(start_row=next_row, 4096)
 ```
 
 ### 4.4 Sort (header click)
 
 1. `render_headers` click → `toggle_sort(source_column)` (`ui/grid.rs:553-559`, `app.rs:1136-1203`). If a filter/SQL result is active, its plan is reused; otherwise `scan().project(all)`. `replace_sort` toggles Asc → Desc → Asc; nulls always last.
-2. `execute` submits **one** `ReadOperation::Sorted` (`execution.rs:351-365`).
-3. Worker `read_sorted` (`source.rs:320-448`): first rejects if the **whole file** has more rows than the budget (100,000) — before applying the filter or limit. Otherwise it materializes all (filtered) rows, checks a byte estimate, sorts with a stable tie-breaker, `take`s output columns and splits into 4,096-row batches.
+2. `execute` submits **one** `ReadOperation::Sorted` with a `SortedRead { sort, budget, limit }` (`execution.rs`); `limit` comes from SQL `LIMIT` (header clicks have none).
+3. Worker `read_sorted`: buffers the rows that pass the filter. Without a limit, more than 100,000 filtered rows (or the byte estimate) is an error. With `LIMIT n` (n ≤ 100,000) only the best n rows are kept while scanning, so any file size works. It sorts with a stable tie-breaker, `take`s output columns and splits into 4,096-row batches.
 4. All sorted batches are moved into `QueryExecution.buffered` at once; the UI then drains them into its 8-batch window like a filter.
 
-**Memory:** up to 100k rows / 128 MB of decoded input plus the sorted copy on the worker; the full sorted result sits in `QueryExecution.buffered` until consumed.
-**Errors:** budget error text ("sort input has N rows, exceeding the in-memory sort budget…") ends up in the status bar / grid error.
+**Memory:** up to 100k filtered rows / 128 MB of decoded input plus the sorted copy on the worker (top-N: about n + 32k rows); the sorted result sits in `QueryExecution.buffered` until consumed.
+**Errors:** budget error text ("sort input exceeds the in-memory sort budget… filter the data or add a LIMIT…") ends up in the status bar / grid error.
 "Return to source order" = `clear_filter` (`ui/toolbar.rs:96`).
 
 ```mermaid
@@ -356,8 +357,8 @@ sequenceDiagram
     UI->>UI: plan.replace_sort(col, dir, NullsLast)
     UI->>Q: execute(plan)
     Q->>W: ReadOperation::Sorted (one task)
-    W->>W: row_count > 100k? → error
-    W->>W: read all rows (filtered), lexsort, take, slice 4096
+    W->>W: scan + filter; LIMIT n: keep best n rows, else > 100k rows → error
+    W->>W: lexsort (value, sequence), take, slice 4096
     W-->>Q: PageOutcome::Batches(all)
     Q-->>UI: batches one per poll → 8-batch window
 ```
@@ -365,7 +366,7 @@ sequenceDiagram
 ### 4.5 SQL (SQL workspace) and aggregates
 
 1. `run_sql` (`app.rs:1029-1111`): `SqlAst::parse` (`sql.rs:61-95`) enforces the subset (one statement, `SELECT`, `FROM dataset` only, one predicate, one `ORDER BY` column, `LIMIT`, optional single `GROUP BY` + aggregates). Column names are resolved case-insensitively (`sql.rs:486-506`). → `to_logical_plan` → `Planner::plan`.
-2. Execution picks one strategy in `schedule_next` (`execution.rs:319-433`), by precedence: **aggregate** (one `Aggregated` task) → **sort** (one `Sorted` task) → **filter** (repeated filtered windows) → **plain scan** (`Page` tasks, or a final `Window` for the LIMIT remainder).
+2. Execution picks one strategy in `schedule_next` (`execution.rs:319-433`), by precedence: **aggregate** (one `Aggregated` task) → **sort** (one `Sorted` task) → **filter** (repeated filtered reads, each resuming at the previous cursor) → **plain scan** (`Page` tasks, or a final `Window` for the LIMIT remainder).
 3. Aggregates (`read_aggregated`, `source.rs:451-526`) stream all row groups, converting every value to a `Scalar` and updating accumulators per row; `COUNT(*)` with no filter uses the metadata row count (fast path, `source.rs:481-485`).
 4. Results flow into the same `FilteredGrid`. History is recorded with duration/row count on finish/failure (`app.rs:628-641`) and the session is saved.
 
@@ -385,9 +386,9 @@ sequenceDiagram
     alt aggregate
         Q->>W: Aggregated (whole file, streaming)
     else ORDER BY
-        Q->>W: Sorted (budgeted)
+        Q->>W: Sorted (budgeted, top-N with LIMIT)
     else WHERE
-        Q->>W: FilteredWindow × n
+        Q->>W: FilteredFrom × n (cursor)
     else plain
         Q->>W: Page × n / Window
     end

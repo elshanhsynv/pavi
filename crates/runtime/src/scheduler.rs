@@ -35,6 +35,15 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// What a sorted read orders by, its memory budget, and an optional row limit
+/// (`ORDER BY … LIMIT n`), which lets inputs larger than the budget be sorted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SortedRead {
+    pub sort: SortSpec,
+    pub budget: SortBudget,
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug)]
 pub enum RuntimeConfigError {
     ZeroWorkers,
@@ -81,15 +90,16 @@ enum ReadOperation {
         first_row: u64,
         row_count: usize,
     },
-    FilteredWindow {
+    FilteredFrom {
         filter: FilterExpr,
-        first_match_offset: u64,
+        start_row: u64,
         row_count: usize,
     },
     Sorted {
         filter: Option<FilterExpr>,
         sort: SortSpec,
         budget: SortBudget,
+        limit: Option<usize>,
     },
     Aggregated {
         filter: Option<FilterExpr>,
@@ -229,11 +239,13 @@ impl Runtime {
         )
     }
 
-    pub fn submit_filtered_window(
+    /// Reads up to `row_count` rows matching `filter` from source row `start_row`;
+    /// the outcome is [`PageOutcome::Filtered`] with the row to resume from.
+    pub fn submit_filtered_from(
         &self,
         source: Arc<ParquetSource>,
         filter: FilterExpr,
-        first_match_offset: u64,
+        start_row: u64,
         row_count: usize,
         projection: Projection,
         generation_id: GenerationId,
@@ -242,9 +254,9 @@ impl Runtime {
             source,
             projection,
             generation_id,
-            ReadOperation::FilteredWindow {
+            ReadOperation::FilteredFrom {
                 filter,
-                first_match_offset,
+                start_row,
                 row_count,
             },
             None,
@@ -256,12 +268,11 @@ impl Runtime {
         source: Arc<ParquetSource>,
         filter: Option<FilterExpr>,
         projection: Projection,
-        sort: SortSpec,
-        budget: SortBudget,
+        read: SortedRead,
         generation_id: GenerationId,
     ) -> Result<PageTask, SubmitError> {
         self.handle()
-            .submit_sorted(source, filter, projection, sort, budget, generation_id)
+            .submit_sorted(source, filter, projection, read, generation_id)
     }
 
     pub fn submit_aggregated(
@@ -371,11 +382,13 @@ impl RuntimeHandle {
         )
     }
 
-    pub fn submit_filtered_window(
+    /// Reads up to `row_count` rows matching `filter` from source row `start_row`;
+    /// the outcome is [`PageOutcome::Filtered`] with the row to resume from.
+    pub fn submit_filtered_from(
         &self,
         source: Arc<ParquetSource>,
         filter: FilterExpr,
-        first_match_offset: u64,
+        start_row: u64,
         row_count: usize,
         projection: Projection,
         generation_id: GenerationId,
@@ -384,9 +397,9 @@ impl RuntimeHandle {
             source,
             projection,
             generation_id,
-            ReadOperation::FilteredWindow {
+            ReadOperation::FilteredFrom {
                 filter,
-                first_match_offset,
+                start_row,
                 row_count,
             },
             None,
@@ -398,8 +411,7 @@ impl RuntimeHandle {
         source: Arc<ParquetSource>,
         filter: Option<FilterExpr>,
         projection: Projection,
-        sort: SortSpec,
-        budget: SortBudget,
+        read: SortedRead,
         generation_id: GenerationId,
     ) -> Result<PageTask, SubmitError> {
         self.submit_read(
@@ -408,8 +420,9 @@ impl RuntimeHandle {
             generation_id,
             ReadOperation::Sorted {
                 filter,
-                sort,
-                budget,
+                sort: read.sort,
+                budget: read.budget,
+                limit: read.limit,
             },
             None,
         )
@@ -595,19 +608,20 @@ fn read_source(
         } => source
             .read_window(first_row, row_count, projection)
             .map(PageOutcome::Batch),
-        ReadOperation::FilteredWindow {
+        ReadOperation::FilteredFrom {
             filter,
-            first_match_offset,
+            start_row,
             row_count,
         } => source
-            .read_filtered_window(&filter, first_match_offset, row_count, projection)
-            .map(PageOutcome::Batch),
+            .read_filtered_from(&filter, start_row, row_count, projection)
+            .map(PageOutcome::Filtered),
         ReadOperation::Sorted {
             filter,
             sort,
             budget,
+            limit,
         } => source
-            .read_sorted(filter.as_ref(), projection, sort, budget)
+            .read_sorted(filter.as_ref(), projection, sort, budget, limit)
             .map(PageOutcome::Batches),
         ReadOperation::Aggregated {
             filter,

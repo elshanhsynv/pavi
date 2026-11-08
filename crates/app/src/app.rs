@@ -775,7 +775,10 @@ impl PaviApp {
                         self.grid.requested.remove(&page_index);
                         self.status = format!("load page {page_index}: {error:#}");
                     }
-                    PageOutcome::Batch(_) | PageOutcome::Batches(_) | PageOutcome::Loaded(_) => {
+                    PageOutcome::Batch(_)
+                    | PageOutcome::Batches(_)
+                    | PageOutcome::Filtered(_)
+                    | PageOutcome::Loaded(_) => {
                         self.grid.requested.remove(&page_index);
                         self.status = format!("unexpected response for page {page_index}");
                     }
