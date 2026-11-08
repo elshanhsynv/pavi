@@ -21,7 +21,8 @@ What we do, in one or two sentences.
 What gets easier, what gets harder, what we must keep doing because of this.
 ```
 
-0001–0004 were written after the fact from the code and docs. Edit them if the original reasons were different.
+0001–0004 were reconstructed after the fact from the code and docs. **Owner: confirm or correct the
+"Context" and "Decision" of each**; until then treat their reasons as informed guesses, not intent.
 
 | ADR | Decision |
 |---|---|

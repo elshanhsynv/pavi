@@ -30,15 +30,30 @@ Each budget is a named constant. Change it in one place and update this table.
 
 ## Targets
 
-Proposed, not yet enforced in CI. Measure with the bench below and adjust.
+Measured 2026-11-09 on the reference machine: Intel i5-11400H (12 threads), 16 GB RAM, SSD,
+Windows 11, release build (thin LTO), warm OS file cache, median of 3 runs.
+Files: `flights` (1M rows, 7 cols), `dummy_5m` (5M rows, 4 cols), `dummy_1b` (1B rows, 10 cols).
 
-| Scenario | Target |
-|---|---|
-| Open any file (footer only) | < 300 ms to first rows on a local SSD |
-| Scroll / jump to any row | Page visible < 100 ms after it scrolls into view |
-| Frame time while scrolling | < 16 ms (60 fps) |
-| Cancel a running scan | < 50 ms |
-| Peak memory, any file | < 1 GB |
+Each target is about 1.5× the slowest measured file, rounded up, with a 50 ms floor so
+sub-frame operations aren't held to timer noise. A change that breaks a target needs a reason in the PR.
+
+| Scenario | How measured | flights | dummy_5m | dummy_1b | Target |
+|---|---|---|---|---|---|
+| Read footer metadata | bench `open_metadata_ms` | 0 ms | 0 ms | 16 ms | < 50 ms |
+| First page, all columns, empty cache | bench `first_page_all_cold_ms` | 8 ms | 3 ms | 19 ms | < 50 ms |
+| Jump to the last page | bench `large_jump_ms` | 5 ms | 1 ms | 11 ms | < 50 ms |
+| First batch of a `LIMIT` query | bench `query_first_batch_ms` | 7 ms | 3 ms | 15 ms | < 50 ms |
+| Scroll 8 pages (32,768 rows) | bench `sequential_scroll_ms` | 66 ms | 30 ms | 144 ms | < 220 ms |
+| App start to window, file given on the command line | `Start-Process` until the window exists | 177 ms | — | 76 ms | < 300 ms |
+| App memory after loading a file | working set 5 s after start | 96 MB | — | 114 MB | < 200 MB |
+| CLI open + 1,000-row preview (includes process start) | wall time | 167 ms | 167 ms | 237 ms | < 400 ms |
+| Full scan: filter matching nothing on a text column | `cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
+| Frame time while scrolling | not yet measured | | | | < 16 ms (60 fps) |
+| Cancel a running scan | not yet measured | | | | < 50 ms |
+
+Not yet enforced in CI: GitHub runners are too noisy for millisecond targets. Check them with the
+`perf-check` skill before merging changes to reading, the runtime, the query engine or the grid,
+and re-measure this table (same machine) when a target is changed.
 
 ## Measuring
 
