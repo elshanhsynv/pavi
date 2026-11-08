@@ -59,9 +59,9 @@ fn load_arrow_metadata(file: &File) -> Result<ArrowReaderMetadata> {
 
 /// Pulls record batches from the Parquet decoder and turns a decoder panic into an error.
 ///
-/// arrow-rs panics on some malformed pages instead of returning an error (for example a data
-/// page that uses dictionary encoding with no dictionary page; found by the `parquet_file`
-/// fuzz target). Guarding here protects every caller, including the CLI and bench, which do
+/// arrow-rs panics on some malformed pages instead of returning an error (found by the
+/// `parquet_file` fuzz target; open upstream as apache/arrow-rs#12129 and #6255, list in
+/// docs/FUZZING.md). Guarding here protects every caller, including the CLI and bench, which do
 /// not run inside the runtime's worker guard. After a panic the decoder's state is unknown,
 /// so the reader stops.
 struct GuardedReader<R> {
