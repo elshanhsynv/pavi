@@ -62,12 +62,15 @@ one escapes, extend those guards rather than adding `catch_unwind` at call sites
 
 ## Findings
 
-| Date | Target | Bug | Where | Handling |
+| Found | Bug | Where | Upstream | PAVI handling |
 |---|---|---|---|---|
-| 2026-11-08 | `parquet_file` | arrow-ipc panics on corrupt embedded Arrow schemas (invalid integer width, and a second case at `convert.rs:514`) | `arrow-ipc` 59 `convert.rs` | `load_arrow_metadata` reopens without the schema hint |
-| 2026-11-08 | `parquet_file` | Decoder panics on a dictionary-encoded data page with no dictionary page ("Decoder for dict should have been set") | `parquet` 59 `column/reader/decoder.rs` | `GuardedReader` returns "malformed Parquet data" and stops reading |
+| 2026-11-08 | Panics on corrupt embedded Arrow schemas (invalid Int width, unknown type id, …; 10 variants) | `arrow-ipc` 59 `convert.rs` | Fixed in arrow-rs 60 (now returns an error) | PAVI uses 60. `load_arrow_metadata` still reopens without the hint, so the file opens |
+| 2026-11-08 | "Decoder for dict should have been set": dictionary-encoded data page with no dictionary page | `parquet` 59–60 `column/reader/decoder.rs` | Not reported yet | `GuardedReader` returns "malformed Parquet data" |
+| 2026-11-09 | "column start and length should not be negative": negative column chunk offset in metadata | `parquet` 59–60 `file/metadata/mod.rs` | Open: apache/arrow-rs#6255 | `GuardedReader` |
+| 2026-11-09 | "offset + len out of bounds": bit-packed definition-level run longer than the page | `arrow-buffer` 59–60 `bit_chunk_iterator.rs` | Fixed upstream (apache/arrow-rs#11691), not yet released | `GuardedReader` |
 
-All were found within the first few thousand inputs. After the fixes, 5-minute runs of every target (about 1 million inputs in total) found nothing new. None has been reported upstream yet.
+The 2026-11-09 rows came from replaying the whole corpus against the plain `parquet` reader (without PAVI's guards) on 59.3.2 and 60.1.0.
+When a new arrow-rs release fixes the remaining ones, keep the guard: new decoder bugs will appear.
 
 ## CI
 

@@ -1,3 +1,7 @@
+// Release builds are GUI-only on Windows: no console window next to the app.
+// Debug builds keep the console for diagnostics.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod chart;
 mod export;

@@ -7,5 +7,7 @@ docs/*
 !docs/PERFORMANCE.md
 !docs/TESTING.md
 !docs/FUZZING.md
+!docs/RELEASING.md
 !docs/architecture/
 !docs/decisions/
+.claude/settings.local.json
