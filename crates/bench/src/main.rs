@@ -154,6 +154,7 @@ fn read_page(
         PageOutcome::ReadFailed(error) => Err(error).context(format!("read page {page}")),
         PageOutcome::Batch(_) => bail!("page {page} unexpectedly returned a record batch"),
         PageOutcome::Batches(_) => bail!("page {page} unexpectedly returned record batches"),
+        PageOutcome::Filtered(_) => bail!("page {page} unexpectedly returned a filtered window"),
     }
 }
 

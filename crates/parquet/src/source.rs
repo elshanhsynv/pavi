@@ -15,7 +15,7 @@ use arrow_array::{
 };
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 use arrow_schema::{DataType, Field, Schema, SortOptions, TimeUnit};
-use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take};
+use arrow_select::{concat::concat_batches, filter::filter_record_batch, take::take_record_batch};
 use parquet::arrow::{
     ProjectionMask,
     arrow_reader::{
@@ -173,6 +173,9 @@ impl ParquetSource {
         Ok(page)
     }
 
+    /// Reads up to `row_count` rows matching `filter`, after skipping the first
+    /// `first_match_offset` matches. This always scans from the start of the file;
+    /// to page through results, use [`Self::read_filtered_from`].
     pub fn read_filtered_window(
         &self,
         filter: &FilterExpr,
@@ -180,8 +183,42 @@ impl ParquetSource {
         row_count: usize,
         projection: &Projection,
     ) -> Result<RecordBatch> {
+        Ok(self
+            .scan_filtered(filter, 0, first_match_offset, row_count, projection)?
+            .batch)
+    }
+
+    /// Reads up to `row_count` rows matching `filter`, starting at source row
+    /// `start_row`, and returns where to resume. Paging with the returned
+    /// [`FilteredWindow::next_row`] visits each row once, so reading a whole
+    /// filtered result stays linear in the file size.
+    pub fn read_filtered_from(
+        &self,
+        filter: &FilterExpr,
+        start_row: u64,
+        row_count: usize,
+        projection: &Projection,
+    ) -> Result<FilteredWindow> {
+        self.scan_filtered(filter, start_row, 0, row_count, projection)
+    }
+
+    fn scan_filtered(
+        &self,
+        filter: &FilterExpr,
+        start_row: u64,
+        mut skip_matches: u64,
+        row_count: usize,
+        projection: &Projection,
+    ) -> Result<FilteredWindow> {
+        let total_rows = self.row_count();
+        if start_row > total_rows {
+            bail!("filter start row {start_row} is past row count {total_rows}");
+        }
         if row_count == 0 {
-            return Ok(self.empty_batch(projection));
+            return Ok(FilteredWindow {
+                batch: self.empty_batch(projection),
+                next_row: start_row,
+            });
         }
 
         let filter_column = filter.column_index(&self.dataset_metadata.schema)?;
@@ -190,83 +227,95 @@ impl ParquetSource {
             read_columns.push(filter_column);
         }
         let read_projection = Projection::columns(read_columns, self.column_count())?;
-        let filter_position = read_projection
+        let filter_position = projected_position(&read_projection, filter_column, "filter")?;
+        let output_positions = projection
             .as_slice()
             .iter()
-            .position(|column| *column == filter_column)
-            .ok_or_else(|| anyhow!("filter column was not projected"))?;
-        let output_positions: Vec<_> = projection
-            .as_slice()
-            .iter()
-            .map(|column| {
-                read_projection
-                    .as_slice()
-                    .iter()
-                    .position(|read_column| read_column == column)
-                    .ok_or_else(|| anyhow!("output column was not projected"))
-            })
-            .collect::<Result<_>>()?;
+            .map(|column| projected_position(&read_projection, *column, "output"))
+            .collect::<Result<Vec<_>>>()?;
 
-        let mut skipped_matches = 0_u64;
         let mut remaining = row_count;
         let mut batches = Vec::new();
-
         for row_group in self.row_groups() {
-            if !self.row_group_might_match(filter, row_group, filter_column) {
+            if row_group.first_row + row_group.row_count <= start_row
+                || !self.row_group_might_match(filter, row_group, filter_column)
+            {
                 continue;
             }
-
-            let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
+            // Only the row group containing `start_row` starts part-way through.
+            let skip = start_row.saturating_sub(row_group.first_row);
+            let selection = (skip > 0).then(|| {
+                RowSelection::from(vec![
+                    RowSelector::skip(skip as usize),
+                    RowSelector::select((row_group.row_count - skip) as usize),
+                ])
+            });
+            let mut reader = self.reader_for(&read_projection, vec![row_group.index], selection)?;
+            let mut batch_first_row = row_group.first_row + skip;
             while let Some(batch) = reader.next().transpose()? {
                 let batch = self.reorder_batch(batch, &read_projection)?;
+                let batch_rows = batch.num_rows() as u64;
                 let mask = filter.evaluate_batch(&batch, filter_position)?;
+                let matches = mask.true_count();
+                if matches as u64 <= skip_matches {
+                    skip_matches -= matches as u64;
+                    batch_first_row += batch_rows;
+                    continue;
+                }
+                let first = skip_matches as usize;
+                skip_matches = 0;
+                let take = remaining.min(matches - first);
                 let filtered = filter_record_batch(&batch, &mask)?;
-                if filtered.num_rows() == 0 {
-                    continue;
-                }
-
-                if skipped_matches + filtered.num_rows() as u64 <= first_match_offset {
-                    skipped_matches += filtered.num_rows() as u64;
-                    continue;
-                }
-
-                let start = first_match_offset.saturating_sub(skipped_matches) as usize;
-                let take = remaining.min(filtered.num_rows() - start);
-                let page = filtered.slice(start, take);
-                batches.push(project_batch(&page, projection, &output_positions)?);
+                batches.push(project_batch(
+                    &filtered.slice(first, take),
+                    projection,
+                    &output_positions,
+                )?);
                 remaining -= take;
-                skipped_matches += filtered.num_rows() as u64;
-
                 if remaining == 0 {
-                    return self.concat_or_empty(projection, batches);
+                    // Resume right after the source row of the last match taken.
+                    let last = mask
+                        .values()
+                        .set_indices()
+                        .nth(first + take - 1)
+                        .ok_or_else(|| anyhow!("filter mask lost a match"))?;
+                    return Ok(FilteredWindow {
+                        batch: self.concat_or_empty(projection, batches)?,
+                        next_row: batch_first_row + last as u64 + 1,
+                    });
                 }
+                batch_first_row += batch_rows;
             }
         }
 
-        self.concat_or_empty(projection, batches)
+        Ok(FilteredWindow {
+            batch: self.concat_or_empty(projection, batches)?,
+            next_row: total_rows,
+        })
     }
 
-    /// Reads, sorts, and returns bounded output batches for one supported sort key.
+    /// Reads, sorts, and returns 4,096-row output batches for one supported sort key.
     ///
-    /// This intentionally rejects inputs beyond `budget`; PAVI has no external sort yet.
+    /// Rows that pass `filter` must fit in `budget`. With `limit` (at most
+    /// `budget.max_rows()`), only the best `limit` rows are kept while scanning, so
+    /// `ORDER BY … LIMIT n` works on files of any size. Ties keep file order.
+    /// PAVI has no external sort for larger inputs.
     pub fn read_sorted(
         &self,
         filter: Option<&FilterExpr>,
         projection: &Projection,
         sort: SortSpec,
         budget: SortBudget,
+        limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>> {
         self.validate_sort(sort)?;
         if let Some(filter) = filter {
             self.validate_filter(filter)?;
         }
-        if self.row_count() > budget.max_rows() as u64 {
-            bail!(
-                "sort input has {} rows, exceeding the in-memory sort budget of {} rows; external sorting is unavailable",
-                self.row_count(),
-                budget.max_rows()
-            );
+        if limit == Some(0) {
+            return Ok(Vec::new());
         }
+        let top = limit.filter(|limit| *limit <= budget.max_rows());
 
         let filter_column = filter
             .map(|filter| filter.column_index(&self.dataset_metadata.schema))
@@ -282,6 +331,7 @@ impl ParquetSource {
         }
         let read_projection = Projection::columns(read_columns, self.column_count())?;
         let sort_position = projected_position(&read_projection, sort.column, "sort")?;
+        let sequence_position = read_projection.as_slice().len();
         let filter_position = filter_column
             .map(|column| projected_position(&read_projection, column, "filter"))
             .transpose()?;
@@ -290,10 +340,16 @@ impl ParquetSource {
             .iter()
             .map(|column| projected_position(&read_projection, *column, "output"))
             .collect::<Result<Vec<_>>>()?;
+        let order = SortKeys {
+            value: sort_position,
+            sequence: sequence_position,
+            sort,
+        };
 
         let mut rows = 0_usize;
         let mut bytes = 0_usize;
-        let mut batches = Vec::new();
+        let mut sequence = 0_u64;
+        let mut retained = Vec::new();
         for row_group in self.row_groups() {
             if let (Some(filter), Some(filter_column)) = (filter, filter_column)
                 && !self.row_group_might_match(filter, row_group, filter_column)
@@ -314,60 +370,50 @@ impl ParquetSource {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let next_rows = rows.saturating_add(batch.num_rows());
-                let next_bytes = bytes.saturating_add(batch.get_array_memory_size());
-                if next_rows > budget.max_rows()
-                    || next_bytes
+                let batch_rows = batch.num_rows();
+                let batch = with_sequence(batch, sequence)?;
+                sequence += batch_rows as u64;
+                rows = rows.saturating_add(batch_rows);
+                bytes = bytes.saturating_add(batch.get_array_memory_size());
+                retained.push(batch);
+                if let Some(top) = top
+                    && rows >= top.saturating_add(8 * BATCH_SIZE)
+                {
+                    let kept = order.sort(&retained, Some(top))?;
+                    rows = kept.num_rows();
+                    bytes = kept.get_array_memory_size();
+                    retained = vec![kept];
+                }
+                if (top.is_none() && rows > budget.max_rows())
+                    || bytes
                         .saturating_mul(3)
-                        .saturating_add(next_rows.saturating_mul(8))
+                        .saturating_add(rows.saturating_mul(8))
                         > budget.max_bytes()
                 {
                     bail!(
-                        "sort input exceeds the in-memory sort budget of {} rows / {} bytes; external sorting is unavailable",
+                        "sort input exceeds the in-memory sort budget of {} rows / {} bytes; \
+                         filter the data or add a LIMIT of at most {} rows (external sorting is unavailable)",
                         budget.max_rows(),
-                        budget.max_bytes()
+                        budget.max_bytes(),
+                        budget.max_rows()
                     );
                 }
-                rows = next_rows;
-                bytes = next_bytes;
-                batches.push(batch);
             }
         }
 
-        if batches.is_empty() {
+        if retained.is_empty() {
             return Ok(Vec::new());
         }
-        let input = self.concat_or_empty(&read_projection, batches)?;
-        let tie_breaker = UInt64Array::from_iter_values(0..input.num_rows() as u64);
-        let indices = lexsort_to_indices(
-            &[
-                SortColumn {
-                    values: input.column(sort_position).clone(),
-                    options: Some(SortOptions {
-                        descending: sort.direction == SortDirection::Descending,
-                        nulls_first: sort.nulls == NullOrder::First,
-                    }),
-                },
-                SortColumn {
-                    values: std::sync::Arc::new(tie_breaker),
-                    options: Some(SortOptions {
-                        descending: false,
-                        nulls_first: false,
-                    }),
-                },
-            ],
-            None,
-        )
-        .context("sort supported Arrow values")?;
+        let sorted = order.sort(&retained, top)?;
         let fields: Vec<Field> = output_positions
             .iter()
-            .map(|position| input.schema().field(*position).clone())
+            .map(|position| sorted.schema().field(*position).clone())
             .collect();
         let arrays = output_positions
             .iter()
-            .map(|position| take(input.column(*position).as_ref(), &indices, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let sorted = RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays)?;
+            .map(|position| sorted.column(*position).clone())
+            .collect();
+        let sorted = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?;
         Ok((0..sorted.num_rows())
             .step_by(PAGE_ROWS as usize)
             .map(|first_row| {
@@ -671,6 +717,72 @@ impl ParquetSource {
 
         project_batch(&batch, projection, &output_positions)
     }
+}
+
+/// Matching rows from [`ParquetSource::read_filtered_from`] and where to resume.
+#[derive(Clone, Debug)]
+pub struct FilteredWindow {
+    pub batch: RecordBatch,
+    /// Source row to continue scanning from; equal to the row count at the end.
+    pub next_row: u64,
+}
+
+/// Column positions and direction for sorting buffered rows. `sequence` holds each
+/// row's position in the filtered input and breaks ties so sorting is stable.
+struct SortKeys {
+    value: usize,
+    sequence: usize,
+    sort: SortSpec,
+}
+
+impl SortKeys {
+    /// Sorts `batches` into one batch, keeping only the first `limit` rows if given.
+    fn sort(&self, batches: &[RecordBatch], limit: Option<usize>) -> Result<RecordBatch> {
+        let input = if batches.len() == 1 {
+            batches[0].clone()
+        } else {
+            concat_batches(&batches[0].schema(), batches)?
+        };
+        let indices = lexsort_to_indices(
+            &[
+                SortColumn {
+                    values: input.column(self.value).clone(),
+                    options: Some(SortOptions {
+                        descending: self.sort.direction == SortDirection::Descending,
+                        nulls_first: self.sort.nulls == NullOrder::First,
+                    }),
+                },
+                SortColumn {
+                    values: input.column(self.sequence).clone(),
+                    options: Some(SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    }),
+                },
+            ],
+            limit,
+        )
+        .context("sort supported Arrow values")?;
+        Ok(take_record_batch(&input, &indices)?)
+    }
+}
+
+/// Appends a sequence-number column starting at `first`.
+fn with_sequence(batch: RecordBatch, first: u64) -> Result<RecordBatch> {
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "__pavi_sequence",
+        DataType::UInt64,
+        false,
+    )));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(UInt64Array::from_iter_values(
+        first..first + batch.num_rows() as u64,
+    )));
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
 }
 
 fn project_batch(
@@ -1702,6 +1814,7 @@ mod tests {
                     &Projection::columns(vec![column], source.column_count()).unwrap(),
                     SortSpec::new(column, direction, NullOrder::Last),
                     SortBudget::default(),
+                    None,
                 )
                 .unwrap();
             cells(&batches[0], 0)
@@ -1742,6 +1855,130 @@ mod tests {
         assert!(error("at > soon").contains("is not a timestamp"));
         assert!(error("day contains 2022").contains("only supported for text"));
         assert!(error("flag > true").contains("only support == and !="));
+    }
+
+    fn numbered_file(rows: i32, row_group_rows: usize) -> (TempDir, ParquetSource) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("numbered.parquet");
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..rows)) as ArrayRef,
+            ),
+            (
+                "bucket",
+                Arc::new(Int32Array::from_iter_values((0..rows).map(|id| id % 7))),
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(row_group_rows))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (directory, ParquetSource::open(path).unwrap())
+    }
+
+    #[test]
+    fn pages_filtered_rows_with_a_resume_cursor() {
+        let (_directory, source) = numbered_file(30_000, 10_000);
+        assert_eq!(source.row_groups().len(), 3);
+        let projection = Projection::columns(vec![0], 2).unwrap();
+        let filter = FilterExpr::parse("bucket == 3").unwrap();
+        let expected = (0..30_000).filter(|id| id % 7 == 3).collect::<Vec<_>>();
+
+        let mut seen = Vec::new();
+        let mut next_row = 0;
+        loop {
+            let window = source
+                .read_filtered_from(&filter, next_row, 1_000, &projection)
+                .unwrap();
+            assert!(window.next_row > next_row || window.batch.num_rows() == 0);
+            seen.extend(ids(&window.batch));
+            next_row = window.next_row;
+            if next_row == source.row_count() {
+                break;
+            }
+        }
+        assert_eq!(seen, expected);
+
+        // Same rows as the offset-based reader.
+        let by_offset = source
+            .read_filtered_window(&filter, 1_500, 10, &projection)
+            .unwrap();
+        assert_eq!(ids(&by_offset), expected[1_500..1_510]);
+
+        // Starting part-way through a row group, and after a pruned prefix.
+        let middle = source
+            .read_filtered_from(&filter, 15_001, 2, &projection)
+            .unwrap();
+        assert_eq!(ids(&middle.batch), [15_004, 15_011]);
+        assert_eq!(middle.next_row, 15_012);
+        let late = source
+            .read_filtered_from(
+                &FilterExpr::parse("id >= 25000").unwrap(),
+                0,
+                3,
+                &projection,
+            )
+            .unwrap();
+        assert_eq!(ids(&late.batch), [25_000, 25_001, 25_002]);
+        assert_eq!(late.next_row, 25_003);
+        assert!(
+            source
+                .read_filtered_from(&filter, 30_001, 1, &projection)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn keeps_the_top_rows_with_stable_ties_and_counts_only_filtered_rows() {
+        let (_directory, source) = numbered_file(30_000, 4_000);
+        let projection = Projection::all(2);
+        let tiny = SortBudget::new(100, SortBudget::DEFAULT_MAX_BYTES).unwrap();
+        let by_bucket = SortSpec::new(1, SortDirection::Descending, NullOrder::Last);
+
+        // 30,000 rows exceed the 100-row budget, but LIMIT 5 keeps only the top 5;
+        // equal buckets keep file order.
+        let top = source
+            .read_sorted(None, &projection, by_bucket, tiny, Some(5))
+            .unwrap();
+        assert_eq!(ids(&top[0]), [6, 13, 20, 27, 34]);
+
+        let error = source
+            .read_sorted(None, &projection, by_bucket, tiny, None)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("add a LIMIT of at most 100 rows")
+        );
+        assert!(
+            source
+                .read_sorted(None, &projection, by_bucket, tiny, Some(101))
+                .is_err()
+        );
+
+        // The budget counts rows that pass the filter, not the whole file.
+        let filtered = source
+            .read_sorted(
+                Some(&FilterExpr::parse("id < 50").unwrap()),
+                &projection,
+                SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
+                tiny,
+                None,
+            )
+            .unwrap();
+        assert_eq!(ids(&filtered[0]), (0..50).rev().collect::<Vec<_>>());
+        assert!(
+            source
+                .read_sorted(None, &projection, by_bucket, tiny, Some(0))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {
@@ -2025,6 +2262,7 @@ mod tests {
                 &projection,
                 SortSpec::new(0, SortDirection::Ascending, NullOrder::First),
                 SortBudget::new(10, 1_000_000).unwrap(),
+                None,
             )
             .unwrap();
         let ascending = ascending[0]
@@ -2043,6 +2281,7 @@ mod tests {
                 &projection,
                 SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
                 SortBudget::new(10, 1_000_000).unwrap(),
+                None,
             )
             .unwrap();
         let descending = descending[0]
@@ -2061,6 +2300,7 @@ mod tests {
                 &projection,
                 SortSpec::new(0, SortDirection::Ascending, NullOrder::Last),
                 SortBudget::new(3, 1_000_000).unwrap(),
+                None,
             )
             .unwrap_err();
         assert!(
@@ -2108,6 +2348,7 @@ mod tests {
                     &projection,
                     SortSpec::new(column, direction, NullOrder::Last),
                     SortBudget::new(10, 1_000_000).unwrap(),
+                    None,
                 )
                 .unwrap();
             assert_eq!(ids(&sorted[0]), expected);

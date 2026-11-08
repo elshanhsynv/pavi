@@ -3,10 +3,10 @@ use std::{collections::VecDeque, sync::Arc};
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use parquet_reader::{DataPage, GroupBudget, PAGE_ROWS, SortBudget};
+use parquet_reader::{DataPage, FilteredWindow, GroupBudget, PAGE_ROWS, SortBudget};
 use pavi_runtime::{
-    CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SubmitError,
-    TaskId,
+    CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SortedRead,
+    SubmitError, TaskId,
 };
 
 use crate::{LogicalPlan, PhysicalPlan, Planner};
@@ -27,7 +27,8 @@ pub struct QueryExecution {
     in_flight: Option<InFlight>,
     buffered: VecDeque<(TaskId, RecordBatch)>,
     next_page: u64,
-    next_filter_offset: u64,
+    /// Source row the next filtered read resumes from.
+    next_filter_row: u64,
     remaining: Option<usize>,
     finished: bool,
     cancelled: bool,
@@ -53,7 +54,7 @@ pub enum QueryPoll {
 enum InFlight {
     Page,
     Window,
-    Filtered { requested_rows: usize },
+    Filtered,
     Sorted,
     Aggregate,
 }
@@ -105,7 +106,7 @@ impl QueryEngine {
             in_flight: None,
             buffered: VecDeque::new(),
             next_page: 0,
-            next_filter_offset: 0,
+            next_filter_row: 0,
             finished: false,
             cancelled: false,
             scheduled_reads: 0,
@@ -176,6 +177,9 @@ impl QueryExecution {
                 PageOutcome::Batches(batches) => {
                     self.buffer_batches(batches, in_flight, response.task_id)?
                 }
+                PageOutcome::Filtered(window) => {
+                    self.buffer_filtered(window, in_flight, response.task_id)?
+                }
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
                     return Err(error).context(format!("query task {} failed", response.task_id.0));
@@ -236,6 +240,9 @@ impl QueryExecution {
                 PageOutcome::Batches(batches) => {
                     self.buffer_batches(batches, in_flight, response.task_id)?
                 }
+                PageOutcome::Filtered(window) => {
+                    self.buffer_filtered(window, in_flight, response.task_id)?
+                }
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
                     return Err(error).context(format!("query task {} failed", response.task_id.0));
@@ -265,18 +272,35 @@ impl QueryExecution {
     ) -> Result<()> {
         match in_flight {
             InFlight::Window => {}
-            InFlight::Filtered { requested_rows } => {
-                self.next_filter_offset += batch.num_rows() as u64;
-                if batch.num_rows() < requested_rows {
-                    self.finished = true;
-                }
-            }
+            InFlight::Filtered => bail!("runtime returned a plain batch for a filtered query read"),
             InFlight::Aggregate => self.finished = true,
             InFlight::Page => bail!("runtime returned a batch for a page query read"),
             InFlight::Sorted => bail!("runtime returned one batch for a sorted query read"),
         }
         if batch.num_rows() > 0 {
             self.buffered.push_back((task_id, batch));
+        }
+        Ok(())
+    }
+
+    fn buffer_filtered(
+        &mut self,
+        window: FilteredWindow,
+        in_flight: InFlight,
+        task_id: TaskId,
+    ) -> Result<()> {
+        if !matches!(in_flight, InFlight::Filtered) {
+            bail!("runtime returned a filtered window for a non-filter query read");
+        }
+        if window.next_row < self.next_filter_row {
+            bail!("filtered read moved backwards");
+        }
+        self.next_filter_row = window.next_row;
+        if window.next_row >= self.plan.source.row_count() {
+            self.finished = true;
+        }
+        if window.batch.num_rows() > 0 {
+            self.buffered.push_back((task_id, window.batch));
         }
         Ok(())
     }
@@ -355,8 +379,11 @@ impl QueryExecution {
                     source,
                     self.plan.filter.clone(),
                     projection,
-                    sort,
-                    self.sort_budget,
+                    SortedRead {
+                        sort,
+                        budget: self.sort_budget,
+                        limit: self.plan.limit,
+                    },
                     self.generation_id,
                 ),
                 InFlight::Sorted,
@@ -364,17 +391,15 @@ impl QueryExecution {
             )
         } else if let Some(filter) = &self.plan.filter {
             (
-                self.runtime.submit_filtered_window(
+                self.runtime.submit_filtered_from(
                     source,
                     filter.clone(),
-                    self.next_filter_offset,
+                    self.next_filter_row,
                     row_count,
                     projection,
                     self.generation_id,
                 ),
-                InFlight::Filtered {
-                    requested_rows: row_count,
-                },
+                InFlight::Filtered,
                 false,
             )
         } else {
@@ -1190,6 +1215,51 @@ mod tests {
         assert_eq!(ids(&batch), vec![ROWS - 1, ROWS - 2, ROWS - 3]);
         assert!(execution.next_batch().unwrap().is_none());
         assert_eq!(execution.scheduled_reads(), 1);
+    }
+
+    #[test]
+    fn order_by_limit_keeps_only_the_top_rows_of_inputs_over_the_budget() {
+        let (_dir, source, _) = source();
+        const { assert!(ROWS > 10) };
+        let runtime = runtime();
+        let engine = QueryEngine::with_sort_budget(
+            &runtime,
+            SortBudget::new(10, SortBudget::DEFAULT_MAX_BYTES).unwrap(),
+        );
+        let plan = crate::SqlAst::parse("SELECT id FROM dataset ORDER BY id DESC LIMIT 3")
+            .unwrap()
+            .to_logical_plan(Arc::clone(&source))
+            .unwrap();
+        let mut execution = engine.execute(&plan, GenerationId(30)).unwrap();
+        let batch = execution.next_batch().unwrap().unwrap().batch;
+        assert_eq!(ids(&batch), vec![ROWS - 1, ROWS - 2, ROWS - 3]);
+        assert!(execution.next_batch().unwrap().is_none());
+
+        // A filter that leaves fewer rows than the budget sorts without a LIMIT.
+        let plan = crate::SqlAst::parse("SELECT id FROM dataset WHERE id < 5 ORDER BY id DESC")
+            .unwrap()
+            .to_logical_plan(source)
+            .unwrap();
+        let mut execution = engine.execute(&plan, GenerationId(31)).unwrap();
+        let batch = execution.next_batch().unwrap().unwrap().batch;
+        assert_eq!(ids(&batch), vec![4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn filtered_results_resume_without_rescanning() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(
+                &LogicalPlan::scan(source).filter(Filter::parse("enabled == true").unwrap()),
+                GenerationId(32),
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some(batch) = execution.next_batch().unwrap() {
+            seen.extend(ids(&batch.batch));
+        }
+        assert_eq!(seen, (0..ROWS).step_by(2).collect::<Vec<_>>());
     }
 
     #[test]
