@@ -12,7 +12,7 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
 - **The main pattern** is a single "God struct" `PaviApp` (`crates/app/src/app.rs:292-327`) with ~35 fields; the `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** `cargo clippy --all-targets --all-features` → **0 warnings**. `cargo test --workspace` → **157 tests, all pass** (parquet_reader 42, pavi 74, pavi_query 31, pavi_runtime 9, cli 1). No CI, no `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (164 tests: parquet_reader 46, pavi 77, pavi_query 31, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -141,7 +141,7 @@ crates/app/src/                (pavi)
 
 ### Cargo features
 
-None. No crate defines `[features]`, there are no optional dependencies, no `build.rs`, no `[profile.*]` overrides, no `.cargo/config.toml`, no `clippy.toml`, no CI workflows. `--all-features` is therefore identical to a default build. eframe's own defaults are used (glow, x11, wayland, accesskit; `persistence` **off**).
+None. No crate defines `[features]`, there are no optional dependencies, no `build.rs`, no `[profile.*]` overrides, no `.cargo/config.toml`, no `clippy.toml`. `--all-features` is therefore identical to a default build. eframe's own defaults are used (glow, x11, wayland, accesskit; `persistence` **off**).
 
 ---
 
