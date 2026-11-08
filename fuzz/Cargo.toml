@@ -11,9 +11,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-arrow-array = { version = "59", features = ["chrono-tz"] }
-arrow-schema = "59"
-parquet = { version = "59", features = ["arrow"] }
+arrow-array = { version = "60", features = ["chrono-tz"] }
+arrow-schema = "60"
+parquet = { version = "60", features = ["arrow"] }
 parquet_reader = { path = "../crates/parquet" }
 pavi_query = { path = "../crates/query" }
 

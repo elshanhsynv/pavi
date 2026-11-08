@@ -42,19 +42,18 @@ const BATCH_SIZE: usize = 4096;
 /// Loads the footer and the Arrow schema.
 ///
 /// Writers may embed an Arrow schema (`ARROW:schema`) as a hint for exact Arrow types.
-/// arrow-ipc panics on some corrupt hints instead of returning an error (found by the
-/// `parquet_file` fuzz target). The hint is optional, so if decoding it panics we load
-/// again without it and derive the schema from the Parquet schema alone.
+/// The hint is optional: if it is corrupt, load again without it and derive the schema
+/// from the Parquet schema alone, so the file still opens. If that fails too, report the
+/// original error. (Before arrow-rs 60, corrupt hints panicked; found by the `parquet_file`
+/// fuzz target.)
 fn load_arrow_metadata(file: &File) -> Result<ArrowReaderMetadata> {
-    let with_hint = catch_unwind(AssertUnwindSafe(|| {
-        ArrowReaderMetadata::load(file, ArrowReaderOptions::new())
-    }));
-    match with_hint {
-        Ok(result) => Ok(result?),
-        Err(_) => Ok(ArrowReaderMetadata::load(
+    match ArrowReaderMetadata::load(file, ArrowReaderOptions::new()) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) => ArrowReaderMetadata::load(
             file,
             ArrowReaderOptions::new().with_skip_arrow_metadata(true),
-        )?),
+        )
+        .map_err(|_| error.into()),
     }
 }
 
@@ -1714,8 +1713,9 @@ mod tests {
         );
     }
 
-    /// Regression for a `parquet_file` fuzz crash: arrow-ipc panics on an embedded Arrow
-    /// schema whose integer width is invalid ("Int type with bit width of 524288").
+    /// Regression for a `parquet_file` fuzz crash: an embedded Arrow schema whose integer
+    /// width is invalid ("Int type with bit width of 524288"). arrow-rs 59 panicked on it;
+    /// 60 returns an error. Either way PAVI opens the file using the Parquet schema.
     #[test]
     fn opens_files_whose_embedded_arrow_schema_is_corrupt() {
         use arrow_array::Int16Array;
@@ -1752,8 +1752,9 @@ mod tests {
             .unwrap();
 
         // Set the Int16 column's bit width to the value the fuzzer found. The hint keeps its
-        // byte length, so the footer stays valid. Keep the patch that makes arrow-ipc panic.
-        let triggers_bug = (0..ipc.len().saturating_sub(3))
+        // byte length, so the footer stays valid. Keep the patch that arrow-rs rejects (it
+        // must return an error, not panic).
+        let hint_rejected = (0..ipc.len().saturating_sub(3))
             .filter(|&at| ipc[at..at + 4] == 16_i32.to_le_bytes())
             .any(|at| {
                 let mut forged = ipc.clone();
@@ -1762,18 +1763,10 @@ mod tests {
                 bytes[hint_at..hint_at + hint.len()]
                     .copy_from_slice(STANDARD.encode(&forged).as_bytes());
                 std::fs::write(&path, &bytes).unwrap();
-                catch_unwind(|| {
-                    ArrowReaderMetadata::load(
-                        &File::open(&path).unwrap(),
-                        ArrowReaderOptions::new(),
-                    )
-                })
-                .is_err()
+                ArrowReaderMetadata::load(&File::open(&path).unwrap(), ArrowReaderOptions::new())
+                    .is_err()
             });
-        assert!(
-            triggers_bug,
-            "arrow-ipc no longer panics on this hint; load_arrow_metadata's fallback may be removable"
-        );
+        assert!(hint_rejected, "no patch made arrow-rs reject the hint");
 
         let source = ParquetSource::open(&path).unwrap();
         assert_eq!(source.schema().field(0).data_type(), &DataType::Int16);

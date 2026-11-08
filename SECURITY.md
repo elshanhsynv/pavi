@@ -23,7 +23,7 @@ Do not open a public issue. Use GitHub's private vulnerability reporting on this
 - No `unsafe`, `unwrap`, `expect` or `panic!` outside tests. Enforced by `[workspace.lints]` in `Cargo.toml`.
 - Every collection that grows with file content has a named cap and returns an error when exceeded (see the invariants in `docs/ARCHITECTURE.md`).
 - Worker reads and opens run inside `catch_unwind` (`guarded` in `crates/runtime/src/scheduler.rs`): a decoder panic on a malformed file becomes a normal read/open error and the worker keeps running. Export and profiling read through the same pool, so they are covered too.
-- `parquet_reader` contains known panics in its dependencies: a corrupt embedded Arrow schema is ignored at open (`load_arrow_metadata`), and a decoder panic while reading becomes a "malformed Parquet data" error (`GuardedReader`). This covers the CLI and bench too, not only the app.
+- `parquet_reader` contains known panics in its dependencies: a decoder panic while reading becomes a "malformed Parquet data" error (`GuardedReader`), and a corrupt embedded Arrow schema is ignored at open (`load_arrow_metadata`). This covers the CLI and bench too, not only the app. Known upstream bugs are listed in `docs/FUZZING.md` (Findings).
 - Parquet files, filter text and SQL are fuzzed (`fuzz/`, see `docs/FUZZING.md`), nightly in CI and locally after reader or parser changes.
 - Display text is truncated (cells to 256 chars, nested values to 8 levels / 16 items, statistics to 128 chars) so a crafted value cannot freeze rendering.
 - Writes are atomic (temp file + rename), and temp files are removed on failure or cancel.
