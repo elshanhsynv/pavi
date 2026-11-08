@@ -301,6 +301,10 @@ pub(crate) struct PaviApp {
     frame_page_requests: BTreeSet<u64>,
     /// First and last page the source grid drew this frame.
     visible_page_range: Option<(u64, u64)>,
+    /// First and last absolute row the source grid drew this frame.
+    drawn_rows: Option<(u64, u64)>,
+    /// Vertical offset to apply to the source grid's table on the next frame.
+    grid_scroll_offset: Option<f32>,
     pages: HashMap<u64, DataPage>,
     page_order: VecDeque<u64>,
     filtered: Option<FilteredGrid>,
@@ -360,6 +364,8 @@ impl PaviApp {
             pending_pages: HashMap::new(),
             frame_page_requests: BTreeSet::new(),
             visible_page_range: None,
+            drawn_rows: None,
+            grid_scroll_offset: None,
             pages: HashMap::new(),
             page_order: VecDeque::new(),
             filtered: None,
@@ -807,6 +813,28 @@ impl PaviApp {
                 self.grid.loaded.remove(&oldest);
             }
         }
+    }
+
+    /// Records an absolute row the source grid drew this frame.
+    fn note_drawn_row(&mut self, row: u64) {
+        self.drawn_rows = Some(match self.drawn_rows {
+            Some((first, last)) => (first.min(row), last.max(row)),
+            None => (row, row),
+        });
+    }
+
+    /// Moves the source grid's table window to start at `base`, keeping absolute
+    /// row `top` at the top of the view on the next frame.
+    fn move_grid_window(&mut self, base: u64, top: u64, header_rows: usize) {
+        self.grid.window_base = base;
+        self.grid_scroll_offset =
+            Some((top - base).saturating_add(header_rows as u64) as f32 * ROW_HEIGHT);
+    }
+
+    /// Scrolls the source grid so absolute row `top` is at the top of the view.
+    fn scroll_grid_to(&mut self, top: u64, header_rows: usize) {
+        let base = self.grid.window_base_for(top);
+        self.move_grid_window(base, top, header_rows);
     }
 
     /// Records a page the source grid drew this frame.

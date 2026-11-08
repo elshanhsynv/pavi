@@ -184,8 +184,15 @@ impl ColumnLayout {
     }
 }
 
+/// Most rows the source grid's table holds at once. At 28 px per row this is
+/// 14 million points, small enough for egui's `f32` layout to place every row
+/// exactly. Larger files are shown through a window that moves with the view.
+pub const GRID_WINDOW_ROWS: u64 = 500_000;
+
 pub struct GridState {
     pub generation: GenerationId,
+    /// Absolute row shown at the top of the table's window (0 unless windowed).
+    pub window_base: u64,
     /// Absolute index of the first row in the grid; non-zero once a bounded
     /// result window has slid forward. Selections use absolute row indexes.
     pub first_row: u64,
@@ -202,6 +209,7 @@ impl Default for GridState {
     fn default() -> Self {
         Self {
             generation: GenerationId(0),
+            window_base: 0,
             first_row: 0,
             rows: 0,
             columns: 0,
@@ -217,6 +225,7 @@ impl Default for GridState {
 impl GridState {
     pub fn reset(&mut self) -> GenerationId {
         self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.window_base = 0;
         self.first_row = 0;
         self.rows = 0;
         self.columns = 0;
@@ -232,6 +241,42 @@ impl GridState {
         self.rows = rows;
         self.columns = columns;
         self.loading = LoadState::Ready;
+    }
+
+    /// Whether the rows don't fit in one table window.
+    pub fn is_windowed(&self) -> bool {
+        self.rows > GRID_WINDOW_ROWS
+    }
+
+    /// Rows in the table: all of them, or one window.
+    pub fn window_rows(&self) -> u64 {
+        self.rows.min(GRID_WINDOW_ROWS)
+    }
+
+    /// Window start that puts `row` in the middle of the window (clamped to the data).
+    pub fn window_base_for(&self, row: u64) -> u64 {
+        if !self.is_windowed() {
+            return 0;
+        }
+        row.saturating_sub(GRID_WINDOW_ROWS / 2)
+            .min(self.rows - GRID_WINDOW_ROWS)
+    }
+
+    /// A new window start when the drawn rows `first..=last` come within a quarter
+    /// window of an edge that isn't the start or end of the data; `None` otherwise.
+    pub fn recentered_base(&self, first: u64, last: u64) -> Option<u64> {
+        if !self.is_windowed() {
+            return None;
+        }
+        let margin = GRID_WINDOW_ROWS / 4;
+        let window_end = self.window_base + GRID_WINDOW_ROWS;
+        let near_top = self.window_base > 0 && first < self.window_base + margin;
+        let near_bottom = window_end < self.rows && last + margin >= window_end;
+        if !near_top && !near_bottom {
+            return None;
+        }
+        let base = self.window_base_for(first);
+        (base != self.window_base).then_some(base)
     }
 
     pub fn page_for_row(&self, row: u64) -> Option<u64> {
@@ -341,6 +386,41 @@ impl GridState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_large_row_counts_and_recenters_near_inner_edges() {
+        let mut grid = GridState::default();
+        grid.ready(GRID_WINDOW_ROWS, 2);
+        assert!(!grid.is_windowed());
+        assert_eq!(grid.window_base_for(400_000), 0);
+        assert_eq!(grid.recentered_base(450_000, 450_030), None);
+
+        grid.ready(1_000_000_000, 2);
+        assert!(grid.is_windowed());
+        assert_eq!(grid.window_rows(), GRID_WINDOW_ROWS);
+        assert_eq!(grid.window_base_for(10), 0);
+        assert_eq!(grid.window_base_for(600_000_000), 599_750_000);
+        assert_eq!(
+            grid.window_base_for(999_999_999),
+            1_000_000_000 - GRID_WINDOW_ROWS
+        );
+
+        // At the start of the data nothing moves; near the window's lower quarter it does.
+        assert_eq!(grid.recentered_base(0, 30), None);
+        assert_eq!(grid.recentered_base(374_000, 374_030), None);
+        assert_eq!(grid.recentered_base(380_000, 380_030), Some(130_000));
+        grid.window_base = 130_000;
+        assert_eq!(grid.recentered_base(380_000, 380_030), None);
+        // Near the top edge of a window that doesn't start at row 0.
+        assert_eq!(grid.recentered_base(140_000, 140_030), Some(0));
+
+        // At the end of the data the window stays put.
+        grid.window_base = 1_000_000_000 - GRID_WINDOW_ROWS;
+        assert_eq!(grid.recentered_base(999_999_970, 999_999_999), None);
+
+        grid.reset();
+        assert_eq!(grid.window_base, 0);
+    }
 
     #[test]
     fn selects_absolute_rows_inside_a_slid_window() {

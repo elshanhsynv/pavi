@@ -483,6 +483,128 @@ fn cancels_pending_page_reads_that_scrolled_out_of_view() {
     assert!(app.pending_pages.contains_key(&0));
 }
 
+fn grid_frame(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1448.0, 900.0),
+        )),
+        time: Some(time),
+        events,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn reaches_every_row_of_a_billion_row_grid() {
+    use crate::state::GRID_WINDOW_ROWS;
+
+    const ROWS: u64 = 1_000_000_000;
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    app.grid.ready(ROWS, app.column_layout.visible().len());
+    let ctx = egui::Context::default();
+    ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    let mut time = 0.0;
+    let mut render = |app: &mut PaviApp, events: Vec<egui::Event>| {
+        time += 0.1;
+        let _ = ctx.run(grid_frame(time, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        });
+    };
+    for _ in 0..3 {
+        render(&mut app, vec![]);
+    }
+    assert_eq!(app.drawn_rows.map(|(first, _)| first), Some(0));
+    assert_eq!(app.grid.window_base, 0);
+
+    // The very last row (unreachable before: egui's f32 layout ran out of precision).
+    app.jump_row_input = ROWS.to_string();
+    app.jump_to_input();
+    for _ in 0..4 {
+        render(&mut app, vec![]);
+    }
+    assert_eq!(app.drawn_rows.map(|(_, last)| last), Some(ROWS - 1));
+    assert_eq!(app.grid.window_base, ROWS - GRID_WINDOW_ROWS);
+
+    // The middle row, centred.
+    app.jump_row_input = "500000001".to_string();
+    app.jump_to_input();
+    for _ in 0..4 {
+        render(&mut app, vec![]);
+    }
+    let (first, last) = app.drawn_rows.unwrap();
+    assert!((first..=last).contains(&500_000_000));
+    let base_before = app.grid.window_base;
+
+    // Wheel-scroll 150,000 rows down: past the window's inner edge, so the window
+    // moves, and the view lands on the same rows it would without windowing.
+    let pointer = egui::pos2(600.0, 450.0);
+    let wheel = vec![
+        egui::Event::PointerMoved(pointer),
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -150_000.0 * ROW_HEIGHT),
+            modifiers: egui::Modifiers::NONE,
+        },
+    ];
+    render(&mut app, wheel);
+    for _ in 0..60 {
+        render(&mut app, vec![egui::Event::PointerMoved(pointer)]);
+    }
+    let (scrolled_first, _) = app.drawn_rows.unwrap();
+    assert!(
+        scrolled_first.abs_diff(first + 150_000) <= 1,
+        "expected about {}, got {scrolled_first}",
+        first + 150_000
+    );
+    assert_ne!(app.grid.window_base, base_before, "the window moved");
+    assert!(
+        app.grid
+            .recentered_base(scrolled_first, scrolled_first + 30)
+            .is_none()
+    );
+}
+
+#[test]
+fn row_scrollbar_maps_clicks_to_rows_across_the_whole_file() {
+    let ctx = egui::Context::default();
+    let bar = egui::Rect::from_min_max(egui::pos2(500.0, 100.0), egui::pos2(512.0, 700.0));
+    let click = |y: f32| {
+        let position = egui::pos2(506.0, y);
+        vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    };
+    let target = |events: Vec<egui::Event>| {
+        let mut result = None;
+        let _ = ctx.run(grid_frame(0.0, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                result = ui::grid::row_scrollbar(ui, bar, 1_000_000_000, 0, 30);
+            });
+        });
+        result
+    };
+    assert_eq!(target(vec![]), None);
+    let bottom = target(click(699.0)).unwrap();
+    assert_eq!(bottom, 1_000_000_000 - 31);
+    let middle = target(click(400.0)).unwrap();
+    assert!(middle.abs_diff(500_000_000) < 5_000_000);
+    assert_eq!(target(click(101.0)), Some(0));
+}
+
 #[test]
 fn replaces_and_cancels_obsolete_filters() {
     let (_directory, source, path) = source(8);
