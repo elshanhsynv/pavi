@@ -25,12 +25,6 @@ pub struct PageResponse {
     pub outcome: PageOutcome,
 }
 
-impl PageResponse {
-    pub fn is_stale_for(&self, current_generation: GenerationId) -> bool {
-        self.generation_id != current_generation
-    }
-}
-
 pub enum OpenOutcome {
     Opened(Arc<ParquetSource>),
     Cancelled,

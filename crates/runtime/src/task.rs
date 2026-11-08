@@ -9,42 +9,25 @@ pub struct TaskId(pub u64);
 pub struct GenerationId(pub u64);
 
 /// The caller-owned control and response endpoint for a submitted page read.
+/// Its task and generation IDs arrive with the response.
 pub struct PageTask {
-    id: TaskId,
-    generation_id: GenerationId,
     cancellation: CancellationToken,
     response: Receiver<PageResponse>,
 }
 
 /// The caller-owned control and response endpoint for a background source open.
+/// Its task and generation IDs arrive with the response.
 pub struct OpenTask {
-    id: TaskId,
-    generation_id: GenerationId,
     cancellation: CancellationToken,
     response: Receiver<OpenResponse>,
 }
 
 impl PageTask {
-    pub(crate) fn new(
-        id: TaskId,
-        generation_id: GenerationId,
-        cancellation: CancellationToken,
-        response: Receiver<PageResponse>,
-    ) -> Self {
+    pub(crate) fn new(cancellation: CancellationToken, response: Receiver<PageResponse>) -> Self {
         Self {
-            id,
-            generation_id,
             cancellation,
             response,
         }
-    }
-
-    pub fn id(&self) -> TaskId {
-        self.id
-    }
-
-    pub fn generation_id(&self) -> GenerationId {
-        self.generation_id
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -65,30 +48,11 @@ impl PageTask {
 }
 
 impl OpenTask {
-    pub(crate) fn new(
-        id: TaskId,
-        generation_id: GenerationId,
-        cancellation: CancellationToken,
-        response: Receiver<OpenResponse>,
-    ) -> Self {
+    pub(crate) fn new(cancellation: CancellationToken, response: Receiver<OpenResponse>) -> Self {
         Self {
-            id,
-            generation_id,
             cancellation,
             response,
         }
-    }
-
-    pub fn id(&self) -> TaskId {
-        self.id
-    }
-
-    pub fn generation_id(&self) -> GenerationId {
-        self.generation_id
-    }
-
-    pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation.clone()
     }
 
     pub fn cancel(&self) {

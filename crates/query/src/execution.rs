@@ -73,7 +73,8 @@ impl QueryEngine {
         }
     }
 
-    pub fn with_sort_budget(runtime: &Runtime, sort_budget: SortBudget) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_sort_budget(runtime: &Runtime, sort_budget: SortBudget) -> Self {
         Self {
             runtime: runtime.handle(),
             sort_budget,
@@ -81,7 +82,8 @@ impl QueryEngine {
         }
     }
 
-    pub fn with_group_budget(runtime: &Runtime, group_budget: GroupBudget) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_group_budget(runtime: &Runtime, group_budget: GroupBudget) -> Self {
         Self {
             runtime: runtime.handle(),
             sort_budget: SortBudget::default(),
@@ -456,12 +458,6 @@ fn is_queue_full(error: &anyhow::Error) -> bool {
             .downcast_ref::<SubmitError>()
             .is_some_and(|error| *error == SubmitError::QueueFull)
     })
-}
-
-impl QueryBatch {
-    pub fn is_stale_for(&self, current_generation: GenerationId) -> bool {
-        self.generation_id != current_generation
-    }
 }
 
 #[cfg(test)]
@@ -864,8 +860,7 @@ mod tests {
             .next_batch()
             .unwrap()
             .unwrap();
-        assert!(batch.is_stale_for(GenerationId(8)));
-        assert!(!batch.is_stale_for(GenerationId(7)));
+        assert_eq!(batch.generation_id, GenerationId(7));
     }
 
     #[test]
@@ -1055,7 +1050,6 @@ mod tests {
             .unwrap();
         let batch = execution.next_batch().unwrap().unwrap();
         assert_eq!(batch.generation_id, GenerationId(23));
-        assert!(batch.is_stale_for(GenerationId(24)));
         let values = batch
             .batch
             .column(1)
