@@ -8,9 +8,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 use arrow_schema::{DataType, Field, Schema, SortOptions, TimeUnit};
@@ -26,8 +27,11 @@ use parquet::file::metadata::ParquetMetaData;
 use crate::{
     AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
     NullOrder, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo,
-    RowWindow, SortBudget, SortDirection, SortSpec, filter::FilterExpr, page::PAGE_ROWS,
+    RowWindow, SortBudget, SortDirection, SortSpec,
+    filter::FilterExpr,
+    page::PAGE_ROWS,
     statistics::metadata_statistics,
+    types::{is_comparable, is_numeric, is_signed_integer, is_unsigned_integer},
 };
 
 const BATCH_SIZE: usize = 4096;
@@ -460,7 +464,7 @@ impl ParquetSource {
                 .fields()
                 .get(group)
                 .ok_or_else(|| anyhow!("group column {group} out of range"))?;
-            if !supports_grouping(field.data_type()) {
+            if !is_comparable(field.data_type()) {
                 bail!(
                     "GROUP BY is not supported for {:?} columns",
                     field.data_type()
@@ -480,9 +484,9 @@ impl ParquetSource {
             match (expression.function(), field) {
                 (AggregateFunction::Count, _) => {}
                 (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
-                    if supports_numeric(field.data_type()) => {}
+                    if is_numeric(field.data_type()) => {}
                 (AggregateFunction::Min | AggregateFunction::Max, Some(field))
-                    if supports_min_max(field.data_type()) => {}
+                    if is_comparable(field.data_type()) => {}
                 (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
                     "{:?} is not supported for {:?} columns",
                     expression.function(),
@@ -517,25 +521,13 @@ impl ParquetSource {
             .fields()
             .get(sort.column)
             .ok_or_else(|| anyhow!("sort column {} out of range", sort.column))?;
-        match field.data_type() {
-            DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Timestamp(_, _) => Ok(()),
-            data_type => bail!("sorting is not supported for {data_type:?} columns"),
+        if !is_comparable(field.data_type()) {
+            bail!(
+                "sorting is not supported for {:?} columns",
+                field.data_type()
+            );
         }
+        Ok(())
     }
 
     fn read_window_batches(
@@ -750,8 +742,8 @@ impl Accumulator {
         match expression.function() {
             AggregateFunction::Count => Ok(Self::Count(0)),
             AggregateFunction::Sum => match data_type {
-                Some(data_type) if is_signed(data_type) => Ok(Self::SumI64(None)),
-                Some(data_type) if is_unsigned(data_type) => Ok(Self::SumU64(None)),
+                Some(data_type) if is_signed_integer(data_type) => Ok(Self::SumI64(None)),
+                Some(data_type) if is_unsigned_integer(data_type) => Ok(Self::SumU64(None)),
                 Some(DataType::Float32 | DataType::Float64) => Ok(Self::SumF64(None)),
                 _ => bail!("SUM needs a numeric column"),
             },
@@ -1109,47 +1101,11 @@ impl GroupCollector {
     }
 }
 
-fn supports_numeric(data_type: &DataType) -> bool {
-    is_signed(data_type)
-        || is_unsigned(data_type)
-        || matches!(data_type, DataType::Float32 | DataType::Float64)
-}
-
-fn is_signed(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
-
-fn is_unsigned(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
-    )
-}
-
-fn supports_min_max(data_type: &DataType) -> bool {
-    supports_numeric(data_type)
-        || matches!(
-            data_type,
-            DataType::Boolean
-                | DataType::Utf8
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Timestamp(_, None)
-        )
-}
-
-fn supports_grouping(data_type: &DataType) -> bool {
-    supports_min_max(data_type)
-}
-
 fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) -> Result<DataType> {
     match expression.function() {
         AggregateFunction::Count => Ok(DataType::UInt64),
-        AggregateFunction::Sum if input.is_some_and(is_signed) => Ok(DataType::Int64),
-        AggregateFunction::Sum if input.is_some_and(is_unsigned) => Ok(DataType::UInt64),
+        AggregateFunction::Sum if input.is_some_and(is_signed_integer) => Ok(DataType::Int64),
+        AggregateFunction::Sum if input.is_some_and(is_unsigned_integer) => Ok(DataType::UInt64),
         AggregateFunction::Sum | AggregateFunction::Avg
             if input.is_some_and(|data_type| {
                 matches!(data_type, DataType::Float32 | DataType::Float64)
@@ -1157,7 +1113,7 @@ fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) ->
         {
             Ok(DataType::Float64)
         }
-        AggregateFunction::Avg if input.is_some_and(supports_numeric) => Ok(DataType::Float64),
+        AggregateFunction::Avg if input.is_some_and(is_numeric) => Ok(DataType::Float64),
         AggregateFunction::Min | AggregateFunction::Max => {
             input.cloned().context("MIN/MAX needs a source column")
         }
@@ -1272,6 +1228,22 @@ fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scal
                 .value(row)
                 .to_owned(),
         )),
+        DataType::LargeUtf8 => Ok(Scalar::Utf8(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .context("read large string aggregate value")?
+                .value(row)
+                .to_owned(),
+        )),
+        DataType::Utf8View => Ok(Scalar::Utf8(
+            array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .context("read string view aggregate value")?
+                .value(row)
+                .to_owned(),
+        )),
         DataType::Date32 => Ok(Scalar::Date32(
             array
                 .as_any()
@@ -1286,28 +1258,28 @@ fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scal
                 .context("read date64 aggregate value")?
                 .value(row),
         )),
-        DataType::Timestamp(TimeUnit::Second, None) => Ok(Scalar::Timestamp(
+        DataType::Timestamp(TimeUnit::Second, _) => Ok(Scalar::Timestamp(
             array
                 .as_any()
                 .downcast_ref::<TimestampSecondArray>()
                 .context("read second timestamp aggregate value")?
                 .value(row),
         )),
-        DataType::Timestamp(TimeUnit::Millisecond, None) => Ok(Scalar::Timestamp(
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Scalar::Timestamp(
             array
                 .as_any()
                 .downcast_ref::<TimestampMillisecondArray>()
                 .context("read millisecond timestamp aggregate value")?
                 .value(row),
         )),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Scalar::Timestamp(
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Scalar::Timestamp(
             array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .context("read microsecond timestamp aggregate value")?
                 .value(row),
         )),
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(Scalar::Timestamp(
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Ok(Scalar::Timestamp(
             array
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
@@ -1393,6 +1365,18 @@ fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayR
             Scalar::Utf8(value) => Ok(value.clone()),
             _ => bail!("aggregate output type mismatch"),
         }))),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(values!(
+            |value: &Scalar| match value {
+                Scalar::Utf8(value) => Ok(value.clone()),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        ))),
+        DataType::Utf8View => Arc::new(StringViewArray::from(values!(
+            |value: &Scalar| match value {
+                Scalar::Utf8(value) => Ok(value.clone()),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        ))),
         DataType::Date32 => Arc::new(Date32Array::from(values!(|value: &Scalar| match value {
             Scalar::Date32(value) => Ok(*value),
             _ => bail!("aggregate output type mismatch"),
@@ -1401,29 +1385,33 @@ fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayR
             Scalar::Date64(value) => Ok(*value),
             _ => bail!("aggregate output type mismatch"),
         }))),
-        DataType::Timestamp(TimeUnit::Second, None) => Arc::new(TimestampSecondArray::from(
-            values!(|value: &Scalar| match value {
+        DataType::Timestamp(TimeUnit::Second, timezone) => Arc::new(
+            TimestampSecondArray::from(values!(|value: &Scalar| match value {
                 Scalar::Timestamp(value) => Ok(*value),
                 _ => bail!("aggregate output type mismatch"),
-            }),
-        )),
-        DataType::Timestamp(TimeUnit::Millisecond, None) => Arc::new(
+            }))
+            .with_timezone_opt(timezone.clone()),
+        ),
+        DataType::Timestamp(TimeUnit::Millisecond, timezone) => Arc::new(
             TimestampMillisecondArray::from(values!(|value: &Scalar| match value {
                 Scalar::Timestamp(value) => Ok(*value),
                 _ => bail!("aggregate output type mismatch"),
-            })),
+            }))
+            .with_timezone_opt(timezone.clone()),
         ),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => Arc::new(
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => Arc::new(
             TimestampMicrosecondArray::from(values!(|value: &Scalar| match value {
                 Scalar::Timestamp(value) => Ok(*value),
                 _ => bail!("aggregate output type mismatch"),
-            })),
+            }))
+            .with_timezone_opt(timezone.clone()),
         ),
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => Arc::new(
             TimestampNanosecondArray::from(values!(|value: &Scalar| match value {
                 Scalar::Timestamp(value) => Ok(*value),
                 _ => bail!("aggregate output type mismatch"),
-            })),
+            }))
+            .with_timezone_opt(timezone.clone()),
         ),
         _ => bail!("aggregate output is not supported for {data_type:?}"),
     })
@@ -1608,6 +1596,152 @@ mod tests {
             range(3),
             ("-12.345".into(), "100000000000000000.000".into())
         );
+    }
+
+    #[test]
+    fn sorts_aggregates_and_filters_every_comparable_type() {
+        use arrow_array::{BooleanArray, LargeStringArray, StringViewArray};
+
+        use crate::value::format_cell;
+
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("comparable.parquet");
+        let start = 1_700_000_000_000_i64; // 2023-11-14T23:13:20+01:00
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "name",
+                Arc::new(LargeStringArray::from(vec!["b", "a", "b", "a", "c"])) as ArrayRef,
+            ),
+            (
+                "view",
+                Arc::new(StringViewArray::from(vec![
+                    "kiwi", "apple", "banana", "cherry", "date",
+                ])),
+            ),
+            (
+                "day",
+                Arc::new(Date32Array::from(vec![
+                    19_000, 19_001, 19_002, 19_003, 19_004,
+                ])),
+            ),
+            (
+                "at",
+                Arc::new(
+                    TimestampMillisecondArray::from_iter_values(
+                        (0..5).map(|hour| start + hour * 3_600_000),
+                    )
+                    .with_timezone("Europe/Berlin"),
+                ),
+            ),
+            (
+                "flag",
+                Arc::new(BooleanArray::from(vec![true, false, true, false, true])),
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let source = ParquetSource::open(path).unwrap();
+        assert_eq!(source.schema().field(0).data_type(), &DataType::LargeUtf8);
+        assert_eq!(source.schema().field(1).data_type(), &DataType::Utf8View);
+        let all = Projection::all(source.column_count());
+        let cells = |batch: &RecordBatch, column: usize| {
+            (0..batch.num_rows())
+                .map(|row| format_cell(batch.column(column).as_ref(), row))
+                .collect::<Vec<_>>()
+        };
+
+        // GROUP BY a LargeUtf8 column with MIN over a zoned timestamp and MAX over Utf8View.
+        let grouped = source
+            .read_aggregated(
+                None,
+                &AggregateSpec::grouped(
+                    0,
+                    vec![
+                        AggregateExpr::count_all(),
+                        AggregateExpr::min(3),
+                        AggregateExpr::max(1),
+                    ],
+                )
+                .unwrap(),
+                GroupBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(cells(&grouped, 0), ["b", "a", "c"]);
+        assert_eq!(cells(&grouped, 1), ["2", "2", "1"]);
+        assert_eq!(
+            cells(&grouped, 2),
+            [
+                "2023-11-14T23:13:20+01:00",
+                "2023-11-15T00:13:20+01:00",
+                "2023-11-15T03:13:20+01:00"
+            ]
+        );
+        assert_eq!(cells(&grouped, 3), ["kiwi", "cherry", "date"]);
+        let minimum = source
+            .read_aggregated(
+                None,
+                &AggregateSpec::new(vec![AggregateExpr::min(0)]).unwrap(),
+                GroupBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(minimum.schema().field(0).data_type(), &DataType::LargeUtf8);
+        assert_eq!(cells(&minimum, 0), ["a"]);
+
+        // Sorting by Utf8View and by a zoned timestamp.
+        let sort = |column: usize, direction: SortDirection| {
+            let batches = source
+                .read_sorted(
+                    None,
+                    &Projection::columns(vec![column], source.column_count()).unwrap(),
+                    SortSpec::new(column, direction, NullOrder::Last),
+                    SortBudget::default(),
+                )
+                .unwrap();
+            cells(&batches[0], 0)
+        };
+        assert_eq!(
+            sort(1, SortDirection::Ascending),
+            ["apple", "banana", "cherry", "date", "kiwi"]
+        );
+        assert_eq!(
+            sort(3, SortDirection::Descending)[0],
+            "2023-11-15T03:13:20+01:00"
+        );
+
+        // Filters on dates, zoned timestamps (local time unless an offset is given) and Utf8View.
+        let count = |expression: &str| {
+            source
+                .read_filtered_window(&FilterExpr::parse(expression).unwrap(), 0, 100, &all)
+                .unwrap()
+                .num_rows()
+        };
+        assert_eq!(count("day >= 2022-01-10"), 3);
+        assert_eq!(count("day == 2022-01-08"), 1);
+        assert_eq!(count("day > 2030-01-01"), 0);
+        assert_eq!(count("at < 2023-11-15T01:00:00"), 2);
+        assert_eq!(count("at == 2023-11-15T00:13:20+01:00"), 1);
+        assert_eq!(count("at >= 2023-11-14T22:13:20Z"), 5);
+        assert_eq!(count("view contains an"), 1);
+        assert_eq!(count("view > c"), 3);
+        assert_eq!(count("name == b"), 2);
+
+        let error = |expression: &str| {
+            source
+                .validate_filter(&FilterExpr::parse(expression).unwrap())
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error("day == tomorrow").contains("is not a date"));
+        assert!(error("at > soon").contains("is not a timestamp"));
+        assert!(error("day contains 2022").contains("only supported for text"));
+        assert!(error("flag > true").contains("only support == and !="));
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {

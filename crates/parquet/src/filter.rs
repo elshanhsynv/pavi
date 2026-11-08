@@ -2,11 +2,19 @@ use std::cmp::Ordering;
 
 use anyhow::{Result, anyhow, bail};
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
+    timezone::Tz,
+    types::{Date32Type, Date64Type},
 };
-use arrow_schema::{DataType, Schema};
+use arrow_cast::parse::{Parser, string_to_datetime};
+use arrow_schema::{DataType, Schema, TimeUnit};
 use parquet::file::statistics::Statistics;
+
+use crate::types::{is_comparable, is_numeric, is_string};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FilterOp {
@@ -78,35 +86,59 @@ impl FilterExpr {
 
     pub fn validate_schema(&self, schema: &Schema) -> Result<()> {
         let column = self.column_index(schema)?;
-        match schema.field(column).data_type() {
-            DataType::Boolean => {
-                if !matches!(self.op, FilterOp::Eq | FilterOp::Ne) {
-                    bail!("boolean columns only support == and !=");
-                }
-                self.value
-                    .parse::<bool>()
-                    .map_err(|_| anyhow!("'{}' is not a boolean", self.value))?;
+        self.validate_type(schema.field(column).data_type())
+    }
+
+    /// Checks that this operator and value can be used on a column of `data_type`.
+    ///
+    /// Filters accept the comparable types (`types::is_comparable`): booleans with
+    /// `==`/`!=`, numbers, dates and timestamps with any comparison, and text with any
+    /// comparison or `contains`.
+    pub fn validate_type(&self, data_type: &DataType) -> Result<()> {
+        if !is_comparable(data_type) {
+            bail!("filtering is not supported for {data_type:?} columns");
+        }
+        if self.op == FilterOp::Contains && !is_string(data_type) {
+            bail!("contains is only supported for text columns");
+        }
+        if *data_type == DataType::Boolean {
+            if !matches!(self.op, FilterOp::Eq | FilterOp::Ne) {
+                bail!("boolean columns only support == and !=");
             }
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64 => {
-                if self.op == FilterOp::Contains {
-                    bail!("contains is only supported for UTF-8 columns");
-                }
-                Number::parse(&self.value)
-                    .ok_or_else(|| anyhow!("'{}' is not a number", self.value))?;
-            }
-            DataType::Utf8 | DataType::LargeUtf8 => {}
-            other => bail!("filtering is not supported for {other:?} columns"),
+            self.value
+                .parse::<bool>()
+                .map_err(|_| anyhow!("'{}' is not a boolean", self.value))?;
+        } else if !is_string(data_type) {
+            self.ordered_value(data_type)?;
         }
         Ok(())
+    }
+
+    /// The comparison value for number, date and timestamp columns, in the column's
+    /// own units: days for `Date32`, milliseconds for `Date64`, the column's unit
+    /// for timestamps. A timestamp without an offset is read in the column's time
+    /// zone (naive columns: as written).
+    fn ordered_value(&self, data_type: &DataType) -> Result<Number> {
+        let value = self.value.as_str();
+        let parsed = match data_type {
+            DataType::Date32 => Date32Type::parse(value).map(|days| Number::Int(days.into())),
+            DataType::Date64 => Date64Type::parse(value).map(|millis| Number::Int(millis.into())),
+            DataType::Timestamp(unit, timezone) => {
+                parse_timestamp(value, *unit, timezone.as_deref())
+                    .map(|ticks| Number::Int(ticks.into()))
+            }
+            data_type if is_numeric(data_type) => Number::parse(value),
+            _ => None,
+        };
+        parsed.ok_or_else(|| match data_type {
+            DataType::Date32 | DataType::Date64 => {
+                anyhow!("'{value}' is not a date (expected YYYY-MM-DD)")
+            }
+            DataType::Timestamp(_, _) => {
+                anyhow!("'{value}' is not a timestamp (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
+            }
+            _ => anyhow!("'{value}' is not a number"),
+        })
     }
 
     pub fn evaluate_batch(
@@ -115,43 +147,54 @@ impl FilterExpr {
         column_position: usize,
     ) -> Result<BooleanArray> {
         let array = batch.column(column_position).as_ref();
-        let mask = match array.data_type() {
+        let data_type = array.data_type();
+        self.validate_type(data_type)?;
+        let mask = match data_type {
             DataType::Boolean => self.evaluate_bool(array)?,
-            DataType::Int8 => {
-                self.evaluate_numbers(array, |a: &Int8Array, row| Number::Int(a.value(row).into()))?
-            }
-            DataType::Int16 => self.evaluate_numbers(array, |a: &Int16Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::Int32 => self.evaluate_numbers(array, |a: &Int32Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::Int64 => self.evaluate_numbers(array, |a: &Int64Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::UInt8 => self.evaluate_numbers(array, |a: &UInt8Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::UInt16 => self.evaluate_numbers(array, |a: &UInt16Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::UInt32 => self.evaluate_numbers(array, |a: &UInt32Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::UInt64 => self.evaluate_numbers(array, |a: &UInt64Array, row| {
-                Number::Int(a.value(row).into())
-            })?,
-            DataType::Float32 => self.evaluate_numbers(array, |a: &Float32Array, row| {
-                Number::Float(a.value(row).into())
-            })?,
-            DataType::Float64 => {
-                self.evaluate_numbers(array, |a: &Float64Array, row| Number::Float(a.value(row)))?
-            }
             DataType::Utf8 => self.evaluate_strings(array, |a: &StringArray, row| a.value(row))?,
             DataType::LargeUtf8 => {
                 self.evaluate_strings(array, |a: &LargeStringArray, row| a.value(row))?
             }
-            other => bail!("filtering is not supported for {other:?} columns"),
+            DataType::Utf8View => {
+                self.evaluate_strings(array, |a: &StringViewArray, row| a.value(row))?
+            }
+            _ => {
+                let expected = self.ordered_value(data_type)?;
+                macro_rules! ordered {
+                    ($array:ty, $number:path) => {
+                        self.evaluate_ordered(array, expected, |a: &$array, row| {
+                            $number(a.value(row).into())
+                        })?
+                    };
+                }
+                match data_type {
+                    DataType::Int8 => ordered!(Int8Array, Number::Int),
+                    DataType::Int16 => ordered!(Int16Array, Number::Int),
+                    DataType::Int32 => ordered!(Int32Array, Number::Int),
+                    DataType::Int64 => ordered!(Int64Array, Number::Int),
+                    DataType::UInt8 => ordered!(UInt8Array, Number::Int),
+                    DataType::UInt16 => ordered!(UInt16Array, Number::Int),
+                    DataType::UInt32 => ordered!(UInt32Array, Number::Int),
+                    DataType::UInt64 => ordered!(UInt64Array, Number::Int),
+                    DataType::Float32 => ordered!(Float32Array, Number::Float),
+                    DataType::Float64 => ordered!(Float64Array, Number::Float),
+                    DataType::Date32 => ordered!(Date32Array, Number::Int),
+                    DataType::Date64 => ordered!(Date64Array, Number::Int),
+                    DataType::Timestamp(TimeUnit::Second, _) => {
+                        ordered!(TimestampSecondArray, Number::Int)
+                    }
+                    DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                        ordered!(TimestampMillisecondArray, Number::Int)
+                    }
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                        ordered!(TimestampMicrosecondArray, Number::Int)
+                    }
+                    DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                        ordered!(TimestampNanosecondArray, Number::Int)
+                    }
+                    other => bail!("filtering is not supported for {other:?} columns"),
+                }
+            }
         };
 
         Ok(mask)
@@ -160,7 +203,8 @@ impl FilterExpr {
     /// Returns `false` only when row-group statistics prove that no row can match.
     ///
     /// `data_type` is the Arrow type of the filtered column. Parquet stores unsigned
-    /// integers in signed physical types, so their statistics must be reinterpreted.
+    /// integers, dates and timestamps in signed integer physical types, so statistics
+    /// are read in the same units as [`Self::ordered_value`].
     pub fn might_match_statistics(
         &self,
         statistics: Option<&Statistics>,
@@ -169,6 +213,7 @@ impl FilterExpr {
         let Some(statistics) = statistics else {
             return true;
         };
+        let expected = || self.ordered_value(data_type).ok();
 
         match statistics {
             Statistics::Boolean(stats) => {
@@ -189,7 +234,7 @@ impl FilterExpr {
                 stats
                     .max_opt()
                     .map(|value| int32_statistic(*value, data_type)),
-                &self.value,
+                expected(),
                 &self.op,
             ),
             Statistics::Int64(stats) => number_range_might_match(
@@ -199,19 +244,19 @@ impl FilterExpr {
                 stats
                     .max_opt()
                     .map(|value| int64_statistic(*value, data_type)),
-                &self.value,
+                expected(),
                 &self.op,
             ),
             Statistics::Float(stats) => number_range_might_match(
                 stats.min_opt().map(|value| Number::Float((*value).into())),
                 stats.max_opt().map(|value| Number::Float((*value).into())),
-                &self.value,
+                expected(),
                 &self.op,
             ),
             Statistics::Double(stats) => number_range_might_match(
                 stats.min_opt().map(|value| Number::Float(*value)),
                 stats.max_opt().map(|value| Number::Float(*value)),
-                &self.value,
+                expected(),
                 &self.op,
             ),
             Statistics::ByteArray(stats) => {
@@ -228,10 +273,6 @@ impl FilterExpr {
     }
 
     fn evaluate_bool(&self, array: &dyn Array) -> Result<BooleanArray> {
-        if !matches!(self.op, FilterOp::Eq | FilterOp::Ne) {
-            bail!("boolean columns only support == and !=");
-        }
-
         let expected = self
             .value
             .parse::<bool>()
@@ -246,24 +287,19 @@ impl FilterExpr {
         })))
     }
 
-    fn evaluate_numbers<T>(
+    fn evaluate_ordered<T>(
         &self,
         array: &dyn Array,
+        expected: Number,
         value_at: impl Fn(&T, usize) -> Number,
     ) -> Result<BooleanArray>
     where
         T: Array + 'static,
     {
-        if self.op == FilterOp::Contains {
-            bail!("contains is only supported for UTF-8 columns");
-        }
-
-        let expected = Number::parse(&self.value)
-            .ok_or_else(|| anyhow!("'{}' is not a number", self.value))?;
         let array = array
             .as_any()
             .downcast_ref::<T>()
-            .ok_or_else(|| anyhow!("numeric array type mismatch"))?;
+            .ok_or_else(|| anyhow!("{:?} array type mismatch", array.data_type()))?;
 
         Ok(BooleanArray::from_iter((0..array.len()).map(|row| {
             Some(!array.is_null(row) && compare_number(value_at(array, row), expected, &self.op))
@@ -342,6 +378,19 @@ impl Number {
     }
 }
 
+/// Parses a timestamp literal into ticks of `unit`. Text without an offset is read
+/// in `timezone`; naive columns (no time zone) store wall-clock time as if UTC.
+fn parse_timestamp(value: &str, unit: TimeUnit, timezone: Option<&str>) -> Option<i64> {
+    let timezone: Tz = timezone.unwrap_or("+00:00").parse().ok()?;
+    let datetime = string_to_datetime(&timezone, value).ok()?;
+    match unit {
+        TimeUnit::Second => Some(datetime.timestamp()),
+        TimeUnit::Millisecond => Some(datetime.timestamp_millis()),
+        TimeUnit::Microsecond => Some(datetime.timestamp_micros()),
+        TimeUnit::Nanosecond => datetime.timestamp_nanos_opt(),
+    }
+}
+
 fn int32_statistic(value: i32, data_type: &DataType) -> Number {
     match data_type {
         DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => Number::Int((value as u32).into()),
@@ -399,14 +448,14 @@ fn bool_range_might_match(
 fn number_range_might_match(
     min: Option<Number>,
     max: Option<Number>,
-    value: &str,
+    value: Option<Number>,
     op: &FilterOp,
 ) -> bool {
     if *op == FilterOp::Contains {
         return true;
     }
 
-    let Some(value) = Number::parse(value) else {
+    let Some(value) = value else {
         return true;
     };
     let Some((min, max)) = min.zip(max) else {
