@@ -483,11 +483,23 @@ impl RuntimeHandle {
             .ok_or(SubmitError::Shutdown)
     }
 
+    /// Returns the current ID and advances the counter, failing instead of wrapping.
     fn next_task_id(&self) -> Result<TaskId, SubmitError> {
-        self.next_task_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map(TaskId)
-            .map_err(|_| SubmitError::TaskIdExhausted)
+        // A compare-exchange loop rather than `fetch_update`, which newer toolchains
+        // deprecate in favor of `try_update` (not available on older ones).
+        let mut current = self.next_task_id.load(Ordering::Relaxed);
+        loop {
+            let next = current.checked_add(1).ok_or(SubmitError::TaskIdExhausted)?;
+            match self.next_task_id.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(TaskId(current)),
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
