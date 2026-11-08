@@ -108,6 +108,7 @@ impl PaviApp {
             return;
         }
         let jump_target = self.jump_target.take().map(ui_row_count);
+        self.visible_page_range = None;
         let header_rows = if self.freeze_header {
             0
         } else if self.show_column_types {
@@ -167,6 +168,7 @@ impl PaviApp {
                                     self.grid.selection.is_some_and(|(row, _)| row == row_index),
                                 );
                                 for page in self.grid.visible_pages(row_index, row_index) {
+                                    self.note_visible_page(page);
                                     self.request_page(page);
                                 }
                                 table_row.col(|ui| {
@@ -193,6 +195,7 @@ impl PaviApp {
                         );
                     });
             });
+        self.cancel_offscreen_pages();
     }
 
     pub(in crate::app) fn show_filtered_grid(&mut self, ui: &mut egui::Ui) {

@@ -12,7 +12,7 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
 - **The main pattern** is a single "God struct" `PaviApp` (`crates/app/src/app.rs:292-327`) with ~35 fields; the `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (178 tests: parquet_reader 56, pavi 79, pavi_query 33, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (180 tests: parquet_reader 57, pavi 80, pavi_query 33, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -278,7 +278,7 @@ sequenceDiagram
 6. Jump-to-row (`ui/dataset_bar.rs:100-134`) and keyboard navigation (`ui/grid.rs:388-463`) also call `request_page` and `scroll_to_row`.
 
 **Memory:** ≤8 UI pages × 4,096 rows × visible columns, plus ≤8 pages / 128 MB in the source cache (often the same pages → double retention of `Arc`'d arrays, mostly shared buffers).
-**Back-pressure:** queue capacity 32; on `QueueFull` the request is dropped, the status bar shows `queue page N: runtime request queue is full`, and it's retried on a later frame. Pending tasks for pages scrolled past keep running.
+**Back-pressure:** queue capacity 32; on `QueueFull` the request is dropped, the status bar shows `queue page N: runtime request queue is full`, and it's retried on a later frame. After drawing, the grid cancels pending page reads more than one page away from the pages it drew (`cancel_offscreen_pages`), except pages requested in the same frame such as a jump target; they are requested again if they scroll back into view.
 **Errors:** `ReadFailed` → status bar message; page stays `…`.
 **Column layout change** (hide/move/reset) cancels and clears all pages because the projection key changes (`app.rs:568-575`).
 
@@ -495,14 +495,14 @@ All of it runs on the main thread; memory is ≤1,000 rows of the projected colu
 
 | Work | Thread | Cancel mechanism | Effective? |
 |---|---|---|---|
-| Open, page, window, filter window, sort, aggregate | `pavi-page-N` pool (N = CPU count, `scheduler.rs:27-36`) | `CancellationToken` checked **before and after** the read (`scheduler.rs:535-569`) | Only for queued tasks. A running full-file sort/aggregate/filter scan runs to completion. |
+| Open, page, window, filtered read, sort, aggregate | `pavi-page-N` pool (N = CPU count) | `CancellationToken` and the runtime's shutdown flag, combined into a `stop` check (`scheduler.rs::execute`). Checked before and after every read, and by filtered/sorted/aggregated scans before each 4,096-row batch; a stopped scan returns `parquet_reader::Cancelled`, reported as `PageOutcome::Cancelled` | Yes; a running scan stops within one batch (sub-millisecond on the sample files) |
 | Export | `pavi-export` (one per export) | token checked between batches | Yes, at batch granularity |
-| Profile | `pavi-profile` | token checked between polls | Yes, but the in-flight pool task still completes |
+| Profile | `pavi-profile` | token checked between polls; cancels its query's pool task | Yes, at batch granularity |
 | Stale results | — | `GenerationId` per grid / chart / profile / export | Yes; late responses are dropped |
 
-Opening a new file cancels all of the above (`app.rs:643-660`). If the user acts while loading, the newest action bumps the generation and results from older actions are ignored, but their worker time is still spent. All consumers share the one pool: a long sort/aggregate occupies a worker until done; grid page reads, filters, charts, profiling and export all queue on the same workers.
+Opening a new file cancels all of the above (`app.rs:643-660`). If the user acts while loading, the newest action bumps the generation and results from older actions are ignored; replaced filter/SQL/sort/chart queries are cancelled, so their scans stop within a batch. All consumers share the one pool; grid page reads, filters, charts, profiling and export all queue on the same workers.
 
-**Shutdown:** `Runtime` is dropped with `PaviApp`; `Drop` → `shutdown()` **joins** all workers (`scheduler.rs:279-287, 494-498`), so closing the window waits for any in-progress scan to finish. Export/profile threads are detached.
+**Shutdown:** `Runtime` is dropped with `PaviApp`; `Drop` → `shutdown()` sets the shutdown flag, closes the queue and joins the workers. Running scans see the flag before their next batch, so closing the window doesn't wait for them to finish. Export/profile threads are detached.
 
 ### Shared state
 

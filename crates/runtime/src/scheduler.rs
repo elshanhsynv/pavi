@@ -10,7 +10,8 @@ use std::{
 };
 
 use parquet_reader::{
-    AggregateSpec, FilterExpr, GroupBudget, ParquetSource, Projection, SortBudget, SortSpec,
+    AggregateSpec, Cancelled, FilterExpr, GroupBudget, ParquetSource, Projection, SortBudget,
+    SortSpec,
 };
 
 use crate::{
@@ -575,14 +576,16 @@ fn execute(request: PageRequest, shutdown: &AtomicBool) {
         before_read();
     }
 
-    let outcome = if shutdown.load(Ordering::Acquire) || cancellation.is_cancelled() {
+    // Long scans check this between batches, so cancelling a task or shutting the
+    // runtime down ends them within one batch instead of after the whole read.
+    let stop = || shutdown.load(Ordering::Acquire) || cancellation.is_cancelled();
+    let outcome = if stop() {
         PageOutcome::Cancelled
     } else {
-        match read_source(&source, operation, &projection) {
-            Ok(_) if shutdown.load(Ordering::Acquire) || cancellation.is_cancelled() => {
-                PageOutcome::Cancelled
-            }
+        match read_source(&source, operation, &projection, &stop) {
+            Ok(_) if stop() => PageOutcome::Cancelled,
             Ok(outcome) => outcome,
+            Err(error) if stop() || error.is::<Cancelled>() => PageOutcome::Cancelled,
             Err(error) => PageOutcome::ReadFailed(error),
         }
     };
@@ -597,6 +600,7 @@ fn read_source(
     source: &ParquetSource,
     operation: ReadOperation,
     projection: &Projection,
+    stop: &dyn Fn() -> bool,
 ) -> anyhow::Result<PageOutcome> {
     match operation {
         ReadOperation::Page { page_index } => source
@@ -613,7 +617,7 @@ fn read_source(
             start_row,
             row_count,
         } => source
-            .read_filtered_from(&filter, start_row, row_count, projection)
+            .read_filtered_from(&filter, start_row, row_count, projection, stop)
             .map(PageOutcome::Filtered),
         ReadOperation::Sorted {
             filter,
@@ -621,14 +625,14 @@ fn read_source(
             budget,
             limit,
         } => source
-            .read_sorted(filter.as_ref(), projection, sort, budget, limit)
+            .read_sorted(filter.as_ref(), projection, sort, budget, limit, stop)
             .map(PageOutcome::Batches),
         ReadOperation::Aggregated {
             filter,
             aggregate,
             budget,
         } => source
-            .read_aggregated(filter.as_ref(), &aggregate, budget)
+            .read_aggregated(filter.as_ref(), &aggregate, budget, stop)
             .map(PageOutcome::Batch),
     }
 }

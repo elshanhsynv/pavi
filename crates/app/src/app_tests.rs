@@ -455,6 +455,35 @@ fn records_the_opened_path_even_if_the_path_box_changes() {
 }
 
 #[test]
+fn cancels_pending_page_reads_that_scrolled_out_of_view() {
+    let rows = (parquet_reader::PAGE_ROWS * 20) as usize;
+    let (_directory, source, path) = source(rows);
+    let mut app = make_app(source, path);
+    for page in 0..10 {
+        app.request_page(page);
+    }
+
+    // A later frame in which the grid drew only page 9.
+    app.frame_page_requests.clear();
+    app.note_visible_page(9);
+    app.cancel_offscreen_pages();
+    let mut pending = app.pending_pages.keys().copied().collect::<Vec<_>>();
+    pending.sort_unstable();
+    assert_eq!(pending, [8, 9], "keeps one page of margin");
+    assert_eq!(
+        app.grid.requested.iter().copied().collect::<Vec<_>>(),
+        [8, 9]
+    );
+
+    // A cancelled page can be requested again, and a page requested this frame
+    // (like a jump target) survives even though it was not drawn.
+    app.request_page(0);
+    app.note_visible_page(9);
+    app.cancel_offscreen_pages();
+    assert!(app.pending_pages.contains_key(&0));
+}
+
+#[test]
 fn replaces_and_cancels_obsolete_filters() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);
