@@ -107,8 +107,7 @@ impl PaviApp {
             });
             return;
         }
-        let jump_target = self.jump_target.take().map(ui_row_count);
-        self.visible_page_range = None;
+        let windowed = self.grid.is_windowed();
         let header_rows = if self.freeze_header {
             0
         } else if self.show_column_types {
@@ -117,84 +116,159 @@ impl PaviApp {
             1
         };
         let header_height = if self.show_column_types { 52.0 } else { 32.0 };
-        egui::ScrollArea::horizontal()
-            .id_salt("grid_horizontal")
-            .show(ui, |ui| {
-                ui.set_min_width(
-                    (visible.iter().map(|(_, _, width)| width).sum::<f32>() + ROW_NUMBER_WIDTH)
-                        .max(ui.available_width()),
-                );
-                let mut table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(ROW_NUMBER_WIDTH));
-                for (index, (_, _, width)) in visible.iter().enumerate() {
-                    table = table.column(if index + 1 == columns {
-                        Column::remainder().at_least(*width)
-                    } else {
-                        Column::initial(*width).at_least(72.0)
-                    });
-                }
-                if let Some(row) = jump_target {
-                    table =
-                        table.scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
-                }
-                table
-                    .header(
-                        if self.freeze_header {
-                            header_height
-                        } else {
-                            0.0
-                        },
-                        |header| {
-                            if self.freeze_header {
-                                self.render_headers(header, &headers, false, false);
-                            }
-                        },
-                    )
-                    .body(|body| {
-                        body.rows(
-                            ROW_HEIGHT,
-                            ui_row_count(self.grid.rows).saturating_add(header_rows),
-                            |mut table_row| {
-                                let index = table_row.index();
-                                if index < header_rows {
-                                    self.render_headers(table_row, &headers, true, index == 1);
-                                    return;
-                                }
-                                let row_index = (index - header_rows) as u64;
-                                table_row.set_selected(
-                                    self.grid.selection.is_some_and(|(row, _)| row == row_index),
-                                );
-                                for page in self.grid.visible_pages(row_index, row_index) {
-                                    self.note_visible_page(page);
-                                    self.request_page(page);
-                                }
-                                table_row.col(|ui| {
-                                    decorate_cell(ui, false);
-                                    ui.label((row_index + 1).to_string());
-                                });
-                                for column in 0..columns {
-                                    table_row.col(|ui| {
-                                        decorate_cell(ui, false);
-                                        let selected = self.grid.is_selected(row_index, column);
-                                        let text = self
-                                            .cell_text(row_index, column)
-                                            .unwrap_or_else(|| "…".to_string());
-                                        if cell_value(ui, &text, selected).clicked() {
-                                            if ui.input(|input| input.modifiers.shift) {
-                                                self.grid.extend_selection(row_index, column);
-                                            } else {
-                                                self.grid.select(row_index, column);
-                                            }
-                                        }
-                                    });
-                                }
-                            },
+        let area = ui.available_rect_before_wrap();
+        let mut jump_row = None;
+        if let Some(row) = self.jump_target.take() {
+            if windowed {
+                // Move the window around the target and set the scroll offset
+                // directly, which applies this frame (`scroll_to_row` lands a frame
+                // or two later, after re-centering would already have run).
+                let rows_in_view = ((area.height() - header_height) / ROW_HEIGHT).max(1.0) as u64;
+                let top = row.saturating_sub(rows_in_view / 2);
+                self.scroll_grid_to(top, header_rows);
+            } else {
+                jump_row = Some(ui_row_count(row));
+            }
+        }
+        let base = self.grid.window_base;
+        let scroll_offset = self.grid_scroll_offset.take();
+        self.visible_page_range = None;
+        self.drawn_rows = None;
+        // Large files: the table holds one window of rows and PAVI draws a scrollbar
+        // for the whole file in a strip on the right.
+        let scrollbar = windowed.then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(area.right() - SCROLLBAR_WIDTH, area.top()),
+                area.max,
+            )
+        });
+        let table_area = if windowed {
+            area.with_max_x(area.right() - SCROLLBAR_WIDTH - 2.0)
+        } else {
+            area
+        };
+        // The table's vertical scroll offset after this frame (egui applies wheel
+        // movement at the end of the frame, after the rows were drawn).
+        let table_offset = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(table_area), |ui| {
+                egui::ScrollArea::horizontal()
+                    .id_salt("grid_horizontal")
+                    .show(ui, |ui| {
+                        ui.set_min_width(
+                            (visible.iter().map(|(_, _, width)| width).sum::<f32>()
+                                + ROW_NUMBER_WIDTH)
+                                .max(ui.available_width()),
                         );
-                    });
-            });
+                        let mut table = TableBuilder::new(ui)
+                            .striped(true)
+                            .resizable(true)
+                            .cell_layout(Layout::left_to_right(Align::Center))
+                            .column(Column::exact(ROW_NUMBER_WIDTH));
+                        for (index, (_, _, width)) in visible.iter().enumerate() {
+                            table = table.column(if index + 1 == columns {
+                                Column::remainder().at_least(*width)
+                            } else {
+                                Column::initial(*width).at_least(72.0)
+                            });
+                        }
+                        if windowed {
+                            table = table.scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            );
+                        }
+                        if let Some(offset) = scroll_offset {
+                            table = table.vertical_scroll_offset(offset);
+                        }
+                        if let Some(row) = jump_row {
+                            table = table.scroll_to_row(
+                                row.saturating_add(header_rows),
+                                Some(Align::Center),
+                            );
+                        }
+                        table
+                            .header(
+                                if self.freeze_header {
+                                    header_height
+                                } else {
+                                    0.0
+                                },
+                                |header| {
+                                    if self.freeze_header {
+                                        self.render_headers(header, &headers, false, false);
+                                    }
+                                },
+                            )
+                            .body(|body| {
+                                body.rows(
+                                    ROW_HEIGHT,
+                                    ui_row_count(self.grid.window_rows())
+                                        .saturating_add(header_rows),
+                                    |mut table_row| {
+                                        let index = table_row.index();
+                                        if index < header_rows {
+                                            self.render_headers(
+                                                table_row,
+                                                &headers,
+                                                true,
+                                                index == 1,
+                                            );
+                                            return;
+                                        }
+                                        let row_index = base + (index - header_rows) as u64;
+                                        self.note_drawn_row(row_index);
+                                        table_row.set_selected(
+                                            self.grid
+                                                .selection
+                                                .is_some_and(|(row, _)| row == row_index),
+                                        );
+                                        for page in self.grid.visible_pages(row_index, row_index) {
+                                            self.note_visible_page(page);
+                                            self.request_page(page);
+                                        }
+                                        table_row.col(|ui| {
+                                            decorate_cell(ui, false);
+                                            ui.label((row_index + 1).to_string());
+                                        });
+                                        for column in 0..columns {
+                                            table_row.col(|ui| {
+                                                decorate_cell(ui, false);
+                                                let selected =
+                                                    self.grid.is_selected(row_index, column);
+                                                let text = self
+                                                    .cell_text(row_index, column)
+                                                    .unwrap_or_else(|| "…".to_string());
+                                                if cell_value(ui, &text, selected).clicked() {
+                                                    if ui.input(|input| input.modifiers.shift) {
+                                                        self.grid
+                                                            .extend_selection(row_index, column);
+                                                    } else {
+                                                        self.grid.select(row_index, column);
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    },
+                                );
+                            })
+                            .state
+                            .offset
+                            .y
+                    })
+                    .inner
+            })
+            .inner;
+        if let (Some(bar), Some((first, last))) = (scrollbar, self.drawn_rows) {
+            if let Some(top) = row_scrollbar(ui, bar, self.grid.rows, first, last) {
+                self.scroll_grid_to(top, header_rows);
+                ui.ctx().request_repaint();
+            } else if let Some(new_base) = self.grid.recentered_base(first, last) {
+                // Keep the exact view: shift the offset by however far the window moved.
+                let shift = (new_base as f64 - base as f64) * f64::from(ROW_HEIGHT);
+                self.grid.window_base = new_base;
+                self.grid_scroll_offset = Some((f64::from(table_offset) - shift) as f32);
+                ui.ctx().request_repaint();
+            }
+        }
         self.cancel_offscreen_pages();
     }
 
@@ -563,6 +637,56 @@ impl PaviApp {
             });
         }
     }
+}
+
+const SCROLLBAR_WIDTH: f32 = 12.0;
+
+/// PAVI's scrollbar for windowed grids. It shows the drawn rows `first..=last`
+/// within all `total` rows and, when clicked or dragged, returns the row to show
+/// at the top of the view.
+pub(in crate::app) fn row_scrollbar(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    total: u64,
+    first: u64,
+    last: u64,
+) -> Option<u64> {
+    let response = ui.interact(
+        rect,
+        ui.id().with("pavi_row_scrollbar"),
+        egui::Sense::click_and_drag(),
+    );
+    let visible = (last.saturating_sub(first) + 1).clamp(1, total.max(1));
+    let max_top = total.saturating_sub(visible);
+    let track = rect.shrink2(egui::vec2(2.0, 2.0));
+    let thumb_height = (track.height() * (visible as f64 / total.max(1) as f64) as f32)
+        .max(24.0)
+        .min(track.height());
+    let travel = (track.height() - thumb_height).max(1.0);
+    let position = if max_top == 0 {
+        0.0
+    } else {
+        first.min(max_top) as f64 / max_top as f64
+    };
+    let thumb = egui::Rect::from_min_size(
+        egui::pos2(track.left(), track.top() + travel * position as f32),
+        egui::vec2(track.width(), thumb_height),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(track, 4.0, theme::GRID_LINE);
+    let active = response.hovered() || response.dragged();
+    painter.rect_filled(
+        thumb,
+        4.0,
+        if active { theme::ACCENT } else { theme::MUTED },
+    );
+    let response = response.on_hover_text(format!("Rows {}–{} of {total}", first + 1, last + 1));
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    let pointer = response.interact_pointer_pos()?;
+    let fraction = ((pointer.y - track.top() - thumb_height / 2.0) / travel).clamp(0.0, 1.0);
+    Some((f64::from(fraction) * max_top as f64).round() as u64)
 }
 
 fn decorate_cell(ui: &mut egui::Ui, header: bool) {

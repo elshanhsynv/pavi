@@ -12,7 +12,7 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
 - **The main pattern** is a single "God struct" `PaviApp` (`crates/app/src/app.rs:292-327`) with ~35 fields; the `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (180 tests: parquet_reader 57, pavi 80, pavi_query 33, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (183 tests: parquet_reader 57, pavi 83, pavi_query 33, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -270,12 +270,15 @@ sequenceDiagram
 
 ### 4.2 Scrolling / paging (unfiltered)
 
-1. `show_grid_content` builds a `TableBuilder` with `body.rows(28 px, row_count)` (`ui/grid.rs:155-193`); egui calls the row closure only for visible rows.
+1. `show_grid_content` builds a `TableBuilder` with `body.rows(28 px, rows)`; egui calls the row closure only for visible rows. Files with more than `GRID_WINDOW_ROWS` (500,000) rows are **windowed**, because egui lays rows out in `f32` points, which stop being exact past about 16.7 million points (≈600,000 rows):
+   - The table holds only 500,000 rows starting at `GridState::window_base`; row closure indexes are offset by it, so selection, page requests and cell text use absolute rows.
+   - The table's own scrollbar is hidden. PAVI draws `row_scrollbar` in a 12 px strip on the right. Its thumb shows the drawn rows within the whole file, and clicking or dragging it scrolls there (`scroll_grid_to`).
+   - After each frame, if the drawn rows are within a quarter window of an inner edge, `GridState::recentered_base` picks a window centred on them. The table's post-frame scroll offset is shifted by the same number of rows, so the view doesn't move.
 2. For each visible row: `grid.visible_pages()` → `request_page(page)` (`app.rs:1286-1322`). `GridState::request_page` dedupes via `requested`/`loaded` sets. The projection is the **currently visible columns** in display order. `submit_page` → worker.
 3. Each visible cell calls `cell_text` (`app.rs:1324-1345`), which also prefetches the next page when the row is a page boundary, then formats the value with `format_cell_with_limit(…, 256)` **every frame** — or shows `…` if the page isn't loaded.
 4. Worker: `read_page` checks the source `PageCache` (mutex held only for lookup/insert), else `read_window_batches` decodes rows `[i·4096, (i+1)·4096)` from overlapping row groups using `RowSelection::skip/select`.
 5. `poll_pages` (`app.rs:738-781`) `try_recv`s each pending task; `insert_page` keeps ≤8 pages, evicting oldest and un-marking it as loaded so it will be re-requested.
-6. Jump-to-row (`ui/dataset_bar.rs:100-134`) and keyboard navigation (`ui/grid.rs:388-463`) also call `request_page` and `scroll_to_row`.
+6. Jump-to-row (`ui/dataset_bar.rs`) and keyboard navigation (`ui/grid.rs`) also call `request_page`. Jumps use `scroll_to_row`; in windowed grids they instead move the window around the target and set the scroll offset directly, which applies in the same frame.
 
 **Memory:** ≤8 UI pages × 4,096 rows × visible columns, plus ≤8 pages / 128 MB in the source cache (often the same pages → double retention of `Arc`'d arrays, mostly shared buffers).
 **Back-pressure:** queue capacity 32; on `QueueFull` the request is dropped, the status bar shows `queue page N: runtime request queue is full`, and it's retried on a later frame. After drawing, the grid cancels pending page reads more than one page away from the pages it drew (`cancel_offscreen_pages`), except pages requested in the same frame such as a jump target; they are requested again if they scroll back into view.
@@ -615,7 +618,7 @@ flowchart TB
 | Profiling types | Comparable types. Numbers get a mean and histogram, text gets lengths, dates/timestamps are ordered by time (not text). |
 | Statistics display | Rebuilt as the column's Arrow type and formatted like grid values: unsigned integers, dates, times, timestamps (in their zone) and decimals (INT32/INT64/byte-array storage). INT96 and other physical types show the stored value. |
 | Files written by polars (the repo's sample data) | Strings load as `LargeUtf8` (e.g. `dummy_5m`, `dummy_1b`), which every operation accepts like `Utf8`. |
-| Large files | Row counts are `u64`; the grid casts to `usize` and uses egui `f32` pixel math |
+| Large files | Row counts are `u64`. The source grid shows files over 500,000 rows through a moving 500,000-row window with its own scrollbar, so every row (including the last of a billion) is reachable. Filtered results are ≤ 32,768 rows and are never windowed |
 
 ### Platform-specific code
 - No `cfg(target_os)` anywhere. Implicitly Windows-oriented: session path uses `LOCALAPPDATA` (`session.rs:192-199`).
