@@ -59,6 +59,14 @@ Dependencies point down only: app → query → runtime → parquet_reader.
 | Untrusted input, dependencies | `SECURITY.md` |
 | "Why is it like this?" | `docs/decisions/` |
 
+## Skills
+
+Step-by-step recipes in `.claude/skills/`. Use them when the task matches:
+
+- `add-query-feature`: extend the SQL subset or filter grammar.
+- `add-arrow-type`: support a new column type across display, filters, sort, aggregates, profiling and export.
+- `perf-check`: benchmark `main` against the branch and produce the before/after table for the PR.
+
 ## Keeping docs true
 
 If your change alters behavior, a budget, a data flow or a rule described in these docs, update the doc in the same commit.
@@ -68,7 +76,7 @@ A decision that reverses an ADR needs a new ADR. Stale docs are worse than none.
 
 - Branch from `main` (`feat/…`, `fix/…`, `chore/…`, `docs/…`); never commit directly to `main`.
 - Commit messages: imperative summary line describing the user-visible effect (e.g. "Resume filtered scans from a cursor").
-- For changes to reading, runtime, query or grid code, include before/after `pavi_bench` numbers in the PR.
+- For changes to reading, runtime, query or grid code, include before/after `pavi_bench` numbers in the PR (the `perf-check` skill).
 
 ## Gotchas
 
