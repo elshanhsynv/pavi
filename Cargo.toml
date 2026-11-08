@@ -12,7 +12,8 @@ members = [
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-arrow-array = "59"
+arrow-array = { version = "59", features = ["chrono-tz"] }
+arrow-cast = "59"
 arrow-schema = "59"
 arrow-select = "59"
 arrow-ord = "59"

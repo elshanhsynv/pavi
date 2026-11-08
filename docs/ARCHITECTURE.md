@@ -12,7 +12,7 @@ All paths are relative to the repo root. Line numbers refer to that commit.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB, group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤64 KB.
 - **The main pattern** is a single "God struct" `PaviApp` (`crates/app/src/app.rs:292-327`) with ~35 fields; the `ui/*.rs` files are `impl PaviApp` blocks that render *and* mutate state directly (no message/command enum).
-- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (164 tests: parquet_reader 46, pavi 77, pavi_query 31, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
+- **Tooling.** GitHub Actions CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and `cargo test --workspace` on Windows and Ubuntu (171 tests: parquet_reader 52, pavi 78, pavi_query 31, pavi_runtime 9, cli 1). No `rust-toolchain.toml`, no logging/tracing, no `unsafe`, no `cfg(target_os)`.
 
 ```mermaid
 flowchart TB
@@ -58,7 +58,7 @@ PAVI opens a single local Parquet file, reads only its footer metadata up front 
 | GUI | `eframe 0.31.1` with default features → **glow** (OpenGL) renderer, winit, accesskit. **No `persistence` feature.** `egui_extras 0.31` (`TableBuilder`) for the grid. No `egui_plot` — charts are hand-painted. | `Cargo.toml`, `crates/app/Cargo.toml` |
 | Dialogs | `rfd 0.15` synchronous `FileDialog` (open/save) | `app.rs:444`, `app.rs:855`, `ui/toolbar.rs:115` |
 | Clipboard | egui's `ctx.copy_text` (no extra crate) | `app.rs:1745`, `ui/inspector.rs:66,127` |
-| Parquet/Arrow | `parquet 59` (feature `arrow`), `arrow-array/-schema/-select/-ord 59`. **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
+| Parquet/Arrow | `parquet 59` (feature `arrow`), `arrow-array/-schema/-select/-ord 59`, `arrow-cast 59` (value display rules), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
 | SQL | `sqlparser 0.62` (GenericDialect) used only for parsing; execution is custom | `crates/query/src/sql.rs` |
 | Threading | `std::thread` + `std::sync::mpsc::sync_channel` + `Arc<AtomicBool>` cancellation. No tokio, no rayon. | `crates/runtime/` |
 | CLI | `clap 4` derive | `crates/cli/src/args.rs` |
@@ -91,7 +91,8 @@ Direction is strictly downward: `app → query → runtime → parquet_reader`. 
 crates/parquet/src/            (parquet_reader)
 ├── lib.rs          re-exports the public surface
 ├── source.rs       ParquetSource (1,924 lines): open, read_page/window/filtered/sorted/aggregated,
-│                   GroupCollector/Accumulator/Scalar (aggregation), statistics summaries
+│                   GroupCollector/Accumulator/Scalar (aggregation)
+├── statistics.rs   row-group statistics → display text, typed by the column's Arrow type
 ├── metadata.rs     DatasetMetadata, RowGroupInfo, ColumnInfo, ColumnStatistics; row→row-group math
 ├── page.rs         PAGE_ROWS = 4096, PageKey, RowWindow, DataPage
 ├── cache.rs        PageCache (LRU in a VecDeque), PageCacheLimits (8 pages / 128 MB), stats
@@ -99,7 +100,7 @@ crates/parquet/src/            (parquet_reader)
 ├── filter.rs       FilterExpr/FilterOp: text parser, schema validation, batch evaluation, stats pruning
 ├── sort.rs         SortSpec, SortDirection, NullOrder, SortBudget (100k rows / 128 MB)
 ├── aggregate.rs    AggregateFunction/Expr/Spec, GroupBudget (10k groups / 8 MB)
-└── value.rs        format_cell / format_cell_with_limit (shared by GUI and CLI)
+└── value.rs        shared value → text: format_cell* (bounded display), scalar_text (full, for CSV/profiling)
 
 crates/runtime/src/            (pavi_runtime)
 ├── scheduler.rs    Runtime, RuntimeHandle, RuntimeConfig, ReadOperation, worker_loop, execute
@@ -135,9 +136,9 @@ crates/app/src/                (pavi)
 
 ### Sharing between GUI and CLI
 
-- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `FilterExpr::parse`, `Projection`, and `value::format_cell*`.
+- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `FilterExpr::parse`, `Projection`, and the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling).
 - **GUI-only:** the runtime, the query engine/SQL, sort, aggregates, page cache use (`read_page`), export, profiling, charts.
-- **Duplicated logic:** CLI has its own table printer and truncation (`crates/cli/src/output.rs`). Scalar → text conversions exist **four times** with different rules: `value.rs` (display), `export.rs::write_csv_value` (CSV), `profile.rs::scalar_text` (profiling), `source.rs::scalar_at` (aggregation keys). Type-support lists are likewise repeated (`validate_sort`, `supports_min_max`, `FilterExpr::validate_schema`, `ensure_csv_type`, chart checks).
+- **Duplicated logic:** CLI has its own table printer and truncation (`crates/cli/src/output.rs`). Value → text conversion lives in one place, `value.rs`: display, CSV export, profiling and row-group statistics all use it. Aggregation keeps its own typed `Scalar` values (`source.rs::scalar_at`), which are turned back into Arrow arrays and displayed through `value.rs`. Type-support lists are likewise repeated (`validate_sort`, `supports_min_max`, `FilterExpr::validate_schema`, `ensure_csv_type`, chart checks).
 
 ### Cargo features
 
@@ -194,7 +195,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 | `FilterExpr` | `col OP value` with `== != > >= < <= contains`; integer literals compare exactly against integer columns (as `i128`), otherwise as `f64`; row-group pruning reads unsigned statistics as unsigned | `filter.rs:28-157` |
 | `SortSpec`/`SortBudget`, `AggregateSpec`/`GroupBudget` | Single sort key; ≤1 group-by column with COUNT/SUM/AVG/MIN/MAX | `sort.rs`, `aggregate.rs` |
 | `SqlAst` → `LogicalPlan` → `Planner` → `PhysicalPlan` | Parse → tree → validated flat struct `{projection, filter, limit, sort, aggregate}` (operator order is ignored) | `crates/query/src/{sql,logical,planner}.rs` |
-| `format_cell_with_limit` | Arrow value → display string (truncated; nested ≤8 deep/≤16 items) | `value.rs:18-97` |
+| `format_cell_with_limit` / `scalar_text` | Arrow value → text. Display is truncated (nested ≤8 deep/≤16 items); `scalar_text` is full-length for scalars | `value.rs:18-97` |
 
 ### Data access
 
@@ -396,7 +397,7 @@ sequenceDiagram
 
 ### 4.6 Inspector: schema, metadata, row-group statistics, profiling
 
-- **Metadata/schema/stats** are computed once at open (`metadata_statistics`, `source.rs:36-58`; strings capped at 128 chars) and rendered from memory each frame; long lists use `ScrollArea::show_rows` (virtualized) (`ui/inspector.rs:203-240`). For schemas with nested columns (top-level count ≠ leaf count), **all statistics are dropped** (`source.rs:41-43`).
+- **Metadata/schema/stats** are computed once at open (`statistics::metadata_statistics`; min/max rebuilt as typed values and formatted like grid cells, byte strings capped at 128 chars) and rendered from memory each frame; long lists use `ScrollArea::show_rows` (virtualized) (`ui/inspector.rs:203-240`). For schemas with nested columns (top-level count ≠ leaf count), **all statistics are dropped** (`statistics.rs`).
 - **Selected cell:** `selected_cell_details` → `inspect_cell` on the in-memory batch (`app.rs:1560-1603`).
 - **Profile column:** `run_profile` (`app.rs:1482-1503`) → `ProfileTask::start` spawns thread `pavi-profile` (`profile.rs:83-119`), which runs a `scan().project([col])` query and polls it with a 5 ms sleep loop (`profile.rs:143-176`), building exact distinct counts, min/max/mean, string lengths and a distribution chart. Result returns via a capacity-1 channel; UI polls in `poll_profile` (`app.rs:1513-1543`). Exact distinct counting is capped at 4,096 values and 128 bytes per value; past that the profile ends with an error (`profile.rs:275-294`).
 
@@ -420,7 +421,7 @@ sequenceDiagram
 
 ### 4.7 Export and clipboard
 
-- **Export** (`app.rs:842-886`, `export.rs:76-206`): save dialog (blocks UI), build `ExportInput` = the current filter/SQL/sort `LogicalPlan`, or a full-scan plan, or one selected row; spawn `pavi-export` thread. It writes to `<file>.pavi-<gen>.tmp`, driving `poll_next_batch` with a 5 ms sleep loop, writing each batch to CSV or `ArrowWriter`, sending best-effort progress (`try_send`, capacity 1), then `fs::rename` to the target. Cancel/failure deletes the temp file. CSV accepts only flat scalar types (`export.rs:338-364`) and writes dates/timestamps as **raw integers** (`export.rs:392-405`).
+- **Export** (`app.rs:842-886`, `export.rs:76-206`): save dialog (blocks UI), build `ExportInput` = the current filter/SQL/sort `LogicalPlan`, or a full-scan plan, or one selected row; spawn `pavi-export` thread. It writes to `<file>.pavi-<gen>.tmp`, driving `poll_next_batch` with a 5 ms sleep loop, writing each batch to CSV or `ArrowWriter`, sending best-effort progress (`try_send`, capacity 1), then `fs::rename` to the target. Cancel/failure deletes the temp file. CSV accepts every non-nested type and writes each field with `value::scalar_text`, the same text the grid shows, untruncated; nulls are empty fields and binary is `0x`-prefixed hex.
 - **Copy:** Ctrl+C copies the selected cell range (TSV) from in-memory batches (`app.rs:1659-1751`) using the same 256-char display formatting, capped at 64 KB; fails if any selected row has been evicted from the window.
 
 ```mermaid
@@ -603,13 +604,13 @@ flowchart TB
 | Column projection | Top-level roots only (`ProjectionMask::roots`); nested columns are read whole (tested: `source.rs:1735`) |
 | Row-group pruning | For filters, using min/max stats — **disabled entirely for nested schemas** (`source.rs:694-696`) |
 | Page index / bloom filters | Not used (`ArrowReaderMetadata::load(&file, Default::default())`) |
-| Display formatting (`value.rs`) | Bool, ints, floats, Utf8/LargeUtf8, Binary/LargeBinary (hex), List/LargeList/Struct/Map (bounded). Dates shown as raw `date32:<days>` / `date64_ms:<ms>`; timestamps as `timestamp_us:<int> <tz>` with naive timestamps labelled **"UTC"** (`value.rs:61-84`). **Everything else** (Decimal128/256, Dictionary, Time32/64, Duration, Interval, FixedSizeBinary, FixedSizeList, Float16, Utf8View/BinaryView, Null, Union) falls to `format!("{DataType:?}")` → the cell shows the type name (`value.rs:96`). |
+| Display formatting (`value.rs`) | Ints, floats and bools via `Display`; strings (Utf8/LargeUtf8/Utf8View) as-is; binary types as hex; dictionary cells show the referenced value. Dates, timestamps, times, durations, intervals, decimals, Float16 and run-end-encoded values use arrow-cast's rules: `2022-01-08`, naive `2023-11-14T22:13:20`, zoned `2023-11-14T23:13:20+01:00` (UTC as `Z`), `123.45`, `PT90S`. `Date64` shows as a date-time. List/LargeList/FixedSizeList/Struct/Map are bounded (≤8 deep, ≤16 items). |
 | Filter types | Bool, ints, floats, Utf8/LargeUtf8 (integers compared exactly, floats as `f64`). No dates/timestamps/decimals. |
 | Sort types | Bool, ints, floats, Utf8/LargeUtf8, Date32/64, Timestamp (any tz) |
 | MIN/MAX/GROUP BY types | numeric, Bool, **Utf8 only** (not LargeUtf8), dates, Timestamp **without** tz |
-| CSV export types | flat scalars only; dates/timestamps as raw integers |
+| CSV export types | every non-nested type, as the shared display text (ISO dates, RFC 3339 timestamps, scaled decimals) |
 | Profiling types | ints, floats, Utf8/LargeUtf8 only |
-| Statistics display | Physical values; unsigned integers reinterpreted from Parquet's signed storage using the Arrow type. Decimals unscaled, dates as day numbers, INT96 as `Display` of the struct. |
+| Statistics display | Rebuilt as the column's Arrow type and formatted like grid values: unsigned integers, dates, times, timestamps (in their zone) and decimals (INT32/INT64/byte-array storage). INT96 and other physical types show the stored value. |
 | Files written by polars (the repo's sample data) | Strings load as `LargeUtf8` (e.g. `dummy_5m`, `dummy_1b`); GROUP BY / MIN / MAX accept only `Utf8` strings. |
 | Large files | Row counts are `u64`; the grid casts to `usize` and uses egui `f32` pixel math |
 

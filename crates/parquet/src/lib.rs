@@ -6,6 +6,7 @@ pub mod page;
 pub mod projection;
 pub mod sort;
 mod source;
+mod statistics;
 pub mod value;
 
 pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
