@@ -35,14 +35,16 @@ const STAT_VALUE_LIMIT: usize = 128;
 
 fn metadata_statistics(
     metadata: &ParquetMetaData,
-    top_level_columns: usize,
+    schema: &Schema,
 ) -> Vec<Vec<Option<ColumnStatistics>>> {
+    let top_level_columns = schema.fields().len();
     let row_groups = metadata.num_row_groups();
     if top_level_columns != metadata.file_metadata().schema_descr().num_columns() {
         return vec![vec![None; row_groups]; top_level_columns];
     }
     (0..top_level_columns)
         .map(|column| {
+            let data_type = schema.field(column).data_type();
             (0..row_groups)
                 .map(|row_group| {
                     metadata
@@ -50,22 +52,34 @@ fn metadata_statistics(
                         .columns()
                         .get(column)
                         .and_then(|column| column.statistics())
-                        .map(statistics_summary)
+                        .map(|statistics| statistics_summary(statistics, data_type))
                 })
                 .collect()
         })
         .collect()
 }
 
-fn statistics_summary(statistics: &Statistics) -> ColumnStatistics {
-    let (min, max) = match statistics {
-        Statistics::Boolean(stats) => display_pair(stats.min_opt(), stats.max_opt()),
-        Statistics::Int32(stats) => display_pair(stats.min_opt(), stats.max_opt()),
-        Statistics::Int64(stats) => display_pair(stats.min_opt(), stats.max_opt()),
-        Statistics::Int96(stats) => display_pair(stats.min_opt(), stats.max_opt()),
-        Statistics::Float(stats) => display_pair(stats.min_opt(), stats.max_opt()),
-        Statistics::Double(stats) => display_pair(stats.min_opt(), stats.max_opt()),
-        Statistics::ByteArray(_) | Statistics::FixedLenByteArray(_) => (
+/// Formats statistics for display. Parquet stores unsigned integers in signed
+/// physical types, so their min/max are reinterpreted using the Arrow type.
+fn statistics_summary(statistics: &Statistics, data_type: &DataType) -> ColumnStatistics {
+    let (min, max) = match (statistics, data_type) {
+        (Statistics::Int32(stats), DataType::UInt8 | DataType::UInt16 | DataType::UInt32) => {
+            display_pair(
+                stats.min_opt().map(|value| *value as u32).as_ref(),
+                stats.max_opt().map(|value| *value as u32).as_ref(),
+            )
+        }
+        (Statistics::Int64(stats), DataType::UInt64) => display_pair(
+            stats.min_opt().map(|value| *value as u64).as_ref(),
+            stats.max_opt().map(|value| *value as u64).as_ref(),
+        ),
+        (Statistics::Boolean(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
+        (Statistics::Int32(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
+        (Statistics::Int64(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
+        (Statistics::Int96(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
+        (Statistics::Float(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
+        (Statistics::Double(stats), _) => display_pair(stats.min_opt(), stats.max_opt()),
+        (Statistics::ByteArray(_) | Statistics::FixedLenByteArray(_), _) => (
             statistics.min_bytes_opt().map(format_stat_bytes),
             statistics.max_bytes_opt().map(format_stat_bytes),
         ),
@@ -145,7 +159,7 @@ impl ParquetSource {
             (0..metadata.num_row_groups()).map(|index| metadata.row_group(index).num_rows() as u64);
         let dataset_metadata = DatasetMetadata::new(schema.clone(), row_group_counts)
             .with_context(|| format!("build row-group index for {}", path.display()))?
-            .with_column_statistics(metadata_statistics(&metadata, schema.fields().len()));
+            .with_column_statistics(metadata_statistics(&metadata, &schema));
 
         Ok(Self {
             path,
@@ -695,11 +709,16 @@ impl ParquetSource {
             return true;
         }
 
+        let data_type = self
+            .dataset_metadata
+            .schema
+            .field(filter_column)
+            .data_type();
         self.metadata
             .row_group(row_group.index)
             .columns()
             .get(filter_column)
-            .is_none_or(|column| filter.might_match_statistics(column.statistics()))
+            .is_none_or(|column| filter.might_match_statistics(column.statistics(), data_type))
     }
 
     fn concat_or_empty(
@@ -1550,6 +1569,67 @@ mod tests {
 
         writer.close().unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn filters_and_reports_statistics_for_large_unsigned_values() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("unsigned.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("u32", DataType::UInt32, false),
+            Field::new("u64", DataType::UInt64, false),
+        ]));
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let high = (1_u64 << 63) + 5;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(UInt32Array::from(vec![
+                    3_000_000_000,
+                    3_000_000_001,
+                    5,
+                    6,
+                    5,
+                    3_000_000_002,
+                ])),
+                Arc::new(UInt64Array::from(vec![high, high + 1, 5, 6, 5, high + 2])),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let source = ParquetSource::open(path).unwrap();
+        assert_eq!(source.row_groups().len(), 3);
+        let projection = Projection::all(source.column_count());
+        let count = |expression: &str| {
+            source
+                .read_filtered_window(&FilterExpr::parse(expression).unwrap(), 0, 100, &projection)
+                .unwrap()
+                .num_rows()
+        };
+        assert_eq!(count("u32 > 2999999999"), 3);
+        assert_eq!(count("u32 == 3000000001"), 1);
+        assert_eq!(count("u32 < 10"), 3);
+        assert_eq!(count(&format!("u64 > {}", 1_u64 << 63)), 3);
+        assert_eq!(count(&format!("u64 == {}", high + 1)), 1);
+        assert_eq!(count("u64 < 10"), 3);
+
+        let statistics = |column: usize, row_group: usize| {
+            source.metadata().columns()[column].row_group_statistics[row_group]
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(statistics(0, 0).min.as_deref(), Some("3000000000"));
+        assert_eq!(statistics(0, 0).max.as_deref(), Some("3000000001"));
+        assert_eq!(statistics(0, 2).min.as_deref(), Some("5"));
+        assert_eq!(statistics(0, 2).max.as_deref(), Some("3000000002"));
+        assert_eq!(statistics(1, 0).min, Some(high.to_string()));
+        assert_eq!(statistics(1, 2).max, Some((high + 2).to_string()));
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {
