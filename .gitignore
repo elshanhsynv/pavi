@@ -9,3 +9,4 @@ docs/*
 !docs/FUZZING.md
 !docs/architecture/
 !docs/decisions/
+.claude/settings.local.json
