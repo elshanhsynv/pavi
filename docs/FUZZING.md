@@ -68,8 +68,9 @@ one escapes, extend those guards rather than adding `catch_unwind` at call sites
 | 2026-11-08 | "Decoder for dict should have been set": dictionary-encoded data page with no dictionary page | `parquet` 59–60 `column/reader/decoder.rs` | Reported: [apache/arrow-rs#12129](https://github.com/apache/arrow-rs/issues/12129) | `GuardedReader` returns "malformed Parquet data" |
 | 2026-11-09 | "column start and length should not be negative": negative column chunk offset in metadata | `parquet` 59–60 `file/metadata/mod.rs` | Open: [apache/arrow-rs#6255](https://github.com/apache/arrow-rs/issues/6255) (reproducer added 2026-11-09) | `GuardedReader` |
 | 2026-11-09 | "offset + len out of bounds": bit-packed definition-level run longer than the page | `arrow-buffer` 59–60 `bit_chunk_iterator.rs` | Fixed upstream ([apache/arrow-rs#11691](https://github.com/apache/arrow-rs/issues/11691)), not yet released | `GuardedReader` |
+| 2026-11-09 | CPU hang: skipping an unknown Thrift field that is a `list<bool>` loops over the *claimed* size without consuming input (~5 s per 9-byte field; a valid-looking 10 KB file could take over an hour) | `parquet` 60 `parquet_thrift.rs` `skip_till_depth` | Not reported yet | `footer::check_collection_sizes` rejects footers whose collections claim more elements than bytes left. Page headers use the same skip code and are not covered |
 
-The 2026-11-09 rows came from replaying the whole corpus against the plain `parquet` reader (without PAVI's guards) on 59.3.2 and 60.1.0.
+The 2026-11-09 panic rows came from replaying the whole corpus against the plain `parquet` reader (without PAVI's guards) on 59.3.2 and 60.1.0.
 When a new arrow-rs release fixes the remaining ones, keep the guard: new decoder bugs will appear.
 
 ## CI

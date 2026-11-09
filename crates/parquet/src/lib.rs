@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod cache;
 pub mod filter;
+mod footer;
 pub mod metadata;
 pub mod page;
 pub mod projection;

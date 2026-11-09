@@ -119,6 +119,8 @@ impl ParquetSource {
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let file_info = file.metadata().context("read file properties")?;
+        crate::footer::check_collection_sizes(&file)
+            .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
         let arrow_metadata = load_arrow_metadata(&file)
             .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
         let schema = arrow_metadata.schema().clone();
@@ -1680,6 +1682,39 @@ mod tests {
 
         writer.close().unwrap();
         (dir, path)
+    }
+
+    /// A 9-byte unknown footer field, `list<bool>` claiming i32::MAX elements, made the parquet
+    /// crate spin for ~5 s per field while skipping it (found by the `parquet_file` fuzz target).
+    #[test]
+    fn rejects_footer_collections_claiming_more_elements_than_bytes() {
+        let (_dir, path) = test_file();
+        assert!(ParquetSource::open(&path).is_ok());
+
+        let bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len();
+        let footer_len = u32::from_le_bytes(bytes[n - 8..n - 4].try_into().unwrap()) as usize;
+        let mut footer = bytes[n - 8 - footer_len..n - 8].to_vec();
+        assert_eq!(footer.pop(), Some(0x00), "FileMetaData stop byte");
+        // Unknown field 100 (long form), list<bool> with i32::MAX elements, then stop.
+        footer.extend([0x09, 0xC8, 0x01, 0xF1, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00]);
+        let mut forged = bytes[..n - 8 - footer_len].to_vec();
+        forged.extend(&footer);
+        forged.extend((footer.len() as u32).to_le_bytes());
+        forged.extend(b"PAR1");
+        std::fs::write(&path, forged).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = ParquetSource::open(&path).err().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{error:#}").contains("claims 2147483647 elements"),
+            "{error:#}"
+        );
     }
 
     #[test]

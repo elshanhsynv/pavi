@@ -24,7 +24,7 @@ flowchart TB
         RUNTIME["pavi_runtime<br/>fixed worker pool, bounded mpsc, cancellation"]
         PQ["parquet_reader<br/>ParquetSource, PageCache, filter/sort/aggregate, value formatting"]
     end
-    ARROW["arrow-rs 59 / parquet 59"]
+    ARROW["arrow-rs 60 / parquet 60"]
     FS[("Local .parquet file")]
 
     GUI --> QUERY
