@@ -1,6 +1,6 @@
 # PAVI — agent guide
 
-PAVI is a native Windows-first desktop explorer for Parquet files (Rust, egui/eframe, arrow-rs/parquet 59).
+PAVI is a native Windows-first desktop explorer for Parquet files (Rust, egui/eframe, arrow-rs/parquet 60).
 It must stay responsive and memory-bounded on files of any size, up to billions of rows.
 
 ## Commands

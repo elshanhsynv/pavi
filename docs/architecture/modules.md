@@ -16,7 +16,7 @@ PAVI opens a single local Parquet file, reads only its footer metadata up front 
 | GUI | `eframe 0.31.1` with default features → **glow** (OpenGL) renderer, winit, accesskit. **No `persistence` feature.** `egui_extras 0.31` (`TableBuilder`) for the grid. No `egui_plot` — charts are hand-painted. | `Cargo.toml`, `crates/app/Cargo.toml` |
 | Dialogs | `rfd 0.15` synchronous `FileDialog` (open/save) | `app.rs:444`, `app.rs:855`, `ui/toolbar.rs:115` |
 | Clipboard | egui's `ctx.copy_text` (no extra crate) | `app.rs:1745`, `ui/inspector.rs:66,127` |
-| Parquet/Arrow | `parquet 59` (feature `arrow`), `arrow-array/-schema/-select/-ord 59`, `arrow-cast 59` (value display rules), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
+| Parquet/Arrow | `parquet 60` (feature `arrow`), `arrow-array/-schema/-select/-ord 60`, `arrow-cast 60` (value display rules), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
 | SQL | `sqlparser 0.62` (GenericDialect) used only for parsing; execution is custom | `crates/query/src/sql.rs` |
 | Threading | `std::thread` + `std::sync::mpsc::sync_channel` + `Arc<AtomicBool>` cancellation. No tokio, no rayon. | `crates/runtime/` |
 | CLI | `clap 4` derive | `crates/cli/src/args.rs` |
