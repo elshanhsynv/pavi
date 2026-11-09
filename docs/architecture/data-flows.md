@@ -8,7 +8,7 @@
 
 **Steps**
 1. `begin_open(path)` (`app.rs:643-673`, UI thread) cancels everything (open, pages, export, filter, chart, profile), clears the dataset, bumps the generation, and calls `RuntimeHandle::submit_open` → `try_send` on the bounded queue (`scheduler.rs:349-374`).
-2. A worker runs `execute_open` (`scheduler.rs:516-533`) → `ParquetSource::open`: `File::open`, `footer::check_collection_sizes` (rejects impossible collection sizes before the parser sees them), `ArrowReaderMetadata::load` (footer read + Arrow schema), compression set, `DatasetMetadata` + statistics strings. Result is `Arc<ParquetSource>` sent on a capacity-1 channel.
+2. A worker runs `execute_open` (`scheduler.rs:516-533`) → `ParquetSource::open`: `File::open`, `footer::check_footer` (rejects impossible collection sizes and schema child counts before the parser sees them), `ArrowReaderMetadata::load` (footer read + Arrow schema), compression set, `DatasetMetadata` + statistics strings. Result is `Arc<ParquetSource>` sent on a capacity-1 channel.
 3. Each frame `update()` calls `poll_open()` (`app.rs:675-736`): `try_recv`; drops if generation differs; on success builds `Dataset`, restores the saved column layout for this schema, `grid.ready(rows, cols)`, records the recent file and **writes the session JSON synchronously**, presets chart columns.
 4. The next frame renders the grid; rendering rows triggers page loads (§4.2). Inspector reads metadata already in memory.
 
