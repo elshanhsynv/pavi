@@ -19,6 +19,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Chart input | 16,384 rows | `chart::MAX_INPUT_ROWS` |
 | Clipboard copy | 64 KB | `MAX_CLIPBOARD_BYTES` |
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |
+| Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
 
 ## Responsiveness rules

@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -96,6 +96,74 @@ where
     }
 }
 
+/// Largest dictionary page PAVI decodes (uncompressed). Writers default to 1 MiB.
+const MAX_DICTIONARY_PAGE_BYTES: i64 = 256 * 1024 * 1024;
+
+/// Page headers are usually under 100 bytes; the read starts here and grows if needed.
+const PAGE_HEADER_FIRST_READ_BYTES: u64 = 1024;
+
+/// Checks the first page of a column chunk if it is a dictionary page.
+/// Anything this can't read or decode is left for the parquet crate to report.
+fn check_dictionary_page(
+    mut file: &File,
+    column: &parquet::file::metadata::ColumnChunkMetaData,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let offset = column
+        .dictionary_page_offset()
+        .unwrap_or(column.data_page_offset());
+    let (Ok(offset), Ok(chunk)) = (
+        u64::try_from(offset),
+        u64::try_from(column.compressed_size()),
+    ) else {
+        return Ok(());
+    };
+    // Read more until the header decodes, up to the whole chunk, so padding a header with
+    // unknown fields can't push it past this check.
+    let limit = chunk.min(file.metadata()?.len().saturating_sub(offset));
+    let mut len = PAGE_HEADER_FIRST_READ_BYTES.min(limit);
+    let sizes = loop {
+        let mut header = vec![0_u8; usize::try_from(len)?];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut header)?;
+        if let Some(sizes) = crate::footer::page_header_sizes(&header) {
+            break sizes;
+        }
+        if len >= limit {
+            return Ok(());
+        }
+        len = len.saturating_mul(16).min(limit);
+    };
+    if sizes.page_type != Some(crate::footer::DICTIONARY_PAGE) {
+        return Ok(());
+    }
+    let (Some(values), Some(bytes)) = (sizes.dictionary_values, sizes.uncompressed_size) else {
+        return Ok(());
+    };
+    if bytes > MAX_DICTIONARY_PAGE_BYTES {
+        bail!(
+            "dictionary page is {bytes} bytes, over PAVI's {MAX_DICTIONARY_PAGE_BYTES}-byte limit"
+        );
+    }
+    // Smallest PLAIN encoding of one dictionary value, in bits.
+    let bits_per_value: i64 = match column.column_type() {
+        parquet::basic::Type::BOOLEAN => 1,
+        parquet::basic::Type::INT32 | parquet::basic::Type::FLOAT => 32,
+        parquet::basic::Type::INT64 | parquet::basic::Type::DOUBLE => 64,
+        parquet::basic::Type::INT96 => 96,
+        parquet::basic::Type::BYTE_ARRAY => 32, // 4-byte length prefix
+        parquet::basic::Type::FIXED_LEN_BYTE_ARRAY => {
+            8 * i64::from(column.column_descr().type_length().max(1))
+        }
+    };
+    let needed_bits = values.saturating_mul(bits_per_value);
+    if values < 0 || bytes < 0 || needed_bits > bytes.saturating_mul(8) {
+        bail!("dictionary page claims {values} values but holds only {bytes} bytes");
+    }
+    Ok(())
+}
+
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
@@ -112,6 +180,9 @@ pub struct ParquetSource {
     metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
     cache: Mutex<PageCache>,
+    /// `(row group, leaf column)` chunks whose dictionary page header passed
+    /// [`ParquetSource::check_dictionary_pages`].
+    checked_dictionaries: Mutex<HashSet<(usize, usize)>>,
 }
 
 impl ParquetSource {
@@ -119,7 +190,7 @@ impl ParquetSource {
         let path = path.as_ref().to_owned();
         let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let file_info = file.metadata().context("read file properties")?;
-        crate::footer::check_collection_sizes(&file)
+        crate::footer::check_footer(&file)
             .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
         let arrow_metadata = load_arrow_metadata(&file)
             .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
@@ -150,6 +221,7 @@ impl ParquetSource {
             metadata,
             arrow_metadata,
             cache: Mutex::new(PageCache::default()),
+            checked_dictionaries: Mutex::new(HashSet::new()),
         })
     }
 
@@ -720,9 +792,10 @@ impl ParquetSource {
     ) -> Result<GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
         let file =
             File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
+        let parquet_columns = projection.parquet_columns();
+        self.check_dictionary_pages(&file, &parquet_columns, &row_groups)?;
         let builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.arrow_metadata.clone());
-        let parquet_columns = projection.parquet_columns();
         let projection = ProjectionMask::roots(builder.parquet_schema(), parquet_columns);
         let mut builder = builder
             .with_batch_size(BATCH_SIZE)
@@ -734,6 +807,52 @@ impl ParquetSource {
         }
 
         Ok(GuardedReader::new(builder.build()?))
+    }
+
+    /// Rejects dictionary pages whose header claims more values than the page can hold.
+    ///
+    /// The parquet crate sizes the dictionary from the header's `num_values` before decoding
+    /// (`DictDecoder::set_dict`), so a 20-byte page claiming 1.5 billion values allocates
+    /// gigabytes, and a failed allocation aborts the process. Each chunk is checked once.
+    fn check_dictionary_pages(
+        &self,
+        file: &File,
+        root_columns: &[usize],
+        row_groups: &[usize],
+    ) -> Result<()> {
+        let schema = self.metadata.file_metadata().schema_descr();
+        let leaves: Vec<usize> = (0..schema.num_columns())
+            .filter(|&leaf| root_columns.contains(&schema.get_column_root_idx(leaf)))
+            .collect();
+        for &group in row_groups {
+            let Some(row_group) = self.metadata.row_groups().get(group) else {
+                continue;
+            };
+            for &leaf in &leaves {
+                let key = (group, leaf);
+                let already = self
+                    .checked_dictionaries
+                    .lock()
+                    .map_err(|_| anyhow!("dictionary check lock poisoned"))?
+                    .contains(&key);
+                if already {
+                    continue;
+                }
+                if let Some(column) = row_group.columns().get(leaf) {
+                    check_dictionary_page(file, column).with_context(|| {
+                        format!(
+                            "malformed Parquet data in column {} of row group {group}",
+                            column.column_path()
+                        )
+                    })?;
+                }
+                self.checked_dictionaries
+                    .lock()
+                    .map_err(|_| anyhow!("dictionary check lock poisoned"))?
+                    .insert(key);
+            }
+        }
+        Ok(())
     }
 
     fn row_group_might_match(
@@ -1714,6 +1833,51 @@ mod tests {
         assert!(
             format!("{error:#}").contains("claims 2147483647 elements"),
             "{error:#}"
+        );
+    }
+
+    /// The parquet crate sizes a dictionary from its page header's `num_values` before decoding;
+    /// fuzzing found 20-byte pages claiming 1.5 billion values (a 5.9 GB allocation).
+    #[test]
+    fn rejects_dictionary_pages_claiming_more_values_than_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("dictionary.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![7, 8, 7, 8]));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, vec![values]).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(
+            source
+                .read_window(0, 4, &Projection::all(1))
+                .unwrap()
+                .num_rows(),
+            4
+        );
+
+        // PageHeader … 7: DictionaryPageHeader { 1: num_values = 2 } is `4C 15 04`. Claim 63
+        // values instead (zigzag 0x7E keeps the byte length) in a page that holds 8 bytes.
+        let column = source.metadata.row_group(0).column(0);
+        let offset = column.dictionary_page_offset().unwrap() as usize;
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = offset
+            + bytes[offset..offset + 32]
+                .windows(3)
+                .position(|window| window == [0x4C, 0x15, 0x04])
+                .unwrap();
+        bytes[at + 2] = 0x7E;
+        std::fs::write(&path, bytes).unwrap();
+
+        let source = ParquetSource::open(&path).unwrap();
+        let error = source.read_window(0, 4, &Projection::all(1)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("dictionary page claims 63 values but holds only 8 bytes"),
+            "{message}"
         );
     }
 

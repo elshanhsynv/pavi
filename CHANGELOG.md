@@ -14,6 +14,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ### Fixed
 - A malformed Parquet file shows a "malformed Parquet data" error instead of crashing the CLI or a worker thread.
 - A crafted Parquet footer can no longer keep a file open busy for seconds to hours; such files are rejected immediately.
+- A crafted Parquet file can no longer make PAVI try to allocate gigabytes (and close) through an oversized dictionary page or schema; it shows an error instead.
 
 ## [0.1.0] - 2026-11-08
 
