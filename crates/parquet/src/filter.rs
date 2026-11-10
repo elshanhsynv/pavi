@@ -127,6 +127,13 @@ impl FilterExpr {
                 parse_timestamp(value, *unit, timezone.as_deref())
                     .map(|ticks| Number::Int(ticks.into()))
             }
+            // A Float32 column holds the nearest f32 to what was written; read the
+            // filter value the same way, so `x == 9.083333` matches the cell that
+            // displays as 9.083333.
+            DataType::Float32 => Number::parse(value).map(|number| match number {
+                Number::Float(float) => Number::Float(f64::from(float as f32)),
+                int @ Number::Int(_) => int,
+            }),
             data_type if is_numeric(data_type) => Number::parse(value),
             _ => None,
         };
@@ -519,6 +526,34 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn float32_columns_match_the_value_they_display() {
+        use arrow_schema::Field;
+        use std::sync::Arc;
+
+        let values = Float32Array::from(vec![9.083333_f32, 0.1, 2.0]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Float32, false)])),
+            vec![Arc::new(values)],
+        )
+        .unwrap();
+        let matches = |filter: &str| {
+            let mask = FilterExpr::parse(filter)
+                .unwrap()
+                .evaluate_batch(&batch, 0)
+                .unwrap();
+            (0..mask.len())
+                .map(|row| mask.value(row))
+                .collect::<Vec<_>>()
+        };
+        // 9.083333 and 0.1 have no exact f32; the column holds the nearest one.
+        assert_eq!(matches("x == 9.083333"), [true, false, false]);
+        assert_eq!(matches("x == 0.1"), [false, true, false]);
+        assert_eq!(matches("x != 0.1"), [true, false, true]);
+        assert_eq!(matches("x > 0.1"), [true, false, true]);
+        assert_eq!(matches("x == 2"), [false, false, true]);
+    }
 
     #[test]
     fn parses_supported_filters() {

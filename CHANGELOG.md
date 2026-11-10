@@ -11,6 +11,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Drop a Parquet file on the window to open it.
 - Ctrl+G jumps to the "Go to row" box.
 - Sort menu in the top bar.
+- Right-click a cell to filter to its value, exclude its value, or copy the cell or row.
 - Right-click a column header to sort ascending or descending, profile the column, fit its width, hide it or copy its name.
 
 ### Changed
@@ -26,6 +27,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Release builds no longer open a console window next to the app.
 
 ### Fixed
+- A filter on a 32-bit float column now matches the value the grid shows, e.g. `DEP_TIME == 8.916667`.
 - A file opened once by a relative path and once by its full path is listed once under recent files.
 - A malformed Parquet file shows a "malformed Parquet data" error instead of crashing the CLI or a worker thread.
 - A crafted Parquet footer can no longer keep a file open busy for seconds to hours; such files are rejected immediately.

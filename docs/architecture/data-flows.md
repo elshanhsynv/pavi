@@ -77,9 +77,13 @@ sequenceDiagram
     G->>A: cell_text(row, col) → format_cell_with_limit (every frame)
 ```
 
-## 4.3 Filter (toolbar filter box)
+## 4.3 Filter (filter box, cell right-click)
 
-1. `apply_filter` (`app.rs:948-1000`): `Filter::parse` (text grammar, `filter.rs:28-60`) → `LogicalPlan::scan().filter().project(all)` → `Planner::plan` validates column/type → cancel pages & previous filter → `grid.reset()` → `QueryEngine::execute`.
+1. Two entry points build a `Filter` and call `start_filter`:
+   - the filter box: `apply_filter` → `Filter::parse` (text grammar, `filter.rs`);
+   - a cell's right-click menu ("Filter to this value" / "Exclude this value"): `cell_menu` in `ui/grid.rs` stores a `CellAction`; `apply_cell_action` runs it after the table is drawn. `selected_cell_filter` builds the `FilterExpr` directly from the selected cell (column `==` or `!=` the cell's `value::scalar_text`), so no text is re-parsed, and writes the equivalent text into the filter box. It is refused, with the reason shown in the menu, for null cells, types that are not comparable, aggregate results, values over `MAX_FILTER_VALUE_BYTES` (1,024), and any value whose `==` filter does not match its own cell.
+
+   `start_filter`: `LogicalPlan::scan().filter().project(all)` → `Planner::plan` validates column/type → cancel pages & previous filter → `grid.reset()` → `QueryEngine::execute`.
 2. `execute` (`execution.rs:91-120`) schedules the first read: `submit_filtered_from(filter, start_row 0, 4096 rows)`.
 3. Worker: `read_filtered_from` starts at `start_row`, skips row groups whose statistics can't match (`row_group_might_match`), decodes `projection ∪ filter column`, evaluates a `BooleanArray` mask, and returns up to 4,096 matches as `PageOutcome::Filtered` with `next_row`.
 4. UI `poll_filtered` (`app.rs:1219-1278`) calls `poll_next_batch()` while `needs_more()`; batches go into `FilteredGrid.push`, which keeps only the last 8 batches and advances `first_result`. `grid.rows` is set to the **window size**, not the total.

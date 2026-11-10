@@ -100,6 +100,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 - Dropping a file on the window opens it.
 - A header click selects the column: it is underlined in `ACCENT` and the Inspector's Column section describes it. It never starts a scan.
 - A header right-click opens a menu: Sort ascending / descending, Profile column, Fit width, Hide column, Copy name.
+- A cell right-click selects the cell and opens a menu: Filter to this value, Exclude this value, Copy cell, Copy row. When the cell cannot be filtered by (null, an unsupported type, an aggregate result) the two filter rows are disabled and a caption says why.
 - Sorting is always an explicit choice (the Sort menu or the header menu), because it scans the whole file. A sort without a SQL `LIMIT` returns the first 100,000 rows in sort order and says so in the result strip; "Back to file order" in the Sort menu clears it.
 - Every long action can be cancelled or replaced by starting a new one.
 

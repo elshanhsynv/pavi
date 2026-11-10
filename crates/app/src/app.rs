@@ -10,7 +10,9 @@ use std::{
 use eframe::egui::{self, Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use parquet_reader::{
-    NullOrder, ParquetSource, Projection, SortDirection, value::format_cell_with_limit,
+    FilterExpr, FilterOp, NullOrder, ParquetSource, Projection, SortDirection,
+    types::{is_comparable, is_string},
+    value::{format_cell_with_limit, scalar_text},
 };
 use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryPoll, SqlAst};
 use pavi_runtime::{GenerationId, OpenOutcome, OpenTask, Runtime, RuntimeConfig};
@@ -32,6 +34,8 @@ use crate::state::{
 const ROW_HEIGHT: f32 = 24.0;
 const INITIAL_COLUMN_WIDTH: f32 = 110.0;
 const CELL_LIMIT: usize = 256;
+/// Longest cell value "Filter to this value" accepts; longer ones are refused.
+const MAX_FILTER_VALUE_BYTES: usize = 1024;
 /// Rows a sort without a LIMIT returns: the first ones in sort order. Kept at the
 /// reader's sort budget, so the scan keeps only these rows and works on any file size.
 const SORT_ROW_CAP: usize = pavi_query::SortBudget::DEFAULT_MAX_ROWS;
@@ -60,6 +64,8 @@ pub(crate) struct PaviApp {
     drawn_rows: Option<(u64, u64)>,
     /// What the user asked of a grid header this frame; applied after the table is drawn.
     header_action: Option<HeaderAction>,
+    /// What the user chose in a cell's right-click menu this frame.
+    cell_action: Option<CellAction>,
     /// Vertical offset to apply to the source grid's table on the next frame.
     grid_scroll_offset: Option<f32>,
     filtered: Option<FilteredGrid>,
@@ -110,6 +116,18 @@ enum HeaderAction {
     CopyName(String),
 }
 
+/// An action chosen in a grid cell's right-click menu. It applies to the selected
+/// cell: a right-click selects the cell first.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CellAction {
+    /// Keep only rows whose value in this column equals the cell's.
+    FilterTo,
+    /// Drop rows whose value in this column equals the cell's.
+    Exclude,
+    CopyCell,
+    CopyRow,
+}
+
 struct RunningSql {
     text: String,
     started: Instant,
@@ -138,6 +156,7 @@ impl PaviApp {
             pages: SourcePages::default(),
             drawn_rows: None,
             header_action: None,
+            cell_action: None,
             grid_scroll_offset: None,
             filtered: None,
             column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
@@ -718,13 +737,121 @@ impl PaviApp {
 
     fn apply_filter(&mut self) {
         let expression = self.filter_input.trim().to_owned();
-        let filter = match Filter::parse(&expression) {
-            Ok(filter) => filter,
-            Err(error) => {
-                self.filter_error = Some(format!("Invalid filter: {error}"));
-                return;
+        match Filter::parse(&expression) {
+            Ok(filter) => self.start_filter(filter, &expression),
+            Err(error) => self.filter_error = Some(format!("Invalid filter: {error}")),
+        }
+    }
+
+    /// The filter "selected column == (or !=) the selected cell's value" and its
+    /// text for the filter box, or why that cell cannot be filtered by.
+    fn selected_cell_filter(&self, exclude: bool) -> Result<(Filter, String), String> {
+        let (row, display_column) = self.grid.selection.ok_or("Select a cell first")?;
+        let dataset = self.dataset.as_ref().ok_or("Open a file first")?;
+        let (source, batch_column) = match &self.filtered {
+            Some(filtered) if filtered.aggregate => {
+                return Err("Aggregated results cannot be filtered by value".to_owned());
             }
+            Some(filtered) => *filtered
+                .display_columns
+                .get(display_column)
+                .ok_or("That column is no longer shown")?,
+            None => (
+                *self
+                    .column_layout
+                    .visible()
+                    .get(display_column)
+                    .ok_or("That column is no longer shown")?,
+                display_column,
+            ),
         };
+        let (batch, offset) = self.batch_row_at(row).ok_or("That cell is still loading")?;
+        let array = batch
+            .columns()
+            .get(batch_column)
+            .ok_or("That column is no longer shown")?;
+        let name = dataset
+            .column_names
+            .get(source)
+            .ok_or("That column is no longer shown")?;
+        let data_type = array.data_type();
+        if !is_comparable(data_type) {
+            return Err(format!("{data_type} columns cannot be filtered"));
+        }
+        if array.is_null(offset) {
+            return Err("Filtering by null is not supported".to_owned());
+        }
+        let value = scalar_text(array.as_ref(), offset)
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or("Filtering by null is not supported")?;
+        if value.len() > MAX_FILTER_VALUE_BYTES {
+            return Err(format!(
+                "That value is longer than {MAX_FILTER_VALUE_BYTES} bytes; type a shorter filter"
+            ));
+        }
+        // A column whose name is a number would be read as a column position.
+        let column = if name.parse::<usize>().is_ok() {
+            source.to_string()
+        } else {
+            name.clone()
+        };
+        let equals = FilterExpr {
+            column,
+            op: FilterOp::Eq,
+            value,
+        };
+        // The filter is only offered when it finds the cell it was made from.
+        let matches_itself = arrow_array::RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                name.as_str(),
+                data_type.clone(),
+                true,
+            )])),
+            vec![array.slice(offset, 1)],
+        )
+        .ok()
+        .and_then(|cell| equals.evaluate_batch(&cell, 0).ok())
+        .is_some_and(|mask| mask.len() == 1 && mask.value(0));
+        if !matches_itself {
+            return Err("That value cannot be matched exactly by a filter".to_owned());
+        }
+        let shown = if is_string(data_type) {
+            format!("\"{}\"", equals.value)
+        } else {
+            equals.value.clone()
+        };
+        let text = format!("{name} {} {shown}", if exclude { "!=" } else { "==" });
+        let expression = FilterExpr {
+            op: if exclude { FilterOp::Ne } else { FilterOp::Eq },
+            ..equals
+        };
+        Ok((Filter::new(expression), text))
+    }
+
+    /// Applies the action chosen in a cell's right-click menu, if any.
+    fn apply_cell_action(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.cell_action.take() else {
+            return;
+        };
+        match action {
+            CellAction::CopyCell => self.copy_selection(ctx, false),
+            CellAction::CopyRow => self.copy_selection(ctx, true),
+            CellAction::FilterTo | CellAction::Exclude => {
+                match self.selected_cell_filter(action == CellAction::Exclude) {
+                    Ok((filter, text)) => {
+                        self.filter_input = text.clone();
+                        self.workspace = Workspace::Grid;
+                        self.start_filter(filter, &text);
+                    }
+                    Err(reason) => self.status = reason,
+                }
+            }
+        }
+    }
+
+    /// Replaces the current result with the rows of the file that pass `filter`.
+    /// `expression` is the filter as text, for the status bar.
+    fn start_filter(&mut self, filter: Filter, expression: &str) {
         let Some(dataset) = &self.dataset else {
             self.filter_error = Some("Open a dataset before applying a filter".to_string());
             return;
