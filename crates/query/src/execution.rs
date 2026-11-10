@@ -133,6 +133,18 @@ impl QueryExecution {
         self.generation_id
     }
 
+    /// Source rows the scan in flight has passed, or `None` when no filter, sort
+    /// or aggregate scan is running. It is a position in the file: divide by the
+    /// file's row count for a fraction.
+    pub fn scanned_rows(&self) -> Option<u64> {
+        let task = self.pending.as_ref()?;
+        match self.in_flight.as_ref()? {
+            InFlight::Filtered => Some(task.progress().scanned_rows().max(self.next_filter_row)),
+            InFlight::Sorted | InFlight::Aggregate => Some(task.progress().scanned_rows()),
+            InFlight::Page | InFlight::Window => None,
+        }
+    }
+
     pub fn cancellation_token(&self) -> Option<CancellationToken> {
         self.pending.as_ref().map(PageTask::cancellation_token)
     }
@@ -711,6 +723,44 @@ mod tests {
             .unwrap()
             .batch;
         assert_eq!(ids(&batch), (4100..ROWS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reports_scan_progress_only_while_a_scan_is_in_flight() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let rows = source.row_count();
+
+        // A plain scan reads pages: there is no scan position to report.
+        let execution = QueryEngine::new(&runtime)
+            .execute(&LogicalPlan::scan(Arc::clone(&source)), GenerationId(1))
+            .unwrap();
+        assert_eq!(execution.scanned_rows(), None);
+
+        // A filter that matches nothing scans the whole file in one read.
+        let filtered = LogicalPlan::scan(Arc::clone(&source))
+            .filter(Filter::parse("id < 0").unwrap())
+            .project(vec![0]);
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&filtered, GenerationId(2))
+            .unwrap();
+        let mut last = 0;
+        loop {
+            if let Some(scanned) = execution.scanned_rows() {
+                assert!(scanned >= last && scanned <= rows, "{scanned} of {rows}");
+                last = scanned;
+            }
+            match execution.poll_next_batch().unwrap() {
+                QueryPoll::Finished => break,
+                QueryPoll::Pending => std::thread::yield_now(),
+                QueryPoll::Batch(_) => {}
+            }
+        }
+        assert_eq!(
+            execution.scanned_rows(),
+            None,
+            "nothing in flight once finished"
+        );
     }
 
     #[test]

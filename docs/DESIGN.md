@@ -80,7 +80,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 - **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted.
 - **SQL workspace** (`ui/sql.rs`): editor, Run, Cancel and the History menu above the result grid.
 - **Inspector** (`ui/inspector.rs`): collapsible sections Cell, Column (with profile), File, Schema, Row groups, Page cache.
-- **Status bar** (`ui/status.rs`): status dot or spinner and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
+- **Status bar** (`ui/status.rs`): status dot or spinner, the share of the file a running filter, sort or SQL scan has read (e.g. `42%`), and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
 - **Charts** is the only floating window.
 
 ## UI states every view must handle
@@ -88,7 +88,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 | State | Pattern |
 |---|---|
 | No file | Centered prompt: drop a file, Browse, or pick a recent file |
-| Loading | Placeholders (`…`) plus a status bar message; no blocking spinners |
+| Loading | Placeholders (`…`) plus a status bar message; no blocking spinners. A scan of the whole file shows how far it has got |
 | Empty result | Say so ("No rows match") rather than an empty grid |
 | Error | Red text in the area that failed, plus the status bar; the rest of the UI keeps working |
 | Limit reached | Name the limit and the way out (e.g. "add a LIMIT or a filter") |

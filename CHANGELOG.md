@@ -11,6 +11,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Drop a Parquet file on the window to open it.
 - Ctrl+G jumps to the "Go to row" box.
 - Sort menu in the top bar.
+- A running filter, sort or SQL query shows how much of the file it has scanned, in the status bar and in the grid.
 - Right-click a cell to filter to its value, exclude its value, or copy the cell or row.
 - Right-click a column header to sort ascending or descending, profile the column, fit its width, hide it or copy its name.
 

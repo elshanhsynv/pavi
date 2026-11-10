@@ -1,6 +1,6 @@
 use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
 
-use crate::{CancellationToken, OpenResponse, PageResponse};
+use crate::{CancellationToken, OpenResponse, PageResponse, ScanProgress};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(pub u64);
@@ -12,6 +12,7 @@ pub struct GenerationId(pub u64);
 /// Its task and generation IDs arrive with the response.
 pub struct PageTask {
     cancellation: CancellationToken,
+    progress: ScanProgress,
     response: Receiver<PageResponse>,
 }
 
@@ -23,15 +24,25 @@ pub struct OpenTask {
 }
 
 impl PageTask {
-    pub(crate) fn new(cancellation: CancellationToken, response: Receiver<PageResponse>) -> Self {
+    pub(crate) fn new(
+        cancellation: CancellationToken,
+        progress: ScanProgress,
+        response: Receiver<PageResponse>,
+    ) -> Self {
         Self {
             cancellation,
+            progress,
             response,
         }
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// How far this read has scanned; see [`ScanProgress::scanned_rows`].
+    pub fn progress(&self) -> ScanProgress {
+        self.progress.clone()
     }
 
     pub fn cancel(&self) {

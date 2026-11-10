@@ -85,7 +85,7 @@ sequenceDiagram
 
    `start_filter`: `LogicalPlan::scan().filter().project(all)` → `Planner::plan` validates column/type → cancel pages & previous filter → `grid.reset()` → `QueryEngine::execute`.
 2. `execute` (`execution.rs:91-120`) schedules the first read: `submit_filtered_from(filter, start_row 0, 4096 rows)`.
-3. Worker: `read_filtered_from` starts at `start_row`, skips row groups whose statistics can't match (`row_group_might_match`), decodes `projection ∪ filter column`, evaluates a `BooleanArray` mask, and returns up to 4,096 matches as `PageOutcome::Filtered` with `next_row`.
+3. Worker: `read_filtered_from` starts at `start_row`, reports its position in the file before each batch (`checkpoint`, see concurrency.md), skips row groups whose statistics can't match (`row_group_might_match`), decodes `projection ∪ filter column`, evaluates a `BooleanArray` mask, and returns up to 4,096 matches as `PageOutcome::Filtered` with `next_row`.
 4. UI `poll_filtered` (`app.rs:1219-1278`) calls `poll_next_batch()` while `needs_more()`; batches go into `FilteredGrid.push`, which keeps only the last 8 batches and advances `first_result`. `grid.rows` is set to the **window size**, not the total.
 5. When the last window row is rendered, `request_more_filtered` raises `target_result` by 4,096 (`ui/grid.rs:347-349`), causing the next `submit_filtered_from` at `next_filter_row`, the cursor returned by the previous read.
 6. `Finished` when `next_row` reaches the file's row count.
@@ -120,7 +120,8 @@ sequenceDiagram
 2. If the plan has no `LIMIT`, `sort_column` adds `LIMIT SORT_ROW_CAP` (100,000, the sort budget's row cap) and marks the result `sort_capped`; the status bar and the result strip say that only the first 100,000 rows in sort order are shown. A SQL `LIMIT` is left as written.
 3. `execute` submits **one** `ReadOperation::Sorted` with a `SortedRead { sort, budget, limit }` (`execution.rs`).
 4. Worker `read_sorted`: with `LIMIT n` (n ≤ 100,000) only the best n rows are kept while scanning, so any file size works. That is the path every GUI sort takes. Without a limit (or with a larger SQL `LIMIT`) it buffers the rows that pass the filter, and more than 100,000 of them (or the byte estimate) is an error. It sorts with a stable tie-breaker, `take`s output columns and splits into 4,096-row batches.
-5. All sorted batches are moved into `QueryExecution.buffered` at once; the UI then drains them into its 8-batch window like a filter.
+5. While the scan runs, `QueryExecution::scanned_rows()` returns the position the worker last reported (`None` for page and window reads). `PaviApp::scan_fraction` divides it by the file's row count; the status bar and the grid's "query running…" placeholder show it as a percentage. The same applies to filter and SQL scans. The percentage is the share of the file read, so the final in-memory sort is not counted.
+6. All sorted batches are moved into `QueryExecution.buffered` at once; the UI then drains them into its 8-batch window like a filter.
 
 **Memory:** up to 100k filtered rows / 128 MB of decoded input plus the sorted copy on the worker (top-N: about n + 32k rows); the sorted result sits in `QueryExecution.buffered` until consumed.
 **Errors:** budget error text ("sort input exceeds the in-memory sort budget… filter the data or add a LIMIT…") ends up in the status bar / grid error. GUI sorts can still hit the 128 MB byte budget on very wide rows.
