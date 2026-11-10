@@ -9,6 +9,8 @@ use super::{
 const MENU_COLUMNS: usize = 128;
 /// Characters of the file name shown in the top bar.
 const FILE_LABEL_CHARS: usize = 36;
+/// Characters of a recent file's folder shown in the file menu.
+const FOLDER_HINT_CHARS: usize = 26;
 
 impl PaviApp {
     /// The one bar above the data: file, workspace, filter, tools, window controls.
@@ -160,7 +162,7 @@ impl PaviApp {
                     let file = path.file_name().unwrap_or_default().to_string_lossy();
                     let folder = path
                         .parent()
-                        .map(|parent| parent.display().to_string())
+                        .map(|parent| tail(&parent.display().to_string(), FOLDER_HINT_CHARS))
                         .unwrap_or_default();
                     if widgets::menu_item(ui, &file, &folder)
                         .on_hover_text(path.display().to_string())
@@ -586,6 +588,17 @@ impl PaviApp {
             _ => self.status = "Enter a row number within the current result set".to_string(),
         }
     }
+}
+
+/// The last `max_chars` characters of `text`, with "…" in front when it was cut.
+/// The end of a folder path tells recent files apart; the start rarely does.
+fn tail(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_owned();
+    }
+    let kept = text.chars().skip(count - max_chars).collect::<String>();
+    format!("…{kept}")
 }
 
 fn toggle_maximized(ctx: &egui::Context) {

@@ -22,7 +22,7 @@ impl QueryKind {
         match self {
             Self::Filter => "Filter",
             Self::Sql => "SQL",
-            Self::Sort => "Sorted",
+            Self::Sort => "Sort",
         }
     }
 

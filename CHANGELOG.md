@@ -20,6 +20,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Text uses Segoe UI on Windows.
 - Clicking a column header selects the column and shows it in the Inspector instead of starting a sort.
 - Sorting a large file no longer fails with a budget error: it shows the first 100,000 rows in sort order and says so.
+- The status bar shows a spinner while a filter or sort is scanning.
 - Upgraded Apache Arrow and Parquet to 60.1.0. Files with a corrupt embedded Arrow schema still open, using the Parquet schema.
 - Release builds no longer open a console window next to the app.
 
