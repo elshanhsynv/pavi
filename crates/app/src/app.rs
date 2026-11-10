@@ -29,10 +29,12 @@ use crate::state::{
     ColumnLayout, GridState, LoadState, ToolbarAvailability, ToolbarCommand, Workspace,
 };
 
-const ROW_HEIGHT: f32 = 28.0;
-const ROW_NUMBER_WIDTH: f32 = 58.0;
+const ROW_HEIGHT: f32 = 24.0;
 const INITIAL_COLUMN_WIDTH: f32 = 110.0;
 const CELL_LIMIT: usize = 256;
+/// Rows a sort without a LIMIT returns: the first ones in sort order. Kept at the
+/// reader's sort budget, so the scan keeps only these rows and works on any file size.
+const SORT_ROW_CAP: usize = pavi_query::SortBudget::DEFAULT_MAX_ROWS;
 const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
 
 fn ui_row_count(rows: u64) -> usize {
@@ -56,6 +58,8 @@ pub(crate) struct PaviApp {
     pages: SourcePages,
     /// First and last absolute row the source grid drew this frame.
     drawn_rows: Option<(u64, u64)>,
+    /// What the user asked of a grid header this frame; applied after the table is drawn.
+    header_action: Option<HeaderAction>,
     /// Vertical offset to apply to the source grid's table on the next frame.
     grid_scroll_offset: Option<f32>,
     filtered: Option<FilteredGrid>,
@@ -78,12 +82,32 @@ pub(crate) struct PaviApp {
     show_safe_full_selection: bool,
     show_nested_selection: bool,
     workspace: Workspace,
-    show_filter_controls: bool,
-    ui_initialized: bool,
     show_column_types: bool,
     freeze_header: bool,
-    show_tools: bool,
     status: String,
+}
+
+/// Installs PAVI's fonts and style. Call once, before the first frame: fonts
+/// set during a frame only take effect on the next one.
+pub(crate) fn apply_theme(ctx: &egui::Context) {
+    ui::theme::apply(ctx);
+}
+
+/// An action chosen on a grid column header.
+#[derive(Clone, Debug, PartialEq)]
+enum HeaderAction {
+    /// Select the column at this display position.
+    Select(usize),
+    /// Sort by a source column.
+    Sort(usize, SortDirection),
+    /// Hide a source column.
+    Hide(usize),
+    /// Fit a source column's width to the loaded values.
+    Fit(usize),
+    /// Profile a source column in the Inspector.
+    Profile(usize),
+    /// Copy the column name.
+    CopyName(String),
 }
 
 struct RunningSql {
@@ -113,6 +137,7 @@ impl PaviApp {
             opening_path: None,
             pages: SourcePages::default(),
             drawn_rows: None,
+            header_action: None,
             grid_scroll_offset: None,
             filtered: None,
             column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
@@ -139,11 +164,8 @@ impl PaviApp {
             show_safe_full_selection: false,
             show_nested_selection: false,
             workspace: Workspace::default(),
-            show_filter_controls: false,
-            ui_initialized: false,
             show_column_types: true,
             freeze_header: true,
-            show_tools: false,
             status: "Choose a Parquet file to begin".to_string(),
         };
         if app.runtime.is_none() {
@@ -228,8 +250,24 @@ impl PaviApp {
             && ctx.input(|input| input.key_pressed(egui::Key::F))
         {
             self.workspace = Workspace::Grid;
-            self.show_filter_controls = true;
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("filter_search")));
+        }
+        if self.dataset.is_some() && ctx.input(|input| input.key_pressed(egui::Key::G)) {
+            ctx.memory_mut(|memory| memory.request_focus(ui::status::jump_box_id()));
+        }
+    }
+
+    /// Opens the first file dropped on the window.
+    fn open_dropped_file(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .first()
+                .and_then(|file| file.path.clone())
+        });
+        if let Some(path) = dropped {
+            self.begin_open(path);
         }
     }
 
@@ -415,7 +453,6 @@ impl PaviApp {
         self.show_safe_full_selection = false;
         self.show_nested_selection = false;
         self.workspace = Workspace::Grid;
-        self.show_filter_controls = false;
         self.dataset = None;
         self.filter_error = None;
         self.sql_error = None;
@@ -497,6 +534,50 @@ impl PaviApp {
                 self.persist_session();
                 self.open_error(format!("open file: {error:#}"));
             }
+        }
+    }
+
+    /// Selects the cell of display column `column` in the current row, so the
+    /// Inspector shows that column. Falls back to the first row in view.
+    fn select_column(&mut self, column: usize) {
+        let drawn = if self.filtered.is_none() {
+            self.drawn_rows.map(|(first, _)| first)
+        } else {
+            None
+        };
+        let row = self
+            .grid
+            .selection
+            .map(|(row, _)| row)
+            .or(drawn)
+            .unwrap_or(self.grid.first_row);
+        if !self.grid.select(row, column) {
+            self.grid.select(self.grid.first_row, column);
+        }
+    }
+
+    /// Applies the header action chosen this frame, if any.
+    fn apply_header_action(&mut self, ctx: &egui::Context) {
+        match self.header_action.take() {
+            Some(HeaderAction::Select(column)) => self.select_column(column),
+            Some(HeaderAction::Sort(source, direction)) => self.sort_column(source, direction),
+            Some(HeaderAction::Hide(source)) => {
+                self.column_layout.set_hidden(source, true);
+                self.apply_column_layout_change();
+            }
+            Some(HeaderAction::Fit(source)) => self.auto_fit_column(source),
+            Some(HeaderAction::Profile(source)) => {
+                if !self.show_inspector {
+                    self.show_inspector = true;
+                    self.persist_session();
+                }
+                self.run_profile(source);
+            }
+            Some(HeaderAction::CopyName(name)) => {
+                ctx.copy_text(name);
+                self.status = "Copied the column name".to_string();
+            }
+            None => {}
         }
     }
 
@@ -809,7 +890,19 @@ impl PaviApp {
         }
     }
 
+    /// Sorts by `column`: ascending, or descending when it is already sorted ascending.
     fn toggle_sort(&mut self, column: usize) {
+        let previous = self.filtered.as_ref().and_then(|filtered| filtered.sort);
+        let direction = match previous {
+            Some(sort) if sort.column == column && sort.direction == SortDirection::Ascending => {
+                SortDirection::Descending
+            }
+            _ => SortDirection::Ascending,
+        };
+        self.sort_column(column, direction);
+    }
+
+    fn sort_column(&mut self, column: usize, direction: SortDirection) {
         let Some(dataset) = &self.dataset else {
             self.status = "Open a dataset before sorting".to_string();
             return;
@@ -821,24 +914,28 @@ impl PaviApp {
             self.status = format!("Sort column {column} is out of range");
             return;
         };
-        let (plan, kind, previous) = if let Some(filtered) = &self.filtered {
-            (filtered.plan.clone(), filtered.kind, filtered.sort)
+        let (plan, kind) = if let Some(filtered) = &self.filtered {
+            (filtered.plan.clone(), filtered.kind)
         } else {
             (
                 LogicalPlan::scan(source).project((0..column_count).collect::<Vec<_>>()),
                 QueryKind::Sort,
-                None,
             )
         };
-        let direction = match previous {
-            Some(sort) if sort.column == column && sort.direction == SortDirection::Ascending => {
-                SortDirection::Descending
-            }
-            _ => SortDirection::Ascending,
-        };
-        let plan = plan.replace_sort(column, direction, NullOrder::Last);
+        let mut plan = plan.replace_sort(column, direction, NullOrder::Last);
+        let mut capped = self
+            .filtered
+            .as_ref()
+            .is_some_and(|filtered| filtered.sort_capped);
         let (projected_columns, sort) = match Planner::plan(&plan) {
-            Ok(plan) => (plan.projected_columns().to_vec(), plan.sort()),
+            Ok(planned) => {
+                if planned.limit().is_none() {
+                    // Without a LIMIT every row would have to fit in the sort budget.
+                    plan = plan.limit(SORT_ROW_CAP);
+                    capped = true;
+                }
+                (planned.projected_columns().to_vec(), planned.sort())
+            }
             Err(error) => {
                 self.status = format!("Sort error: {error:#}");
                 return;
@@ -859,20 +956,23 @@ impl PaviApp {
         };
         match QueryEngine::new(runtime).execute(&plan, generation) {
             Ok(execution) => {
-                self.filtered = Some(FilteredGrid::new(
-                    kind,
-                    plan,
-                    sort,
-                    false,
-                    projected_columns,
-                    execution,
-                ));
+                let mut filtered =
+                    FilteredGrid::new(kind, plan, sort, false, projected_columns, execution);
+                filtered.sort_capped = capped;
+                self.filtered = Some(filtered);
                 self.refresh_grid_columns();
                 let arrow = match direction {
                     SortDirection::Ascending => "↑",
                     SortDirection::Descending => "↓",
                 };
-                self.status = format!("Sorting {column_name} {arrow} (nulls last)");
+                self.status = if capped {
+                    format!(
+                        "Sorting {column_name} {arrow} (nulls last, first {} rows)",
+                        ui::theme::number(SORT_ROW_CAP as u64)
+                    )
+                } else {
+                    format!("Sorting {column_name} {arrow} (nulls last)")
+                };
             }
             Err(error) => self.status = format!("Start sort: {error:#}"),
         }
@@ -1455,12 +1555,9 @@ impl eframe::App for PaviApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.ui_initialized {
-            ui::theme::apply(ctx);
-            self.ui_initialized = true;
-        }
         self.pages.begin_frame();
         self.handle_global_shortcuts(ctx);
+        self.open_dropped_file(ctx);
         self.poll_open();
         if self.filtered.is_none()
             && let Some(status) = self.pages.poll(&mut self.grid)
@@ -1473,29 +1570,38 @@ impl eframe::App for PaviApp {
         self.poll_export();
         self.show_top_bar(ctx);
         self.show_chart_window(ctx);
-        ui::status::show(
-            ctx,
-            ui::status::StatusBar {
-                status: &self.status,
-                activity: self.active_task_label(),
-                has_error: matches!(self.grid.loading, LoadState::Error(_))
-                    || self.filter_error.is_some()
-                    || self.sql_error.is_some(),
-                selection: self.grid.selection,
-                cached_pages: self.pages.loaded_count(),
-                rows: self.grid.rows,
-                path: self.dataset.as_ref().map(|dataset| dataset.path.as_path()),
-                columns: self.dataset.as_ref().map(|_| self.grid.columns),
-            },
-        );
+        let compression = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.source.compression());
+        let jump =
+            ui::status::show(
+                ctx,
+                ui::status::StatusBar {
+                    status: &self.status,
+                    activity: self.active_task_label(),
+                    has_error: matches!(self.grid.loading, LoadState::Error(_))
+                        || self.filter_error.is_some()
+                        || self.sql_error.is_some(),
+                    selection: self.grid.selection,
+                    dataset: self.dataset.as_ref().zip(compression).map(
+                        |(dataset, compression)| ui::status::DatasetSummary {
+                            rows: self.grid.rows,
+                            columns: self.grid.columns,
+                            row_groups: dataset.source.row_groups().len(),
+                            compression,
+                        },
+                    ),
+                    path: self.dataset.as_ref().map(|dataset| dataset.path.as_path()),
+                    jump_input: &mut self.jump_row_input,
+                },
+            );
+        if jump {
+            self.jump_to_input();
+        }
         self.show_inspector_panel(ctx);
-        self.show_tools_window(ctx);
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(ui::theme::BACKGROUND)
-                    .inner_margin(ui::spacing::Spacing::Md.margin()),
-            )
+            .frame(egui::Frame::new().fill(ui::theme::BACKGROUND))
             .show(ctx, |ui| match self.workspace {
                 Workspace::Grid => self.show_grid(ui),
                 Workspace::Sql => self.show_sql_workspace(ui),

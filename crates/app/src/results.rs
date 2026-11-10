@@ -39,6 +39,9 @@ pub(crate) struct FilteredGrid {
     pub(crate) kind: QueryKind,
     pub(crate) plan: LogicalPlan,
     pub(crate) sort: Option<SortSpec>,
+    /// The sort had no LIMIT, so PAVI added one: the result is the first
+    /// `SORT_ROW_CAP` rows in sort order, not every row.
+    pub(crate) sort_capped: bool,
     pub(crate) aggregate: bool,
     pub(crate) projected_columns: Vec<usize>,
     pub(crate) display_columns: Vec<(usize, usize)>,
@@ -64,6 +67,7 @@ impl FilteredGrid {
             kind,
             plan,
             sort,
+            sort_capped: false,
             aggregate,
             projected_columns,
             display_columns: Vec::new(),

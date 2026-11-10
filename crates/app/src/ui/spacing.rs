@@ -8,7 +8,6 @@ pub enum Spacing {
     Sm = 4,
     Md = 8,
     Lg = 12,
-    Xl = 16,
 }
 impl Spacing {
     pub const fn px(self) -> f32 {

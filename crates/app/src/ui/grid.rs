@@ -1,24 +1,48 @@
 use super::super::*;
-use super::{inspector::type_label, spacing::Spacing, theme};
+use super::{
+    inspector::type_label,
+    spacing::Spacing,
+    theme,
+    widgets::{self, Icon},
+};
+
+/// Recent files offered on the start screen.
+const RECENT_ON_START: usize = 4;
+/// Height of the pinned header row.
+const HEADER_HEIGHT: f32 = 28.0;
+/// Width of the menu a right-click on a header opens.
+const HEADER_MENU_WIDTH: f32 = 180.0;
 
 struct Header {
     source: Option<usize>,
     name: String,
     data_type: String,
+    /// Color of the type label.
+    color: egui::Color32,
+    /// Values are right-aligned.
+    numeric: bool,
+}
+
+impl Header {
+    fn new(source: Option<usize>, name: &str, data_type: Option<&arrow_schema::DataType>) -> Self {
+        Self {
+            source,
+            name: name.to_owned(),
+            data_type: data_type.map(type_label).unwrap_or_default(),
+            color: data_type.map_or(theme::MUTED, type_color),
+            numeric: data_type.is_some_and(arrow_schema::DataType::is_numeric),
+        }
+    }
 }
 
 impl PaviApp {
     pub(in crate::app) fn show_grid(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .fill(super::theme::PANEL)
-            .stroke(egui::Stroke::new(1.0_f32, theme::GRID_LINE))
-            .corner_radius(5.0)
-            .show(ui, |ui| {
-                ui.set_min_size(ui.available_size());
-                ui.spacing_mut().item_spacing = Spacing::None.vec(Spacing::None);
-                ui.spacing_mut().interact_size.y = ROW_HEIGHT;
-                self.show_grid_content(ui);
-            });
+        egui::Frame::new().fill(theme::BACKGROUND).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            ui.spacing_mut().item_spacing = Spacing::None.vec(Spacing::None);
+            ui.spacing_mut().interact_size.y = ROW_HEIGHT;
+            self.show_grid_content(ui);
+        });
     }
 
     fn show_grid_content(&mut self, ui: &mut egui::Ui) {
@@ -27,42 +51,16 @@ impl PaviApp {
             return;
         }
         if self.dataset.is_none() {
-            match &self.grid.loading {
-                LoadState::Opening => {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.spinner();
-                            ui.strong("Opening dataset…");
-                            ui.label("Reading Parquet metadata on a background worker.");
-                        });
-                    });
-                }
-                LoadState::Error(error) => {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.heading("Couldn’t open dataset");
-                            ui.label(RichText::new(error).color(egui::Color32::RED));
-                            ui.label("Choose Open… to try another Parquet file.");
-                        });
-                    });
-                }
-                _ => {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.heading("Open a Parquet file");
-                            ui.label("Use Open… or Ctrl+O to start exploring.");
-                        });
-                    });
-                }
-            }
+            self.show_closed_state(ui);
             return;
         }
         if self.grid.rows == 0 {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.heading("Dataset is empty");
-                    ui.label("The schema and metadata are still available in Inspector.");
-                });
+            widgets::placeholder(ui, |ui| {
+                ui.heading("This file has no rows");
+                ui.label(
+                    RichText::new("Its schema and metadata are in the Inspector (Ctrl+I).")
+                        .color(theme::MUTED),
+                );
             });
             return;
         }
@@ -90,32 +88,31 @@ impl PaviApp {
             .collect::<Vec<_>>();
         let headers = visible
             .iter()
-            .map(|(source, name, _)| Header {
-                source: Some(*source),
-                name: name.clone(),
-                data_type: self
-                    .dataset
-                    .as_ref()
-                    .map(|d| type_label(d.source.schema().field(*source).data_type()))
-                    .unwrap_or_default(),
+            .map(|(source, name, _)| {
+                let schema = self.dataset.as_ref().map(|d| d.source.schema());
+                Header::new(
+                    Some(*source),
+                    name,
+                    schema
+                        .as_ref()
+                        .map(|schema| schema.field(*source).data_type()),
+                )
             })
             .collect::<Vec<_>>();
         let columns = visible.len();
         if columns == 0 {
-            ui.centered_and_justified(|ui| {
-                ui.label("All columns are hidden. Use Columns to show one.")
+            widgets::placeholder(ui, |ui| {
+                ui.heading("Every column is hidden");
+                ui.label(
+                    RichText::new("Show one from Columns in the top bar.").color(theme::MUTED),
+                );
             });
             return;
         }
         let windowed = self.grid.is_windowed();
-        let header_rows = if self.freeze_header {
-            0
-        } else if self.show_column_types {
-            2
-        } else {
-            1
-        };
-        let header_height = if self.show_column_types { 52.0 } else { 32.0 };
+        let header_rows = usize::from(!self.freeze_header);
+        let gutter = row_number_width(self.grid.rows);
+        let selected_row = self.grid.selection.map(|(row, _)| row);
         let area = ui.available_rect_before_wrap();
         let mut jump_row = None;
         if let Some(row) = self.jump_target.take() {
@@ -123,7 +120,7 @@ impl PaviApp {
                 // Move the window around the target and set the scroll offset
                 // directly, which applies this frame (`scroll_to_row` lands a frame
                 // or two later, after re-centering would already have run).
-                let rows_in_view = ((area.height() - header_height) / ROW_HEIGHT).max(1.0) as u64;
+                let rows_in_view = ((area.height() - HEADER_HEIGHT) / ROW_HEIGHT).max(1.0) as u64;
                 let top = row.saturating_sub(rows_in_view / 2);
                 self.scroll_grid_to(top, header_rows);
             } else {
@@ -155,22 +152,20 @@ impl PaviApp {
                     .id_salt("grid_horizontal")
                     .show(ui, |ui| {
                         ui.set_min_width(
-                            (visible.iter().map(|(_, _, width)| width).sum::<f32>()
-                                + ROW_NUMBER_WIDTH)
+                            (visible.iter().map(|(_, _, width)| width).sum::<f32>() + gutter)
                                 .max(ui.available_width()),
                         );
                         let mut table = TableBuilder::new(ui)
                             .striped(true)
                             .resizable(true)
                             .cell_layout(Layout::left_to_right(Align::Center))
-                            .column(Column::exact(ROW_NUMBER_WIDTH));
-                        for (index, (_, _, width)) in visible.iter().enumerate() {
-                            table = table.column(if index + 1 == columns {
-                                Column::remainder().at_least(*width)
-                            } else {
-                                Column::initial(*width).at_least(72.0)
-                            });
+                            .column(Column::exact(gutter));
+                        for (_, _, width) in &visible {
+                            table = table.column(Column::initial(*width).at_least(72.0));
                         }
+                        // An empty last column takes the leftover width, so data
+                        // columns keep their own widths.
+                        table = table.column(Column::remainder());
                         if windowed {
                             table = table.scroll_bar_visibility(
                                 egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
@@ -188,13 +183,13 @@ impl PaviApp {
                         table
                             .header(
                                 if self.freeze_header {
-                                    header_height
+                                    HEADER_HEIGHT
                                 } else {
                                     0.0
                                 },
                                 |header| {
                                     if self.freeze_header {
-                                        self.render_headers(header, &headers, false, false);
+                                        self.render_headers(header, &headers);
                                     }
                                 },
                             )
@@ -206,38 +201,30 @@ impl PaviApp {
                                     |mut table_row| {
                                         let index = table_row.index();
                                         if index < header_rows {
-                                            self.render_headers(
-                                                table_row,
-                                                &headers,
-                                                true,
-                                                index == 1,
-                                            );
+                                            self.render_headers(table_row, &headers);
                                             return;
                                         }
                                         let row_index = base + (index - header_rows) as u64;
                                         self.note_drawn_row(row_index);
-                                        table_row.set_selected(
-                                            self.grid
-                                                .selection
-                                                .is_some_and(|(row, _)| row == row_index),
-                                        );
+                                        let current_row = selected_row == Some(row_index);
                                         for page in self.grid.visible_pages(row_index, row_index) {
                                             self.pages.note_visible(page);
                                             self.request_page(page);
                                         }
-                                        table_row.col(|ui| {
-                                            decorate_cell(ui, false);
-                                            ui.label((row_index + 1).to_string());
-                                        });
-                                        for column in 0..columns {
+                                        table_row.col(|ui| row_number(ui, row_index, current_row));
+                                        for (column, header) in headers.iter().enumerate() {
                                             table_row.col(|ui| {
-                                                decorate_cell(ui, false);
-                                                let selected =
-                                                    self.grid.is_selected(row_index, column);
+                                                let look = CellLook {
+                                                    selected: self
+                                                        .grid
+                                                        .is_selected(row_index, column),
+                                                    current_row,
+                                                    numeric: header.numeric,
+                                                };
                                                 let text = self
                                                     .cell_text(row_index, column)
                                                     .unwrap_or_else(|| "…".to_string());
-                                                if cell_value(ui, &text, selected).clicked() {
+                                                if cell_value(ui, &text, look).clicked() {
                                                     if ui.input(|input| input.modifiers.shift) {
                                                         self.grid
                                                             .extend_selection(row_index, column);
@@ -247,6 +234,7 @@ impl PaviApp {
                                                 }
                                             });
                                         }
+                                        table_row.col(|_| {});
                                     },
                                 );
                             })
@@ -270,6 +258,7 @@ impl PaviApp {
             }
         }
         self.pages.cancel_offscreen(&mut self.grid);
+        self.apply_header_action(ui.ctx());
     }
 
     pub(in crate::app) fn show_filtered_grid(&mut self, ui: &mut egui::Ui) {
@@ -285,16 +274,20 @@ impl PaviApp {
         let error = filtered.error.clone();
         let kind = filtered.kind;
         let aggregate = filtered.aggregate;
+        let sort_capped = filtered.sort_capped;
         let display_columns = filtered.display_columns.clone();
         if rows == 0 {
-            ui.centered_and_justified(|ui| {
+            widgets::placeholder(ui, |ui| {
                 if let Some(error) = error {
-                    ui.label(RichText::new(error).color(egui::Color32::RED));
+                    widgets::error(ui, &error);
                 } else if finished {
-                    ui.label(kind.empty_message());
+                    ui.heading(kind.empty_message());
                 } else {
-                    ui.spinner();
-                    ui.label(format!("{} query running…", kind.label()));
+                    ui.add(egui::Spinner::new().color(theme::ACCENT));
+                    ui.label(
+                        RichText::new(format!("{} query running…", kind.label()))
+                            .color(theme::MUTED),
+                    );
                 }
             });
             return;
@@ -320,20 +313,22 @@ impl PaviApp {
                 .collect::<Vec<_>>()
         };
         self.handle_grid_keyboard(ui.ctx(), first_result);
+        let batch_schema = self
+            .filtered
+            .as_ref()
+            .and_then(|filtered| filtered.batches.front())
+            .map(|batch| batch.schema());
         let headers = names
             .iter()
             .enumerate()
-            .map(|(index, name)| Header {
-                source: (!aggregate).then_some(display_columns[index].0),
-                name: name.clone(),
-                data_type: self
-                    .filtered
-                    .as_ref()
-                    .and_then(|f| f.batches.front())
-                    .map(|batch| {
-                        type_label(batch.schema().field(display_columns[index].1).data_type())
-                    })
-                    .unwrap_or_default(),
+            .map(|(index, name)| {
+                Header::new(
+                    (!aggregate).then_some(display_columns[index].0),
+                    name,
+                    batch_schema
+                        .as_ref()
+                        .map(|schema| schema.field(display_columns[index].1).data_type()),
+                )
             })
             .collect::<Vec<_>>();
         let columns = names.len();
@@ -342,23 +337,37 @@ impl PaviApp {
             .take()
             .and_then(|row| row.checked_sub(first_result))
             .map(ui_row_count);
-        if let Some(error) = error {
-            ui.label(RichText::new(error).color(egui::Color32::RED));
-        }
-        ui.label(format!(
-            "{} rows {}–{} (bounded window)",
-            kind.label(),
-            first_result + 1,
-            first_result + rows
-        ));
-        let header_rows = if self.freeze_header {
-            0
-        } else if self.show_column_types {
-            2
-        } else {
-            1
-        };
-        let header_height = if self.show_column_types { 52.0 } else { 32.0 };
+        egui::Frame::new()
+            .fill(theme::PANEL)
+            .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if let Some(error) = error {
+                    widgets::error(ui, &error);
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} result, rows {}–{} of the loaded window{}",
+                        kind.label(),
+                        theme::number(first_result + 1),
+                        theme::number(first_result + rows),
+                        if sort_capped {
+                            format!(
+                                ". Sorted: at most the first {} rows in sort order; \
+                                 filter to narrow.",
+                                theme::number(SORT_ROW_CAP as u64)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .font(theme::small())
+                    .color(theme::MUTED),
+                );
+            });
+        let header_rows = usize::from(!self.freeze_header);
+        let gutter = row_number_width(first_result.saturating_add(rows));
+        let selected_row = self.grid.selection.map(|(row, _)| row);
         egui::ScrollArea::horizontal()
             .id_salt("filtered_grid_horizontal")
             .show(ui, |ui| {
@@ -373,26 +382,23 @@ impl PaviApp {
                             }
                         })
                         .sum::<f32>()
-                        + ROW_NUMBER_WIDTH)
+                        + gutter)
                         .max(ui.available_width()),
                 );
                 let mut table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(ROW_NUMBER_WIDTH));
-                for (index, (source, _)) in display_columns.iter().enumerate() {
+                    .column(Column::exact(gutter));
+                for (source, _) in &display_columns {
                     let width = if aggregate {
                         INITIAL_COLUMN_WIDTH
                     } else {
                         self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
                     };
-                    table = table.column(if index + 1 == columns {
-                        Column::remainder().at_least(width)
-                    } else {
-                        Column::initial(width).at_least(72.0)
-                    });
+                    table = table.column(Column::initial(width).at_least(72.0));
                 }
+                table = table.column(Column::remainder());
                 if let Some(row) = jump_target {
                     table =
                         table.scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
@@ -400,13 +406,13 @@ impl PaviApp {
                 table
                     .header(
                         if self.freeze_header {
-                            header_height
+                            HEADER_HEIGHT
                         } else {
                             0.0
                         },
                         |header| {
                             if self.freeze_header {
-                                self.render_headers(header, &headers, false, false);
+                                self.render_headers(header, &headers);
                             }
                         },
                     )
@@ -417,7 +423,7 @@ impl PaviApp {
                             |mut table_row| {
                                 let index = table_row.index();
                                 if index < header_rows {
-                                    self.render_headers(table_row, &headers, true, index == 1);
+                                    self.render_headers(table_row, &headers);
                                     return;
                                 }
                                 let row_index = (index - header_rows) as u64;
@@ -425,25 +431,21 @@ impl PaviApp {
                                     self.request_more_filtered();
                                 }
                                 let result_row = first_result.saturating_add(row_index);
-                                table_row.set_selected(
-                                    self.grid
-                                        .selection
-                                        .is_some_and(|(row, _)| row == result_row),
-                                );
-                                table_row.col(|ui| {
-                                    decorate_cell(ui, false);
-                                    ui.label((result_row + 1).to_string());
-                                });
+                                let current_row = selected_row == Some(result_row);
+                                table_row.col(|ui| row_number(ui, result_row, current_row));
                                 for (column, (_, batch_column)) in
                                     display_columns.iter().enumerate()
                                 {
                                     table_row.col(|ui| {
-                                        decorate_cell(ui, false);
-                                        let selected = self.grid.is_selected(result_row, column);
+                                        let look = CellLook {
+                                            selected: self.grid.is_selected(result_row, column),
+                                            current_row,
+                                            numeric: headers[column].numeric,
+                                        };
                                         let text = self
                                             .filtered_cell_text(row_index, *batch_column)
                                             .unwrap_or_else(|| "…".to_string());
-                                        if cell_value(ui, &text, selected).clicked() {
+                                        if cell_value(ui, &text, look).clicked() {
                                             if ui.input(|input| input.modifiers.shift) {
                                                 self.grid.extend_selection(result_row, column);
                                             } else {
@@ -456,10 +458,57 @@ impl PaviApp {
                                         }
                                     });
                                 }
+                                table_row.col(|_| {});
                             },
                         );
                     });
             });
+        self.apply_header_action(ui.ctx());
+    }
+
+    /// No dataset: opening, failed to open, or nothing chosen yet.
+    fn show_closed_state(&mut self, ui: &mut egui::Ui) {
+        let mut browse = false;
+        let mut open = None;
+        widgets::placeholder(ui, |ui| match &self.grid.loading {
+            LoadState::Opening => {
+                ui.add(egui::Spinner::new().color(theme::ACCENT));
+                ui.heading("Opening file…");
+                ui.label(RichText::new("Reading the Parquet footer.").color(theme::MUTED));
+            }
+            LoadState::Error(error) => {
+                ui.heading("This file could not be opened");
+                widgets::error(ui, error);
+                browse = widgets::primary_button(ui, Some(Icon::Folder), "Choose another file")
+                    .clicked();
+            }
+            _ => {
+                let (mark, _) =
+                    ui.allocate_exact_size(egui::vec2(40.0, 36.0), egui::Sense::hover());
+                widgets::logo(ui, mark.center(), 2.2);
+                ui.heading("Open a Parquet file");
+                ui.label(
+                    RichText::new("Drop a file on this window, or browse (Ctrl+O).")
+                        .color(theme::MUTED),
+                );
+                browse = widgets::primary_button(ui, Some(Icon::Folder), "Browse…").clicked();
+                for path in self.session.recent_files.iter().take(RECENT_ON_START) {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    if widgets::tool_button(ui, Some(Icon::History), &name, false)
+                        .on_hover_text(path.display().to_string())
+                        .clicked()
+                    {
+                        open = Some(path.clone());
+                    }
+                }
+            }
+        });
+        if browse {
+            self.pick_file();
+        }
+        if let Some(path) = open {
+            self.begin_open(path);
+        }
     }
 
     pub(in crate::app) fn handle_grid_keyboard(&mut self, ctx: &egui::Context, first_row: u64) {
@@ -538,36 +587,21 @@ impl PaviApp {
             self.request_page(page);
         }
     }
-    fn render_headers(
-        &mut self,
-        mut row: egui_extras::TableRow<'_, '_>,
-        headers: &[Header],
-        single_line: bool,
-        types_only: bool,
-    ) {
-        row.col(|ui| {
-            decorate_cell(ui, true);
-            if !types_only {
-                ui.label("#");
-            }
-        });
-        for header in headers {
+    fn sort_direction(&self, column: usize) -> Option<SortDirection> {
+        self.filtered
+            .as_ref()
+            .and_then(|filtered| filtered.sort)
+            .filter(|sort| sort.column == column)
+            .map(|sort| sort.direction)
+    }
+
+    fn render_headers(&mut self, mut row: egui_extras::TableRow<'_, '_>, headers: &[Header]) {
+        row.col(|ui| header_fill(ui, ui.max_rect(), false));
+        let selected_column = self.grid.selection.map(|(_, column)| column);
+        for (column, header) in headers.iter().enumerate() {
             row.col(|ui| {
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(rect, 0.0, theme::HEADER);
-                ui.painter().vline(
-                    rect.right(),
-                    rect.y_range(),
-                    egui::Stroke::new(1.0_f32, theme::GRID_LINE),
-                );
-                let (rect, response) = ui.allocate_exact_size(
-                    rect.size(),
-                    if header.source.is_some() && !types_only {
-                        egui::Sense::click()
-                    } else {
-                        egui::Sense::hover()
-                    },
-                );
+                let (rect, response) =
+                    ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::click());
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(
                         egui::WidgetType::Button,
@@ -575,67 +609,94 @@ impl PaviApp {
                         &header.name,
                     )
                 });
-                let x = rect.left() + Spacing::Lg.px();
-                let painter = ui.painter_at(rect);
-                if !types_only {
-                    let heading = header.source.map_or_else(
-                        || header.name.clone(),
-                        |source| self.sort_heading(source, &header.name),
+                header_fill(ui, rect, response.hovered());
+                if selected_column == Some(column) {
+                    // Marks the column the Inspector describes.
+                    ui.painter().hline(
+                        rect.x_range(),
+                        rect.bottom() - 1.0,
+                        egui::Stroke::new(2.0_f32, theme::ACCENT),
                     );
-                    painter.text(
-                        egui::pos2(
-                            x,
-                            if single_line || !self.show_column_types {
-                                rect.center().y
-                            } else {
-                                rect.top() + 16.0
-                            },
-                        ),
-                        egui::Align2::LEFT_CENTER,
-                        heading,
-                        egui::FontId::proportional(13.0),
-                        theme::TEXT,
+                }
+                let pad = Spacing::Md.px();
+                let name = ui.painter_at(rect.shrink2(egui::vec2(pad, 0.0))).text(
+                    egui::pos2(rect.left() + pad, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &header.name,
+                    theme::strong(12.5),
+                    theme::TEXT,
+                );
+                let mut used = name.right();
+                if let Some(direction) =
+                    header.source.and_then(|source| self.sort_direction(source))
+                    && used + 18.0 < rect.right()
+                {
+                    widgets::icon(
+                        ui,
+                        egui::pos2(used + 10.0, rect.center().y),
+                        match direction {
+                            SortDirection::Ascending => Icon::ArrowUp,
+                            SortDirection::Descending => Icon::ArrowDown,
+                        },
+                        theme::ACCENT,
                     );
-                    if header.source.is_some() {
-                        let x = rect.right() - Spacing::Md.px();
-                        let y = rect.top() + 14.0;
-                        for sign in [-1.0, 1.0] {
-                            painter.add(egui::Shape::line(
-                                vec![
-                                    egui::pos2(x - 3.0, y + sign * 3.0),
-                                    egui::pos2(x, y + sign * 6.0),
-                                    egui::pos2(x + 3.0, y + sign * 3.0),
-                                ],
-                                egui::Stroke::new(1.0_f32, theme::ACCENT),
-                            ));
-                        }
+                    used += 18.0;
+                }
+                if self.show_column_types {
+                    // The name wins: the type label is cut on the left when space is short.
+                    let room = rect.with_min_x(used + pad).with_max_x(rect.right() - pad);
+                    if room.width() > 0.0 {
+                        ui.painter_at(room).text(
+                            room.right_center(),
+                            egui::Align2::RIGHT_CENTER,
+                            &header.data_type,
+                            theme::small(),
+                            header.color,
+                        );
                     }
                 }
-                if types_only || (!single_line && self.show_column_types) {
-                    painter.text(
-                        egui::pos2(
-                            x,
-                            if types_only {
-                                rect.center().y
-                            } else {
-                                rect.top() + 36.0
-                            },
-                        ),
-                        egui::Align2::LEFT_CENTER,
-                        &header.data_type,
-                        egui::FontId::proportional(12.0),
-                        theme::MUTED,
-                    );
+                let response = response.on_hover_text(format!(
+                    "{}\n{}\nClick to select, right-click for more",
+                    header.name, header.data_type,
+                ));
+                if response.clicked() {
+                    self.header_action = Some(HeaderAction::Select(column));
                 }
-                if response
-                    .on_hover_text(format!("{} · {}", header.name, header.data_type))
-                    .clicked()
-                    && let Some(source) = header.source
-                {
-                    self.toggle_sort(source);
-                }
+                response.context_menu(|ui| {
+                    ui.set_width(HEADER_MENU_WIDTH);
+                    let mut chosen = None;
+                    if let Some(source) = header.source {
+                        for (label, direction) in [
+                            ("Sort ascending", SortDirection::Ascending),
+                            ("Sort descending", SortDirection::Descending),
+                        ] {
+                            if widgets::menu_item(ui, label, "").clicked() {
+                                chosen = Some(HeaderAction::Sort(source, direction));
+                            }
+                        }
+                        ui.separator();
+                        if widgets::menu_item(ui, "Profile column", "").clicked() {
+                            chosen = Some(HeaderAction::Profile(source));
+                        }
+                        if widgets::menu_item(ui, "Fit width", "").clicked() {
+                            chosen = Some(HeaderAction::Fit(source));
+                        }
+                        if widgets::menu_item(ui, "Hide column", "").clicked() {
+                            chosen = Some(HeaderAction::Hide(source));
+                        }
+                        ui.separator();
+                    }
+                    if widgets::menu_item(ui, "Copy name", "").clicked() {
+                        chosen = Some(HeaderAction::CopyName(header.name.clone()));
+                    }
+                    if chosen.is_some() {
+                        self.header_action = chosen;
+                        ui.close_menu();
+                    }
+                });
             });
         }
+        row.col(|ui| header_fill(ui, ui.max_rect(), false));
     }
 }
 
@@ -673,12 +734,11 @@ pub(in crate::app) fn row_scrollbar(
         egui::vec2(track.width(), thumb_height),
     );
     let painter = ui.painter_at(rect);
-    painter.rect_filled(track, 4.0, theme::GRID_LINE);
     let active = response.hovered() || response.dragged();
     painter.rect_filled(
         thumb,
         4.0,
-        if active { theme::ACCENT } else { theme::MUTED },
+        if active { theme::MUTED } else { theme::BORDER },
     );
     let response = response.on_hover_text(format!("Rows {}–{} of {total}", first + 1, last + 1));
     if !(response.dragged() || response.clicked()) {
@@ -689,52 +749,116 @@ pub(in crate::app) fn row_scrollbar(
     Some((f64::from(fraction) * max_top as f64).round() as u64)
 }
 
-fn decorate_cell(ui: &mut egui::Ui, header: bool) {
+/// Width of the row-number gutter: wide enough for the last row number.
+fn row_number_width(rows: u64) -> f32 {
+    let digits = rows.max(1).ilog10() + 1;
+    (digits as f32 * 7.0 + 20.0).max(44.0)
+}
+
+/// Text color of a type label, by type family.
+fn type_color(data_type: &arrow_schema::DataType) -> egui::Color32 {
+    super::inspector::type_color(data_type)
+}
+
+fn header_fill(ui: &egui::Ui, rect: egui::Rect, hovered: bool) {
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        0.0,
+        if hovered { theme::HOVER } else { theme::HEADER },
+    );
+    let line = egui::Stroke::new(1.0_f32, theme::BORDER);
+    painter.vline(rect.right(), rect.y_range(), line);
+    painter.hline(rect.x_range(), rect.bottom(), line);
+}
+
+/// The row-number gutter cell.
+fn row_number(ui: &mut egui::Ui, row: u64, current: bool) {
     let rect = ui.max_rect();
-    if header {
-        ui.painter().rect_filled(rect, 0.0, super::theme::HEADER);
+    let painter = ui.painter_at(rect);
+    if current {
+        painter.rect_filled(rect, 0.0, theme::HEADER);
     }
-    ui.painter().vline(
+    painter.vline(
         rect.right(),
         rect.y_range(),
-        egui::Stroke::new(1.0_f32, theme::GRID_LINE),
+        egui::Stroke::new(1.0_f32, theme::BORDER),
     );
-    if header {
-        ui.painter().hline(
-            rect.x_range(),
-            rect.bottom(),
-            egui::Stroke::new(1.0_f32, theme::GRID_LINE),
-        );
-    }
-    ui.add_space(Spacing::Lg.px());
+    painter.text(
+        egui::pos2(rect.right() - Spacing::Md.px(), rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        (row + 1).to_string(),
+        theme::small(),
+        if current { theme::TEXT } else { theme::MUTED },
+    );
 }
-fn cell_value(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), ROW_HEIGHT),
-        egui::Sense::click(),
-    );
+
+/// How one data cell is drawn.
+#[derive(Clone, Copy)]
+struct CellLook {
+    /// The cell is part of the selection.
+    selected: bool,
+    /// The cell is in the row of the selected cell.
+    current_row: bool,
+    /// Right-align, so digits line up.
+    numeric: bool,
+}
+
+fn cell_value(ui: &mut egui::Ui, text: &str, look: CellLook) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
             ui.is_enabled(),
-            selected,
+            look.selected,
             text,
         )
     });
-    if selected {
-        ui.painter().rect_stroke(
-            rect.shrink(1.0),
-            1.0,
-            egui::Stroke::new(1.0_f32, super::theme::ACCENT),
+    let painter = ui.painter_at(rect);
+    if look.selected {
+        painter.rect_filled(rect, 0.0, theme::SELECTED);
+    } else if look.current_row {
+        painter.rect_filled(rect, 0.0, theme::HEADER);
+    }
+    painter.vline(
+        rect.right(),
+        rect.y_range(),
+        egui::Stroke::new(1.0_f32, theme::GRID_LINE),
+    );
+    if look.selected {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(1.0_f32, theme::ACCENT),
             egui::StrokeKind::Inside,
         );
     }
-    ui.painter_at(rect).text(
-        rect.left_center(),
-        egui::Align2::LEFT_CENTER,
-        text,
-        egui::FontId::proportional(13.0),
-        super::theme::TEXT,
-    );
-    response.on_hover_text(text)
+    let pad = Spacing::Md.px();
+    let color = match text {
+        "null" => theme::MUTED,
+        "…" => theme::DISABLED,
+        _ => theme::TEXT,
+    };
+    let drawn = if look.numeric {
+        painter.text(
+            egui::pos2(rect.right() - pad, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            text,
+            theme::body(),
+            color,
+        )
+    } else {
+        painter.text(
+            egui::pos2(rect.left() + pad, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            theme::body(),
+            color,
+        )
+    };
+    if drawn.width() + pad * 2.0 > rect.width() {
+        response.on_hover_text(text)
+    } else {
+        response
+    }
 }

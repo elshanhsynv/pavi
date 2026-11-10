@@ -14,6 +14,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Page size | 4,096 rows | `parquet_reader::page::PAGE_ROWS` |
 | Filter/SQL/sort result window | 8 batches (~32k rows) | `pavi::results::MAX_FILTERED_BATCHES` |
 | Sort input (no LIMIT) | 100,000 rows / 128 MB | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
+| Rows a GUI sort returns | first 100,000 in sort order | `pavi::app::SORT_ROW_CAP` (= `SortBudget::DEFAULT_MAX_ROWS`) |
 | GROUP BY | 10,000 groups / 8 MB | `GroupBudget::DEFAULT_MAX_GROUPS`, `DEFAULT_MAX_BYTES` |
 | Profile distinct values | 4,096 values / 1 MB, 128 bytes each | `profile::MAX_DISTINCT_*` |
 | Chart input | 16,384 rows | `chart::MAX_INPUT_ROWS` |

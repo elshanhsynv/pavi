@@ -26,7 +26,7 @@
 
 ## Platform-specific code
 - No `cfg(target_os)` anywhere. Implicitly Windows-oriented: session path uses `LOCALAPPDATA` (`session.rs:192-199`).
-- Window decorations are disabled on all platforms; the toolbar draws its own drag/maximize/close controls (`ui/toolbar.rs:26-55`, `159-163`).
+- Window decorations are disabled on all platforms; the top bar is the drag area and draws its own minimize/maximize/close controls (`show_top_bar`, `window_controls` in `ui/toolbar.rs`).
 - Native dialogs: `rfd` (synchronous). Clipboard: egui/winit.
 
 ## unsafe / FFI

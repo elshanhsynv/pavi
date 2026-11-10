@@ -28,6 +28,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "PAVI",
         options,
-        Box::new(move |_| Ok(Box::new(app::PaviApp::new(initial_path)))),
+        Box::new(move |creation| {
+            app::apply_theme(&creation.egui_ctx);
+            Ok(Box::new(app::PaviApp::new(initial_path)))
+        }),
     )
 }

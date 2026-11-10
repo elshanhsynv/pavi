@@ -4,7 +4,7 @@
 
 ## 4.1 Open a file (GUI)
 
-**Triggers:** `argv[1]` or last session file at startup (`app.rs:345, 392-394`); Ctrl+O (`app.rs:443-449`); toolbar Open (`ui/toolbar.rs:114-120`); Recent menu (`ui/toolbar.rs:68-72`); path box + Enter (`ui/dataset_bar.rs:37-42`); Refresh/Ctrl+R (`app.rs:432-436`). **No drag-and-drop** (`dropped_files` is never read).
+**Triggers:** `argv[1]` or last session file at startup (`app.rs:345, 392-394`); Ctrl+O (`handle_global_shortcuts`); the file menu in the top bar (`file_menu` in `ui/toolbar.rs`: Browse, a recent file, or the path box + Enter); Browse or a recent file on the start screen (`show_closed_state` in `ui/grid.rs`); a file dropped on the window (`open_dropped_file`, first dropped file only); Reload/Ctrl+R.
 
 **Steps**
 1. `begin_open(path)` (`app.rs:643-673`, UI thread) cancels everything (open, pages, export, filter, chart, profile), clears the dataset, bumps the generation, and calls `RuntimeHandle::submit_open` → `try_send` on the bounded queue (`scheduler.rs:349-374`).
@@ -41,7 +41,7 @@ sequenceDiagram
 
 ## 4.2 Scrolling / paging (unfiltered)
 
-1. `show_grid_content` builds a `TableBuilder` with `body.rows(28 px, rows)`; egui calls the row closure only for visible rows. Files with more than `GRID_WINDOW_ROWS` (500,000) rows are **windowed**, because egui lays rows out in `f32` points, which stop being exact past about 16.7 million points (≈600,000 rows):
+1. `show_grid_content` builds a `TableBuilder` with `body.rows(24 px, rows)`; egui calls the row closure only for visible rows. Files with more than `GRID_WINDOW_ROWS` (500,000) rows are **windowed**, because egui lays rows out in `f32` points, which stop being exact past about 16.7 million points (≈700,000 rows):
    - The table holds only 500,000 rows starting at `GridState::window_base`; row closure indexes are offset by it, so selection, page requests and cell text use absolute rows.
    - The table's own scrollbar is hidden. PAVI draws `row_scrollbar` in a 12 px strip on the right. Its thumb shows the drawn rows within the whole file, and clicking or dragging it scrolls there (`scroll_grid_to`).
    - After each frame, if the drawn rows are within a quarter window of an inner edge, `GridState::recentered_base` picks a window centred on them. The table's post-frame scroll offset is shifted by the same number of rows, so the view doesn't move.
@@ -49,7 +49,7 @@ sequenceDiagram
 3. Each visible cell calls `cell_text` (`app.rs:1324-1345`), which also prefetches the next page when the row is a page boundary, then formats the value with `format_cell_with_limit(…, 256)` **every frame** — or shows `…` if the page isn't loaded.
 4. Worker: `read_page` checks the source `PageCache` (mutex held only for lookup/insert), else `read_window_batches` decodes rows `[i·4096, (i+1)·4096)` from overlapping row groups using `RowSelection::skip/select`.
 5. `SourcePages::poll` (`pages.rs`) `try_recv`s each pending task and keeps ≤8 loaded pages, evicting the oldest and un-marking it as loaded so it will be re-requested.
-6. Jump-to-row (`ui/dataset_bar.rs`) and keyboard navigation (`ui/grid.rs`) also call `request_page`. Jumps use `scroll_to_row`; in windowed grids they instead move the window around the target and set the scroll offset directly, which applies in the same frame.
+6. Jump-to-row (the "Go to row" box in `ui/status.rs`, handled by `jump_to_input`) and keyboard navigation (`ui/grid.rs`) also call `request_page`. Jumps use `scroll_to_row`; in windowed grids they instead move the window around the target and set the scroll offset directly, which applies in the same frame.
 
 **Memory:** ≤8 UI pages × 4,096 rows × visible columns, plus ≤8 pages / 128 MB in the source cache (often the same pages → double retention of `Arc`'d arrays, mostly shared buffers).
 **Back-pressure:** queue capacity 32; on `QueueFull` the request is dropped, the status bar shows `queue page N: runtime request queue is full`, and it's retried on a later frame. After drawing, the grid cancels pending page reads more than one page away from the pages it drew (`cancel_offscreen_pages`), except pages requested in the same frame such as a jump target; they are requested again if they scroll back into view.
@@ -110,25 +110,26 @@ sequenceDiagram
     Q->>RT: submit_filtered_from(start_row=next_row, 4096)
 ```
 
-## 4.4 Sort (header click)
+## 4.4 Sort (Sort menu, header right-click)
 
-1. `render_headers` click → `toggle_sort(source_column)` (`ui/grid.rs:553-559`, `app.rs:1136-1203`). If a filter/SQL result is active, its plan is reused; otherwise `scan().project(all)`. `replace_sort` toggles Asc → Desc → Asc; nulls always last.
-2. `execute` submits **one** `ReadOperation::Sorted` with a `SortedRead { sort, budget, limit }` (`execution.rs`); `limit` comes from SQL `LIMIT` (header clicks have none).
-3. Worker `read_sorted`: buffers the rows that pass the filter. Without a limit, more than 100,000 filtered rows (or the byte estimate) is an error. With `LIMIT n` (n ≤ 100,000) only the best n rows are kept while scanning, so any file size works. It sorts with a stable tie-breaker, `take`s output columns and splits into 4,096-row batches.
-4. All sorted batches are moved into `QueryExecution.buffered` at once; the UI then drains them into its 8-batch window like a filter.
+1. The Sort menu in the top bar calls `toggle_sort(source_column)` (Asc → Desc → Asc). A right-click on a grid header offers "Sort ascending" / "Sort descending": `render_headers` stores a `HeaderAction`, and `apply_header_action` runs it after the table is drawn. Both end in `sort_column(column, direction)`. A plain header click only selects the column (`HeaderAction::Select`); it never starts a scan. If a filter/SQL result is active, its plan is reused; otherwise `scan().project(all)`. Nulls are always last.
+2. If the plan has no `LIMIT`, `sort_column` adds `LIMIT SORT_ROW_CAP` (100,000, the sort budget's row cap) and marks the result `sort_capped`; the status bar and the result strip say that only the first 100,000 rows in sort order are shown. A SQL `LIMIT` is left as written.
+3. `execute` submits **one** `ReadOperation::Sorted` with a `SortedRead { sort, budget, limit }` (`execution.rs`).
+4. Worker `read_sorted`: with `LIMIT n` (n ≤ 100,000) only the best n rows are kept while scanning, so any file size works. That is the path every GUI sort takes. Without a limit (or with a larger SQL `LIMIT`) it buffers the rows that pass the filter, and more than 100,000 of them (or the byte estimate) is an error. It sorts with a stable tie-breaker, `take`s output columns and splits into 4,096-row batches.
+5. All sorted batches are moved into `QueryExecution.buffered` at once; the UI then drains them into its 8-batch window like a filter.
 
 **Memory:** up to 100k filtered rows / 128 MB of decoded input plus the sorted copy on the worker (top-N: about n + 32k rows); the sorted result sits in `QueryExecution.buffered` until consumed.
-**Errors:** budget error text ("sort input exceeds the in-memory sort budget… filter the data or add a LIMIT…") ends up in the status bar / grid error.
-"Return to source order" = `clear_filter` (`ui/toolbar.rs:96`).
+**Errors:** budget error text ("sort input exceeds the in-memory sort budget… filter the data or add a LIMIT…") ends up in the status bar / grid error. GUI sorts can still hit the 128 MB byte budget on very wide rows.
+"Back to file order" in the Sort menu = `clear_filter`.
 
 ```mermaid
 sequenceDiagram
-    participant H as Header click
+    participant H as Sort menu / header menu
     participant UI as PaviApp
     participant Q as QueryExecution
     participant W as Worker
-    H->>UI: toggle_sort(col)
-    UI->>UI: plan.replace_sort(col, dir, NullsLast)
+    H->>UI: sort_column(col, dir)
+    UI->>UI: plan.replace_sort(col, dir, NullsLast), add LIMIT 100k if none
     UI->>Q: execute(plan)
     Q->>W: ReadOperation::Sorted (one task)
     W->>W: scan + filter; LIMIT n: keep best n rows, else > 100k rows → error

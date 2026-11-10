@@ -1,59 +1,63 @@
-use super::{
-    spacing::Spacing,
-    theme,
-    widgets::{self, Icon},
-};
+use super::{spacing::Spacing, theme, widgets};
 use eframe::egui::{self, Align, Layout, RichText};
+
+/// Facts about the open file shown on the right of the status bar.
+pub struct DatasetSummary<'a> {
+    pub rows: u64,
+    pub columns: usize,
+    pub row_groups: usize,
+    pub compression: &'a str,
+}
 
 pub struct StatusBar<'a> {
     pub status: &'a str,
     pub activity: Option<&'static str>,
     pub has_error: bool,
     pub selection: Option<(u64, usize)>,
-    pub cached_pages: usize,
-    pub columns: Option<usize>,
-    pub rows: u64,
+    pub dataset: Option<DatasetSummary<'a>>,
     pub path: Option<&'a std::path::Path>,
+    pub jump_input: &'a mut String,
 }
 
-pub fn show(ctx: &egui::Context, status: StatusBar<'_>) {
+/// Id of the "go to row" box, so Ctrl+G can focus it.
+pub fn jump_box_id() -> egui::Id {
+    egui::Id::new("jump_row")
+}
+
+/// Draws the status bar. Returns `true` when the user asked to jump to the typed row.
+pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
+    let mut jump = false;
     egui::TopBottomPanel::bottom("status_bar")
-        .exact_height(40.0)
+        .exact_height(theme::STATUS_HEIGHT)
         .resizable(false)
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
-                .inner_margin(Spacing::Lg.symmetric(Spacing::Sm))
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER)),
+                .inner_margin(Spacing::Lg.symmetric(Spacing::None)),
         )
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = Spacing::Md.px();
+                ui.spacing_mut().interact_size.y = 20.0;
+                let small = |text: String| RichText::new(text).font(theme::small());
                 if status.activity.is_some() {
-                    ui.spinner();
+                    ui.add(egui::Spinner::new().size(11.0).color(theme::ACCENT));
                 } else {
                     let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(
                         rect.center(),
-                        8.0,
+                        3.5,
                         if status.has_error {
-                            egui::Color32::LIGHT_RED
+                            theme::ERROR
                         } else {
-                            egui::Color32::from_rgb(25, 193, 123)
+                            theme::SUCCESS
                         },
                     );
                 }
-                ui.label(status.activity.unwrap_or(if status.has_error {
-                    "Error"
-                } else {
-                    "Ready"
-                }));
-                ui.separator();
-                let right_width = if status.columns.is_some() {
-                    350.0
-                } else {
-                    150.0
-                };
+                if let Some(activity) = status.activity {
+                    ui.label(small(activity.to_owned()).color(theme::TEXT));
+                }
                 let message = if status.status.starts_with("Ready:") {
                     status.path.map_or_else(
                         || status.status.to_string(),
@@ -62,13 +66,17 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) {
                 } else {
                     status.status.to_string()
                 };
+                let right_width = if status.dataset.is_some() { 560.0 } else { 0.0 };
                 ui.allocate_ui_with_layout(
-                    egui::vec2((ui.available_width() - right_width).max(70.0), 28.0),
+                    egui::vec2(
+                        (ui.available_width() - right_width).max(60.0),
+                        theme::STATUS_HEIGHT,
+                    ),
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         ui.add(
-                            egui::Label::new(RichText::new(&message).color(if status.has_error {
-                                egui::Color32::LIGHT_RED
+                            egui::Label::new(small(message.clone()).color(if status.has_error {
+                                theme::ERROR
                             } else {
                                 theme::MUTED
                             }))
@@ -77,33 +85,51 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) {
                         .on_hover_text(&message);
                     },
                 );
+                let Some(dataset) = status.dataset else {
+                    return;
+                };
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{} cached pages", status.cached_pages))
-                            .color(theme::MUTED),
+                    let response = ui.add(
+                        egui::TextEdit::singleline(status.jump_input)
+                            .id(jump_box_id())
+                            .desired_width(96.0)
+                            .font(theme::small())
+                            .vertical_align(Align::Center)
+                            .margin(Spacing::Sm.symmetric(Spacing::None))
+                            .hint_text("Go to row"),
                     );
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(25.0, 24.0), egui::Sense::hover());
-                    widgets::icon(ui, rect.center(), Icon::Database, theme::MUTED);
-                    ui.separator();
-                    if let Some(columns) = status.columns {
-                        let response = ui.label(
-                            RichText::new(format!(
-                                "{} rows × {} columns",
-                                theme::number(status.rows),
-                                columns
-                            ))
-                            .color(theme::MUTED),
-                        );
-                        if let Some((row, column)) = status.selection {
-                            response.on_hover_text(format!(
-                                "Selected: row {}, column {}",
-                                row + 1,
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        jump = true;
+                    }
+                    response.on_hover_text("Type a row number and press Enter (Ctrl+G)");
+                    for fact in [
+                        dataset.compression.to_owned(),
+                        format!(
+                            "{} row group{}",
+                            theme::number(dataset.row_groups as u64),
+                            if dataset.row_groups == 1 { "" } else { "s" }
+                        ),
+                        format!("{} columns", dataset.columns),
+                        format!("{} rows", theme::number(dataset.rows)),
+                    ] {
+                        widgets::divider(ui);
+                        ui.label(small(fact).color(theme::MUTED));
+                    }
+                    if let Some((row, column)) = status.selection {
+                        widgets::divider(ui);
+                        ui.label(
+                            small(format!(
+                                "Row {}, column {}",
+                                theme::number(row + 1),
                                 column + 1
-                            ));
-                        }
+                            ))
+                            .color(theme::TEXT),
+                        );
                     }
                 });
             });
         });
+    jump
 }
