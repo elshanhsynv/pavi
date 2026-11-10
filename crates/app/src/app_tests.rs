@@ -926,6 +926,22 @@ fn sorts_an_active_filter_and_rejects_stale_sorted_results() {
 }
 
 #[test]
+fn two_spellings_of_a_path_are_one_recent_file() {
+    let (directory, _source, path) = source(3);
+    let mut app =
+        PaviApp::new_with_store(None, SessionStore::new(path.with_extension("session.json")));
+    // The same file, spelled another way.
+    let detour = directory.path().join(".").join(path.file_name().unwrap());
+
+    app.begin_open(path.clone());
+    poll_until_opened(&mut app);
+    app.begin_open(detour);
+    poll_until_opened(&mut app);
+    assert_eq!(app.grid.rows, 3);
+    assert_eq!(app.session.recent_files, vec![path]);
+}
+
+#[test]
 fn opens_a_file_dropped_on_the_window() {
     let (_directory, _source, path) = source(3);
     let mut app =

@@ -76,11 +76,11 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 ## Layout
 
-- **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box, Browse, Reload, Copy path, recent files), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (CSV, Parquet, copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `ACCENT`.
+- **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box, Browse, Reload, Copy path, recent files), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (CSV, Parquet, copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `ACCENT`. Below a window width of 1,100 px (`COMPACT_BAR_WIDTH`) Sort, Columns and Export show only their icons, with the name in the tooltip, so the filter box keeps a usable width.
 - **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted.
 - **SQL workspace** (`ui/sql.rs`): editor, Run, Cancel and the History menu above the result grid.
 - **Inspector** (`ui/inspector.rs`): collapsible sections Cell, Column (with profile), File, Schema, Row groups, Page cache.
-- **Status bar** (`ui/status.rs`): status dot or spinner and message on the left; selection, row/column/row-group counts, compression and the "Go to row" box on the right.
+- **Status bar** (`ui/status.rs`): status dot or spinner and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
 - **Charts** is the only floating window.
 
 ## UI states every view must handle
@@ -109,4 +109,3 @@ Fix these when touching the file; do not copy them:
 
 - The Charts window still uses stock egui combo boxes, buttons and text fields instead of the shared controls.
 - Some pixel sizes for painted pieces (icon boxes, the 20 px Inspector rows, the status bar's fixed right-hand width) are literals in the UI files instead of named constants.
-- At the minimum window width the filter box shrinks to about 120 px.

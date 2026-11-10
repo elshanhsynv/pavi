@@ -55,9 +55,6 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                         },
                     );
                 }
-                if let Some(activity) = status.activity {
-                    ui.label(small(activity.to_owned()).color(theme::TEXT));
-                }
                 let message = if status.status.starts_with("Ready:") {
                     status.path.map_or_else(
                         || status.status.to_string(),
@@ -66,6 +63,12 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                 } else {
                     status.status.to_string()
                 };
+                // "Sorting" next to "Sorting DEP_DELAY …" says the same thing twice.
+                if let Some(activity) = status.activity
+                    && !message.starts_with(activity)
+                {
+                    ui.label(small(activity.to_owned()).color(theme::TEXT));
+                }
                 let right_width = if status.dataset.is_some() { 560.0 } else { 0.0 };
                 ui.allocate_ui_with_layout(
                     egui::vec2(
