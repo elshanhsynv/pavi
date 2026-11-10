@@ -904,6 +904,22 @@ fn reports_scan_progress_while_a_sort_or_filter_is_scanning() {
 }
 
 #[test]
+fn chart_reset_only_reports_cleared_results_when_there_were_some() {
+    let mut chart = ChartState::default();
+    let prompt = chart.status.clone();
+    chart.reset();
+    assert_eq!(
+        chart.status, prompt,
+        "nothing was drawn, so nothing was cleared"
+    );
+
+    chart.error = Some("bad column".to_string());
+    chart.reset();
+    assert!(chart.status.contains("cleared"));
+    assert!(chart.error.is_none());
+}
+
+#[test]
 fn header_actions_sort_select_and_hide_columns() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);
