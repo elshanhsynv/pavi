@@ -281,6 +281,7 @@ impl PaviApp {
         let kind = filtered.kind;
         let aggregate = filtered.aggregate;
         let sort_capped = filtered.sort_capped;
+        let scanned = self.scan_fraction();
         let display_columns = filtered.display_columns.clone();
         if rows == 0 {
             widgets::placeholder(ui, |ui| {
@@ -291,8 +292,15 @@ impl PaviApp {
                 } else {
                     ui.add(egui::Spinner::new().color(theme::ACCENT));
                     ui.label(
-                        RichText::new(format!("{} query running…", kind.label()))
-                            .color(theme::MUTED),
+                        RichText::new(match scanned {
+                            Some(fraction) => format!(
+                                "{} query running… {} of the file scanned",
+                                kind.label(),
+                                super::status::percent(fraction)
+                            ),
+                            None => format!("{} query running…", kind.label()),
+                        })
+                        .color(theme::MUTED),
                     );
                 }
             });

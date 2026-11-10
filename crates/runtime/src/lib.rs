@@ -9,7 +9,7 @@ mod response;
 mod scheduler;
 mod task;
 
-pub use cancellation::CancellationToken;
+pub use cancellation::{CancellationToken, ScanProgress};
 pub use response::{OpenOutcome, OpenResponse, PageOutcome, PageResponse};
 pub use scheduler::{
     Runtime, RuntimeConfig, RuntimeConfigError, RuntimeHandle, SortedRead, SubmitError,

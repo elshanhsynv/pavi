@@ -16,7 +16,7 @@ Read `docs/architecture/data-flows.md` §4.3 (filter) and §4.5 (SQL) first.
   (`is_comparable`, `is_numeric`, …). Add a predicate there instead of matching types inline.
 - What is its memory bound? Anything that buffers rows needs a named budget constant and a
   clear "exceeds budget, add a filter or LIMIT" error (`docs/PERFORMANCE.md`, ADR 0002).
-- Can it be cancelled within one 4,096-row batch? Long scans must call `stop()` every batch.
+- Can it be cancelled within one 4,096-row batch? Long scans must call `checkpoint(scanned_rows)` every batch: it reports progress and returns `true` when the scan must stop.
 
 ## 2. Change each layer, in order
 

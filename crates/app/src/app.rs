@@ -212,6 +212,14 @@ impl PaviApp {
         }
     }
 
+    /// How much of the file the running filter, sort or SQL scan has passed, from
+    /// 0 to 1. `None` when no scan is running.
+    fn scan_fraction(&self) -> Option<f32> {
+        let scanned = self.filtered.as_ref()?.execution.as_ref()?.scanned_rows()?;
+        let total = self.dataset.as_ref()?.source.row_count();
+        (total > 0).then(|| (scanned as f64 / total as f64).min(1.0) as f32)
+    }
+
     fn active_task_label(&self) -> Option<&'static str> {
         if self.opening.is_some() {
             Some("Opening")
@@ -1737,6 +1745,7 @@ impl eframe::App for PaviApp {
                 ui::status::StatusBar {
                     status: &self.status,
                     activity: self.active_task_label(),
+                    progress: self.scan_fraction(),
                     has_error: matches!(self.grid.loading, LoadState::Error(_))
                         || self.filter_error.is_some()
                         || self.sql_error.is_some(),

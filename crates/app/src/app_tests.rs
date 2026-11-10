@@ -885,6 +885,25 @@ fn cell_menu_filters_to_and_excludes_the_selected_value() {
 }
 
 #[test]
+fn reports_scan_progress_while_a_sort_or_filter_is_scanning() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    assert_eq!(app.scan_fraction(), None, "nothing is running");
+
+    app.toggle_sort(0);
+    let fraction = app.scan_fraction().expect("a sort scan is in flight");
+    assert!((0.0..=1.0).contains(&fraction));
+    poll_until_idle(&mut app);
+    assert_eq!(app.scan_fraction(), None, "the scan has finished");
+
+    app.filter_input = "id >= 2".to_string();
+    app.apply_filter();
+    assert!(app.scan_fraction().is_some(), "a filter scan is in flight");
+    poll_until_idle(&mut app);
+    assert_eq!(app.scan_fraction(), None);
+}
+
+#[test]
 fn header_actions_sort_select_and_hide_columns() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);

@@ -18,7 +18,7 @@ use parquet_reader::{
 
 use crate::{
     CancellationToken, GenerationId, OpenOutcome, OpenResponse, OpenTask, PageOutcome,
-    PageResponse, PageTask, TaskId,
+    PageResponse, PageTask, ScanProgress, TaskId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +118,7 @@ struct PageRequest {
     operation: ReadOperation,
     projection: Projection,
     cancellation: CancellationToken,
+    progress: ScanProgress,
     response: SyncSender<PageResponse>,
     #[cfg(test)]
     before_read: Option<Box<dyn FnOnce() + Send>>,
@@ -392,6 +393,7 @@ impl RuntimeHandle {
         let sender = self.sender()?;
         let task_id = self.next_task_id()?;
         let cancellation = CancellationToken::default();
+        let progress = ScanProgress::default();
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let request = PageRequest {
             task_id,
@@ -400,13 +402,14 @@ impl RuntimeHandle {
             operation,
             projection,
             cancellation: cancellation.clone(),
+            progress: progress.clone(),
             response: response_sender,
             #[cfg(test)]
             before_read,
         };
 
         match sender.try_send(Request::Read(request)) {
-            Ok(()) => Ok(PageTask::new(cancellation, response_receiver)),
+            Ok(()) => Ok(PageTask::new(cancellation, progress, response_receiver)),
             Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Shutdown),
         }
@@ -490,6 +493,7 @@ fn execute(request: PageRequest, shutdown: &AtomicBool) {
         operation,
         projection,
         cancellation,
+        progress,
         response,
         #[cfg(test)]
         before_read,
@@ -506,7 +510,13 @@ fn execute(request: PageRequest, shutdown: &AtomicBool) {
             if let Some(before_read) = before_read {
                 before_read();
             }
-            read_source(&source, operation, &projection, &stop)
+            // Long scans call this between batches: it records how far they got
+            // and tells them whether to stop.
+            let checkpoint = |scanned_rows: u64| {
+                progress.set_scanned_rows(scanned_rows);
+                stop()
+            };
+            read_source(&source, operation, &projection, &checkpoint)
         });
         match read {
             Ok(_) if stop() => PageOutcome::Cancelled,
@@ -548,7 +558,7 @@ fn read_source(
     source: &ParquetSource,
     operation: ReadOperation,
     projection: &Projection,
-    stop: &dyn Fn() -> bool,
+    checkpoint: &dyn Fn(u64) -> bool,
 ) -> anyhow::Result<PageOutcome> {
     match operation {
         ReadOperation::Page { page_index } => source
@@ -565,7 +575,7 @@ fn read_source(
             start_row,
             row_count,
         } => source
-            .read_filtered_from(&filter, start_row, row_count, projection, stop)
+            .read_filtered_from(&filter, start_row, row_count, projection, checkpoint)
             .map(PageOutcome::Filtered),
         ReadOperation::Sorted {
             filter,
@@ -573,14 +583,14 @@ fn read_source(
             budget,
             limit,
         } => source
-            .read_sorted(filter.as_ref(), projection, sort, budget, limit, stop)
+            .read_sorted(filter.as_ref(), projection, sort, budget, limit, checkpoint)
             .map(PageOutcome::Batches),
         ReadOperation::Aggregated {
             filter,
             aggregate,
             budget,
         } => source
-            .read_aggregated(filter.as_ref(), &aggregate, budget, stop)
+            .read_aggregated(filter.as_ref(), &aggregate, budget, checkpoint)
             .map(PageOutcome::Batch),
     }
 }

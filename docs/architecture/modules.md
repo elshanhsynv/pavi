@@ -64,7 +64,7 @@ crates/runtime/src/            (pavi_runtime)
 ├── scheduler.rs    Runtime, RuntimeHandle, RuntimeConfig, ReadOperation, worker_loop, execute
 ├── task.rs         TaskId, GenerationId, PageTask, OpenTask (receiver + cancel token; IDs arrive with the response)
 ├── response.rs     PageOutcome/PageResponse, OpenOutcome/OpenResponse
-└── cancellation.rs CancellationToken(Arc<AtomicBool>)
+└── cancellation.rs CancellationToken(Arc<AtomicBool>), ScanProgress(Arc<AtomicU64>): source rows a scan has passed
 
 crates/query/src/              (pavi_query)
 ├── sql.rs          SqlAst::parse, to_logical_plan, column resolution
@@ -77,7 +77,7 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    43 tests driving PaviApp without a window
+├── app_tests.rs    44 tests driving PaviApp without a window
 ├── state.rs        GridState, ColumnLayout, SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
 ├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator

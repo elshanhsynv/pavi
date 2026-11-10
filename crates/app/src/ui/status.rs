@@ -12,11 +12,18 @@ pub struct DatasetSummary<'a> {
 pub struct StatusBar<'a> {
     pub status: &'a str,
     pub activity: Option<&'static str>,
+    /// How far the running scan has got, from 0 to 1.
+    pub progress: Option<f32>,
     pub has_error: bool,
     pub selection: Option<(u64, usize)>,
     pub dataset: Option<DatasetSummary<'a>>,
     pub path: Option<&'a std::path::Path>,
     pub jump_input: &'a mut String,
+}
+
+/// A 0–1 fraction as a whole percentage, e.g. "42%".
+pub fn percent(fraction: f32) -> String {
+    format!("{:.0}%", (fraction.clamp(0.0, 1.0) * 100.0).floor())
 }
 
 /// Id of the "go to row" box, so Ctrl+G can focus it.
@@ -68,6 +75,10 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                     && !message.starts_with(activity)
                 {
                     ui.label(small(activity.to_owned()).color(theme::TEXT));
+                }
+                if let Some(progress) = status.progress {
+                    ui.label(small(percent(progress)).color(theme::TEXT))
+                        .on_hover_text("Share of the file scanned so far");
                 }
                 let right_width = if status.dataset.is_some() { 560.0 } else { 0.0 };
                 ui.allocate_ui_with_layout(
@@ -135,4 +146,22 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
             });
         });
     jump
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn formats_scan_progress_as_a_whole_percentage() {
+        for (fraction, expected) in [
+            (0.0, "0%"),
+            (0.004, "0%"),
+            (0.425, "42%"),
+            (0.999, "99%"),
+            (1.0, "100%"),
+            (7.0, "100%"),
+            (-1.0, "0%"),
+        ] {
+            assert_eq!(super::percent(fraction), expected);
+        }
+    }
 }
