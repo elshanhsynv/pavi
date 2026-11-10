@@ -77,7 +77,7 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    33 tests driving PaviApp without a window
+├── app_tests.rs    41 tests driving PaviApp without a window
 ├── state.rs        GridState, ColumnLayout, SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
 ├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator
@@ -85,13 +85,13 @@ crates/app/src/                (pavi)
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
 ├── session.rs      SessionState (serde), SessionStore (JSON at %LOCALAPPDATA%\PAVI\session-v1.json)
 └── ui/             (mounted via #[path = "ui/mod.rs"] inside app.rs; every file is `impl PaviApp`)
-    ├── toolbar.rs     top bar, Open/Recent/Export menus, custom window controls
-    ├── dataset_bar.rs path box, jump-to-row
-    ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → sort
-    ├── sql.rs         SQL workspace
+    ├── toolbar.rs     top bar: file menu (path box, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls
+    ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header right-click menu
+    ├── sql.rs         SQL workspace, query history menu
     ├── inspector.rs   right panel: file info, schema, row-group stats, profile
-    ├── charts.rs / profile.rs / tools.rs / status.rs
-    └── theme.rs, spacing.rs, widgets.rs (colors, spacing scale, painted icons/buttons)
+    ├── charts.rs / profile.rs
+    ├── status.rs      status bar: message, dataset facts, jump-to-row
+    └── theme.rs, spacing.rs, widgets.rs (colors, fonts and sizes, spacing scale, painted icons and shared controls)
 ```
 
 ### Sharing between GUI and CLI
@@ -122,14 +122,13 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 
 | Piece | Responsibility | Ref |
 |---|---|---|
-| `show_top_bar` | Open, Recent, Refresh, Filter popup, Export menu, Column types, Inspector, SQL/Grid toggle, window buttons | `ui/toolbar.rs:9-112` |
-| `show_dataset_bar` | Path text box (Enter → open), jump-to-row | `ui/dataset_bar.rs` |
+| `show_top_bar` | File menu (path box + Enter → open, Browse, Reload, Recent), Grid/SQL switch, filter box, Sort menu, Columns menu (types, pinned header, column layout), Export menu, Reload, Charts, Inspector, window buttons | `ui/toolbar.rs` |
 | `show_grid` / `show_grid_content` | Source grid via `TableBuilder::body.rows()` (virtualized); requests pages for rendered rows | `ui/grid.rs:11-196` |
 | `show_filtered_grid` | Same, over `FilteredGrid.batches`; asks for more when the last row is rendered | `ui/grid.rs:198-386` |
-| `render_headers` | Painted header with name/type; **click toggles sort** | `ui/grid.rs:464-562` |
+| `render_headers` | Painted header with name/type. A click selects the column; a right-click opens a menu (sort, profile, fit, hide, copy name). The choice is stored as a `HeaderAction` and run by `apply_header_action` after the table is drawn | `ui/grid.rs`, `app.rs` |
 | `show_inspector_panel` | File props, schema, nested preview, per-row-group stats (virtualized `show_rows`), selected cell, profile | `ui/inspector.rs` |
-| `show_sql_workspace`, `show_chart_window`, `show_tools_window`, `status::show` | SQL editor, charts, history/column layout, status bar | `ui/sql.rs`, `ui/charts.rs`, `ui/tools.rs`, `ui/status.rs` |
-| `theme`, `spacing`, `widgets` | Static palette, spacing scale, painted icons | `ui/theme.rs`, `ui/spacing.rs`, `ui/widgets.rs` |
+| `show_sql_workspace`, `show_chart_window`, `status::show` | SQL editor and query history, charts, status bar with dataset facts and jump-to-row (returns `true` when Enter was pressed in the row box) | `ui/sql.rs`, `ui/charts.rs`, `ui/status.rs` |
+| `theme`, `spacing`, `widgets` | Static palette, fonts and widget sizes, spacing scale, painted icons and shared controls | `ui/theme.rs`, `ui/spacing.rs`, `ui/widgets.rs` |
 
 ### Application state
 

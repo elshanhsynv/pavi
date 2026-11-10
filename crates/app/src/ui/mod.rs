@@ -1,5 +1,4 @@
 pub mod charts;
-pub mod dataset_bar;
 pub mod grid;
 pub mod inspector;
 pub mod profile;
@@ -8,5 +7,4 @@ pub mod sql;
 pub mod status;
 pub mod theme;
 pub mod toolbar;
-pub mod tools;
 pub mod widgets;

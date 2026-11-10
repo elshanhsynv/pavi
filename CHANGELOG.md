@@ -7,7 +7,19 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Added
+- Drop a Parquet file on the window to open it.
+- Ctrl+G jumps to the "Go to row" box.
+- Sort menu in the top bar.
+- Right-click a column header to sort ascending or descending, profile the column, fit its width, hide it or copy its name.
+
 ### Changed
+- Redesigned interface: one top bar (file menu, Grid / SQL switch, always-visible filter box, Sort, Columns and Export menus), a denser grid with striped 24 px rows, right-aligned numbers and colored type labels, a collapsible Inspector, and a status bar that shows the file's row, column and row-group counts.
+- The path box and recent files moved into the file menu; jump-to-row moved to the status bar; column layout moved to the Columns menu; query history moved to the SQL workspace. The separate dataset bar and "Dataset tools" window are gone.
+- The start screen offers Browse and the most recent files.
+- Text uses Segoe UI on Windows.
+- Clicking a column header selects the column and shows it in the Inspector instead of starting a sort.
+- Sorting a large file no longer fails with a budget error: it shows the first 100,000 rows in sort order and says so.
 - Upgraded Apache Arrow and Parquet to 60.1.0. Files with a corrupt embedded Arrow schema still open, using the Parquet schema.
 - Release builds no longer open a console window next to the app.
 

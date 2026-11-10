@@ -20,6 +20,8 @@ fn desktop_layout_keeps_grid_selection_jump_and_workspace_actions_connected() {
     poll_until_page_loaded(&mut app, 0);
     let ctx = egui::Context::default();
     ui::theme::apply(&ctx);
+    // Jumps must land at once: a click during a scroll animation hits another row.
+    ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
 
     let render = |app: &mut PaviApp, width: f32, events: Vec<egui::Event>| {
         ctx.run(
@@ -51,7 +53,8 @@ fn desktop_layout_keeps_grid_selection_jump_and_workspace_actions_connected() {
             .find_map(|shape| {
                 if let egui::Shape::Text(text) = &shape.shape {
                     (text.galley.job.text == label
-                        && (label != "alpha" || text.pos.x < ctx.screen_rect().width() - 280.0))
+                        && (!["alpha", "id"].contains(&label)
+                            || text.pos.x < ctx.screen_rect().width() - 280.0))
                         .then(|| text.pos + text.galley.size() / 2.0)
                 } else {
                     None
@@ -90,10 +93,15 @@ fn desktop_layout_keeps_grid_selection_jump_and_workspace_actions_connected() {
         let output = render(&mut app, width, vec![]);
         render(&mut app, width, click_text(&output, "alpha"));
         assert_eq!(app.grid.selection, Some((0, 1)));
-        app.jump_row_input = "25".to_string();
+        // A header click selects the column in the current row; it never sorts.
         let output = render(&mut app, width, vec![]);
-        render(&mut app, width, click_text(&output, "Go"));
-        assert_eq!(app.grid.selection, Some((24, 1)));
+        render(&mut app, width, click_text(&output, "id"));
+        assert_eq!(app.grid.selection, Some((0, 0)));
+        assert!(app.filtered.is_none());
+        app.jump_row_input = "25".to_string();
+        app.jump_to_input();
+        render(&mut app, width, vec![]);
+        assert_eq!(app.grid.selection, Some((24, 0)));
     }
     let output = render(&mut app, 1448.0, vec![]);
     render(&mut app, 1448.0, click_text(&output, "SQL"));
@@ -102,11 +110,16 @@ fn desktop_layout_keeps_grid_selection_jump_and_workspace_actions_connected() {
     render(&mut app, 1448.0, click_text(&output, "Grid"));
     assert_eq!(app.workspace, Workspace::Grid);
     let output = render(&mut app, 1448.0, vec![]);
-    render(&mut app, 1448.0, click_text(&output, "Column Types"));
+    render(&mut app, 1448.0, click_text(&output, "Columns"));
+    let output = render(&mut app, 1448.0, vec![]);
+    render(&mut app, 1448.0, click_text(&output, "Show types"));
     assert!(app.show_column_types);
     let output = render(&mut app, 1448.0, vec![]);
-    render(&mut app, 1448.0, click_text(&output, "Freeze Header"));
+    render(&mut app, 1448.0, click_text(&output, "Pin header"));
     assert!(!app.freeze_header);
+    // Close the Columns menu again.
+    let output = render(&mut app, 1448.0, vec![]);
+    render(&mut app, 1448.0, click_text(&output, "Grid"));
     assert!(app.pages.loaded_count() <= crate::pages::MAX_LOADED_PAGES);
     app.sql_input = "SELECT id, name FROM dataset LIMIT 5".into();
     app.run_sql();
@@ -297,7 +310,6 @@ fn workspace_shortcuts_route_between_grid_and_sql() {
     assert_eq!(app.workspace, Workspace::Grid);
     send_command_key(&mut app, egui::Key::F);
     assert_eq!(app.workspace, Workspace::Grid);
-    assert!(app.show_filter_controls);
 }
 
 #[test]
@@ -509,6 +521,7 @@ fn reaches_every_row_of_a_billion_row_grid() {
     let mut app = make_app(source, path);
     app.grid.ready(ROWS, app.column_layout.visible().len());
     let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
     ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
     let mut time = 0.0;
     let mut render = |app: &mut PaviApp, events: Vec<egui::Event>| {
@@ -831,6 +844,62 @@ fn sorts_grid_headers_and_toggles_direction_without_a_second_renderer() {
 }
 
 #[test]
+fn header_actions_sort_select_and_hide_columns() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    let ctx = egui::Context::default();
+
+    app.header_action = Some(HeaderAction::Select(1));
+    app.apply_header_action(&ctx);
+    assert_eq!(app.grid.selection, Some((0, 1)));
+    assert_eq!(app.selected_source_column(), Some(1));
+    assert!(app.filtered.is_none());
+
+    app.header_action = Some(HeaderAction::Sort(0, SortDirection::Descending));
+    app.apply_header_action(&ctx);
+    assert!(app.header_action.is_none());
+    poll_until_idle(&mut app);
+    assert_eq!(app.sort_heading(0, "id"), "id ↓");
+    assert_eq!(
+        filtered_ids(&app),
+        (0..8).rev().map(|id| id.to_string()).collect::<Vec<_>>()
+    );
+    // Selecting a column of a sorted result keeps the result.
+    app.header_action = Some(HeaderAction::Select(1));
+    app.apply_header_action(&ctx);
+    assert_eq!(app.grid.selection.map(|(_, column)| column), Some(1));
+    assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sort);
+
+    app.header_action = Some(HeaderAction::Hide(1));
+    app.apply_header_action(&ctx);
+    assert!(app.column_layout.is_hidden(1));
+    assert_eq!(app.grid.columns, 1);
+}
+
+#[test]
+fn sort_without_a_limit_returns_the_first_rows_instead_of_a_budget_error() {
+    let rows = SORT_ROW_CAP + 500;
+    let (_directory, source, path) = source(rows);
+    let mut app = make_app(source, path);
+
+    app.sort_column(0, SortDirection::Descending);
+    poll_until_idle(&mut app);
+    let filtered = app.filtered.as_ref().unwrap();
+    assert!(filtered.error.is_none(), "{:?}", filtered.error);
+    assert!(filtered.sort_capped);
+    assert_eq!(filtered_ids(&app)[0], (rows - 1).to_string());
+    assert!(app.status.contains("first 100,000 rows"));
+
+    // A SQL LIMIT is the user's own cap and is left alone.
+    app.sql_input = "SELECT id FROM dataset ORDER BY id LIMIT 5".into();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    app.toggle_sort(0);
+    poll_until_idle(&mut app);
+    assert!(!app.filtered.as_ref().unwrap().sort_capped);
+}
+
+#[test]
 fn sorts_an_active_filter_and_rejects_stale_sorted_results() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);
@@ -857,6 +926,30 @@ fn sorts_an_active_filter_and_rejects_stale_sorted_results() {
 }
 
 #[test]
+fn opens_a_file_dropped_on_the_window() {
+    let (_directory, _source, path) = source(3);
+    let mut app =
+        PaviApp::new_with_store(None, SessionStore::new(path.with_extension("session.json")));
+    let context = egui::Context::default();
+    context.begin_pass(egui::RawInput {
+        dropped_files: vec![egui::DroppedFile {
+            path: Some(path.clone()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    app.open_dropped_file(&context);
+    let _ = context.end_pass();
+
+    poll_until_opened(&mut app);
+    assert_eq!(app.grid.rows, 3);
+    assert_eq!(
+        app.dataset.as_ref().map(|dataset| dataset.path.clone()),
+        Some(path)
+    );
+}
+
+#[test]
 fn opens_empty_and_replaces_active_document_work() {
     let (_first_directory, _first_source, first_path) = source(3);
     let (_second_directory, _second_source, second_path) = source(0);
@@ -871,13 +964,11 @@ fn opens_empty_and_replaces_active_document_work() {
     app.request_page(0);
     poll_until_page_loaded(&mut app, 0);
     app.workspace = Workspace::Sql;
-    app.show_filter_controls = true;
 
     app.begin_open(second_path);
     assert_eq!(app.pages.loaded_count(), 0);
     assert!(!app.pages.is_loading());
     assert_eq!(app.workspace, Workspace::Grid);
-    assert!(!app.show_filter_controls);
     poll_until_opened(&mut app);
     assert_eq!(app.grid.rows, 0);
     assert!(matches!(app.grid.loading, LoadState::Ready));

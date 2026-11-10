@@ -1,4 +1,5 @@
 use super::super::*;
+use super::{theme, widgets};
 
 impl PaviApp {
     pub(in crate::app) fn show_chart_window(&mut self, ctx: &egui::Context) {
@@ -16,12 +17,13 @@ impl PaviApp {
         let mut cancel = false;
         egui::Window::new("Charts")
             .open(&mut open)
+            .collapsible(false)
             .default_size([620.0, 520.0])
             .min_size([380.0, 280.0])
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("Source:");
+                    ui.label("Source");
                     egui::ComboBox::from_id_salt("chart_source")
                         .selected_text(self.chart.source.label())
                         .show_ui(ui, |ui| {
@@ -36,7 +38,13 @@ impl PaviApp {
                                 ChartSource::CurrentResult.label(),
                             );
                         });
-                    ui.label("Current result uses only its bounded grid window.");
+                    ui.label(
+                        RichText::new(
+                            "The current result charts only the rows loaded in the grid.",
+                        )
+                        .font(theme::small())
+                        .color(theme::MUTED),
+                    );
                 });
                 if self.chart.source == ChartSource::Sql {
                     ui.add(
@@ -48,7 +56,7 @@ impl PaviApp {
                     );
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Type:");
+                    ui.label("Type");
                     egui::ComboBox::from_id_salt("chart_kind")
                         .selected_text(self.chart.config.kind.label())
                         .show_ui(ui, |ui| {
@@ -61,9 +69,9 @@ impl PaviApp {
                             }
                         });
                     ui.label(if self.chart.config.kind == ChartKind::Histogram {
-                        "Value output:"
+                        "Value column"
                     } else {
-                        "X output:"
+                        "X column"
                     });
                     ui.text_edit_singleline(&mut self.chart.config.x_column);
                     egui::ComboBox::from_id_salt("chart_x_column")
@@ -80,7 +88,7 @@ impl PaviApp {
                 });
                 if self.chart.config.kind != ChartKind::Histogram {
                     ui.horizontal(|ui| {
-                        ui.label("Y output:");
+                        ui.label("Y column");
                         ui.text_edit_singleline(&mut self.chart.config.y_column);
                         egui::ComboBox::from_id_salt("chart_y_column")
                             .selected_text("Choose")
@@ -96,21 +104,23 @@ impl PaviApp {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Title:");
+                    ui.label("Title");
                     ui.text_edit_singleline(&mut self.chart.config.title);
-                    ui.label("Point limit:");
+                    ui.label("Point limit");
                     ui.add(
                         egui::DragValue::new(&mut self.chart.config.point_limit)
                             .range(2..=MAX_INPUT_ROWS)
                             .speed(10),
                     );
                     if self.chart.config.kind == ChartKind::Histogram {
-                        ui.label("Bins:");
+                        ui.label("Bins");
                         ui.add(egui::DragValue::new(&mut self.chart.config.bins).range(1..=100));
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Run / Refresh").clicked() {
+                    if widgets::primary_button(ui, Some(widgets::Icon::Play), "Draw chart")
+                        .clicked()
+                    {
                         run = true;
                     }
                     if ui
@@ -119,19 +129,24 @@ impl PaviApp {
                     {
                         cancel = true;
                     }
-                    ui.label(&self.chart.status);
+                    ui.label(RichText::new(&self.chart.status).color(theme::MUTED));
                 });
                 if let Some(error) = &self.chart.error {
-                    ui.label(RichText::new(error).color(egui::Color32::RED));
+                    widgets::error(ui, error);
                 }
                 if let Some(model) = &self.chart.model {
                     chart_notice(ui, model);
                     draw_chart(ui, model, &self.chart.config);
                 } else if self.chart.loading() {
-                    ui.centered_and_justified(|ui| ui.spinner());
+                    ui.centered_and_justified(|ui| {
+                        ui.add(egui::Spinner::new().color(theme::ACCENT))
+                    });
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Run a bounded SQL query or use the current result window.")
+                        ui.label(
+                            RichText::new("Pick a source and columns, then draw the chart.")
+                                .color(theme::MUTED),
+                        )
                     });
                 }
             });
@@ -174,25 +189,25 @@ pub(in crate::app) fn draw_chart(ui: &mut egui::Ui, model: &ChartModel, config: 
     );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    painter.rect_filled(rect, 4.0, theme::BACKGROUND);
     if model.is_empty() {
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             "No chartable values",
-            egui::FontId::proportional(15.0),
-            ui.visuals().weak_text_color(),
+            theme::strong(13.0),
+            theme::MUTED,
         );
         return;
     }
     let plot = rect.shrink2(egui::vec2(48.0, 28.0));
     painter.line_segment(
         [plot.left_bottom(), plot.left_top()],
-        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+        egui::Stroke::new(1.0_f32, theme::MUTED),
     );
     painter.line_segment(
         [plot.left_bottom(), plot.right_bottom()],
-        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+        egui::Stroke::new(1.0_f32, theme::MUTED),
     );
     let title = if config.title.trim().is_empty() {
         format!("{} chart", model.kind.label())
@@ -203,8 +218,8 @@ pub(in crate::app) fn draw_chart(ui: &mut egui::Ui, model: &ChartModel, config: 
         rect.left_top() + egui::vec2(8.0, 6.0),
         egui::Align2::LEFT_TOP,
         title,
-        egui::FontId::proportional(15.0),
-        ui.visuals().text_color(),
+        theme::strong(13.0),
+        theme::TEXT,
     );
 
     let tooltip = match &model.values {
@@ -218,16 +233,16 @@ pub(in crate::app) fn draw_chart(ui: &mut egui::Ui, model: &ChartModel, config: 
         plot.left_bottom() + egui::vec2(0.0, 6.0),
         egui::Align2::LEFT_TOP,
         &config.x_column,
-        egui::FontId::proportional(11.0),
-        ui.visuals().weak_text_color(),
+        theme::small(),
+        theme::MUTED,
     );
     if model.kind != ChartKind::Histogram {
         painter.text(
             plot.left_top() - egui::vec2(42.0, 0.0),
             egui::Align2::LEFT_TOP,
             &config.y_column,
-            egui::FontId::proportional(11.0),
-            ui.visuals().weak_text_color(),
+            theme::small(),
+            theme::MUTED,
         );
     }
     if let Some(tooltip) = tooltip {
@@ -284,7 +299,7 @@ fn draw_points(
         for pair in screen_points.windows(2) {
             painter.line_segment(
                 [pair[0], pair[1]],
-                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(95, 165, 255)),
+                egui::Stroke::new(1.5_f32, theme::CHART_POINT),
             );
         }
     }
@@ -292,7 +307,7 @@ fn draw_points(
         painter.circle_filled(
             *point,
             if kind == ChartKind::Scatter { 2.5 } else { 2.0 },
-            egui::Color32::from_rgb(95, 165, 255),
+            theme::CHART_POINT,
         );
     }
     hover.and_then(|hover| {
@@ -332,7 +347,7 @@ fn draw_bars(
             egui::pos2(left, y.min(baseline)),
             egui::pos2((left + width - 2.0).max(left + 1.0), y.max(baseline)),
         );
-        painter.rect_filled(bar_rect, 1.0, egui::Color32::from_rgb(105, 190, 125));
+        painter.rect_filled(bar_rect, 1.0, theme::CHART_BAR);
         if hover.is_some_and(|hover| bar_rect.expand(3.0).contains(hover)) {
             hovered = Some(format!("{}: {}", bar.label, bar.value));
         }
@@ -356,7 +371,7 @@ fn draw_histogram(
             egui::pos2(left, plot.bottom() - height),
             egui::pos2((left + width - 2.0).max(left + 1.0), plot.bottom()),
         );
-        painter.rect_filled(bar_rect, 1.0, egui::Color32::from_rgb(235, 165, 75));
+        painter.rect_filled(bar_rect, 1.0, theme::CHART_BAR);
         if hover.is_some_and(|hover| bar_rect.expand(3.0).contains(hover)) {
             hovered = Some(format!("{}–{}: {}", bin.start, bin.end, bin.count));
         }

@@ -6,21 +6,22 @@ use super::{
 };
 use arrow_schema::DataType;
 
+/// Width the Inspector opens at; the user can drag it within `INSPECTOR_WIDTHS`.
+const INSPECTOR_WIDTH: f32 = 280.0;
+const INSPECTOR_WIDTHS: std::ops::RangeInclusive<f32> = 240.0..=460.0;
+
 impl PaviApp {
     pub(in crate::app) fn show_inspector_panel(&mut self, ctx: &egui::Context) {
         if !self.show_inspector {
             return;
         }
         egui::SidePanel::right("inspector")
-            .exact_width(280.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BACKGROUND)
-                    .inner_margin(Spacing::Md.margin()),
-            )
+            .default_width(INSPECTOR_WIDTH)
+            .width_range(INSPECTOR_WIDTHS)
+            .resizable(true)
+            .frame(egui::Frame::new().fill(theme::PANEL))
             .show(ctx, |ui| {
-                ui.spacing_mut().interact_size.y = 20.0;
+                ui.spacing_mut().item_spacing = Spacing::None.vec(Spacing::None);
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_scroll")
                     .auto_shrink([false, false])
@@ -33,248 +34,277 @@ impl PaviApp {
         let selected_cell = self.selected_cell_details();
         let mut start_profile = None;
         let mut cancel_profile = false;
-        if let Some(dataset) = &self.dataset {
-            let metadata = dataset.source.metadata();
-            widgets::card(ui, "Inspector", Icon::File, true, |ui| {
-                widgets::button(
-                    ui,
-                    "Dataset",
-                    Icon::Database,
-                    false,
-                    egui::vec2(ui.available_width(), 28.0),
-                );
-                let file = dataset
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                widgets::detail(ui, "File", file.to_string());
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [84.0, 20.0],
-                        egui::Label::new("Path").halign(egui::Align::Min),
-                    );
-                    ui.add_sized(
-                        [(ui.available_width() - 36.0).max(32.0), 20.0],
-                        egui::Label::new(dataset.path.display().to_string()).truncate(),
-                    )
-                    .on_hover_text(dataset.path.display().to_string());
-                    if widgets::button(ui, "", Icon::Copy, false, egui::vec2(28.0, 24.0))
-                        .on_hover_text("Copy file path")
-                        .clicked()
-                    {
-                        ui.ctx().copy_text(dataset.path.display().to_string());
-                    }
-                });
-                widgets::detail(
-                    ui,
-                    "File size",
-                    format_bytes(dataset.source.file_info().len()),
-                );
-                widgets::detail(ui, "Rows", theme::number(metadata.row_count));
-                widgets::detail(ui, "Columns", metadata.column_count.to_string());
-                widgets::detail(ui, "Row groups", metadata.row_groups.len().to_string());
-                widgets::detail(ui, "Compression", dataset.source.compression());
-                widgets::detail(
-                    ui,
-                    "Created (UTC)",
-                    format_time(dataset.source.file_info().created()),
-                );
-                widgets::detail(
-                    ui,
-                    "Modified (UTC)",
-                    format_time(dataset.source.file_info().modified()),
+        let Some(dataset) = &self.dataset else {
+            widgets::placeholder(ui, |ui| {
+                ui.label(
+                    RichText::new("Open a file to see its schema and metadata.")
+                        .color(theme::MUTED),
                 );
             });
-            widgets::card(
+            return;
+        };
+        let metadata = dataset.source.metadata();
+
+        widgets::section(ui, "Cell", "", true, |ui| {
+            let Some(cell) = &selected_cell else {
+                ui.label(RichText::new("Click a cell to see its full value.").color(theme::MUTED));
+                return;
+            };
+            widgets::detail(ui, "Row", theme::number(cell.row + 1));
+            widgets::detail(ui, "Column", &cell.name);
+            ui.add_space(Spacing::Xs.px());
+            egui::Frame::new()
+                .fill(theme::BACKGROUND)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(theme::RADIUS)
+                .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.add(egui::Label::new(&cell.value).wrap());
+                });
+            ui.add_space(Spacing::Xs.px());
+            ui.horizontal(|ui| {
+                if widgets::tool_button(ui, Some(Icon::Copy), "Copy", false).clicked() {
+                    ui.ctx().copy_text(cell.value.clone());
+                }
+                ui.checkbox(&mut self.show_safe_full_selection, "Full value");
+                ui.checkbox(&mut self.show_nested_selection, "Nested");
+            });
+            for extra in [&cell.full_value, &cell.expanded_value]
+                .into_iter()
+                .flatten()
+            {
+                ui.add(egui::Label::new(extra).wrap());
+            }
+        });
+
+        widgets::section(ui, "Column", "", true, |ui| {
+            let Some(index) = selected_column else {
+                ui.label(
+                    RichText::new("Click a cell to see its column's statistics.")
+                        .color(theme::MUTED),
+                );
+                return;
+            };
+            let Some(column) = metadata.columns().get(index) else {
+                ui.label(
+                    RichText::new("This result column has no file metadata.").color(theme::MUTED),
+                );
+                return;
+            };
+            let summary = column_summary(column);
+            widgets::detail(ui, "Name", &summary.name);
+            widgets::detail(ui, "Position", (summary.index + 1).to_string());
+            widgets::detail(ui, "Type", &summary.data_type);
+            widgets::detail(
                 ui,
-                &format!("Schema ({} columns)", metadata.column_count),
-                Icon::Grid,
-                true,
-                |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("schema_rows")
-                        .max_height(240.0)
-                        .show_rows(ui, 20.0, metadata.columns().len(), |ui, rows| {
-                            for index in rows {
-                                let column = &metadata.columns()[index];
-                                ui.horizontal(|ui| {
-                                    ui.add_sized(
-                                        [118.0, 20.0],
-                                        egui::Label::new(&column.name)
-                                            .truncate()
-                                            .halign(egui::Align::Min),
-                                    )
-                                    .on_hover_text(&column.name);
-                                    ui.add(
-                                        egui::Label::new(type_label(&column.data_type)).truncate(),
-                                    )
-                                    .on_hover_text(
-                                        nested_schema_preview(&column.name, &column.data_type),
-                                    );
-                                });
-                            }
-                        });
+                "Nulls",
+                match (summary.nullable, summary.null_count) {
+                    (false, _) => "Not allowed".to_owned(),
+                    (true, Some(count)) => theme::number(count),
+                    (true, None) => "Allowed, count not stored".to_owned(),
                 },
             );
-            widgets::card(ui, "Selection", Icon::Cursor, true, |ui| {
-                if let Some(cell) = &selected_cell {
-                    widgets::detail(ui, "Row", theme::number(cell.row + 1));
-                    widgets::detail(ui, "Column", &cell.name);
-                    widgets::detail(ui, "Value", &cell.value);
-                    ui.horizontal(|ui| {
-                        if ui.small_button("Copy cell").clicked() {
-                            ui.ctx().copy_text(cell.value.clone());
+            widgets::detail(
+                ui,
+                "Statistics",
+                format!(
+                    "In {} of {} row groups",
+                    summary.available_statistics, summary.row_groups
+                ),
+            );
+            ui.add_space(Spacing::Sm.px());
+            if self.profile.loading() && self.profile.column == Some(index) {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                    ui.label(RichText::new(&self.profile.status).color(theme::MUTED));
+                    if ui.button("Cancel").clicked() {
+                        cancel_profile = true;
+                    }
+                });
+            } else if widgets::tool_button(ui, Some(Icon::Chart), "Profile this column", false)
+                .on_hover_text("Scan the column for nulls, distinct values and distribution")
+                .clicked()
+            {
+                start_profile = Some(index);
+            }
+            if let Some(error) = &self.profile.error {
+                widgets::error(ui, error);
+            }
+            if let Some(profile) = &self.profile.result {
+                super::profile::show(ui, profile, super::charts::draw_chart);
+            }
+            if !column.row_group_statistics.is_empty() {
+                ui.add_space(Spacing::Sm.px());
+                ui.label(
+                    RichText::new("Min and max per row group")
+                        .font(theme::small())
+                        .color(theme::MUTED),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_statistics")
+                    .max_height(132.0)
+                    .show_rows(ui, 20.0, column.row_group_statistics.len(), |ui, rows| {
+                        for row_group in rows {
+                            let text = column.row_group_statistics[row_group].as_ref().map_or_else(
+                                || "not stored".to_owned(),
+                                |statistics| {
+                                    format!(
+                                        "{} to {}",
+                                        statistics.min.as_deref().unwrap_or("?"),
+                                        statistics.max.as_deref().unwrap_or("?"),
+                                    )
+                                },
+                            );
+                            widgets::detail(ui, &format!("Group {row_group}"), text);
                         }
-                        ui.checkbox(&mut self.show_safe_full_selection, "Full value");
-                        ui.checkbox(&mut self.show_nested_selection, "Nested");
                     });
-                    if let Some(value) = &cell.full_value {
-                        ui.label(value);
-                    }
-                    if let Some(value) = &cell.expanded_value {
-                        ui.label(value);
-                    }
-                } else {
-                    ui.label("Select a cell to inspect its value.");
-                }
+            }
+        });
+
+        widgets::section(ui, "File", "", true, |ui| {
+            let file = dataset
+                .path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
+            widgets::detail(ui, "Name", file.to_string());
+            widgets::detail(ui, "Folder", {
+                dataset
+                    .path
+                    .parent()
+                    .map(|parent| parent.display().to_string())
+                    .unwrap_or_default()
             });
-            widgets::card(ui, "Cache", Icon::Cache, true, |ui| {
-                match dataset.source.cache_stats() {
-                    Ok(stats) => {
-                        widgets::detail(ui, "Status", format!("{} cached pages", stats.entries));
-                        widgets::detail(ui, "Cache size", format_bytes(stats.bytes as u64));
-                        widgets::detail(
-                            ui,
-                            "Pages cached",
-                            format!(
-                                "{} / {}",
-                                stats.entries,
-                                theme::number(
-                                    metadata.row_count.div_ceil(parquet_reader::PAGE_ROWS)
-                                )
-                            ),
-                        );
-                        widgets::detail(
-                            ui,
-                            "Hits / misses",
-                            format!("{} / {}", stats.hits, stats.misses),
-                        );
-                    }
-                    Err(error) => {
-                        ui.label(error.to_string());
-                    }
-                }
-            });
-            widgets::card(ui, "More details", Icon::Info, false, |ui| {
-                widgets::section(ui, "Dataset Profile", Icon::Chart, |ui| {
-                    ui.label(format!(
-                        "Exact row count: {} (Parquet metadata)",
-                        metadata.row_count
-                    ));
-                    ui.label("Column scans run only when Profile selected column is requested.");
-                });
-                widgets::section(ui, "Column", Icon::Schema, |ui| {
-                    let Some(index) = selected_column else {
-                        ui.label("Select a source-grid cell to inspect its column.");
-                        return;
-                    };
-                    let Some(column) = metadata.columns().get(index) else {
-                        ui.label("Column metadata is unavailable for this result column.");
-                        return;
-                    };
-                    let summary = column_summary(column);
-                    ui.label(format!("{}: {}", summary.index, summary.name));
-                    ui.label(&summary.data_type);
-                    ui.label(if summary.nullable {
-                        "Nullable"
-                    } else {
-                        "Required"
-                    });
-                    ui.label(format!(
-                        "Statistics: {}/{} row groups",
-                        summary.available_statistics, summary.row_groups
-                    ));
-                    match summary.null_count {
-                        Some(count) => ui.label(format!("Null count: {count}")),
-                        None => ui.label("Null count: unavailable"),
-                    };
-                    egui::ScrollArea::vertical()
-                        .id_salt("inspector_statistics")
-                        .max_height(150.0)
-                        .show_rows(ui, 42.0, column.row_group_statistics.len(), |ui, rows| {
-                            for row_group in rows {
-                                match &column.row_group_statistics[row_group] {
-                                Some(statistics) => ui.label(format!(
-                                    "Group {row_group}: min {} · max {}\nnulls: {} · distinct: {}",
-                                    statistics.min.as_deref().unwrap_or("unavailable"),
-                                    statistics.max.as_deref().unwrap_or("unavailable"),
-                                    statistics.null_count.map_or_else(
-                                        || "unavailable".to_string(),
-                                        |count| count.to_string()
-                                    ),
-                                    statistics.distinct_count.map_or_else(
-                                        || "unavailable".to_string(),
-                                        |count| count.to_string()
-                                    ),
-                                )),
-                                None => {
-                                    ui.label(format!("Group {row_group}: statistics unavailable"))
-                                }
-                            };
-                            }
-                        });
-                });
-                widgets::section(ui, "Row Groups", Icon::Database, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("inspector_row_groups")
-                        .max_height(180.0)
-                        .show_rows(ui, 20.0, metadata.row_groups.len(), |ui, rows| {
-                            for index in rows {
-                                let group = &metadata.row_groups[index];
-                                ui.label(format!(
-                                    "{}: rows {}–{} ({})",
-                                    group.index,
-                                    group.first_row + 1,
-                                    group.first_row.saturating_add(group.row_count),
-                                    group.row_count
-                                ));
-                            }
-                        });
-                });
-                widgets::section(ui, "Profile", Icon::Chart, |ui| {
-                    if let Some(index) = selected_column {
-                        if self.profile.loading() && self.profile.column == Some(index) {
-                            ui.spinner();
-                            ui.label(&self.profile.status);
-                            if ui.button("Cancel profile").clicked() {
-                                cancel_profile = true;
-                            }
-                        } else if ui.button("Profile selected column").clicked() {
-                            start_profile = Some(index);
+            widgets::detail(ui, "Size", format_bytes(dataset.source.file_info().len()));
+            widgets::detail(ui, "Rows", theme::number(metadata.row_count));
+            widgets::detail(ui, "Columns", metadata.column_count.to_string());
+            widgets::detail(ui, "Row groups", metadata.row_groups.len().to_string());
+            widgets::detail(ui, "Compression", dataset.source.compression());
+            widgets::detail(
+                ui,
+                "Created",
+                format_time(dataset.source.file_info().created()),
+            );
+            widgets::detail(
+                ui,
+                "Modified",
+                format_time(dataset.source.file_info().modified()),
+            );
+            if widgets::tool_button(ui, Some(Icon::Copy), "Copy path", false).clicked() {
+                ui.ctx().copy_text(dataset.path.display().to_string());
+            }
+        });
+
+        widgets::section(
+            ui,
+            "Schema",
+            &format!("{} columns", metadata.column_count),
+            true,
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("schema_rows")
+                    .max_height(260.0)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, 20.0, metadata.columns().len(), |ui, rows| {
+                        for index in rows {
+                            let column = &metadata.columns()[index];
+                            let (rect, response) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 20.0),
+                                egui::Sense::hover(),
+                            );
+                            let label = type_label(&column.data_type);
+                            let kind = ui.painter_at(rect).text(
+                                rect.right_center(),
+                                egui::Align2::RIGHT_CENTER,
+                                &label,
+                                theme::small(),
+                                type_color(&column.data_type),
+                            );
+                            ui.painter_at(rect.with_max_x(kind.left() - Spacing::Md.px()))
+                                .text(
+                                    rect.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    &column.name,
+                                    theme::body(),
+                                    theme::TEXT,
+                                );
+                            response.on_hover_text(nested_schema_preview(
+                                &column.name,
+                                &column.data_type,
+                            ));
                         }
-                    } else {
-                        ui.label("Select a source column to profile it on demand.");
-                    }
-                    if let Some(error) = &self.profile.error {
-                        ui.label(RichText::new(error).color(egui::Color32::RED));
-                    }
-                    if let Some(profile) = &self.profile.result {
-                        super::profile::show(ui, profile, super::charts::draw_chart);
-                    }
-                });
-            });
-        } else {
-            widgets::card(ui, "Inspector", Icon::File, true, |ui| {
-                ui.label("Open a Parquet file to view its metadata.");
-            });
-        }
+                    });
+            },
+        );
+
+        widgets::section(
+            ui,
+            "Row groups",
+            &metadata.row_groups.len().to_string(),
+            false,
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("inspector_row_groups")
+                    .max_height(180.0)
+                    .show_rows(ui, 20.0, metadata.row_groups.len(), |ui, rows| {
+                        for index in rows {
+                            let group = &metadata.row_groups[index];
+                            widgets::detail(
+                                ui,
+                                &format!("Group {}", group.index),
+                                format!(
+                                    "rows {}–{}",
+                                    theme::number(group.first_row + 1),
+                                    theme::number(group.first_row.saturating_add(group.row_count)),
+                                ),
+                            );
+                        }
+                    });
+            },
+        );
+
+        widgets::section(ui, "Page cache", "", false, |ui| {
+            match dataset.source.cache_stats() {
+                Ok(stats) => {
+                    widgets::detail(
+                        ui,
+                        "Pages",
+                        format!(
+                            "{} of {}",
+                            stats.entries,
+                            theme::number(metadata.row_count.div_ceil(parquet_reader::PAGE_ROWS))
+                        ),
+                    );
+                    widgets::detail(ui, "Memory", format_bytes(stats.bytes as u64));
+                    widgets::detail(ui, "Hits", theme::number(stats.hits));
+                    widgets::detail(ui, "Misses", theme::number(stats.misses));
+                }
+                Err(error) => {
+                    widgets::error(ui, &error.to_string());
+                }
+            }
+        });
+
         if cancel_profile {
             self.cancel_profile();
         }
         if let Some(column) = start_profile {
             self.run_profile(column);
         }
+    }
+}
+
+/// Text color of a type label, by type family.
+pub fn type_color(data_type: &DataType) -> egui::Color32 {
+    if data_type.is_numeric() {
+        theme::TYPE_NUMBER
+    } else if data_type.is_temporal() {
+        theme::TYPE_TEMPORAL
+    } else if matches!(data_type, DataType::Boolean) {
+        theme::TYPE_BOOL
+    } else {
+        theme::MUTED
     }
 }
 

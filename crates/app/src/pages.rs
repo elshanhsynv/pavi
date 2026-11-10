@@ -37,6 +37,7 @@ impl SourcePages {
         self.loaded.values()
     }
 
+    #[cfg(test)]
     pub(crate) fn loaded_count(&self) -> usize {
         self.loaded.len()
     }
