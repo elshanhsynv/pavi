@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-10
+
 ### Added
 - Drop a Parquet file on the window to open it.
 - Ctrl+G jumps to the "Go to row" box.
@@ -58,5 +60,6 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.2.0
 [0.1.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.1.0
