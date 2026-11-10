@@ -347,14 +347,14 @@ impl PaviApp {
                 }
                 ui.label(
                     RichText::new(format!(
-                        "{} result, rows {}–{} of the loaded window{}",
+                        "{} result · rows {}–{} loaded{}",
                         kind.label(),
                         theme::number(first_result + 1),
                         theme::number(first_result + rows),
                         if sort_capped {
                             format!(
-                                ". Sorted: at most the first {} rows in sort order; \
-                                 filter to narrow.",
+                                " · limited to the first {} rows in sort order; \
+                                 filter to narrow",
                                 theme::number(SORT_ROW_CAP as u64)
                             )
                         } else {
@@ -645,12 +645,19 @@ impl PaviApp {
                 if self.show_column_types {
                     // The name wins: the type label is cut on the left when space is short.
                     let room = rect.with_min_x(used + pad).with_max_x(rect.right() - pad);
-                    if room.width() > 0.0 {
-                        ui.painter_at(room).text(
-                            room.right_center(),
-                            egui::Align2::RIGHT_CENTER,
-                            &header.data_type,
-                            theme::small(),
+                    let label = ui.painter().layout_no_wrap(
+                        header.data_type.clone(),
+                        theme::small(),
+                        header.color,
+                    );
+                    // A cut-off label is noise; the tooltip still names the type.
+                    if label.size().x <= room.width() {
+                        ui.painter().galley(
+                            egui::pos2(
+                                room.right() - label.size().x,
+                                room.center().y - label.size().y / 2.0,
+                            ),
+                            label,
                             header.color,
                         );
                     }
@@ -740,7 +747,12 @@ pub(in crate::app) fn row_scrollbar(
         4.0,
         if active { theme::MUTED } else { theme::BORDER },
     );
-    let response = response.on_hover_text(format!("Rows {}–{} of {total}", first + 1, last + 1));
+    let response = response.on_hover_text(format!(
+        "Rows {}–{} of {}",
+        theme::number(first + 1),
+        theme::number(last + 1),
+        theme::number(total)
+    ));
     if !(response.dragged() || response.clicked()) {
         return None;
     }

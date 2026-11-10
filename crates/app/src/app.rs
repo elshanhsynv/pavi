@@ -204,6 +204,17 @@ impl PaviApp {
             Some("Profiling")
         } else if self.running_sql.is_some() {
             Some("Running SQL")
+        } else if let Some(filtered) = self
+            .filtered
+            .as_ref()
+            .filter(|filtered| !filtered.finished && filtered.rows == 0)
+        {
+            // A scan that has not produced its first rows yet.
+            Some(match filtered.kind {
+                QueryKind::Filter => "Filtering",
+                QueryKind::Sort => "Sorting",
+                QueryKind::Sql => "Running SQL",
+            })
         } else if self.pages.is_loading() {
             Some("Loading pages")
         } else {
@@ -1021,6 +1032,22 @@ impl PaviApp {
                     }
                 }
                 Ok(QueryPoll::Batch(batch)) if batch.generation_id == self.grid.generation => {
+                    if filtered.rows == 0 {
+                        // The scan-time message ("Sorting …") is no longer true.
+                        status = Some(if filtered.sort_capped {
+                            format!(
+                                "{} result ready (first {} rows in sort order); \
+                                 more rows load as you scroll",
+                                filtered.kind.label(),
+                                ui::theme::number(SORT_ROW_CAP as u64)
+                            )
+                        } else {
+                            format!(
+                                "{} result ready; more rows load as you scroll",
+                                filtered.kind.label()
+                            )
+                        });
+                    }
                     filtered.push(batch.batch);
                     if self
                         .grid
