@@ -844,6 +844,47 @@ fn sorts_grid_headers_and_toggles_direction_without_a_second_renderer() {
 }
 
 #[test]
+fn cell_menu_filters_to_and_excludes_the_selected_value() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    let ctx = egui::Context::default();
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+
+    // A text cell of the file: the value is quoted in the filter box.
+    assert!(app.grid.select(2, 1));
+    app.cell_action = Some(CellAction::FilterTo);
+    app.apply_cell_action(&ctx);
+    assert!(app.cell_action.is_none());
+    assert_eq!(app.filter_input, "name == \"alpha\"");
+    poll_until_idle(&mut app);
+    assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Filter);
+    assert_eq!(filtered_ids(&app), vec!["0", "2", "4", "6"]);
+
+    // A number cell of that result: the new filter replaces the old one.
+    assert!(app.grid.select_filtered(0, 1, 0));
+    app.cell_action = Some(CellAction::Exclude);
+    app.apply_cell_action(&ctx);
+    assert_eq!(app.filter_input, "id != 2");
+    poll_until_idle(&mut app);
+    assert_eq!(filtered_ids(&app), vec!["0", "1", "3", "4", "5", "6", "7"]);
+
+    // An aggregate has no file column to filter on: it says why and keeps the result.
+    app.sql_input = "SELECT COUNT(*) FROM dataset".into();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.grid.select_filtered(0, 0, 0));
+    app.cell_action = Some(CellAction::FilterTo);
+    app.apply_cell_action(&ctx);
+    assert!(app.status.contains("Aggregated"), "{}", app.status);
+    assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sql);
+
+    // Nothing selected: nothing to filter by.
+    app.grid.selection = None;
+    assert!(app.selected_cell_filter(false).is_err());
+}
+
+#[test]
 fn header_actions_sort_select_and_hide_columns() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);

@@ -10,6 +10,8 @@ use super::{
 const RECENT_ON_START: usize = 4;
 /// Height of the pinned header row.
 const HEADER_HEIGHT: f32 = 28.0;
+/// Width of the menu a right-click on a cell opens.
+const CELL_MENU_WIDTH: f32 = 220.0;
 /// Width of the menu a right-click on a header opens.
 const HEADER_MENU_WIDTH: f32 = 180.0;
 
@@ -224,14 +226,17 @@ impl PaviApp {
                                                 let text = self
                                                     .cell_text(row_index, column)
                                                     .unwrap_or_else(|| "…".to_string());
-                                                if cell_value(ui, &text, look).clicked() {
-                                                    if ui.input(|input| input.modifiers.shift) {
-                                                        self.grid
-                                                            .extend_selection(row_index, column);
-                                                    } else {
-                                                        self.grid.select(row_index, column);
-                                                    }
+                                                let response = cell_value(ui, &text, look);
+                                                if response.clicked()
+                                                    && ui.input(|input| input.modifiers.shift)
+                                                {
+                                                    self.grid.extend_selection(row_index, column);
+                                                } else if response.clicked()
+                                                    || response.secondary_clicked()
+                                                {
+                                                    self.grid.select(row_index, column);
                                                 }
+                                                self.cell_menu(&response);
                                             });
                                         }
                                         table_row.col(|_| {});
@@ -259,6 +264,7 @@ impl PaviApp {
         }
         self.pages.cancel_offscreen(&mut self.grid);
         self.apply_header_action(ui.ctx());
+        self.apply_cell_action(ui.ctx());
     }
 
     pub(in crate::app) fn show_filtered_grid(&mut self, ui: &mut egui::Ui) {
@@ -445,17 +451,20 @@ impl PaviApp {
                                         let text = self
                                             .filtered_cell_text(row_index, *batch_column)
                                             .unwrap_or_else(|| "…".to_string());
-                                        if cell_value(ui, &text, look).clicked() {
-                                            if ui.input(|input| input.modifiers.shift) {
-                                                self.grid.extend_selection(result_row, column);
-                                            } else {
-                                                self.grid.select_filtered(
-                                                    first_result,
-                                                    row_index,
-                                                    column,
-                                                );
-                                            }
+                                        let response = cell_value(ui, &text, look);
+                                        if response.clicked()
+                                            && ui.input(|input| input.modifiers.shift)
+                                        {
+                                            self.grid.extend_selection(result_row, column);
+                                        } else if response.clicked() || response.secondary_clicked()
+                                        {
+                                            self.grid.select_filtered(
+                                                first_result,
+                                                row_index,
+                                                column,
+                                            );
                                         }
+                                        self.cell_menu(&response);
                                     });
                                 }
                                 table_row.col(|_| {});
@@ -464,6 +473,39 @@ impl PaviApp {
                     });
             });
         self.apply_header_action(ui.ctx());
+        self.apply_cell_action(ui.ctx());
+    }
+
+    /// The right-click menu of a data cell. It acts on the selected cell, which a
+    /// right-click has just made this one.
+    fn cell_menu(&mut self, response: &egui::Response) {
+        response.context_menu(|ui| {
+            ui.set_width(CELL_MENU_WIDTH);
+            let unavailable = self.selected_cell_filter(false).err();
+            let mut chosen = None;
+            ui.add_enabled_ui(unavailable.is_none(), |ui| {
+                if widgets::menu_item(ui, "Filter to this value", "").clicked() {
+                    chosen = Some(CellAction::FilterTo);
+                }
+                if widgets::menu_item(ui, "Exclude this value", "").clicked() {
+                    chosen = Some(CellAction::Exclude);
+                }
+            });
+            if let Some(reason) = &unavailable {
+                widgets::menu_caption(ui, reason);
+            }
+            ui.separator();
+            if widgets::menu_item(ui, "Copy cell", "Ctrl+C").clicked() {
+                chosen = Some(CellAction::CopyCell);
+            }
+            if widgets::menu_item(ui, "Copy row", "").clicked() {
+                chosen = Some(CellAction::CopyRow);
+            }
+            if chosen.is_some() {
+                self.cell_action = chosen;
+                ui.close_menu();
+            }
+        });
     }
 
     /// No dataset: opening, failed to open, or nothing chosen yet.
