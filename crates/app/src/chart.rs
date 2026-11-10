@@ -414,8 +414,8 @@ pub(crate) enum ChartSource {
 impl ChartSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Sql => "Chart SQL",
-            Self::CurrentResult => "Current result window",
+            Self::Sql => "SQL query",
+            Self::CurrentResult => "Current result",
         }
     }
 }
@@ -464,11 +464,17 @@ impl ChartState {
     }
 
     pub(crate) fn reset(&mut self) {
+        // Only say results were cleared when there were some.
+        let had_results = self.model.is_some() || self.execution.is_some() || self.error.is_some();
         self.cancel();
         self.generation = GenerationId(self.generation.0.saturating_add(1));
         self.model = None;
         self.error = None;
-        self.status = "Dataset changed; chart results were cleared".to_string();
+        self.status = if had_results {
+            "Dataset changed; chart results were cleared".to_string()
+        } else {
+            Self::default().status
+        };
     }
 
     pub(crate) fn next_generation(&mut self) -> GenerationId {

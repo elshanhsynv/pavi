@@ -401,7 +401,9 @@ pub fn segmented<T: Copy + PartialEq>(
         let selected = *value == current;
         let response = ui.interact(
             segment,
-            ui.id().with(("segment", index)),
+            // `unique_id`, not `id`: sibling layouts share an `id`, so two switches
+            // in one form would otherwise collide.
+            ui.unique_id().with(("segment", index)),
             if *enabled {
                 egui::Sense::click()
             } else {

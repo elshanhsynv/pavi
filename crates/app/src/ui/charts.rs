@@ -1,5 +1,18 @@
 use super::super::*;
-use super::{theme, widgets};
+use super::{
+    spacing::Spacing,
+    theme,
+    widgets::{self, Icon},
+};
+
+/// Width of the label column of the chart form.
+const FIELD_LABEL_WIDTH: f32 = 76.0;
+/// Width of a column-name box in the chart form.
+const COLUMN_BOX_WIDTH: f32 = 220.0;
+/// Height kept free for the plot before a chart is drawn.
+const EMPTY_PLOT_HEIGHT: f32 = 200.0;
+/// Columns listed in a column picker; type the name to reach the rest.
+const PICKER_COLUMNS: usize = 128;
 
 impl PaviApp {
     pub(in crate::app) fn show_chart_window(&mut self, ctx: &egui::Context) {
@@ -18,33 +31,30 @@ impl PaviApp {
         egui::Window::new("Charts")
             .open(&mut open)
             .collapsible(false)
-            .default_size([620.0, 520.0])
-            .min_size([380.0, 280.0])
+            .default_size([640.0, 540.0])
+            .min_size([420.0, 320.0])
             .resizable(true)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Source");
-                    egui::ComboBox::from_id_salt("chart_source")
-                        .selected_text(self.chart.source.label())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.chart.source,
-                                ChartSource::Sql,
-                                ChartSource::Sql.label(),
-                            );
-                            ui.selectable_value(
-                                &mut self.chart.source,
+                ui.spacing_mut().item_spacing = Spacing::Md.vec(Spacing::Sm);
+                let histogram = self.chart.config.kind == ChartKind::Histogram;
+                field(ui, "Source", |ui| {
+                    if let Some(source) = widgets::segmented(
+                        ui,
+                        self.chart.source,
+                        &[
+                            (ChartSource::Sql, ChartSource::Sql.label(), true),
+                            (
                                 ChartSource::CurrentResult,
                                 ChartSource::CurrentResult.label(),
-                            );
-                        });
-                    ui.label(
-                        RichText::new(
-                            "The current result charts only the rows loaded in the grid.",
-                        )
-                        .font(theme::small())
-                        .color(theme::MUTED),
-                    );
+                                true,
+                            ),
+                        ],
+                    ) {
+                        self.chart.source = source;
+                    }
+                    if self.chart.source == ChartSource::CurrentResult {
+                        caption(ui, "Charts only the rows loaded in the grid.");
+                    }
                 });
                 if self.chart.source == ChartSource::Sql {
                     ui.add(
@@ -52,84 +62,75 @@ impl PaviApp {
                             .code_editor()
                             .desired_rows(3)
                             .desired_width(f32::INFINITY)
+                            .margin(Spacing::Md.margin())
                             .hint_text("SELECT x, y FROM dataset WHERE …"),
                     );
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Type");
-                    egui::ComboBox::from_id_salt("chart_kind")
-                        .selected_text(self.chart.config.kind.label())
-                        .show_ui(ui, |ui| {
-                            for kind in ChartKind::ALL {
-                                ui.selectable_value(
-                                    &mut self.chart.config.kind,
-                                    kind,
-                                    kind.label(),
-                                );
-                            }
-                        });
-                    ui.label(if self.chart.config.kind == ChartKind::Histogram {
-                        "Value column"
-                    } else {
-                        "X column"
-                    });
-                    ui.text_edit_singleline(&mut self.chart.config.x_column);
-                    egui::ComboBox::from_id_salt("chart_x_column")
-                        .selected_text("Choose")
-                        .show_ui(ui, |ui| {
-                            for name in &names {
-                                ui.selectable_value(
-                                    &mut self.chart.config.x_column,
-                                    name.clone(),
-                                    name,
-                                );
-                            }
-                        });
+                field(ui, "Type", |ui| {
+                    let kinds = ChartKind::ALL.map(|kind| (kind, kind.label(), true));
+                    if let Some(kind) = widgets::segmented(ui, self.chart.config.kind, &kinds) {
+                        self.chart.config.kind = kind;
+                    }
                 });
-                if self.chart.config.kind != ChartKind::Histogram {
-                    ui.horizontal(|ui| {
-                        ui.label("Y column");
-                        ui.text_edit_singleline(&mut self.chart.config.y_column);
-                        egui::ComboBox::from_id_salt("chart_y_column")
-                            .selected_text("Choose")
-                            .show_ui(ui, |ui| {
-                                for name in &names {
-                                    ui.selectable_value(
-                                        &mut self.chart.config.y_column,
-                                        name.clone(),
-                                        name,
-                                    );
-                                }
-                            });
-                    });
+                column_field(
+                    ui,
+                    if histogram { "Values" } else { "X column" },
+                    "chart_x",
+                    &mut self.chart.config.x_column,
+                    &names,
+                );
+                if !histogram {
+                    column_field(
+                        ui,
+                        "Y column",
+                        "chart_y",
+                        &mut self.chart.config.y_column,
+                        &names,
+                    );
                 }
-                ui.horizontal(|ui| {
-                    ui.label("Title");
-                    ui.text_edit_singleline(&mut self.chart.config.title);
-                    ui.label("Point limit");
+                field(ui, "Title", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.chart.config.title)
+                            .desired_width(COLUMN_BOX_WIDTH)
+                            .hint_text("Optional"),
+                    );
+                });
+                field(ui, "Limits", |ui| {
                     ui.add(
                         egui::DragValue::new(&mut self.chart.config.point_limit)
                             .range(2..=MAX_INPUT_ROWS)
-                            .speed(10),
-                    );
-                    if self.chart.config.kind == ChartKind::Histogram {
-                        ui.label("Bins");
-                        ui.add(egui::DragValue::new(&mut self.chart.config.bins).range(1..=100));
+                            .speed(10)
+                            .suffix(" points"),
+                    )
+                    .on_hover_text("Most points the chart draws; more are thinned out");
+                    if histogram {
+                        ui.add(
+                            egui::DragValue::new(&mut self.chart.config.bins)
+                                .range(1..=100)
+                                .suffix(" bins"),
+                        );
                     }
                 });
+                ui.add_space(Spacing::Xs.px());
                 ui.horizontal(|ui| {
-                    if widgets::primary_button(ui, Some(widgets::Icon::Play), "Draw chart")
-                        .clicked()
-                    {
+                    if widgets::primary_button(ui, Some(Icon::Play), "Draw chart").clicked() {
                         run = true;
                     }
-                    if ui
-                        .add_enabled(self.chart.loading(), egui::Button::new("Cancel"))
-                        .clicked()
-                    {
-                        cancel = true;
+                    if self.chart.loading() {
+                        if widgets::tool_button(ui, Some(Icon::Close), "Cancel", false).clicked() {
+                            cancel = true;
+                        }
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
                     }
-                    ui.label(RichText::new(&self.chart.status).color(theme::MUTED));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&self.chart.status)
+                                .font(theme::small())
+                                .color(theme::MUTED),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&self.chart.status);
                 });
                 if let Some(error) = &self.chart.error {
                     widgets::error(ui, error);
@@ -137,16 +138,17 @@ impl PaviApp {
                 if let Some(model) = &self.chart.model {
                     chart_notice(ui, model);
                     draw_chart(ui, model, &self.chart.config);
-                } else if self.chart.loading() {
-                    ui.centered_and_justified(|ui| {
-                        ui.add(egui::Spinner::new().color(theme::ACCENT))
-                    });
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            RichText::new("Pick a source and columns, then draw the chart.")
-                                .color(theme::MUTED),
-                        )
+                    ui.set_min_height(EMPTY_PLOT_HEIGHT);
+                    widgets::placeholder(ui, |ui| {
+                        if self.chart.loading() {
+                            ui.add(egui::Spinner::new().color(theme::ACCENT));
+                        } else {
+                            ui.label(
+                                RichText::new("Pick a source and columns, then draw the chart.")
+                                    .color(theme::MUTED),
+                            );
+                        }
                     });
                 }
             });
@@ -163,22 +165,87 @@ impl PaviApp {
     }
 }
 
+/// One "label  control" row of the chart form.
+fn field(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(FIELD_LABEL_WIDTH, theme::CONTROL_HEIGHT),
+            egui::Sense::hover(),
+        );
+        ui.painter().text(
+            rect.left_center(),
+            egui::Align2::LEFT_CENTER,
+            label,
+            theme::body(),
+            theme::MUTED,
+        );
+        body(ui);
+    });
+}
+
+/// A column name: typed, because a chart query can name columns the file does
+/// not have, or picked from the file's columns.
+fn column_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    id_salt: &str,
+    value: &mut String,
+    names: &[String],
+) {
+    field(ui, label, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(COLUMN_BOX_WIDTH)
+                .hint_text("Column name"),
+        );
+        widgets::menu(ui, id_salt, Some(Icon::Columns), "", false, 260.0, |ui| {
+            if names.is_empty() {
+                widgets::menu_caption(ui, "Open a file to list its columns.");
+            }
+            egui::ScrollArea::vertical()
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    for name in names.iter().take(PICKER_COLUMNS) {
+                        if widgets::menu_item(ui, name, "").clicked() {
+                            value.clone_from(name);
+                            widgets::close_menu(ui);
+                        }
+                    }
+                });
+            if names.len() > PICKER_COLUMNS {
+                widgets::menu_caption(
+                    ui,
+                    &format!("First {PICKER_COLUMNS} columns. Type the name for the rest."),
+                );
+            }
+        })
+        .on_hover_text("Pick a column of the file");
+    });
+}
+
+fn caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).font(theme::small()).color(theme::MUTED));
+}
+
 fn chart_notice(ui: &mut egui::Ui, model: &ChartModel) {
     if model.is_empty() {
-        ui.label("No chartable non-null values were returned.");
+        caption(ui, "No chartable non-null values were returned.");
         return;
     }
     if model.input_capped || model.reduced {
-        ui.label(format!(
-            "Showing {} chart values from {} bounded input rows{}.",
-            model.output_len(),
-            model.input_rows,
-            if model.input_capped {
-                format!("; query sampling stopped at {MAX_INPUT_ROWS}")
-            } else {
-                String::new()
-            }
-        ));
+        caption(
+            ui,
+            &format!(
+                "Showing {} chart values from {} bounded input rows{}.",
+                model.output_len(),
+                model.input_rows,
+                if model.input_capped {
+                    format!("; query sampling stopped at {MAX_INPUT_ROWS}")
+                } else {
+                    String::new()
+                }
+            ),
+        );
     }
 }
 

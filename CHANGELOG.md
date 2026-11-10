@@ -20,6 +20,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - The path box and recent files moved into the file menu; jump-to-row moved to the status bar; column layout moved to the Columns menu; query history moved to the SQL workspace. The separate dataset bar and "Dataset tools" window are gone.
 - The start screen offers Browse and the most recent files.
 - Text uses Segoe UI on Windows.
+- The Charts window uses the same controls as the rest of the app: switches for the source and chart type, and a column picker next to each column name.
 - Clicking a column header selects the column and shows it in the Inspector instead of starting a sort.
 - Sorting a large file no longer fails with a budget error: it shows the first 100,000 rows in sort order and says so.
 - The status bar shows a spinner while a filter or sort is scanning.

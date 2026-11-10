@@ -66,7 +66,7 @@ On Windows the text is Segoe UI and Segoe UI Semibold, read once from the system
 - `tool_button`: flat button with an icon, a label or both, and a switched-on state.
 - `primary_button`: the one filled button of a view.
 - `menu`, `menu_item`, `menu_caption`, `close_menu`: a top-bar button with a popup below it, and its rows.
-- `segmented`: the Grid / SQL switch.
+- `segmented`: a switch between a few options: Grid / SQL, and the chart source and type.
 - `window_button`, `divider`: top-bar pieces.
 - `section`, `detail`: collapsible Inspector sections and their "label  value" rows.
 - `error`: error text in the one error color.
@@ -81,7 +81,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 - **SQL workspace** (`ui/sql.rs`): editor, Run, Cancel and the History menu above the result grid.
 - **Inspector** (`ui/inspector.rs`): collapsible sections Cell, Column (with profile), File, Schema, Row groups, Page cache.
 - **Status bar** (`ui/status.rs`): status dot or spinner, the share of the file a running filter, sort or SQL scan has read (e.g. `42%`), and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
-- **Charts** is the only floating window.
+- **Charts** (`ui/charts.rs`) is the only floating window: a form of "label  control" rows (source and type switches, column names that can be typed or picked from the file's columns, title, limits), then Draw chart and the plot.
 
 ## UI states every view must handle
 
@@ -108,5 +108,4 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 Fix these when touching the file; do not copy them:
 
-- The Charts window still uses stock egui combo boxes, buttons and text fields instead of the shared controls.
 - Some pixel sizes for painted pieces (icon boxes, the 20 px Inspector rows, the status bar's fixed right-hand width) are literals in the UI files instead of named constants.
