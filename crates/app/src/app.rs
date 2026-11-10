@@ -450,6 +450,9 @@ impl PaviApp {
     }
 
     fn begin_open(&mut self, path: PathBuf) {
+        // One spelling per file, so a relative and an absolute path to the same
+        // file do not become two recent entries. This does not touch the disk.
+        let path = std::path::absolute(&path).unwrap_or(path);
         if let Some(task) = &self.opening {
             task.cancel();
         }

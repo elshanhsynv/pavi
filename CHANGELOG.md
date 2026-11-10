@@ -21,10 +21,12 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Clicking a column header selects the column and shows it in the Inspector instead of starting a sort.
 - Sorting a large file no longer fails with a budget error: it shows the first 100,000 rows in sort order and says so.
 - The status bar shows a spinner while a filter or sort is scanning.
+- On narrow windows the Sort, Columns and Export buttons show only their icons, leaving room for the filter box.
 - Upgraded Apache Arrow and Parquet to 60.1.0. Files with a corrupt embedded Arrow schema still open, using the Parquet schema.
 - Release builds no longer open a console window next to the app.
 
 ### Fixed
+- A file opened once by a relative path and once by its full path is listed once under recent files.
 - A malformed Parquet file shows a "malformed Parquet data" error instead of crashing the CLI or a worker thread.
 - A crafted Parquet footer can no longer keep a file open busy for seconds to hours; such files are rejected immediately.
 - A crafted Parquet file can no longer make PAVI try to allocate gigabytes (and close) through an oversized dictionary page or schema; it shows an error instead.

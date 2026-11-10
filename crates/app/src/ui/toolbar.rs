@@ -7,6 +7,9 @@ use super::{
 
 /// Columns listed in the Sort and Columns menus; narrow the search to reach the rest.
 const MENU_COLUMNS: usize = 128;
+/// Below this window width the Sort, Columns and Export buttons drop their labels,
+/// so the filter box keeps a usable width.
+const COMPACT_BAR_WIDTH: f32 = 1_100.0;
 /// Characters of the file name shown in the top bar.
 const FILE_LABEL_CHARS: usize = 36;
 /// Characters of a recent file's folder shown in the file menu.
@@ -16,6 +19,8 @@ impl PaviApp {
     /// The one bar above the data: file, workspace, filter, tools, window controls.
     pub(in crate::app) fn show_top_bar(&mut self, ctx: &egui::Context) {
         let available = self.toolbar_availability();
+        let compact = ctx.screen_rect().width() < COMPACT_BAR_WIDTH;
+        let label = |text: &'static str| if compact { "" } else { text };
         egui::TopBottomPanel::top("top_bar")
             .exact_height(theme::BAR_HEIGHT)
             .frame(
@@ -71,27 +76,29 @@ impl PaviApp {
                                 ui,
                                 "export",
                                 Some(Icon::Export),
-                                "Export",
+                                label("Export"),
                                 false,
                                 250.0,
                                 |ui| {
                                     self.export_menu(ui);
                                 },
-                            );
+                            )
+                            .on_hover_text("Export or copy");
                         });
                         ui.add_enabled_ui(self.dataset.is_some(), |ui| {
                             widgets::menu(
                                 ui,
                                 "columns",
                                 Some(Icon::Columns),
-                                "Columns",
+                                label("Columns"),
                                 false,
                                 340.0,
                                 |ui| {
                                     self.columns_menu(ui);
                                 },
-                            );
-                            self.sort_menu(ui);
+                            )
+                            .on_hover_text("Show, hide, reorder and resize columns");
+                            self.sort_menu(ui, compact);
                         });
                         ui.add_space(Spacing::Sm.px());
                         self.filter_box(ui, available);
@@ -276,7 +283,7 @@ impl PaviApp {
         );
     }
 
-    fn sort_menu(&mut self, ui: &mut egui::Ui) {
+    fn sort_menu(&mut self, ui: &mut egui::Ui, compact: bool) {
         let names = self
             .dataset
             .as_ref()
@@ -291,7 +298,14 @@ impl PaviApp {
                     .get(sort.column)
                     .map(|name| self.sort_heading(sort.column, name))
             });
-        let label = sorted.as_deref().unwrap_or("Sort");
+        let hint = sorted
+            .as_ref()
+            .map_or_else(|| "Sort".to_owned(), |sorted| format!("Sorted by {sorted}"));
+        let label = if compact {
+            ""
+        } else {
+            sorted.as_deref().unwrap_or("Sort")
+        };
         let mut toggle = None;
         let mut clear = false;
         widgets::menu(
@@ -329,7 +343,8 @@ impl PaviApp {
                     widgets::close_menu(ui);
                 }
             },
-        );
+        )
+        .on_hover_text(hint);
         if clear {
             self.clear_filter();
         }
