@@ -365,13 +365,13 @@ impl ParquetSource {
             });
         }
 
-        let filter_column = filter.column_index(&self.dataset_metadata.schema)?;
         let mut read_columns = projection.as_slice().to_vec();
-        if !read_columns.contains(&filter_column) {
-            read_columns.push(filter_column);
+        for column in filter.columns(&self.dataset_metadata.schema)? {
+            if !read_columns.contains(&column) {
+                read_columns.push(column);
+            }
         }
         let read_projection = Projection::columns(read_columns, self.column_count())?;
-        let filter_position = projected_position(&read_projection, filter_column, "filter")?;
         let output_positions = projection
             .as_slice()
             .iter()
@@ -382,7 +382,7 @@ impl ParquetSource {
         let mut batches = Vec::new();
         for row_group in self.row_groups() {
             if row_group.first_row + row_group.row_count <= start_row
-                || !self.row_group_might_match(filter, row_group, filter_column)
+                || !self.row_group_might_match(filter, row_group)
             {
                 continue;
             }
@@ -402,7 +402,7 @@ impl ParquetSource {
                 }
                 let batch = self.reorder_batch(batch, &read_projection)?;
                 let batch_rows = batch.num_rows() as u64;
-                let mask = filter.evaluate_batch(&batch, filter_position)?;
+                let mask = self.evaluate_filter(filter, &batch, &read_projection)?;
                 let matches = mask.true_count();
                 if matches as u64 <= skip_matches {
                     skip_matches -= matches as u64;
@@ -467,24 +467,22 @@ impl ParquetSource {
         }
         let top = limit.filter(|limit| *limit <= budget.max_rows());
 
-        let filter_column = filter
-            .map(|filter| filter.column_index(&self.dataset_metadata.schema))
-            .transpose()?;
+        let filter_columns = filter
+            .map(|filter| filter.columns(&self.dataset_metadata.schema))
+            .transpose()?
+            .unwrap_or_default();
         let mut read_columns = projection.as_slice().to_vec();
         if !read_columns.contains(&sort.column) {
             read_columns.push(sort.column);
         }
-        if let Some(filter_column) = filter_column
-            && !read_columns.contains(&filter_column)
-        {
-            read_columns.push(filter_column);
+        for column in filter_columns {
+            if !read_columns.contains(&column) {
+                read_columns.push(column);
+            }
         }
         let read_projection = Projection::columns(read_columns, self.column_count())?;
         let sort_position = projected_position(&read_projection, sort.column, "sort")?;
         let sequence_position = read_projection.as_slice().len();
-        let filter_position = filter_column
-            .map(|column| projected_position(&read_projection, column, "filter"))
-            .transpose()?;
         let output_positions = projection
             .as_slice()
             .iter()
@@ -501,8 +499,8 @@ impl ParquetSource {
         let mut sequence = 0_u64;
         let mut retained = Vec::new();
         for row_group in self.row_groups() {
-            if let (Some(filter), Some(filter_column)) = (filter, filter_column)
-                && !self.row_group_might_match(filter, row_group, filter_column)
+            if let Some(filter) = filter
+                && !self.row_group_might_match(filter, row_group)
             {
                 continue;
             }
@@ -514,13 +512,12 @@ impl ParquetSource {
                 }
                 scanned += batch.num_rows() as u64;
                 let batch = self.reorder_batch(batch, &read_projection)?;
-                let batch = match (filter, filter_position) {
-                    (Some(filter), Some(filter_position)) => filter_record_batch(
+                let batch = match filter {
+                    Some(filter) => filter_record_batch(
                         &batch,
-                        &filter.evaluate_batch(&batch, filter_position)?,
+                        &self.evaluate_filter(filter, &batch, &read_projection)?,
                     )?,
-                    (Some(_), None) => bail!("filter column was not projected for sorting"),
-                    (None, _) => batch,
+                    None => batch,
                 };
                 if batch.num_rows() == 0 {
                     continue;
@@ -596,9 +593,10 @@ impl ParquetSource {
             self.validate_filter(filter)?;
         }
 
-        let filter_column = filter
-            .map(|filter| filter.column_index(&self.dataset_metadata.schema))
-            .transpose()?;
+        let filter_columns = filter
+            .map(|filter| filter.columns(&self.dataset_metadata.schema))
+            .transpose()?
+            .unwrap_or_default();
         let mut read_columns = Vec::new();
         if let Some(group) = aggregate.group_by() {
             read_columns.push(group);
@@ -610,10 +608,10 @@ impl ParquetSource {
                 read_columns.push(column);
             }
         }
-        if let Some(column) = filter_column
-            && !read_columns.contains(&column)
-        {
-            read_columns.push(column);
+        for column in filter_columns {
+            if !read_columns.contains(&column) {
+                read_columns.push(column);
+            }
         }
         if read_columns.is_empty() {
             let mut groups = GroupCollector::new(aggregate, &self.dataset_metadata.schema, budget)?;
@@ -624,9 +622,6 @@ impl ParquetSource {
         let group_position = aggregate
             .group_by()
             .map(|column| projected_position(&read_projection, column, "group"))
-            .transpose()?;
-        let filter_position = filter_column
-            .map(|column| projected_position(&read_projection, column, "filter"))
             .transpose()?;
         let expression_positions = aggregate
             .expressions()
@@ -641,8 +636,8 @@ impl ParquetSource {
 
         let mut groups = GroupCollector::new(aggregate, &self.dataset_metadata.schema, budget)?;
         for row_group in self.row_groups() {
-            if let (Some(filter), Some(filter_column)) = (filter, filter_column)
-                && !self.row_group_might_match(filter, row_group, filter_column)
+            if let Some(filter) = filter
+                && !self.row_group_might_match(filter, row_group)
             {
                 continue;
             }
@@ -654,12 +649,12 @@ impl ParquetSource {
                 }
                 scanned += batch.num_rows() as u64;
                 let batch = self.reorder_batch(batch, &read_projection)?;
-                let batch = match (filter, filter_position) {
-                    (Some(filter), Some(position)) => {
-                        filter_record_batch(&batch, &filter.evaluate_batch(&batch, position)?)?
-                    }
-                    (Some(_), None) => bail!("filter column was not projected for aggregation"),
-                    (None, _) => batch,
+                let batch = match filter {
+                    Some(filter) => filter_record_batch(
+                        &batch,
+                        &self.evaluate_filter(filter, &batch, &read_projection)?,
+                    )?,
+                    None => batch,
                 };
                 groups.update_batch(&batch, group_position, &expression_positions)?;
             }
@@ -862,26 +857,32 @@ impl ParquetSource {
         Ok(())
     }
 
-    fn row_group_might_match(
+    /// Evaluates `filter` on a batch read with `read_projection`, which holds every
+    /// column the filter names.
+    fn evaluate_filter(
         &self,
         filter: &FilterExpr,
-        row_group: &RowGroupInfo,
-        filter_column: usize,
-    ) -> bool {
+        batch: &RecordBatch,
+        read_projection: &Projection,
+    ) -> Result<arrow_array::BooleanArray> {
+        filter.evaluate(batch, &self.dataset_metadata.schema, &|column| {
+            projected_position(read_projection, column, "filter")
+        })
+    }
+
+    /// `false` only when the row group's statistics prove no row can pass `filter`.
+    fn row_group_might_match(&self, filter: &FilterExpr, row_group: &RowGroupInfo) -> bool {
+        // Nested columns: Parquet leaf columns no longer line up with Arrow fields.
         if self.column_count() != self.metadata.file_metadata().schema_descr().num_columns() {
             return true;
         }
-
-        let data_type = self
-            .dataset_metadata
-            .schema
-            .field(filter_column)
-            .data_type();
-        self.metadata
-            .row_group(row_group.index)
-            .columns()
-            .get(filter_column)
-            .is_none_or(|column| filter.might_match_statistics(column.statistics(), data_type))
+        let schema = &self.dataset_metadata.schema;
+        let columns = self.metadata.row_group(row_group.index).columns();
+        filter.might_match(schema, &|column| {
+            columns
+                .get(column)
+                .map(|chunk| (chunk.statistics(), schema.field(column).data_type()))
+        })
     }
 
     fn concat_or_empty(
@@ -2492,6 +2493,70 @@ mod tests {
             .read_filtered_from(&filter, 15_000, 30_000, &projection, &record)
             .unwrap();
         assert!(seen.take().iter().all(|rows| *rows >= 15_000));
+    }
+
+    #[test]
+    fn filters_on_several_columns_across_row_groups() {
+        // Three row groups of 10,000 rows; `bucket` is `id % 7`.
+        let (_directory, source) = numbered_file(30_000, 10_000);
+        // Only `id` is read out: the filter columns are added to the read and dropped.
+        let projection = Projection::columns(vec![0], 2).unwrap();
+        let matches = |filter: &str| {
+            let filter = FilterExpr::parse(filter).unwrap();
+            source.validate_filter(&filter).unwrap();
+            let window = source
+                .read_filtered_from(&filter, 0, 30_000, &projection, &|_| false)
+                .unwrap();
+            assert_eq!(window.batch.num_columns(), 1);
+            ids(&window.batch)
+        };
+
+        // One match in each of the last two row groups.
+        assert_eq!(matches("id IN (5, 10005, 25000)"), [5, 10_005, 25_000]);
+        // AND over two columns, spanning a row-group boundary.
+        assert_eq!(
+            matches("id BETWEEN 9990 AND 10010 AND bucket == 3"),
+            (9_990..=10_010)
+                .filter(|id| id % 7 == 3)
+                .collect::<Vec<_>>()
+        );
+        // An OR must keep row groups that only one side can match.
+        assert_eq!(
+            matches("id == 3 OR (id > 29990 AND bucket == 0)"),
+            [3, 29_995]
+        );
+        assert_eq!(matches("id < 3 AND bucket NOT IN (0, 1)"), [2]);
+        assert_eq!(matches("id IS NULL"), Vec::<i32>::new());
+        assert_eq!(matches("id IS NOT NULL AND id < 2"), [0, 1]);
+
+        // The same filter narrows a sort and an aggregate.
+        let filter = FilterExpr::parse("id >= 29990 AND (bucket == 1 OR bucket == 2)").unwrap();
+        let sorted = source
+            .read_sorted(
+                Some(&filter),
+                &projection,
+                SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
+                SortBudget::default(),
+                None,
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(
+            sorted.iter().flat_map(ids).collect::<Vec<_>>(),
+            [29_997, 29_996, 29_990]
+        );
+        let counted = source
+            .read_aggregated(
+                Some(&filter),
+                &AggregateSpec::new(vec![AggregateExpr::count_all()]).unwrap(),
+                GroupBudget::default(),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::value::format_cell(counted.column(0).as_ref(), 0),
+            "3"
+        );
     }
 
     fn ids(batch: &RecordBatch) -> Vec<i32> {

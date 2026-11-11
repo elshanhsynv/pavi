@@ -54,7 +54,7 @@ crates/parquet/src/            (parquet_reader)
 ├── page.rs         PAGE_ROWS = 4096, PageKey, RowWindow, DataPage
 ├── cache.rs        PageCache (LRU in a VecDeque), PageCacheLimits (8 pages / 128 MB), stats
 ├── projection.rs   Projection (ordered, de-duplicated top-level column indexes)
-├── filter.rs       FilterExpr/FilterOp: text parser, schema validation, batch evaluation, stats pruning
+├── filter.rs       FilterExpr (AND/OR tree), Comparison, FilterOp: text parser, schema validation, batch evaluation, stats pruning, Display
 ├── sort.rs         SortSpec, SortDirection, NullOrder, SortBudget (100k rows / 128 MB)
 ├── types.rs        which Arrow types each operation accepts (is_comparable, is_numeric, is_string, …)
 ├── aggregate.rs    AggregateFunction/Expr/Spec, GroupBudget (10k groups / 8 MB)
@@ -77,7 +77,7 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    45 tests driving PaviApp without a window
+├── app_tests.rs    46 tests driving PaviApp without a window
 ├── state.rs        GridState, ColumnLayout, SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
 ├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator
@@ -151,7 +151,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 |---|---|---|
 | `DatasetMetadata`, `RowGroupInfo`, `ColumnInfo`, `ColumnStatistics` | Schema, cumulative row ranges per row group, stringified min/max/null/distinct per (column, row group) | `crates/parquet/src/metadata.rs` |
 | `Projection` | Ordered unique top-level column indexes; `parquet_columns()` gives sorted order for the reader | `projection.rs` |
-| `FilterExpr` | `col OP value` with `== != > >= < <= contains`. The value is parsed for the column's type (`ordered_value`): integers exactly (as `i128`), floats as `f64` (rounded to the nearest `f32` for `Float32` columns, so a filter on the displayed value matches the cell), dates as `YYYY-MM-DD`, timestamps as `YYYY-MM-DD[THH:MM:SS][offset]` (read in the column's time zone when no offset is given). Row-group pruning reads statistics in the same units | `filter.rs:28-157` |
+| `FilterExpr` | A tree of `Comparison`s joined by `And` / `Or`. A `Comparison` is `col OP value` with `== != > >= < <= contains LIKE NOT LIKE IS NULL IS NOT NULL`; a null cell passes only `IS NULL`. `IN` / `BETWEEN` are parsed into comparisons. The value is parsed for the column's type (`ordered_value`): integers exactly (as `i128`), floats as `f64` (rounded to the nearest `f32` for `Float32` columns, so a filter on the displayed value matches the cell), dates as `YYYY-MM-DD`, timestamps as `YYYY-MM-DD[THH:MM:SS][offset]` (read in the column's time zone when no offset is given). Row-group pruning reads statistics in the same units | `filter.rs:28-157` |
 | `SortSpec`/`SortBudget`, `AggregateSpec`/`GroupBudget` | Single sort key; ≤1 group-by column with COUNT/SUM/AVG/MIN/MAX | `sort.rs`, `aggregate.rs` |
 | `SqlAst` → `LogicalPlan` → `Planner` → `PhysicalPlan` | Parse → tree → validated flat struct `{projection, filter, limit, sort, aggregate}` (operator order is ignored) | `crates/query/src/{sql,logical,planner}.rs` |
 | `format_cell_with_limit` / `scalar_text` | Arrow value → text. Display is truncated (nested ≤8 deep/≤16 items); `scalar_text` is full-length for scalars | `value.rs:18-97` |

@@ -498,6 +498,14 @@ impl PaviApp {
                 if widgets::menu_item(ui, "Exclude this value", "").clicked() {
                     chosen = Some(CellAction::Exclude);
                 }
+                if self.active_filter().is_some() {
+                    if widgets::menu_item(ui, "Add to filter: this value", "").clicked() {
+                        chosen = Some(CellAction::AndFilterTo);
+                    }
+                    if widgets::menu_item(ui, "Add to filter: not this value", "").clicked() {
+                        chosen = Some(CellAction::AndExclude);
+                    }
+                }
             });
             if let Some(reason) = &unavailable {
                 widgets::menu_caption(ui, reason);

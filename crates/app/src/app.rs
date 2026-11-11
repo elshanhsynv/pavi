@@ -10,8 +10,8 @@ use std::{
 use eframe::egui::{self, Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use parquet_reader::{
-    FilterExpr, FilterOp, NullOrder, ParquetSource, Projection, SortDirection,
-    types::{is_comparable, is_string},
+    Comparison, FilterExpr, FilterOp, NullOrder, ParquetSource, Projection, SortDirection,
+    types::is_comparable,
     value::{format_cell_with_limit, scalar_text},
 };
 use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryPoll, SqlAst};
@@ -120,10 +120,15 @@ enum HeaderAction {
 /// cell: a right-click selects the cell first.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CellAction {
-    /// Keep only rows whose value in this column equals the cell's.
+    /// Keep only rows whose value in this column equals the cell's (or is null,
+    /// for a null cell).
     FilterTo,
     /// Drop rows whose value in this column equals the cell's.
     Exclude,
+    /// Like `FilterTo`, on top of the filter already applied.
+    AndFilterTo,
+    /// Like `Exclude`, on top of the filter already applied.
+    AndExclude,
     CopyCell,
     CopyRow,
 }
@@ -745,15 +750,25 @@ impl PaviApp {
 
     fn apply_filter(&mut self) {
         let expression = self.filter_input.trim().to_owned();
-        match Filter::parse(&expression) {
+        match FilterExpr::parse(&expression) {
             Ok(filter) => self.start_filter(filter, &expression),
             Err(error) => self.filter_error = Some(format!("Invalid filter: {error}")),
         }
     }
 
-    /// The filter "selected column == (or !=) the selected cell's value" and its
-    /// text for the filter box, or why that cell cannot be filtered by.
-    fn selected_cell_filter(&self, exclude: bool) -> Result<(Filter, String), String> {
+    /// The filter applied from the filter box or a cell menu, if that is what the
+    /// grid is showing. A sort on top of it keeps it.
+    fn active_filter(&self) -> Option<&FilterExpr> {
+        self.filtered
+            .as_ref()
+            .filter(|filtered| filtered.kind == QueryKind::Filter)
+            .and_then(|filtered| filtered.filter.as_ref())
+    }
+
+    /// The test "selected column == (or !=) the selected cell's value", or
+    /// `IS NULL` / `IS NOT NULL` for a null cell, or why that cell cannot be
+    /// filtered by.
+    fn selected_cell_filter(&self, exclude: bool) -> Result<FilterExpr, String> {
         let (row, display_column) = self.grid.selection.ok_or("Select a cell first")?;
         let dataset = self.dataset.as_ref().ok_or("Open a file first")?;
         let (source, batch_column) = match &self.filtered {
@@ -782,28 +797,33 @@ impl PaviApp {
             .column_names
             .get(source)
             .ok_or("That column is no longer shown")?;
-        let data_type = array.data_type();
-        if !is_comparable(data_type) {
-            return Err(format!("{data_type} columns cannot be filtered"));
-        }
-        if array.is_null(offset) {
-            return Err("Filtering by null is not supported".to_owned());
-        }
-        let value = scalar_text(array.as_ref(), offset)
-            .map_err(|error| format!("{error:#}"))?
-            .ok_or("Filtering by null is not supported")?;
-        if value.len() > MAX_FILTER_VALUE_BYTES {
-            return Err(format!(
-                "That value is longer than {MAX_FILTER_VALUE_BYTES} bytes; type a shorter filter"
-            ));
-        }
         // A column whose name is a number would be read as a column position.
         let column = if name.parse::<usize>().is_ok() {
             source.to_string()
         } else {
             name.clone()
         };
-        let equals = FilterExpr {
+        if array.is_null(offset) {
+            let op = if exclude {
+                FilterOp::IsNotNull
+            } else {
+                FilterOp::IsNull
+            };
+            return Ok(FilterExpr::compare(column, op, ""));
+        }
+        let data_type = array.data_type();
+        if !is_comparable(data_type) {
+            return Err(format!("{data_type} columns cannot be filtered"));
+        }
+        let value = scalar_text(array.as_ref(), offset)
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or("That cell has no value to filter by")?;
+        if value.len() > MAX_FILTER_VALUE_BYTES {
+            return Err(format!(
+                "That value is longer than {MAX_FILTER_VALUE_BYTES} bytes; type a shorter filter"
+            ));
+        }
+        let equals = Comparison {
             column,
             op: FilterOp::Eq,
             value,
@@ -823,17 +843,10 @@ impl PaviApp {
         if !matches_itself {
             return Err("That value cannot be matched exactly by a filter".to_owned());
         }
-        let shown = if is_string(data_type) {
-            format!("\"{}\"", equals.value)
-        } else {
-            equals.value.clone()
-        };
-        let text = format!("{name} {} {shown}", if exclude { "!=" } else { "==" });
-        let expression = FilterExpr {
+        Ok(FilterExpr::Compare(Comparison {
             op: if exclude { FilterOp::Ne } else { FilterOp::Eq },
             ..equals
-        };
-        Ok((Filter::new(expression), text))
+        }))
     }
 
     /// Applies the action chosen in a cell's right-click menu, if any.
@@ -844,9 +857,21 @@ impl PaviApp {
         match action {
             CellAction::CopyCell => self.copy_selection(ctx, false),
             CellAction::CopyRow => self.copy_selection(ctx, true),
-            CellAction::FilterTo | CellAction::Exclude => {
-                match self.selected_cell_filter(action == CellAction::Exclude) {
-                    Ok((filter, text)) => {
+            CellAction::FilterTo
+            | CellAction::Exclude
+            | CellAction::AndFilterTo
+            | CellAction::AndExclude => {
+                let exclude = matches!(action, CellAction::Exclude | CellAction::AndExclude);
+                let add = matches!(action, CellAction::AndFilterTo | CellAction::AndExclude);
+                match self.selected_cell_filter(exclude) {
+                    Ok(test) => {
+                        // "Add" narrows the filter already applied; without one it
+                        // is a plain filter.
+                        let filter = match self.active_filter().filter(|_| add) {
+                            Some(active) => active.clone().and(test),
+                            None => test,
+                        };
+                        let text = filter.to_string();
                         self.filter_input = text.clone();
                         self.workspace = Workspace::Grid;
                         self.start_filter(filter, &text);
@@ -859,7 +884,7 @@ impl PaviApp {
 
     /// Replaces the current result with the rows of the file that pass `filter`.
     /// `expression` is the filter as text, for the status bar.
-    fn start_filter(&mut self, filter: Filter, expression: &str) {
+    fn start_filter(&mut self, filter: FilterExpr, expression: &str) {
         let Some(dataset) = &self.dataset else {
             self.filter_error = Some("Open a dataset before applying a filter".to_string());
             return;
@@ -867,7 +892,7 @@ impl PaviApp {
         let source = Arc::clone(&dataset.source);
         let projected_columns = (0..source.column_count()).collect::<Vec<_>>();
         let plan = LogicalPlan::scan(source)
-            .filter(filter)
+            .filter(Filter::new(filter.clone()))
             .project(projected_columns.clone());
         let sort = match Planner::plan(&plan) {
             Ok(plan) => plan.sort(),
@@ -886,14 +911,16 @@ impl PaviApp {
         };
         match QueryEngine::new(runtime).execute(&plan, generation) {
             Ok(execution) => {
-                self.filtered = Some(FilteredGrid::new(
+                let mut filtered = FilteredGrid::new(
                     QueryKind::Filter,
                     plan,
                     sort,
                     false,
                     projected_columns,
                     execution,
-                ));
+                );
+                filtered.filter = Some(filter);
+                self.filtered = Some(filtered);
                 self.refresh_grid_columns();
                 self.filter_error = None;
                 self.status = format!("Filtering: {expression}");
@@ -1076,6 +1103,11 @@ impl PaviApp {
             .filtered
             .as_ref()
             .is_some_and(|filtered| filtered.sort_capped);
+        // Sorting a filtered result keeps its filter, so a cell menu can still add to it.
+        let active_filter = self
+            .filtered
+            .as_ref()
+            .and_then(|filtered| filtered.filter.clone());
         let (projected_columns, sort) = match Planner::plan(&plan) {
             Ok(planned) => {
                 if planned.limit().is_none() {
@@ -1108,6 +1140,7 @@ impl PaviApp {
                 let mut filtered =
                     FilteredGrid::new(kind, plan, sort, false, projected_columns, execution);
                 filtered.sort_capped = capped;
+                filtered.filter = active_filter;
                 self.filtered = Some(filtered);
                 self.refresh_grid_columns();
                 let arrow = match direction {

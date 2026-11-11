@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "parquet_reader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "pavi_query"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "pavi_runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",

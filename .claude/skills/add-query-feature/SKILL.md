@@ -22,7 +22,7 @@ Read `docs/architecture/data-flows.md` §4.3 (filter) and §4.5 (SQL) first.
 
 | Layer | File | What to touch |
 |---|---|---|
-| Filter grammar | `crates/parquet/src/filter.rs` | `FilterOp`, `FilterExpr::parse`, `validate_type`, `ordered_value`, `evaluate_batch`, and `might_match_statistics` (row-group pruning must stay correct: when unsure, return `true`) |
+| Filter grammar | `crates/parquet/src/filter.rs` | `FilterOp`; the parser (`parse_filter` for AND/OR/brackets, `parse_test` for one test); `Comparison::validate_type`, `ordered_value`, `evaluate_batch` and `might_match_statistics` (row-group pruning must stay correct: when unsure, return `true`); `Display`, so text written from a filter parses back. A new form that can be written as existing comparisons (as `IN` and `BETWEEN` are) needs only the parser |
 | SQL parsing | `crates/query/src/sql.rs` | `SqlAst::parse` (reject what you don't support, with a specific message), `SqlPredicate`/`SqlProjection`/`SqlSort`, `to_logical_plan` |
 | Logical plan | `crates/query/src/logical.rs` | New node or field, builder method |
 | Planner | `crates/query/src/planner.rs` | `Planner::plan` validation; `PhysicalPlan` field + accessor |

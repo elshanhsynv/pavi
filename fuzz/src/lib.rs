@@ -222,6 +222,9 @@ pub const FILTER_SEEDS: &[&str] = &[
     "category == red",
     "tags == 1",
     "0 > 42",
+    "id >= 3 AND (name contains me OR active == true)",
+    "category IN (red, \"dark blue\") OR score NOT BETWEEN 1 AND 2.5",
+    "name LIKE me-_% AND text IS NOT NULL OR amount IS NULL",
 ];
 
 pub const SQL_SEEDS: &[&str] = &[
@@ -234,4 +237,7 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT active, MAX(day) FROM dataset WHERE id < 30 GROUP BY active",
     "SELECT * FROM dataset WHERE name LIKE '%2%'",
     "SELECT id FROM other",
+    "SELECT id FROM dataset WHERE (id < 5 OR id > 30) AND active = true",
+    "SELECT name FROM dataset WHERE category IN ('red', 'blue') AND score NOT BETWEEN 1 AND 2",
+    "SELECT COUNT(*) FROM dataset WHERE name LIKE 'me-_%' AND amount IS NOT NULL",
 ];
