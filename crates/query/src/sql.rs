@@ -42,11 +42,51 @@ pub struct SqlAggregateExpr {
     pub column: Option<String>,
 }
 
+/// A `WHERE` clause: comparisons joined by `AND` and `OR`. `IN`, `BETWEEN` and
+/// their `NOT` forms are stored as the comparisons they stand for.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SqlPredicate {
-    pub column: String,
-    pub op: FilterOp,
-    pub value: String,
+pub enum SqlPredicate {
+    Compare {
+        column: String,
+        op: FilterOp,
+        value: String,
+    },
+    And(Vec<SqlPredicate>),
+    Or(Vec<SqlPredicate>),
+}
+
+impl SqlPredicate {
+    fn compare(column: &str, op: FilterOp, value: impl Into<String>) -> Self {
+        Self::Compare {
+            column: column.to_owned(),
+            op,
+            value: value.into(),
+        }
+    }
+
+    /// Resolves column names against `source` and builds the reader's filter.
+    fn to_filter(&self, source: &ParquetSource) -> Result<FilterExpr> {
+        match self {
+            Self::Compare { column, op, value } => {
+                let index = resolve_column(source, column)?;
+                Ok(FilterExpr::compare(
+                    source.schema().field(index).name().to_owned(),
+                    op.clone(),
+                    value.clone(),
+                ))
+            }
+            Self::And(parts) => parts
+                .iter()
+                .map(|part| part.to_filter(source))
+                .collect::<Result<Vec<_>>>()
+                .map(FilterExpr::And),
+            Self::Or(parts) => parts
+                .iter()
+                .map(|part| part.to_filter(source))
+                .collect::<Result<Vec<_>>>()
+                .map(FilterExpr::Or),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,15 +197,7 @@ impl SqlAst {
         let filter = self
             .predicate
             .as_ref()
-            .map(|predicate| -> Result<Filter> {
-                let index = resolve_column(&source, &predicate.column)?;
-                let column = source.schema().field(index).name().to_owned();
-                Ok(Filter::new(FilterExpr {
-                    column,
-                    op: predicate.op.clone(),
-                    value: predicate.value.clone(),
-                }))
-            })
+            .map(|predicate| predicate.to_filter(&source).map(Filter::new))
             .transpose()?;
         let sort = self
             .sort
@@ -386,52 +418,120 @@ fn parse_aggregate(function: &Function) -> Result<SqlAggregateExpr> {
 
 fn parse_predicate(expression: &Expr) -> Result<SqlPredicate> {
     match expression {
+        Expr::Nested(inner) => parse_predicate(inner),
         Expr::BinaryOp {
-            op: BinaryOperator::And,
-            ..
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
         } => {
-            bail!("AND is not supported because a PAVI query has one filter predicate")
+            let parts = vec![parse_predicate(left)?, parse_predicate(right)?];
+            Ok(if *op == BinaryOperator::And {
+                SqlPredicate::And(parts)
+            } else {
+                SqlPredicate::Or(parts)
+            })
         }
-        Expr::BinaryOp { left, op, right } => Ok(SqlPredicate {
-            column: parse_column(left)?,
-            op: match op {
+        Expr::BinaryOp { left, op, right } => Ok(SqlPredicate::compare(
+            &parse_column(left)?,
+            match op {
                 BinaryOperator::Eq => FilterOp::Eq,
                 BinaryOperator::NotEq => FilterOp::Ne,
                 BinaryOperator::Gt => FilterOp::Gt,
                 BinaryOperator::GtEq => FilterOp::Ge,
                 BinaryOperator::Lt => FilterOp::Lt,
                 BinaryOperator::LtEq => FilterOp::Le,
-                _ => bail!("WHERE supports =, !=, >, >=, <, <=, or LIKE '%text%'"),
+                _ => bail!("WHERE supports =, !=, >, >=, <, <=, IN, BETWEEN, LIKE and IS NULL"),
             },
-            value: parse_literal(right)?,
-        }),
+            parse_literal(right)?,
+        )),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let column = parse_column(expr)?;
+            let op = if *negated { FilterOp::Ne } else { FilterOp::Eq };
+            let mut tests = list
+                .iter()
+                .map(|value| {
+                    Ok(SqlPredicate::compare(
+                        &column,
+                        op.clone(),
+                        parse_literal(value)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(match (tests.len(), negated) {
+                (0, _) => bail!("IN needs at least one value"),
+                (1, _) => tests.remove(0),
+                // `NOT IN (a, b)` is `!= a AND != b`; `IN (a, b)` is `= a OR = b`.
+                (_, true) => SqlPredicate::And(tests),
+                (_, false) => SqlPredicate::Or(tests),
+            })
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let column = parse_column(expr)?;
+            let (low, high) = (parse_literal(low)?, parse_literal(high)?);
+            Ok(if *negated {
+                SqlPredicate::Or(vec![
+                    SqlPredicate::compare(&column, FilterOp::Lt, low),
+                    SqlPredicate::compare(&column, FilterOp::Gt, high),
+                ])
+            } else {
+                SqlPredicate::And(vec![
+                    SqlPredicate::compare(&column, FilterOp::Ge, low),
+                    SqlPredicate::compare(&column, FilterOp::Le, high),
+                ])
+            })
+        }
+        Expr::IsNull(expr) => Ok(SqlPredicate::compare(
+            &parse_column(expr)?,
+            FilterOp::IsNull,
+            "",
+        )),
+        Expr::IsNotNull(expr) => Ok(SqlPredicate::compare(
+            &parse_column(expr)?,
+            FilterOp::IsNotNull,
+            "",
+        )),
         Expr::Like {
             negated,
             any,
             expr,
             pattern,
-            ..
+            escape_char,
         } => {
-            if *negated || *any {
-                bail!("WHERE supports only LIKE '%text%' for contains matching");
+            if *any {
+                bail!("LIKE ANY is not supported");
             }
+            if escape_char.is_some() {
+                bail!("LIKE ... ESCAPE is not supported");
+            }
+            let column = parse_column(expr)?;
             let pattern = parse_literal(pattern)?;
-            let Some(value) = pattern
+            // `LIKE '%text%'` stays the plain contains test it has always been.
+            let contained = pattern
                 .strip_prefix('%')
                 .and_then(|value| value.strip_suffix('%'))
-            else {
-                bail!("LIKE must use a contains pattern such as LIKE '%text%'");
-            };
-            if value.contains('%') || value.contains('_') {
-                bail!("LIKE supports only one leading and trailing % for contains matching");
-            }
-            Ok(SqlPredicate {
-                column: parse_column(expr)?,
-                op: FilterOp::Contains,
-                value: value.to_string(),
+                .filter(|value| !value.contains('%') && !value.contains('_'));
+            Ok(match (contained, negated) {
+                (Some(value), false) => SqlPredicate::compare(&column, FilterOp::Contains, value),
+                (_, false) => SqlPredicate::compare(&column, FilterOp::Like, pattern),
+                (_, true) => SqlPredicate::compare(&column, FilterOp::NotLike, pattern),
             })
         }
-        _ => bail!("WHERE must be one supported column predicate"),
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            ..
+        } => bail!("NOT is supported only as NOT IN, NOT BETWEEN, NOT LIKE and IS NOT NULL"),
+        _ => {
+            bail!("WHERE supports comparisons, IN, BETWEEN, LIKE and IS NULL, joined by AND and OR")
+        }
     }
 }
 
@@ -598,6 +698,80 @@ mod tests {
         let batches = execute("SELECT name FROM dataset LIMIT 2", source);
         assert_eq!(batches[0].schema().field(0).name(), "name");
         assert_eq!(batches[0].num_rows(), 2);
+    }
+
+    #[test]
+    fn combines_predicates_with_and_or_in_between_like_and_null_tests() {
+        let (_directory, source) = source();
+        let ids = |sql: &str| {
+            execute(sql, Arc::clone(&source))
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        // `name` is alpha for even ids and beta for odd ones; `enabled` is true for even.
+        for (predicate, expected) in [
+            ("id < 4 AND name = 'beta'", vec![1, 3]),
+            ("id = 1 OR id = 4099", vec![1, 4099]),
+            ("id = 0 OR id < 6 AND enabled = false", vec![0, 1, 3, 5]),
+            ("(id = 0 OR id < 6) AND enabled = false", vec![1, 3, 5]),
+            ("id IN (3, 1, 9999)", vec![1, 3]),
+            ("id < 5 AND id NOT IN (0, 2)", vec![1, 3, 4]),
+            ("id BETWEEN 1000 AND 1002", vec![1000, 1001, 1002]),
+            ("id NOT BETWEEN 2 AND 4097", vec![0, 1, 4098, 4099]),
+            ("id < 4 AND name LIKE 'al%'", vec![0, 2]),
+            ("id < 4 AND name LIKE '_et_'", vec![1, 3]),
+            ("id < 4 AND name NOT LIKE '%ph%'", vec![1, 3]),
+            ("id < 3 AND name IS NOT NULL", vec![0, 1, 2]),
+            ("name IS NULL", vec![]),
+        ] {
+            let sql = format!("SELECT id FROM dataset WHERE {predicate}");
+            assert_eq!(ids(&sql), expected, "{sql}");
+        }
+
+        // The filter also narrows aggregates and sorts.
+        let count = execute(
+            "SELECT COUNT(*) FROM dataset WHERE id < 100 AND enabled = true",
+            Arc::clone(&source),
+        );
+        assert_eq!(
+            parquet_reader::value::format_cell(count[0].column(0).as_ref(), 0),
+            "50"
+        );
+        assert_eq!(
+            ids("SELECT id FROM dataset WHERE id IN (7, 5, 6) ORDER BY id DESC"),
+            vec![7, 6, 5]
+        );
+
+        // `LIKE '%text%'` is still the plain contains test.
+        assert_eq!(
+            SqlAst::parse("SELECT id FROM dataset WHERE name LIKE '%ph%'")
+                .unwrap()
+                .predicate(),
+            Some(&SqlPredicate::compare("name", FilterOp::Contains, "ph"))
+        );
+        // More comparisons than the reader allows is a planning error, not a hang.
+        let many = (0..=parquet_reader::filter::MAX_FILTER_TERMS)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let error = SqlAst::parse(&format!("SELECT id FROM dataset WHERE id IN ({many})"))
+            .unwrap()
+            .to_logical_plan(Arc::clone(&source))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("the limit is 64"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -799,7 +973,13 @@ mod tests {
         for sql in [
             "SELECT FROM dataset",
             "SELECT id FROM other",
-            "SELECT id FROM dataset WHERE id = 1 AND enabled = true",
+            "SELECT id FROM dataset WHERE NOT (id = 1)",
+            "SELECT id FROM dataset WHERE NOT enabled",
+            "SELECT id FROM dataset WHERE id IN (SELECT id FROM dataset)",
+            "SELECT id FROM dataset WHERE name LIKE 'a!%' ESCAPE '!'",
+            "SELECT id FROM dataset WHERE name ILIKE 'a%'",
+            "SELECT id FROM dataset WHERE id + 1 = 2",
+            "SELECT id FROM dataset WHERE id BETWEEN name AND 3",
             "SELECT id FROM dataset ORDER BY id, enabled",
             "SELECT id FROM dataset LIMIT 1 OFFSET 1",
         ] {

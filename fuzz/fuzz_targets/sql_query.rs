@@ -31,7 +31,7 @@ fn check(data: &[u8]) {
     else {
         return;
     };
-    let never = || false;
+    let never = |_: u64| false;
     let batches = if let Some(aggregate) = plan.aggregate() {
         let budget = GroupBudget::new(1_000, 1024 * 1024).expect("budget");
         source

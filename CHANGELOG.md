@@ -7,6 +7,14 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Added
+- Filters can combine tests with `AND`, `OR` and brackets, in the filter box and in SQL `WHERE`.
+- New filter tests: `IN (…)`, `BETWEEN … AND …`, `LIKE` with `%` and `_`, `IS NULL`, and their `NOT` forms. The filter box also accepts `=` and `<>`.
+- Cell menu: "Add to filter" narrows the filter already applied instead of replacing it, and a null cell can be filtered to or away from nulls.
+
+### Changed
+- In the filter box, quote a value that contains `AND`, `OR`, a comma or brackets, e.g. `title == "war and peace"`. Unquoted, `and` / `or` now join two tests.
+
 ## [0.2.0] - 2026-11-10
 
 ### Added

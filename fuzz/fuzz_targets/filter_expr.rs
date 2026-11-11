@@ -25,14 +25,13 @@ fn check(data: &[u8]) {
     let Ok(filter) = FilterExpr::parse(text) else {
         return;
     };
-    let batch = batch();
-    if let Ok(column) = filter.column_index(&batch.schema()) {
-        let _ = filter.evaluate_batch(batch, column);
-    }
+    // Text written back from a parsed filter must parse again.
+    let _ = FilterExpr::parse(&filter.to_string());
+    let _ = filter.evaluate_batch(batch());
     let source = pavi_fuzz::fixture_source();
     if source.validate_filter(&filter).is_ok() {
         let projection = Projection::all(source.column_count());
-        if let Ok(window) = source.read_filtered_from(&filter, 0, 64, &projection, &|| false) {
+        if let Ok(window) = source.read_filtered_from(&filter, 0, 64, &projection, &|_| false) {
             pavi_fuzz::format_all(&window.batch);
         }
     }

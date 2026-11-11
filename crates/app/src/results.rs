@@ -42,6 +42,8 @@ pub(crate) struct FilteredGrid {
     /// The sort had no LIMIT, so PAVI added one: the result is the first
     /// `SORT_ROW_CAP` rows in sort order, not every row.
     pub(crate) sort_capped: bool,
+    /// The filter-box filter this result shows, kept so a cell menu can add to it.
+    pub(crate) filter: Option<parquet_reader::FilterExpr>,
     pub(crate) aggregate: bool,
     pub(crate) projected_columns: Vec<usize>,
     pub(crate) display_columns: Vec<(usize, usize)>,
@@ -68,6 +70,7 @@ impl FilteredGrid {
             plan,
             sort,
             sort_capped: false,
+            filter: None,
             aggregate,
             projected_columns,
             display_columns: Vec::new(),

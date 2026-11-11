@@ -279,7 +279,10 @@ impl PaviApp {
             }
         }
         response.on_hover_text(
-            "column == value, !=, contains, >, >=, <, <=\nEnter applies the filter (Ctrl+F)",
+            "column == value, !=, >, >=, <, <=, contains, LIKE a%\n\
+             column IN (a, b), BETWEEN a AND b, IS NULL; NOT IN / NOT LIKE / IS NOT NULL\n\
+             Join tests with AND and OR; group them with brackets\n\
+             Enter applies the filter (Ctrl+F)",
         );
     }
 

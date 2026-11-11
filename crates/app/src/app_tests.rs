@@ -856,7 +856,7 @@ fn cell_menu_filters_to_and_excludes_the_selected_value() {
     app.cell_action = Some(CellAction::FilterTo);
     app.apply_cell_action(&ctx);
     assert!(app.cell_action.is_none());
-    assert_eq!(app.filter_input, "name == \"alpha\"");
+    assert_eq!(app.filter_input, "name == alpha");
     poll_until_idle(&mut app);
     assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Filter);
     assert_eq!(filtered_ids(&app), vec!["0", "2", "4", "6"]);
@@ -917,6 +917,100 @@ fn chart_reset_only_reports_cleared_results_when_there_were_some() {
     chart.reset();
     assert!(chart.status.contains("cleared"));
     assert!(chart.error.is_none());
+}
+
+#[test]
+fn cell_menu_adds_to_the_active_filter_and_filters_null_cells() {
+    // id 0..6; name is null for id 2 and 5, otherwise alpha / beta by parity.
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("nullable.parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let names = (0..6).map(|id| match id {
+        2 | 5 => None,
+        id if id % 2 == 0 => Some("alpha"),
+        _ => Some("beta"),
+    });
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+    writer
+        .write(
+            &arrow_array::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..6)),
+                    Arc::new(StringArray::from_iter(names)),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    writer.close().unwrap();
+    let mut app =
+        PaviApp::new_with_store(None, SessionStore::new(path.with_extension("session.json")));
+    let ctx = egui::Context::default();
+    app.begin_open(path);
+    poll_until_opened(&mut app);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    let act = |app: &mut PaviApp, action: CellAction| {
+        app.cell_action = Some(action);
+        app.apply_cell_action(&ctx);
+        poll_until_idle(app);
+        filtered_ids(app)
+    };
+
+    // With no filter applied, "add" is a plain filter.
+    assert!(app.active_filter().is_none());
+    assert!(app.grid.select(1, 1));
+    assert_eq!(act(&mut app, CellAction::AndExclude), ["0", "4"]);
+    assert_eq!(app.filter_input, "name != beta");
+
+    // Adding narrows what is applied instead of replacing it.
+    assert!(app.grid.select_filtered(0, 1, 0));
+    assert_eq!(act(&mut app, CellAction::AndExclude), ["0"]);
+    assert_eq!(app.filter_input, "name != beta AND id != 4");
+    assert!(app.grid.select_filtered(0, 0, 1));
+    assert_eq!(act(&mut app, CellAction::AndFilterTo), ["0"]);
+    assert_eq!(
+        app.filter_input,
+        "name != beta AND id != 4 AND name == alpha"
+    );
+
+    // A sort keeps the filter, so adding still works on the sorted result.
+    app.sort_column(0, SortDirection::Descending);
+    poll_until_idle(&mut app);
+    assert!(app.active_filter().is_some());
+
+    // A null cell filters to, or away from, nulls.
+    app.clear_filter();
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    assert!(app.grid.select(2, 1));
+    assert_eq!(act(&mut app, CellAction::FilterTo), ["2", "5"]);
+    assert_eq!(app.filter_input, "name IS NULL");
+    app.clear_filter();
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    assert!(app.grid.select(2, 1));
+    assert_eq!(act(&mut app, CellAction::Exclude), ["0", "1", "3", "4"]);
+    assert_eq!(app.filter_input, "name IS NOT NULL");
+
+    // The filter box takes the whole grammar.
+    app.filter_input = "id IN (0, 1, 2, 3) AND (name IS NULL OR name LIKE b%)".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    assert!(app.filter_error.is_none(), "{:?}", app.filter_error);
+    assert_eq!(filtered_ids(&app), ["1", "2", "3"]);
+    app.filter_input = "id == 1 AND".to_string();
+    app.apply_filter();
+    assert!(
+        app.filter_error
+            .as_deref()
+            .is_some_and(|error| error.contains("both sides"))
+    );
 }
 
 #[test]
