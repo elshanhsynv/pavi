@@ -26,6 +26,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Comparisons in one filter | 64 (each `IN` value counts), 16 levels deep | `filter::MAX_FILTER_TERMS`, `MAX_FILTER_DEPTH` |
 | `LIKE` pattern | 256 characters | `filter::MAX_LIKE_PATTERN_CHARS` |
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |
+| Rows per scan reader (filter, sort and aggregate scans read consecutive row groups of one file with one reader; its dictionary pages are checked when it opens) | 1,048,576 rows | `SCAN_RUN_ROWS` in `crates/parquet/src/source.rs` |
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
 | Saved queries | 100, each ≤ 16 KB, names ≤ 80 characters | `session::MAX_SAVED_QUERIES`, `MAX_QUERY_BYTES`, `MAX_SAVED_NAME_CHARS` |

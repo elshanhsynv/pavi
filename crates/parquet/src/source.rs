@@ -47,6 +47,10 @@ use crate::{
 
 const BATCH_SIZE: usize = 4096;
 
+/// A scan stops adding row groups to one reader's run past this many rows, so the
+/// up-front dictionary checks of a run stay small when a filtered page ends early.
+const SCAN_RUN_ROWS: u64 = 1 << 20;
+
 /// Loads the footer and the Arrow schema.
 ///
 /// Writers may embed an Arrow schema (`ARROW:schema`) as a hint for exact Arrow types.
@@ -644,23 +648,11 @@ impl ParquetSource {
 
         let mut remaining = row_count;
         let mut batches = Vec::new();
-        for row_group in self.row_groups() {
-            if row_group.first_row + row_group.row_count <= start_row
-                || !self.row_group_might_match(filter, row_group)
-            {
-                continue;
-            }
-            // Only the row group containing `start_row` starts part-way through.
-            let skip = start_row.saturating_sub(row_group.first_row);
-            let selection = (skip > 0).then(|| {
-                RowSelection::from(vec![
-                    RowSelector::skip(skip as usize),
-                    RowSelector::select((row_group.row_count - skip) as usize),
-                ])
-            });
-            let (file, local) = self.locate(row_group.index)?;
-            let mut reader = self.reader_for(file, &read_projection, vec![local], selection)?;
-            let mut batch_first_row = row_group.first_row + skip;
+        let mut next_group = 0;
+        let keep = |row_group: &RowGroupInfo| self.row_group_might_match(filter, row_group);
+        while let Some(run) = self.next_scan_run(&mut next_group, start_row, &keep)? {
+            let (file, mut reader, mut batch_first_row) =
+                self.run_reader(&run, &read_projection, start_row)?;
             while let Some(batch) = reader.next().transpose()? {
                 if checkpoint(batch_first_row) {
                     return Err(Cancelled.into());
@@ -779,15 +771,12 @@ impl ParquetSource {
         let mut retained = Vec::new();
         let mut runs: Option<RunWriter> = None;
         let mut scanned_total = 0_u64;
-        for row_group in self.row_groups() {
-            if let Some(filter) = filter
-                && !self.row_group_might_match(filter, row_group)
-            {
-                continue;
-            }
-            let (file, local) = self.locate(row_group.index)?;
-            let mut reader = self.reader_for(file, &read_projection, vec![local], None)?;
-            let mut scanned = row_group.first_row;
+        let mut next_group = 0;
+        let keep = |row_group: &RowGroupInfo| {
+            filter.is_none_or(|filter| self.row_group_might_match(filter, row_group))
+        };
+        while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
+            let (file, mut reader, mut scanned) = self.run_reader(&run, &read_projection, 0)?;
             while let Some(batch) = reader.next().transpose()? {
                 if checkpoint(scanned) {
                     return Err(Cancelled.into());
@@ -932,15 +921,12 @@ impl ParquetSource {
             .collect::<Result<Vec<_>>>()?;
 
         let mut groups = GroupCollector::new(aggregate, &self.dataset_metadata.schema, budget)?;
-        for row_group in self.row_groups() {
-            if let Some(filter) = filter
-                && !self.row_group_might_match(filter, row_group)
-            {
-                continue;
-            }
-            let (file, local) = self.locate(row_group.index)?;
-            let mut reader = self.reader_for(file, &read_projection, vec![local], None)?;
-            let mut scanned = row_group.first_row;
+        let mut next_group = 0;
+        let keep = |row_group: &RowGroupInfo| {
+            filter.is_none_or(|filter| self.row_group_might_match(filter, row_group))
+        };
+        while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
+            let (file, mut reader, mut scanned) = self.run_reader(&run, &read_projection, 0)?;
             while let Some(batch) = reader.next().transpose()? {
                 if checkpoint(scanned) {
                     return Err(Cancelled.into());
@@ -1034,6 +1020,83 @@ impl ParquetSource {
             }
         }
         Ok(())
+    }
+
+    /// The next run of row groups a scan reads with one reader, searching from
+    /// `next_group` and advancing it: consecutive row groups of one file that end
+    /// after `start_row` and that `keep` accepts, up to [`SCAN_RUN_ROWS`] rows.
+    /// The run's rows are contiguous in the source, so a scan's position is the
+    /// run's first row plus the rows it has decoded.
+    fn next_scan_run(
+        &self,
+        next_group: &mut usize,
+        start_row: u64,
+        keep: &dyn Fn(&RowGroupInfo) -> bool,
+    ) -> Result<Option<ScanRun>> {
+        let row_groups = self.row_groups();
+        let mut run: Option<ScanRun> = None;
+        while let Some(row_group) = row_groups.get(*next_group) {
+            let (file, local) = self
+                .row_group_files
+                .get(row_group.index)
+                .copied()
+                .ok_or_else(|| anyhow!("row group {} out of range", row_group.index))?;
+            if let Some(run) = &run
+                && (file != run.file || run.row_count >= SCAN_RUN_ROWS)
+            {
+                break;
+            }
+            *next_group += 1;
+            let wanted = row_group.first_row + row_group.row_count > start_row && keep(row_group);
+            match (&mut run, wanted) {
+                (Some(run), true) => {
+                    run.local_row_groups.push(local);
+                    run.row_count += row_group.row_count;
+                }
+                // A skipped row group ends the run: the next one is not contiguous.
+                (Some(_), false) => break,
+                (None, true) => {
+                    run = Some(ScanRun {
+                        file,
+                        local_row_groups: vec![local],
+                        first_row: row_group.first_row,
+                        row_count: row_group.row_count,
+                    });
+                }
+                (None, false) => {}
+            }
+        }
+        Ok(run)
+    }
+
+    /// A reader over `run` from `start_row` on, with its file and the source row of
+    /// its first decoded row.
+    fn run_reader(
+        &self,
+        run: &ScanRun,
+        projection: &Projection,
+        start_row: u64,
+    ) -> Result<(
+        &SourceFile,
+        GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
+        u64,
+    )> {
+        let file = self
+            .files
+            .get(run.file)
+            .ok_or_else(|| anyhow!("file {} out of range", run.file))?;
+        // Only the run containing `start_row` starts part-way through.
+        let skip = start_row.saturating_sub(run.first_row).min(run.row_count);
+        let selection = if skip > 0 {
+            Some(RowSelection::from(vec![
+                RowSelector::skip(usize::try_from(skip)?),
+                RowSelector::select(usize::try_from(run.row_count - skip)?),
+            ]))
+        } else {
+            None
+        };
+        let reader = self.reader_for(file, projection, run.local_row_groups.clone(), selection)?;
+        Ok((file, reader, run.first_row + skip))
     }
 
     fn read_window_batches(
@@ -1319,6 +1382,16 @@ impl ParquetSource {
             &RecordBatchOptions::new().with_row_count(Some(rows)),
         )?)
     }
+}
+
+/// Consecutive row groups of one file that a scan reads with one reader.
+struct ScanRun {
+    /// Index into [`ParquetSource::files`].
+    file: usize,
+    local_row_groups: Vec<usize>,
+    /// Source row of the run's first row.
+    first_row: u64,
+    row_count: u64,
 }
 
 /// The error a long read returns when its `checkpoint` callback asks it to end early.
@@ -3238,6 +3311,123 @@ mod tests {
             .read_filtered_from(&filter, 15_000, 30_000, &projection, &record)
             .unwrap();
         assert!(seen.take().iter().all(|rows| *rows >= 15_000));
+    }
+
+    /// Every position a scan passes to `checkpoint`.
+    fn scan_positions(source: &ParquetSource, filter: Option<&str>) -> [Vec<u64>; 3] {
+        use std::cell::RefCell;
+
+        let seen = RefCell::new(Vec::new());
+        let record = |rows: u64| {
+            seen.borrow_mut().push(rows);
+            false
+        };
+        let filter = filter.map(|filter| FilterExpr::parse(filter).unwrap());
+        let projection = Projection::all(source.column_count());
+        let all = FilterExpr::parse("id >= 0").unwrap();
+        source
+            .read_filtered_from(
+                filter.as_ref().unwrap_or(&all),
+                0,
+                usize::MAX,
+                &projection,
+                &record,
+            )
+            .unwrap();
+        let filtered = seen.take();
+        source
+            .read_sorted_all(
+                filter.as_ref(),
+                &projection,
+                &[SortSpec::new(0, SortDirection::Descending, NullOrder::Last)],
+                SortBudget::default(),
+                None,
+                &record,
+            )
+            .unwrap();
+        let sorted = seen.take();
+        source
+            .read_aggregated(
+                filter.as_ref(),
+                &AggregateSpec::new(vec![AggregateExpr::sum(0)]).unwrap(),
+                GroupBudget::default(),
+                &record,
+            )
+            .unwrap();
+        [filtered, sorted, seen.take()]
+    }
+
+    #[test]
+    fn scans_report_exact_positions_across_row_group_runs() {
+        // Thirty 1,000-row groups read as one run: batches span row groups.
+        let (_directory, source) = numbered_file(30_000, 1_000);
+        assert_eq!(source.row_groups().len(), 30);
+        let every_batch = (0..30_000).step_by(BATCH_SIZE).collect::<Vec<u64>>();
+        for positions in scan_positions(&source, None) {
+            assert_eq!(positions, every_batch);
+        }
+
+        // Pruned row groups split the scan into runs that start at their own rows.
+        for positions in scan_positions(&source, Some("id < 3000 OR id >= 25500")) {
+            assert_eq!(positions, [0, 25_000, 29_096]);
+        }
+
+        // Each file of a folder is its own run.
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "a.parquet", 0..5_000, false);
+        write_ids(directory.path(), "b.parquet", 5_000..9_000, false);
+        let folder = ParquetSource::open(directory.path()).unwrap();
+        assert_eq!(folder.row_groups().len(), 5);
+        for positions in scan_positions(&folder, None) {
+            assert_eq!(positions, [0, 4_096, 5_000]);
+        }
+        for positions in scan_positions(&folder, Some("id >= 4500")) {
+            assert_eq!(positions, [4_096, 5_000]);
+        }
+    }
+
+    #[test]
+    fn resume_cursors_stay_exact_across_row_group_runs() {
+        let (_directory, source) = numbered_file(30_000, 1_000);
+        let projection = Projection::columns(vec![0], 2).unwrap();
+        let filter = FilterExpr::parse("bucket == 3").unwrap();
+        let expected = (0..30_000).filter(|id| id % 7 == 3).collect::<Vec<_>>();
+
+        // Pages end in the middle of runs and batches; each resumes after its last match.
+        let mut seen = Vec::new();
+        let mut next_row = 0;
+        while next_row < source.row_count() {
+            let window = source
+                .read_filtered_from(&filter, next_row, 333, &projection, &|_| false)
+                .unwrap();
+            let page = ids(&window.batch);
+            if let Some(last) = page.last()
+                && window.next_row < source.row_count()
+            {
+                assert_eq!(window.next_row, *last as u64 + 1);
+            }
+            seen.extend(page);
+            next_row = window.next_row;
+        }
+        assert_eq!(seen, expected);
+
+        // Starting inside a row group and inside a batch of a later run.
+        let middle = source
+            .read_filtered_from(&filter, 15_001, 2, &projection, &|_| false)
+            .unwrap();
+        assert_eq!(ids(&middle.batch), [15_004, 15_011]);
+        assert_eq!(middle.next_row, 15_012);
+        let split = FilterExpr::parse("id < 3000 OR id >= 25500").unwrap();
+        let after_gap = source
+            .read_filtered_from(&split, 2_999, 3, &projection, &|_| false)
+            .unwrap();
+        assert_eq!(ids(&after_gap.batch), [2_999, 25_500, 25_501]);
+        assert_eq!(after_gap.next_row, 25_502);
+        let resumed = source
+            .read_filtered_from(&split, 26_000, 2, &projection, &|_| false)
+            .unwrap();
+        assert_eq!(ids(&resumed.batch), [26_000, 26_001]);
+        assert_eq!(resumed.next_row, 26_002);
     }
 
     #[test]
