@@ -3,8 +3,8 @@
 > Part of the [architecture docs](../ARCHITECTURE.md). `file:line` references can drift; search for the symbol name if a line doesn't match.
 
 ## File system
-- One local file per session, by path (`File::open`). No globbing, directories, multi-file datasets, URLs or object storage.
-- The file is **re-opened by path for every read** (`source.rs:670-671`); metadata is cached from open time. If the file changes on disk, reads use stale metadata against new bytes.
+- Local files and folders, by path, up to 16 open at once in tabs (`MAX_TABS`). A folder is one table of every `.parquet` file below it (ADR 0006, `parquet_reader::dataset`): searched in path order, skipping names that start with `.` or `_`, at most 16 folder levels (`MAX_FOLDER_DEPTH`), 100,000 directory entries (`MAX_FOLDER_ENTRIES`), 4,096 files (`MAX_DATASET_FILES`) and 256 MB of footer metadata (`MAX_DATASET_METADATA_BYTES`). All files must have the same column names and types; `key=value` folders become partition columns (`Int64` if every value is an integer, else `Utf8`). Symbolic links are followed, within the depth limit. No globbing, URLs or object storage.
+- Each file is **re-opened by path for every read** (a read that crosses files opens each) (`source.rs:670-671`); metadata is cached from open time. If the file changes on disk, reads use stale metadata against new bytes.
 - Writes: export target (+ temp file next to it) and the session JSON.
 
 ## Parquet/Arrow features

@@ -30,6 +30,9 @@ Each budget is a named constant. Change it in one place and update this table.
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
 | Saved queries | 100, each ≤ 16 KB, names ≤ 80 characters | `session::MAX_SAVED_QUERIES`, `MAX_QUERY_BYTES`, `MAX_SAVED_NAME_CHARS` |
 | SQL completions shown | 8 | `sql_editor::MAX_SUGGESTIONS` |
+| Open tabs | 16; each parked tab keeps its own bounded pages, result window and footer metadata, so the per-dataset budgets above apply per tab | `tabs::MAX_TABS` (= `session::MAX_OPEN_FILES`) |
+| Folder dataset search (ADR 0006) | 4,096 files, 16 folder levels, 100,000 directory entries looked at | `dataset::MAX_DATASET_FILES`, `MAX_FOLDER_DEPTH`, `MAX_FOLDER_ENTRIES` |
+| Folder dataset footers in memory | 256 MB for all files together | `dataset::MAX_DATASET_METADATA_BYTES` |
 
 ## Responsiveness rules
 

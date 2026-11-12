@@ -1,3 +1,5 @@
+#[path = "tabs.rs"]
+mod tabs;
 #[path = "ui/mod.rs"]
 mod ui;
 
@@ -52,6 +54,12 @@ struct Dataset {
 
 pub(crate) struct PaviApp {
     runtime: Option<Runtime>,
+    /// Identifies the open tab; its widgets' state (scroll positions) is kept
+    /// under this id. The fields from here to `workspace` belong to the open tab
+    /// and are swapped with a parked one when another tab is shown (`tabs.rs`).
+    tab_id: u64,
+    /// The other tabs, parked.
+    tabs: tabs::Tabs,
     grid: GridState,
     dataset: Option<Dataset>,
     opening: Option<OpenTask>,
@@ -195,11 +203,14 @@ impl PaviApp {
     fn new_with_store(initial_path: Option<PathBuf>, session_store: SessionStore) -> Self {
         let runtime = Runtime::new(RuntimeConfig::default());
         let session = session_store.load();
+        let initial_path_given = initial_path.clone();
         let reopened_path = initial_path.or_else(|| session.last_opened_file.clone());
         let show_inspector = session.preferences.inspector_visible;
         let chart_visible = session.preferences.chart_visible;
         let mut app = Self {
             runtime: runtime.ok(),
+            tab_id: 0,
+            tabs: tabs::Tabs::default(),
             grid: GridState::default(),
             dataset: None,
             opening: None,
@@ -246,6 +257,17 @@ impl PaviApp {
         if app.runtime.is_none() {
             app.grid.loading = LoadState::Error("start background runtime".to_string());
             app.status = "Unable to start the background runtime".to_string();
+        } else if let Some(path) = initial_path_given {
+            app.begin_open(path);
+        } else if !app.session.open_files.is_empty() {
+            // The tabs open when the app was last closed.
+            let (paths, active) = (app.session.open_files.clone(), app.session.active_file);
+            for (index, path) in paths.into_iter().enumerate() {
+                if index == 0 || app.new_tab() {
+                    app.begin_open(path);
+                }
+            }
+            app.switch_tab(active);
         } else if let Some(path) = reopened_path {
             app.begin_open(path);
         }
@@ -253,6 +275,9 @@ impl PaviApp {
     }
 
     fn persist_session(&mut self) {
+        let (open_files, active_file) = self.open_tab_paths();
+        self.session.open_files = open_files;
+        self.session.active_file = active_file;
         self.session.sql_input = self.sql_input.clone();
         self.session.preferences.inspector_visible = self.show_inspector;
         self.session.preferences.chart_visible = self.chart.visible;
@@ -336,12 +361,31 @@ impl PaviApp {
         if !command {
             return;
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::O))
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("Parquet", &["parquet"])
-                .pick_file()
-        {
-            self.begin_open(path);
+        if find_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::O,
+        ) {
+            self.pick_folder();
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::O)) {
+            self.pick_file();
+        }
+        if find_key(egui::Modifiers::COMMAND, egui::Key::T) {
+            self.new_tab();
+        }
+        if find_key(egui::Modifiers::COMMAND, egui::Key::W) {
+            self.close_tab(self.tabs.active);
+        }
+        if self.tab_count() > 1 {
+            let count = self.tab_count();
+            if find_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            ) {
+                self.switch_tab((self.tabs.active + count - 1) % count);
+            } else if find_key(egui::Modifiers::COMMAND, egui::Key::Tab) {
+                self.switch_tab((self.tabs.active + 1) % count);
+            }
         }
         if ctx.input(|input| input.key_pressed(egui::Key::Num1)) {
             self.workspace = Workspace::Grid;
@@ -371,17 +415,19 @@ impl PaviApp {
         }
     }
 
-    /// Opens the first file dropped on the window.
-    fn open_dropped_file(&mut self, ctx: &egui::Context) {
+    /// Opens each file or folder dropped on the window, in its own tab.
+    fn open_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
-                .first()
-                .and_then(|file| file.path.clone())
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .take(tabs::MAX_TABS)
+                .collect::<Vec<_>>()
         });
-        if let Some(path) = dropped {
-            self.begin_open(path);
+        for path in dropped {
+            self.open_path(path);
         }
     }
 
@@ -558,17 +604,7 @@ impl PaviApp {
         // One spelling per file, so a relative and an absolute path to the same
         // file do not become two recent entries. This does not touch the disk.
         let path = std::path::absolute(&path).unwrap_or(path);
-        if let Some(task) = &self.opening {
-            task.cancel();
-        }
-        self.opening = None;
-        self.opening_path = None;
-        self.cancel_page_work();
-        self.cancel_export();
-        self.record_sql_history(false, None);
-        self.cancel_filter();
-        self.chart.reset();
-        self.profile.reset();
+        self.cancel_tab_work();
         self.show_safe_full_selection = false;
         self.show_nested_selection = false;
         self.workspace = Workspace::Grid;
@@ -641,10 +677,19 @@ impl PaviApp {
                         .cloned()
                         .unwrap_or_default();
                 }
+                let files = self
+                    .dataset
+                    .as_ref()
+                    .filter(|dataset| dataset.source.is_folder())
+                    .map(|dataset| match dataset.source.file_count() {
+                        1 => " from 1 file".to_string(),
+                        count => format!(" from {count} files"),
+                    })
+                    .unwrap_or_default();
                 self.status = if rows == 0 {
-                    "Opened empty dataset".to_string()
+                    format!("Opened empty dataset{files}")
                 } else {
-                    format!("Ready: {rows} rows × {columns} columns")
+                    format!("Ready: {rows} rows × {columns} columns{files}")
                 };
             }
             OpenOutcome::Cancelled => self.status = "File open cancelled".to_string(),
@@ -2008,7 +2053,7 @@ impl eframe::App for PaviApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pages.begin_frame();
         self.handle_global_shortcuts(ctx);
-        self.open_dropped_file(ctx);
+        self.open_dropped_files(ctx);
         self.poll_open();
         if self.filtered.is_none()
             && let Some(status) = self.pages.poll(&mut self.grid)
@@ -2055,9 +2100,12 @@ impl eframe::App for PaviApp {
         self.show_inspector_panel(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(ui::theme::BACKGROUND))
-            .show(ctx, |ui| match self.workspace {
-                Workspace::Grid => self.show_grid(ui),
-                Workspace::Sql => self.show_sql_workspace(ui),
+            .show(ctx, |ui| {
+                // Each tab keeps its own scroll positions.
+                ui.push_id(("tab", self.tab_id), |ui| match self.workspace {
+                    Workspace::Grid => self.show_grid(ui),
+                    Workspace::Sql => self.show_sql_workspace(ui),
+                });
             });
 
         if self.opening.is_some()

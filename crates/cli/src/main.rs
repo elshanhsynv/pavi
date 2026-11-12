@@ -15,6 +15,13 @@ fn main() -> anyhow::Result<()> {
     let parquet = ParquetSource::open(&args.file)?;
     let projection = parse_columns(args.columns.as_deref(), parquet.column_count())?;
 
+    if parquet.is_folder() {
+        println!("Files: {}", parquet.file_count());
+        let partitions = parquet.partition_column_names();
+        if !partitions.is_empty() {
+            println!("Partitions: {}", partitions.join(", "));
+        }
+    }
     println!("Rows: {}", parquet.row_count());
     println!("Columns: {}", parquet.column_count());
     println!("Row groups: {}", parquet.row_groups().len());

@@ -225,21 +225,33 @@ impl PaviApp {
             }
         });
 
-        widgets::section(ui, "File", "", true, |ui| {
+        let folder = dataset.source.is_folder();
+        widgets::section(ui, if folder { "Folder" } else { "File" }, "", true, |ui| {
             let file = dataset
                 .path
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy();
             widgets::detail(ui, "Name", file.to_string());
-            widgets::detail(ui, "Folder", {
+            widgets::detail(ui, if folder { "In" } else { "Folder" }, {
                 dataset
                     .path
                     .parent()
                     .map(|parent| parent.display().to_string())
                     .unwrap_or_default()
             });
-            widgets::detail(ui, "Size", format_bytes(dataset.source.file_info().len()));
+            if folder {
+                widgets::detail(
+                    ui,
+                    "Files",
+                    theme::number(dataset.source.file_count() as u64),
+                );
+                let partitions = dataset.source.partition_column_names();
+                if !partitions.is_empty() {
+                    widgets::detail(ui, "Partitions", partitions.join(", "));
+                }
+            }
+            widgets::detail(ui, "Size", format_bytes(dataset.source.total_bytes()));
             widgets::detail(ui, "Rows", theme::number(metadata.row_count));
             widgets::detail(ui, "Columns", metadata.column_count.to_string());
             widgets::detail(ui, "Row groups", metadata.row_groups.len().to_string());

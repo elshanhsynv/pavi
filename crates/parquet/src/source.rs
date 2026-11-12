@@ -11,10 +11,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
     Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
-    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    LargeStringArray, RecordBatch, RecordBatchOptions, StringArray, StringViewArray,
+    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::{concat::concat_batches, filter::filter_record_batch};
@@ -25,13 +25,17 @@ use parquet::arrow::{
         RowSelector,
     },
 };
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::{metadata::ParquetMetaData, statistics::Statistics};
 
 use crate::{
     AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
     PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo, RowWindow,
     SortBudget, SortSpec,
+    dataset::{
+        self, MAX_DATASET_METADATA_BYTES, PartitionColumn, constant_array, partition_statistics,
+    },
     filter::FilterExpr,
+    metadata::ColumnStatistics,
     page::PAGE_ROWS,
     sort::validate_sort_keys,
     spill::{RunWriter, SortKeys, SortMerge},
@@ -176,61 +180,313 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or("decoder panicked")
 }
 
+/// One Parquet file of a source: the only file, or one file of a folder dataset.
+struct SourceFile {
+    path: PathBuf,
+    bytes: u64,
+    metadata: Arc<ParquetMetaData>,
+    arrow_metadata: ArrowReaderMetadata,
+    /// The Parquet leaf column of each file column; `None` when nested.
+    leaf_columns: Vec<Option<usize>>,
+    /// Source-wide index of this file's first row group.
+    first_row_group: usize,
+    /// This file's value of each partition column.
+    partition_values: Vec<Option<String>>,
+    /// Per row group of this file, statistics of each partition column.
+    partition_statistics: Vec<Vec<Statistics>>,
+}
+
+/// A Parquet file, or a folder of Parquet files read as one table (ADR 0006).
+///
+/// Row groups are numbered across all files, in file order; columns are the files'
+/// columns followed by the partition columns taken from `key=value` folder names.
 pub struct ParquetSource {
     path: PathBuf,
     file_info: std::fs::Metadata,
     compression: String,
     dataset_metadata: DatasetMetadata,
-    metadata: Arc<ParquetMetaData>,
-    arrow_metadata: ArrowReaderMetadata,
+    files: Vec<SourceFile>,
+    /// For each row group: its file and its index within that file.
+    row_group_files: Vec<(usize, usize)>,
+    /// Columns stored in the files; partition columns come after them.
+    file_columns: usize,
+    partition_columns: Vec<PartitionColumn>,
     cache: Mutex<PageCache>,
     /// `(row group, leaf column)` chunks whose dictionary page header passed
     /// [`ParquetSource::check_dictionary_pages`].
     checked_dictionaries: Mutex<HashSet<(usize, usize)>>,
-    /// The Parquet leaf column of each top-level column; `None` when nested.
-    leaf_columns: Vec<Option<usize>>,
+}
+
+/// Reads one file's footer.
+fn open_file(path: &Path) -> Result<(u64, ArrowReaderMetadata)> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let bytes = file.metadata().context("read file properties")?.len();
+    crate::footer::check_footer(&file)
+        .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
+    let arrow_metadata = load_arrow_metadata(&file)
+        .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
+    Ok((bytes, arrow_metadata))
 }
 
 impl ParquetSource {
+    /// Opens a Parquet file, or every Parquet file in a folder as one table.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_cancellable(path, &|| false)
+    }
+
+    /// Like [`Self::open`]; a folder is opened file by file, and when `cancelled`
+    /// returns `true` between files the open ends with a [`Cancelled`] error.
+    pub fn open_cancellable(path: impl AsRef<Path>, cancelled: &dyn Fn() -> bool) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let file_info = file.metadata().context("read file properties")?;
-        crate::footer::check_footer(&file)
-            .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
-        let arrow_metadata = load_arrow_metadata(&file)
-            .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
-        let schema = arrow_metadata.schema().clone();
-        let metadata = arrow_metadata.metadata().clone();
-        let codecs = metadata
-            .row_groups()
+        let file_info =
+            std::fs::metadata(&path).with_context(|| format!("open {}", path.display()))?;
+        if !file_info.is_dir() {
+            let (bytes, arrow_metadata) = open_file(&path)?;
+            return Self::from_files(
+                path.clone(),
+                file_info,
+                vec![(path, bytes, arrow_metadata, Vec::new())],
+                Vec::new(),
+            );
+        }
+        let found = dataset::find_files(&path, cancelled)?;
+        let partition_columns = dataset::partition_columns(&found);
+        let mut files = Vec::with_capacity(found.len());
+        let mut metadata_bytes = 0_usize;
+        for file in found {
+            if cancelled() {
+                return Err(Cancelled.into());
+            }
+            let (bytes, arrow_metadata) = open_file(&file.path)?;
+            metadata_bytes = metadata_bytes.saturating_add(arrow_metadata.metadata().memory_size());
+            if metadata_bytes > MAX_DATASET_METADATA_BYTES {
+                bail!(
+                    "the footers of this folder's files need more than {} MB of memory; \
+                     open a smaller folder",
+                    MAX_DATASET_METADATA_BYTES / (1024 * 1024)
+                );
+            }
+            let values = file
+                .partitions
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect();
+            files.push((file.path, bytes, arrow_metadata, values));
+        }
+        Self::from_files(path, file_info, files, partition_columns)
+    }
+
+    /// Builds the source from opened files, which must have the same columns.
+    fn from_files(
+        path: PathBuf,
+        file_info: std::fs::Metadata,
+        opened: Vec<(PathBuf, u64, ArrowReaderMetadata, Vec<Option<String>>)>,
+        partition_columns: Vec<PartitionColumn>,
+    ) -> Result<Self> {
+        let Some((first_path, _, first_metadata, _)) = opened.first() else {
+            bail!("{} holds no Parquet files", path.display());
+        };
+        let first_schema = first_metadata.schema().clone();
+        // A column is nullable when it is in any file.
+        let mut fields = first_schema
+            .fields()
             .iter()
-            .flat_map(|group| group.columns())
-            .map(|column| column.compression().to_string())
-            .collect::<std::collections::BTreeSet<_>>();
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        for (other_path, _, other, _) in &opened[1..] {
+            let other_fields = other.schema().fields();
+            let mismatch = if other_fields.len() != fields.len() {
+                Some(format!(
+                    "it has {} columns, not {}",
+                    other_fields.len(),
+                    fields.len()
+                ))
+            } else {
+                fields
+                    .iter()
+                    .zip(other_fields.iter())
+                    .find_map(|(field, other)| {
+                        if field.name() != other.name() {
+                            Some(format!(
+                                "it has column {} where the first file has {}",
+                                other.name(),
+                                field.name()
+                            ))
+                        } else if field.data_type() != other.data_type() {
+                            Some(format!(
+                                "its column {} is {} there but {} here",
+                                field.name(),
+                                field.data_type(),
+                                other.data_type()
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+            };
+            if let Some(mismatch) = mismatch {
+                bail!(
+                    "{} does not have the same columns as {}: {mismatch}",
+                    other_path.display(),
+                    first_path.display()
+                );
+            }
+            for (field, other) in fields.iter_mut().zip(other_fields.iter()) {
+                if other.is_nullable() && !field.is_nullable() {
+                    *field = field.clone().with_nullable(true);
+                }
+            }
+        }
+        let file_columns = fields.len();
+        let file_schema =
+            Schema::new_with_metadata(fields.clone(), first_schema.metadata().clone());
+        // A partition key the files also store as a column (Polars writes both) is
+        // read from the files; its folders add no column.
+        let keep = partition_columns
+            .iter()
+            .map(|column| !fields.iter().any(|field| field.name() == &column.name))
+            .collect::<Vec<_>>();
+        let partition_columns = partition_columns
+            .into_iter()
+            .zip(&keep)
+            .filter_map(|(column, keep)| keep.then_some(column))
+            .collect::<Vec<_>>();
+        for column in &partition_columns {
+            fields.push(Field::new(
+                column.name.clone(),
+                column.data_type.clone(),
+                true,
+            ));
+        }
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            first_schema.metadata().clone(),
+        ));
+
+        let mut codecs = std::collections::BTreeSet::new();
+        let mut row_group_counts = Vec::new();
+        let mut row_group_files = Vec::new();
+        let mut statistics = vec![Vec::new(); schema.fields().len()];
+        let mut files = Vec::with_capacity(opened.len());
+        for (index, (file_path, bytes, arrow_metadata, partition_values)) in
+            opened.into_iter().enumerate()
+        {
+            let partition_values = partition_values
+                .into_iter()
+                .zip(&keep)
+                .filter_map(|(value, keep)| keep.then_some(value))
+                .collect::<Vec<_>>();
+            let metadata = arrow_metadata.metadata().clone();
+            codecs.extend(
+                metadata
+                    .row_groups()
+                    .iter()
+                    .flat_map(|group| group.columns())
+                    .map(|column| column.compression().to_string()),
+            );
+            let first_row_group = row_group_counts.len();
+            let mut partition_stats = Vec::with_capacity(metadata.num_row_groups());
+            for local in 0..metadata.num_row_groups() {
+                let rows = metadata.row_group(local).num_rows().max(0) as u64;
+                row_group_counts.push(rows);
+                row_group_files.push((index, local));
+                partition_stats.push(
+                    partition_columns
+                        .iter()
+                        .zip(&partition_values)
+                        .map(|(column, value)| {
+                            partition_statistics(&column.data_type, value.as_deref(), rows)
+                        })
+                        .collect(),
+                );
+                for (offset, value) in partition_values.iter().enumerate() {
+                    statistics[file_columns + offset].push(Some(ColumnStatistics {
+                        min: value.clone(),
+                        max: value.clone(),
+                        null_count: Some(if value.is_some() { 0 } else { rows }),
+                        distinct_count: Some(u64::from(value.is_some())),
+                    }));
+                }
+            }
+            for (column, file_statistics) in metadata_statistics(&metadata, &file_schema)
+                .into_iter()
+                .enumerate()
+            {
+                statistics[column].extend(file_statistics);
+            }
+            files.push(SourceFile {
+                path: file_path,
+                bytes,
+                leaf_columns: leaf_columns(&metadata, file_columns),
+                metadata,
+                arrow_metadata,
+                first_row_group,
+                partition_values,
+                partition_statistics: partition_stats,
+            });
+        }
         let compression = if codecs.is_empty() {
             "Unavailable".to_string()
         } else {
             codecs.into_iter().collect::<Vec<_>>().join(", ")
         };
-        let row_group_counts =
-            (0..metadata.num_row_groups()).map(|index| metadata.row_group(index).num_rows() as u64);
-        let dataset_metadata = DatasetMetadata::new(schema.clone(), row_group_counts)
+        let dataset_metadata = DatasetMetadata::new(schema, row_group_counts)
             .with_context(|| format!("build row-group index for {}", path.display()))?
-            .with_column_statistics(metadata_statistics(&metadata, &schema));
-
-        let leaf_columns = leaf_columns(&metadata, schema.fields().len());
+            .with_column_statistics(statistics);
         Ok(Self {
             path,
             file_info,
             compression,
             dataset_metadata,
-            metadata,
-            arrow_metadata,
+            files,
+            row_group_files,
+            file_columns,
+            partition_columns,
             cache: Mutex::new(PageCache::default()),
             checked_dictionaries: Mutex::new(HashSet::new()),
-            leaf_columns,
         })
+    }
+
+    /// The file or folder this source was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `true` when this source is a folder of files.
+    pub fn is_folder(&self) -> bool {
+        self.file_info.is_dir()
+    }
+
+    /// How many Parquet files the source reads.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Size of all its Parquet files together.
+    pub fn total_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.bytes).sum()
+    }
+
+    /// Names of the columns made from `key=value` folders, in column order.
+    pub fn partition_column_names(&self) -> Vec<&str> {
+        self.partition_columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect()
+    }
+
+    /// The file holding source row group `row_group`, and its index in that file.
+    fn locate(&self, row_group: usize) -> Result<(&SourceFile, usize)> {
+        let (file, local) = self
+            .row_group_files
+            .get(row_group)
+            .copied()
+            .ok_or_else(|| anyhow!("row group {row_group} out of range"))?;
+        let file = self
+            .files
+            .get(file)
+            .ok_or_else(|| anyhow!("file {file} out of range"))?;
+        Ok((file, local))
     }
 
     pub fn metadata(&self) -> &DatasetMetadata {
@@ -402,13 +658,14 @@ impl ParquetSource {
                     RowSelector::select((row_group.row_count - skip) as usize),
                 ])
             });
-            let mut reader = self.reader_for(&read_projection, vec![row_group.index], selection)?;
+            let (file, local) = self.locate(row_group.index)?;
+            let mut reader = self.reader_for(file, &read_projection, vec![local], selection)?;
             let mut batch_first_row = row_group.first_row + skip;
             while let Some(batch) = reader.next().transpose()? {
                 if checkpoint(batch_first_row) {
                     return Err(Cancelled.into());
                 }
-                let batch = self.reorder_batch(batch, &read_projection)?;
+                let batch = self.reorder_batch(batch, &read_projection, file)?;
                 let batch_rows = batch.num_rows() as u64;
                 let mask = self.evaluate_filter(filter, &batch, &read_projection)?;
                 let matches = mask.true_count();
@@ -528,7 +785,8 @@ impl ParquetSource {
             {
                 continue;
             }
-            let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
+            let (file, local) = self.locate(row_group.index)?;
+            let mut reader = self.reader_for(file, &read_projection, vec![local], None)?;
             let mut scanned = row_group.first_row;
             while let Some(batch) = reader.next().transpose()? {
                 if checkpoint(scanned) {
@@ -536,7 +794,7 @@ impl ParquetSource {
                 }
                 scanned += batch.num_rows() as u64;
                 scanned_total = scanned;
-                let batch = self.reorder_batch(batch, &read_projection)?;
+                let batch = self.reorder_batch(batch, &read_projection, file)?;
                 let batch = match filter {
                     Some(filter) => filter_record_batch(
                         &batch,
@@ -680,14 +938,15 @@ impl ParquetSource {
             {
                 continue;
             }
-            let mut reader = self.reader_for(&read_projection, vec![row_group.index], None)?;
+            let (file, local) = self.locate(row_group.index)?;
+            let mut reader = self.reader_for(file, &read_projection, vec![local], None)?;
             let mut scanned = row_group.first_row;
             while let Some(batch) = reader.next().transpose()? {
                 if checkpoint(scanned) {
                     return Err(Cancelled.into());
                 }
                 scanned += batch.num_rows() as u64;
-                let batch = self.reorder_batch(batch, &read_projection)?;
+                let batch = self.reorder_batch(batch, &read_projection, file)?;
                 let batch = match filter {
                     Some(filter) => filter_record_batch(
                         &batch,
@@ -800,46 +1059,100 @@ impl ParquetSource {
             return Ok(Vec::new());
         }
 
-        let first_selected_row = row_group_indexes
-            .first()
-            .and_then(|index| self.row_groups().get(*index))
-            .map(|group| group.first_row)
-            .ok_or_else(|| anyhow!("no selected row groups"))?;
-        let skip_before = usize::try_from(first_row - first_selected_row)?;
-        let mut selectors = Vec::new();
-        if skip_before > 0 {
-            selectors.push(RowSelector::skip(skip_before));
-        }
-        selectors.push(RowSelector::select(row_count));
-
-        let mut reader = self.reader_for(
-            projection,
-            row_group_indexes,
-            Some(RowSelection::from(selectors)),
-        )?;
+        let end_row = first_row + row_count as u64;
         let mut batches = Vec::new();
+        // Consecutive row groups of one file are read with one reader.
+        let mut start = 0;
+        while start < row_group_indexes.len() {
+            let file_index = self
+                .row_group_files
+                .get(row_group_indexes[start])
+                .map(|(file, _)| *file);
+            let end = start
+                + row_group_indexes[start..]
+                    .iter()
+                    .take_while(|index| {
+                        self.row_group_files.get(**index).map(|(file, _)| *file) == file_index
+                    })
+                    .count();
+            let groups = &row_group_indexes[start..end.max(start + 1)];
+            start = end.max(start + 1);
 
-        while let Some(batch) = reader.next().transpose()? {
-            if batch.num_rows() > 0 {
-                batches.push(self.reorder_batch(batch, projection)?);
+            let (first_group, last_group) = match (groups.first(), groups.last()) {
+                (Some(first), Some(last)) => (
+                    self.row_groups()
+                        .get(*first)
+                        .ok_or_else(|| anyhow!("row group {first} out of range"))?,
+                    self.row_groups()
+                        .get(*last)
+                        .ok_or_else(|| anyhow!("row group {last} out of range"))?,
+                ),
+                _ => continue,
+            };
+            let chunk_start = first_group.first_row;
+            let chunk_end = last_group.first_row + last_group.row_count;
+            let select_from = first_row.max(chunk_start);
+            let select_to = end_row.min(chunk_end);
+            if select_to <= select_from {
+                continue;
+            }
+            let mut selectors = Vec::new();
+            let skip_before = usize::try_from(select_from - chunk_start)?;
+            if skip_before > 0 {
+                selectors.push(RowSelector::skip(skip_before));
+            }
+            selectors.push(RowSelector::select(usize::try_from(
+                select_to - select_from,
+            )?));
+
+            let (file, _) = self.locate(groups[0])?;
+            let local = groups
+                .iter()
+                .map(|group| self.locate(*group).map(|(_, local)| local))
+                .collect::<Result<Vec<_>>>()?;
+            let mut reader =
+                self.reader_for(file, projection, local, Some(RowSelection::from(selectors)))?;
+            while let Some(batch) = reader.next().transpose()? {
+                if batch.num_rows() > 0 {
+                    batches.push(self.reorder_batch(batch, projection, file)?);
+                }
             }
         }
 
         Ok(batches)
     }
 
+    /// The file columns decoded for `projection`, in file order. Partition columns
+    /// are not stored; when only they are wanted, the first column is decoded so
+    /// batches still carry their row counts.
+    fn decoded_columns(&self, projection: &Projection) -> Vec<usize> {
+        let mut columns = projection
+            .parquet_columns()
+            .into_iter()
+            .filter(|column| *column < self.file_columns)
+            .collect::<Vec<_>>();
+        if columns.is_empty() && self.file_columns > 0 {
+            columns.push(0);
+        }
+        columns
+    }
+
+    /// A reader over `row_groups` (indexes within `source_file`).
     fn reader_for(
         &self,
+        source_file: &SourceFile,
         projection: &Projection,
         row_groups: Vec<usize>,
         selection: Option<RowSelection>,
     ) -> Result<GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
-        let file =
-            File::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
-        let parquet_columns = projection.parquet_columns();
-        self.check_dictionary_pages(&file, &parquet_columns, &row_groups)?;
-        let builder =
-            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.arrow_metadata.clone());
+        let file = File::open(&source_file.path)
+            .with_context(|| format!("open {}", source_file.path.display()))?;
+        let parquet_columns = self.decoded_columns(projection);
+        self.check_dictionary_pages(&file, source_file, &parquet_columns, &row_groups)?;
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            file,
+            source_file.arrow_metadata.clone(),
+        );
         let projection = ProjectionMask::roots(builder.parquet_schema(), parquet_columns);
         let mut builder = builder
             .with_batch_size(BATCH_SIZE)
@@ -861,19 +1174,20 @@ impl ParquetSource {
     fn check_dictionary_pages(
         &self,
         file: &File,
+        source_file: &SourceFile,
         root_columns: &[usize],
         row_groups: &[usize],
     ) -> Result<()> {
-        let schema = self.metadata.file_metadata().schema_descr();
+        let schema = source_file.metadata.file_metadata().schema_descr();
         let leaves: Vec<usize> = (0..schema.num_columns())
             .filter(|&leaf| root_columns.contains(&schema.get_column_root_idx(leaf)))
             .collect();
         for &group in row_groups {
-            let Some(row_group) = self.metadata.row_groups().get(group) else {
+            let Some(row_group) = source_file.metadata.row_groups().get(group) else {
                 continue;
             };
             for &leaf in &leaves {
-                let key = (group, leaf);
+                let key = (source_file.first_row_group + group, leaf);
                 let already = self
                     .checked_dictionaries
                     .lock()
@@ -915,13 +1229,25 @@ impl ParquetSource {
     /// `false` only when the row group's statistics prove no row can pass `filter`.
     fn row_group_might_match(&self, filter: &FilterExpr, row_group: &RowGroupInfo) -> bool {
         let schema = &self.dataset_metadata.schema;
-        let chunks = self.metadata.row_group(row_group.index).columns();
+        let Ok((file, local)) = self.locate(row_group.index) else {
+            return true;
+        };
+        let chunks = file.metadata.row_group(local).columns();
         filter.might_match(schema, &|column| {
+            let data_type = schema.fields().get(column)?.data_type();
+            if column >= self.file_columns {
+                // Every row of the file holds its folder's value.
+                let statistics = file
+                    .partition_statistics
+                    .get(local)?
+                    .get(column - self.file_columns)?;
+                return Some((Some(statistics), data_type));
+            }
             // A nested column has no single min/max; it never rules a group out.
-            let leaf = self.leaf_columns.get(column).copied().flatten()?;
+            let leaf = file.leaf_columns.get(column).copied().flatten()?;
             chunks
                 .get(leaf)
-                .map(|chunk| (chunk.statistics(), schema.field(column).data_type()))
+                .map(|chunk| (chunk.statistics(), data_type))
         })
     }
 
@@ -956,20 +1282,42 @@ impl ParquetSource {
         Schema::new(fields)
     }
 
-    fn reorder_batch(&self, batch: RecordBatch, projection: &Projection) -> Result<RecordBatch> {
-        let parquet_columns = projection.parquet_columns();
-        let output_positions: Vec<_> = projection
+    /// Puts a decoded batch of `file` into `projection` order, adding partition
+    /// columns.
+    fn reorder_batch(
+        &self,
+        batch: RecordBatch,
+        projection: &Projection,
+        file: &SourceFile,
+    ) -> Result<RecordBatch> {
+        let decoded = self.decoded_columns(projection);
+        let rows = batch.num_rows();
+        let arrays = projection
             .as_slice()
             .iter()
-            .map(|column| {
-                parquet_columns
+            .map(|&column| {
+                if column >= self.file_columns {
+                    let partition = column - self.file_columns;
+                    let data_type = self
+                        .partition_columns
+                        .get(partition)
+                        .map(|partition| &partition.data_type)
+                        .ok_or_else(|| anyhow!("partition column {column} out of range"))?;
+                    let value = file.partition_values.get(partition).cloned().flatten();
+                    return constant_array(data_type, value.as_deref(), rows);
+                }
+                decoded
                     .iter()
-                    .position(|read_column| read_column == column)
+                    .position(|read_column| *read_column == column)
+                    .map(|position| batch.column(position).clone())
                     .ok_or_else(|| anyhow!("projected column {column} was not decoded"))
             })
-            .collect::<Result<_>>()?;
-
-        project_batch(&batch, projection, &output_positions)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new_with_options(
+            Arc::new(self.projected_schema(projection)),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )?)
     }
 }
 
@@ -2072,7 +2420,7 @@ mod tests {
 
         // PageHeader … 7: DictionaryPageHeader { 1: num_values = 2 } is `4C 15 04`. Claim 63
         // values instead (zigzag 0x7E keeps the byte length) in a page that holds 8 bytes.
-        let column = source.metadata.row_group(0).column(0);
+        let column = source.files[0].metadata.row_group(0).column(0);
         let offset = column.dictionary_page_offset().unwrap() as usize;
         let mut bytes = std::fs::read(&path).unwrap();
         let at = offset
@@ -2482,6 +2830,197 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         (directory, ParquetSource::open(path).unwrap())
+    }
+
+    /// Writes ids `range` as one Parquet file at `root/relative`.
+    fn write_ids(root: &Path, relative: &str, range: std::ops::Range<i32>, nullable: bool) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            nullable,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(range))],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2048))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn texts(batch: &RecordBatch, column: usize) -> Vec<String> {
+        (0..batch.num_rows())
+            .map(|row| {
+                crate::value::scalar_text(batch.column(column).as_ref(), row)
+                    .unwrap()
+                    .unwrap_or_else(|| "null".to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reads_a_partitioned_folder_as_one_table() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        write_ids(root, "year=2023/region=east/a.parquet", 0..5000, false);
+        write_ids(root, "year=2023/region=west/b.parquet", 5000..6000, true);
+        write_ids(root, "year=2024/region=east/c.parquet", 6000..9000, false);
+        write_ids(
+            root,
+            "year=2024/region=__HIVE_DEFAULT_PARTITION__/d.parquet",
+            9000..9100,
+            false,
+        );
+        std::fs::write(root.join("_SUCCESS"), b"").unwrap();
+        let source = ParquetSource::open(root).unwrap();
+
+        // Files in name order: a, b, d (`_` sorts before `e`), c.
+        assert!(source.is_folder());
+        assert_eq!(source.file_count(), 4);
+        assert_eq!(source.row_count(), 9100);
+        assert_eq!(source.partition_column_names(), ["year", "region"]);
+        let schema = source.schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
+        assert!(schema.field(0).is_nullable(), "nullable in one file");
+        assert_eq!(source.row_groups().len(), 3 + 1 + 1 + 2);
+
+        // A window across two files, and one ending in the null partition.
+        let all = Projection::all(3);
+        let window = source.read_window(4998, 4, &all).unwrap();
+        assert_eq!(texts(&window, 0), ["4998", "4999", "5000", "5001"]);
+        assert_eq!(texts(&window, 2), ["east", "east", "west", "west"]);
+        let window = source.read_window(5998, 4, &all).unwrap();
+        assert_eq!(texts(&window, 0), ["5998", "5999", "9000", "9001"]);
+        assert_eq!(texts(&window, 1), ["2023", "2023", "2024", "2024"]);
+        assert_eq!(texts(&window, 2), ["west", "west", "null", "null"]);
+        // Only a partition column.
+        let page = source
+            .read_window(6098, 4, &Projection::columns(vec![2], 3).unwrap())
+            .unwrap();
+        assert_eq!(texts(&page, 0), ["null", "null", "east", "east"]);
+        assert_eq!(
+            source.metadata().columns()[1].row_group_statistics[0]
+                .as_ref()
+                .and_then(|statistics| statistics.min.clone()),
+            Some("2023".to_string())
+        );
+
+        // A filter on a partition column reads only that partition's file.
+        let scanned = std::cell::RefCell::new(Vec::new());
+        let west = source
+            .read_filtered_from(
+                &FilterExpr::parse("region == west").unwrap(),
+                0,
+                10_000,
+                &all,
+                &|row| {
+                    scanned.borrow_mut().push(row);
+                    false
+                },
+            )
+            .unwrap();
+        assert_eq!(west.batch.num_rows(), 1000);
+        // Read: `west` (rows 5000..6000) and the null region (6000..6100), whose
+        // statistics have no min/max. Skipped: every `east` file.
+        assert!(
+            scanned
+                .borrow()
+                .iter()
+                .all(|row| (5000..6100).contains(row))
+        );
+        let late = source
+            .read_filtered_window(
+                &FilterExpr::parse("year == 2024 AND id < 9050").unwrap(),
+                0,
+                10_000,
+                &all,
+            )
+            .unwrap();
+        assert_eq!(late.num_rows(), 3000 + 50);
+        let unknown = source
+            .read_filtered_window(
+                &FilterExpr::parse("region IS NULL").unwrap(),
+                0,
+                10_000,
+                &all,
+            )
+            .unwrap();
+        assert_eq!(unknown.num_rows(), 100);
+
+        // Sort and group by partition columns across files.
+        let sorted = source
+            .read_sorted_all(
+                None,
+                &all,
+                &[
+                    SortSpec::new(1, SortDirection::Descending, NullOrder::Last),
+                    SortSpec::new(0, SortDirection::Ascending, NullOrder::Last),
+                ],
+                SortBudget::default(),
+                Some(2),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(texts(&sorted[0], 0), ["6000", "6001"]);
+        let grouped = source
+            .read_aggregated(
+                None,
+                &AggregateSpec::grouped(1, vec![AggregateExpr::count_all()]).unwrap(),
+                GroupBudget::default(),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(texts(&grouped, 0), ["2023", "2024"]);
+        assert_eq!(texts(&grouped, 1), ["6000", "3100"]);
+    }
+
+    #[test]
+    fn rejects_folders_whose_files_differ() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        write_ids(root, "a.parquet", 0..10, false);
+        let path = root.join("b.parquet");
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let error = format!("{:#}", ParquetSource::open(root).err().unwrap());
+        assert!(error.contains("does not have the same columns"), "{error}");
+        assert!(error.contains("Int32"), "{error}");
+
+        // A partition key the files also store (as Polars writes them) is read
+        // from the files, not added again.
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "id=1/a.parquet", 0..10, false);
+        let polars = ParquetSource::open(directory.path()).unwrap();
+        assert_eq!(polars.column_count(), 1);
+        assert!(polars.partition_column_names().is_empty());
+        assert_eq!(
+            texts(&polars.read_window(8, 2, &Projection::all(1)).unwrap(), 0),
+            ["8", "9"]
+        );
+
+        // Cancelled between files.
+        assert!(
+            ParquetSource::open_cancellable(root, &|| true)
+                .err()
+                .unwrap()
+                .downcast_ref::<Cancelled>()
+                .is_some()
+        );
     }
 
     #[test]

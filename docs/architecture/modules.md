@@ -6,7 +6,7 @@
 
 ### What the app does
 
-PAVI opens a single local Parquet file, reads only its footer metadata up front (`ParquetSource::open`, `crates/parquet/src/source.rs:125-159`), and then decodes rows lazily in fixed 4,096-row pages projected to the visible columns. On top of that it layers a deliberately small query engine (one filter, one sort key, one group-by column, limit) executed incrementally on a background thread pool, with every in-memory structure capped by an explicit budget. The GUI adds an Inspector, charts, column profiling, query history, session restore and streaming export. The CLI is a thin, synchronous preview tool for the same reader.
+PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), each in its own tab. It reads only footer metadata up front (`ParquetSource::open`, `crates/parquet/src/source.rs:125-159`), and then decodes rows lazily in fixed 4,096-row pages projected to the visible columns. On top of that it layers a deliberately small query engine (one filter, one sort key, one group-by column, limit) executed incrementally on a background thread pool, with every in-memory structure capped by an explicit budget. The GUI adds an Inspector, charts, column profiling, query history, session restore and streaming export. The CLI is a thin, synchronous preview tool for the same reader.
 
 ### Tech stack
 
@@ -49,6 +49,7 @@ crates/parquet/src/            (parquet_reader)
 ├── lib.rs          re-exports the public surface
 ├── source.rs       ParquetSource (1,924 lines): open, read_page/window/filtered/sorted/aggregated,
 │                   GroupCollector/Accumulator/Scalar (aggregation)
+├── dataset.rs      folder datasets (ADR 0006): find the files, `key=value` partition columns, their values and statistics
 ├── statistics.rs   row-group statistics → display text, typed by the column's Arrow type
 ├── metadata.rs     DatasetMetadata, RowGroupInfo, ColumnInfo, ColumnStatistics; row→row-group math
 ├── page.rs         PAGE_ROWS = 4096, PageKey, RowWindow, DataPage
@@ -78,7 +79,8 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    51 tests driving PaviApp without a window
+├── app_tests.rs    54 tests driving PaviApp without a window
+├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
@@ -88,7 +90,8 @@ crates/app/src/                (pavi)
 ├── session.rs      SessionState (serde: recent files, history, saved queries, layouts), SessionStore (JSON at %LOCALAPPDATA%\PAVI\session-v1.json)
 ├── sql_editor.rs   SQL tokens for highlighting, word-at-cursor completions, column quoting
 └── ui/             (mounted via #[path = "ui/mod.rs"] inside app.rs; every file is `impl PaviApp`)
-    ├── toolbar.rs     top bar: file menu (path box, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls, window resize strips
+    ├── toolbar.rs     top bar: file menu (path box, open file or folder, new tab, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls, window resize strips
+    ├── tabs.rs        tab strip under the top bar (from two tabs on)
     ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header and cell menus, pinned-column overlay, find bar
     ├── sql.rs         SQL workspace: highlighted editor with completions, History and Saved menus
     ├── inspector.rs   right panel: cell, whole row, column and profile, file info, schema, row-group stats
@@ -125,7 +128,8 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 
 | Piece | Responsibility | Ref |
 |---|---|---|
-| `show_top_bar` | File menu (path box + Enter → open, Browse, Reload, Recent), Grid/SQL switch, filter box, Sort menu, Columns menu (types, pinned header, column layout), Export menu, Reload, Charts, Inspector, window buttons | `ui/toolbar.rs` |
+| `show_top_bar` | File menu (path box + Enter → open a file or folder, Open file, Open folder, New tab, Reload, Recent), Grid/SQL switch, filter box, Sort menu, Columns menu (types, pinned header, column layout), Export menu, Reload, Charts, Inspector, window buttons | `ui/toolbar.rs` |
+| `show_tab_strip` | One tab per open file or folder; click shows, × or middle click closes, + opens an empty tab. Drawn only with two or more tabs | `ui/tabs.rs` |
 | `show_grid` / `show_grid_content` | Source grid via `TableBuilder::body.rows()` (virtualized); requests pages for rendered rows | `ui/grid.rs:11-196` |
 | `show_filtered_grid` | Same, over `FilteredGrid.batches`; asks for more when the last row is rendered | `ui/grid.rs:198-386` |
 | `render_headers` | Painted header with name/type. A click selects the column; a right-click opens a menu (sort, profile, fit, hide, copy name). The choice is stored as a `HeaderAction` and run by `apply_header_action` after the table is drawn | `ui/grid.rs`, `app.rs` |
@@ -137,14 +141,15 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 
 | Type | Holds | Ref |
 |---|---|---|
-| `PaviApp` | runtime, dataset, open task, `pages: SourcePages`, `filtered: Option<FilteredGrid>`, column layout, grid window offsets, `export: ExportState`, chart/profile state, text inputs, session, UI toggles, status string | `app.rs` |
+| `PaviApp` | runtime, the open tab's id and the parked tabs (`tabs: Tabs`), dataset, open task, `pages: SourcePages`, `filtered: Option<FilteredGrid>`, column layout, grid window offsets, `export: ExportState`, chart/profile state, text inputs, session, UI toggles, status string | `app.rs` |
+| `TabState`, `Tabs` | One parked tab: the same fields as `PaviApp` from `tab_id` to `workspace` (dataset, pages, result, layout, inputs, chart, profile, export). Switching swaps them with `PaviApp`'s; nothing is re-run. `Tabs` holds the parked tabs (≤16) and the open tab's position | `tabs.rs` |
 | `SourcePages` | page reads in flight, loaded pages (LRU ≤8), this frame's requests and drawn page range; `poll`, `track`, `cancel_offscreen`, `clear` | `pages.rs` |
 | `Dataset` | `Arc<ParquetSource>`, path, column names | `app.rs:45-49` |
 | `GridState` | generation, `first_row` (absolute index of the first row in a slid result window), row/column counts, load state, requested/loaded page sets, selection (absolute rows) | `state.rs:198-319` |
 | `FilteredGrid` | query kind, `LogicalPlan`, running `QueryExecution`, sliding `VecDeque<RecordBatch>` (≤8), `first_result`, `rows`, `target_result` | `results.rs` |
 | `ColumnLayout` | display order, hidden set, widths (72–480 px) | `state.rs:72-196` |
 | `ChartState`, `ProfileState`, `ExportState` | own generation, running execution/task, result, error. `ExportState` also drops events from replaced exports and turns events into status text | `chart.rs`, `profile.rs`, `export.rs` |
-| `SessionState` | recent files (≤12), last file, SQL input, history (≤50 / 256 KB), inspector/chart visibility, per-schema grid layouts (≤8) | `session.rs:46-53` |
+| `SessionState` | recent files and folders (≤12), last file, files and folders open in tabs (≤16) and the shown one, SQL input, history (≤50 / 256 KB), inspector/chart visibility, per-schema grid layouts (≤8) | `session.rs:46-53` |
 
 State changes happen by direct method calls. Every "restart" (open, filter, SQL, sort, clear) bumps `GridState.generation` via `GridState::reset()` (`state.rs:214-224`) so late responses are ignored.
 
@@ -164,8 +169,8 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 
 | Function | What it reads | Ref |
 |---|---|---|
-| `ParquetSource::open` | Footer only (`ArrowReaderMetadata::load`, default options → **no page index**); builds row-group index + statistics strings | `source.rs:125-159` |
-| `reader_for` | **Re-opens the file** for every read, builds a `ParquetRecordBatchReader` with `ProjectionMask::roots`, row groups, optional `RowSelection`, batch size 4096 | `source.rs:664-686` |
+| `ParquetSource::open` | A file, or every `.parquet` file in a folder (`open_cancellable` stops between files). Footers only (`ArrowReaderMetadata::load`, default options → **no page index**); builds row-group index + statistics strings | `source.rs:125-159` |
+| `reader_for` | **Re-opens the row group's file** for every read (a window that crosses files uses one reader per file; partition columns are added by `reorder_batch`), builds a `ParquetRecordBatchReader` with `ProjectionMask::roots`, row groups, optional `RowSelection`, batch size 4096 | `source.rs:664-686` |
 | `read_window_batches` / `read_window` | Rows `[first, first+n)` → overlapping row groups + skip/select `RowSelection` | `source.rs:613-662` |
 | `read_page` | `read_window` for page `i` through the `Mutex<PageCache>` | `source.rs:223-242` |
 | `read_filtered_from` | From source row `start_row` (stats-pruned row groups; the first group is entered with a `RowSelection` skip), filter each batch, return ≤n matches plus `next_row`, the row after the last match taken (`FilteredWindow`). Paging with `next_row` reads each row once | `source.rs` (`scan_filtered`) |
@@ -182,9 +187,9 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 
 | Arg | Meaning |
 |---|---|
-| `FILE` (positional, required) | Parquet path |
+| `FILE` (positional, required) | Parquet file or folder |
 | `--head N` (default 10) | Preview rows; rejected if >1000 (`main.rs:62-67`) |
 | `--columns 0,3,5` | **Column indexes only** (names not accepted) |
 | `--filter "col OP value"` | Same `FilterExpr` grammar as the GUI filter box |
 
-Output goes to stdout: row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges, then a box-drawn table with cells truncated to 4–32 chars. Exit codes: `0` success; `1` for any `anyhow` error (printed by Rust's `main` as `Error: …` with Debug formatting on stderr); `2` for clap usage errors.
+Output goes to stdout: for a folder, its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges, then a box-drawn table with cells truncated to 4–32 chars. Exit codes: `0` success; `1` for any `anyhow` error (printed by Rust's `main` as `Error: …` with Debug formatting on stderr); `2` for clap usage errors.

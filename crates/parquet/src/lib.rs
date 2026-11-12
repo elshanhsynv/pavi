@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod cache;
+pub mod dataset;
 pub mod filter;
 mod footer;
 pub mod metadata;
@@ -14,6 +15,9 @@ pub mod value;
 
 pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
 pub use cache::{PageCache, PageCacheLimits, PageCacheStats};
+pub use dataset::{
+    MAX_DATASET_FILES, MAX_DATASET_METADATA_BYTES, MAX_FOLDER_DEPTH, MAX_FOLDER_ENTRIES,
+};
 pub use filter::{Comparison, FilterExpr, FilterOp};
 pub use metadata::{ColumnInfo, ColumnStatistics, DatasetMetadata, RowGroupInfo};
 pub use page::{DataPage, PAGE_ROWS, PageKey, RowWindow};

@@ -66,6 +66,8 @@ pub const CHART_BAR: Color32 = ACCENT;
 // Widget sizes (not spacing; see `spacing.rs`).
 /// The single top bar.
 pub const BAR_HEIGHT: f32 = 40.0;
+/// Height of the tab strip under the top bar.
+pub const TAB_BAR_HEIGHT: f32 = 32.0;
 /// The status bar.
 pub const STATUS_HEIGHT: f32 = 26.0;
 /// Buttons, inputs and menu rows.

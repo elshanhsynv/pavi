@@ -494,11 +494,14 @@ fn execute_open(request: OpenRequest, shutdown: &AtomicBool) {
     let outcome = if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() {
         OpenOutcome::Cancelled
     } else {
-        match guarded(|| ParquetSource::open(&request.path)) {
-            Ok(_) if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() => {
+        let cancelled = || shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled();
+        // A folder is opened file by file and stops between files when cancelled.
+        match guarded(|| ParquetSource::open_cancellable(&request.path, &cancelled)) {
+            Ok(_) if cancelled() => OpenOutcome::Cancelled,
+            Ok(source) => OpenOutcome::Opened(Arc::new(source)),
+            Err(error) if error.downcast_ref::<parquet_reader::Cancelled>().is_some() => {
                 OpenOutcome::Cancelled
             }
-            Ok(source) => OpenOutcome::Opened(Arc::new(source)),
             Err(error) => OpenOutcome::OpenFailed(error),
         }
     };

@@ -22,6 +22,7 @@ pub enum Icon {
     ArrowUp,
     ArrowDown,
     Bookmark,
+    Plus,
 }
 
 const ICON_STROKE: f32 = 1.3;
@@ -132,6 +133,10 @@ pub fn icon(ui: &egui::Ui, center: Pos2, glyph: Icon, color: Color32) {
             line(&[(0.0, -5.0), (0.0, 5.0)]);
             line(&[(-3.5, 1.5), (0.0, 5.0), (3.5, 1.5)]);
         }
+        Icon::Plus => {
+            line(&[(0.0, -5.5), (0.0, 5.5)]);
+            line(&[(-5.5, 0.0), (5.5, 0.0)]);
+        }
         Icon::Bookmark => line(&[
             (-4.5, -6.0),
             (4.5, -6.0),
@@ -181,7 +186,8 @@ fn chevron(ui: &egui::Ui, center: Pos2, down: bool, color: Color32) {
 }
 
 /// One line of text, cut with "…" when wider than `max_width`.
-fn elided(
+/// `text` laid out on one line, cut with "…" past `max_width`.
+pub fn elided(
     ui: &egui::Ui,
     text: &str,
     font: egui::FontId,

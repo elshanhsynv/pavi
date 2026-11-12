@@ -105,6 +105,7 @@ impl PaviApp {
                     });
                 });
             });
+        self.show_tab_strip(ctx);
         if let Some(error) = &self.filter_error {
             egui::TopBottomPanel::top("filter_error")
                 .frame(
@@ -128,7 +129,7 @@ impl PaviApp {
                 .into_owned()
         });
         let label = name.as_deref().map_or_else(
-            || "Open file".to_owned(),
+            || "Open".to_owned(),
             |name| {
                 if name.chars().count() > FILE_LABEL_CHARS {
                     let short = name.chars().take(FILE_LABEL_CHARS).collect::<String>();
@@ -140,12 +141,14 @@ impl PaviApp {
         );
         let mut open = None;
         let mut browse = false;
+        let mut browse_folder = false;
+        let mut new_tab = false;
         let mut refresh = false;
         let response = widgets::menu(ui, "file", Some(Icon::Folder), &label, false, 420.0, |ui| {
             let path_box = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Paste a file path and press Enter"),
+                    .hint_text("Paste a file or folder path and press Enter"),
             );
             if path_box.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 let path = self.path_input.trim();
@@ -154,10 +157,14 @@ impl PaviApp {
                 }
             }
             ui.add_space(Spacing::Xs.px());
-            browse = widgets::menu_item(ui, "Browse…", "Ctrl+O").clicked();
+            browse = widgets::menu_item(ui, "Open file…", "Ctrl+O").clicked();
+            browse_folder = widgets::menu_item(ui, "Open folder…", "Ctrl+Shift+O")
+                .on_hover_text("Every Parquet file in the folder as one table")
+                .clicked();
+            new_tab = widgets::menu_item(ui, "New tab", "Ctrl+T").clicked();
             if let Some(dataset) = &self.dataset {
                 refresh = widgets::menu_item(ui, "Reload from disk", "Ctrl+R").clicked();
-                if widgets::menu_item(ui, "Copy file path", "").clicked() {
+                if widgets::menu_item(ui, "Copy path", "").clicked() {
                     ui.ctx().copy_text(dataset.path.display().to_string());
                     widgets::close_menu(ui);
                 }
@@ -179,7 +186,7 @@ impl PaviApp {
                     }
                 }
             }
-            if open.is_some() || browse || refresh {
+            if open.is_some() || browse || browse_folder || new_tab || refresh {
                 widgets::close_menu(ui);
             }
         });
@@ -189,11 +196,17 @@ impl PaviApp {
         if browse {
             self.pick_file();
         }
+        if browse_folder {
+            self.pick_folder();
+        }
+        if new_tab {
+            self.new_tab();
+        }
         if refresh {
             self.refresh_document();
         }
         if let Some(path) = open {
-            self.begin_open(path);
+            self.open_path(path);
         }
     }
 
@@ -576,7 +589,14 @@ impl PaviApp {
             .add_filter("Parquet", &["parquet"])
             .pick_file()
         {
-            self.begin_open(path);
+            self.open_path(path);
+        }
+    }
+
+    /// Opens every Parquet file in a chosen folder as one table.
+    pub(in crate::app) fn pick_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.open_path(path);
         }
     }
 

@@ -5,6 +5,7 @@ pub mod profile;
 pub mod spacing;
 pub mod sql;
 pub mod status;
+pub mod tabs;
 pub mod theme;
 pub mod toolbar;
 pub mod widgets;
