@@ -35,9 +35,13 @@ Opening a new file cancels all of the above (`app.rs:643-660`). If the user acts
 - Atomics: task ID counter, shutdown flag, cancellation flags.
 - No `RwLock`, no locks touched by the UI thread except via `ParquetSource::cache_stats` (Inspector). No lock is held across rendering.
 
+## Tabs
+
+Only the open tab is polled. A parked tab keeps its `OpenTask`, page tasks, `QueryExecution` and export/profile receivers; workers finish their reads and send into those one-slot channels, which never block because each holds one response. The results are picked up, and checked against the tab's own `GridState.generation`, when the tab is shown again. An export keeps writing while its tab is parked. Closing a tab cancels all of its work.
+
 ## Persistence
 
-Custom JSON session at `%LOCALAPPDATA%\PAVI\session-v1.json` (falls back to the temp dir on systems without `LOCALAPPDATA`) (`session.rs:192-199`), written atomically via `.tmp` + rename (`session.rs:213-229`). It stores recent files, last file, SQL input, query history, inspector/chart visibility and per-schema grid layouts (order, hidden, widths). It's saved synchronously on many actions (open, SQL run/finish, layout change, inspector toggle). eframe's own storage is unused: `App::save` is implemented but eframe only calls it with the `persistence` feature, which is off; window size/position are not persisted.
+Custom JSON session at `%LOCALAPPDATA%\PAVI\session-v1.json` (falls back to the temp dir on systems without `LOCALAPPDATA`) (`session.rs:192-199`), written atomically via `.tmp` + rename (`session.rs:213-229`). It stores recent files and folders, last file, the files and folders open in tabs (reopened at start), SQL input, query history, inspector/chart visibility and per-schema grid layouts (order, hidden, widths). It's saved synchronously on many actions (open, SQL run/finish, layout change, inspector toggle). eframe's own storage is unused: `App::save` is implemented but eframe only calls it with the `persistence` feature, which is off; window size/position are not persisted.
 
 
 ## Dependency graph

@@ -31,3 +31,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0003](0003-windowed-grid.md) | The grid shows huge files through a 500,000-row window |
 | [0004](0004-custom-query-engine.md) | A small custom query engine instead of DataFusion/DuckDB/Polars |
 | [0005](0005-external-sort.md) | Sorts larger than memory spill to temporary files (amends 0002) |
+| [0006](0006-folder-datasets.md) | A folder of Parquet files (with `key=value` partitions) is one table |

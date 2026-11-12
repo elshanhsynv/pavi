@@ -14,7 +14,7 @@ Do not open a public issue. Use GitHub's private vulnerability reporting on this
 |---|---|---|
 | Parquet files | Any file the user opens; may be corrupt, truncated or crafted | Never panic, never allocate without a bound, never hang. A bad file is an error in the status bar. |
 | Filter text and SQL | Typed or pasted by the user, or restored from the session file | Parsed into a small fixed subset; anything else is a parse error. Nothing is executed as code or passed to a shell. |
-| File paths | Path box, dialogs, `argv[1]`, recent files | Opened read-only. PAVI only writes to the export target the user picked (via a temp file + rename) and its own session file. |
+| File paths | Path box, dialogs, `argv[1]`, recent files, open tabs, dropped files and folders | Opened read-only. PAVI only writes to the export target the user picked (via a temp file + rename) and its own session file. A folder is searched within fixed limits (16 levels, 100,000 entries, 4,096 files, 256 MB of footers), so a deep, huge or self-linking tree ends with an error rather than exhausting memory or time. |
 | Session file | `%LOCALAPPDATA%\PAVI\session-v1.json` | A missing, corrupt or oversized file falls back to defaults; every list in it is capped on load. |
 | Dependencies | crates.io | Checked by `cargo deny check` (advisories, licenses, sources). |
 

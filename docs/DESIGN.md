@@ -69,6 +69,7 @@ On Windows the text is Segoe UI and Segoe UI Semibold, read once from the system
 - `menu`, `menu_item`, `menu_caption`, `close_menu`: a top-bar button with a popup below it, and its rows.
 - `segmented`: a switch between a few options: Grid / SQL, and the chart source and type.
 - `window_button`, `divider`: top-bar pieces.
+- `elided`: one line of text cut with "…" at a width (tool buttons, tabs).
 - `section`, `detail`: collapsible Inspector sections and their "label  value" rows.
 - `error`: error text in the one error color.
 - `placeholder`: centered empty, loading and error states.
@@ -77,11 +78,12 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 ## Layout
 
-- **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box, Browse, Reload, Copy path, recent files), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (CSV, Parquet, copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `ACCENT`. Below a window width of 1,100 px (`COMPACT_BAR_WIDTH`) Sort, Columns and Export show only their icons, with the name in the tooltip, so the filter box keeps a usable width.
+- **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box for a file or folder, Open file, Open folder, New tab, Reload, Copy path, recent files and folders), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (CSV, Parquet, copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `ACCENT`. Below a window width of 1,100 px (`COMPACT_BAR_WIDTH`) Sort, Columns and Export show only their icons, with the name in the tooltip, so the filter box keeps a usable width.
+- **Tab strip** (`ui/tabs.rs`): under the top bar once a second tab is open (`TAB_BAR_HEIGHT`, 32 px). One tab per file or folder, with a table or folder icon and the name cut at 220 px; the open tab has the `BACKGROUND` fill of the grid and an `ACCENT` line on top. × (shown on the open tab and under the pointer) or a middle click closes a tab; + opens an empty one. The tooltip is the full path.
 - **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted. When the grid scrolls sideways, the row numbers and any pinned columns are drawn again at the left edge, over the columns that slide under them, with a `BORDER` line at their right edge; pinned columns stop at 60% of the grid width (`MAX_PINNED_SHARE`).
 - **Find bar** (`show_find_bar`): opens above the grid with Ctrl+Shift+F. It searches only the rows loaded in memory, says so, and shows where the last match was ("Row 21, ARR_TIME").
 - **SQL workspace** (`ui/sql.rs`): editor, Run, Cancel, the History menu and the Saved menu above the result grid. The editor highlights keywords, functions, strings, numbers and the file's column names, and lists completions (columns first, then keywords, functions and `dataset`) under the cursor while a word is typed: ↑/↓ choose, Tab or Enter take one, Esc closes the list. A completed column name is quoted when it needs to be. The Saved menu saves the editor's query under a name (the same name replaces it), and loads or deletes saved ones; loading does not run the query.
-- **Inspector** (`ui/inspector.rs`): collapsible sections Cell (a list, struct or map value opens as a tree, first level expanded; "As text" shows it on one line), Row (every shown column of the selected row, one per line; click a line to select that cell), Column (with profile), File, Schema, Row groups, Page cache.
+- **Inspector** (`ui/inspector.rs`): collapsible sections Cell (a list, struct or map value opens as a tree, first level expanded; "As text" shows it on one line), Row (every shown column of the selected row, one per line; click a line to select that cell), Column (with profile), File (Folder for a folder dataset, with its file count and partition columns; Size is all its files together), Schema, Row groups, Page cache.
 - **Status bar** (`ui/status.rs`): status dot or spinner, the share of the file a running filter, sort or SQL scan has read (e.g. `42%`), and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
 - **Charts** (`ui/charts.rs`) is the only floating window: a form of "label  control" rows (source and type switches, column names that can be typed or picked from the file's columns, title, limits), then Draw chart and the plot.
 
@@ -89,7 +91,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 | State | Pattern |
 |---|---|
-| No file | Centered prompt: drop a file, Browse, or pick a recent file |
+| No file | Centered prompt: drop files or folders, Open file, Open folder, or pick a recent one |
 | Loading | Placeholders (`…`) plus a status bar message; no blocking spinners. A scan of the whole file shows how far it has got |
 | Empty result | Say so ("No rows match") rather than an empty grid |
 | Error | Red text in the area that failed, plus the status bar; the rest of the UI keeps working |
@@ -98,8 +100,9 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 ## Interaction
 
-- Keyboard: Ctrl+O open, Ctrl+R reload, Ctrl+F focus the filter box, Ctrl+Shift+F find in loaded rows (Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes), Ctrl+G focus "Go to row", Ctrl+I toggle the Inspector, Ctrl+1 / Ctrl+2 Grid / SQL, Ctrl+C copy selection, Ctrl+Enter run SQL, arrow keys, Page Up/Down, Home and End (+Shift) move/extend the cell selection.
-- Dropping a file on the window opens it.
+- Keyboard: Ctrl+O open a file, Ctrl+Shift+O open a folder, Ctrl+T new tab, Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab next / previous tab, Ctrl+R reload, Ctrl+F focus the filter box, Ctrl+Shift+F find in loaded rows (Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes), Ctrl+G focus "Go to row", Ctrl+I toggle the Inspector, Ctrl+1 / Ctrl+2 Grid / SQL, Ctrl+C copy selection, Ctrl+Enter run SQL, arrow keys, Page Up/Down, Home and End (+Shift) move/extend the cell selection.
+- Opening a file or folder uses the open tab when it is empty and a new tab otherwise; one that is already open is shown instead. Each dropped file or folder opens in its own tab. The tabs open when the app closed are reopened at start.
+- Each tab keeps its own filter, sort, SQL text and result, scroll position, column layout and Inspector state; switching tabs does not re-run anything.
 - A header click selects the column: it is underlined in `ACCENT` and the Inspector's Column section describes it. It never starts a scan.
 - A header right-click opens a menu: Sort ascending / descending (by this column alone), Then by ascending / descending (once something is sorted: this column breaks its ties), Profile column, Fit width, Hide column, Pin columns, Copy name. With several sort keys each sorted header shows its arrow and its position (1, 2, …).
 - A cell right-click selects the cell and opens a menu: Filter to this value, Exclude this value, Copy cell, Copy row. While a filter is applied it also offers "Add to filter: this value" and "Add to filter: not this value", which narrow that filter. A null cell filters to or away from nulls. When the cell cannot be filtered by (an unsupported type, an aggregate result) the filter rows are disabled and a caption says why.

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub const SESSION_VERSION: u32 = 1;
 pub const MAX_HISTORY_ENTRIES: usize = 50;
 pub const MAX_RECENT_FILES: usize = 12;
+/// Tabs reopened at start: the files and folders open when the app closed.
+pub const MAX_OPEN_FILES: usize = 16;
 pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 256 * 1024;
 pub const MAX_GRID_LAYOUTS: usize = 8;
@@ -61,6 +63,10 @@ pub struct SessionState {
     pub version: u32,
     pub recent_files: Vec<PathBuf>,
     pub last_opened_file: Option<PathBuf>,
+    /// Files and folders open in tabs, in tab order.
+    pub open_files: Vec<PathBuf>,
+    /// Position in `open_files` of the tab that was shown.
+    pub active_file: usize,
     pub sql_input: String,
     pub query_history: Vec<QueryHistoryEntry>,
     /// Sorted by name, ignoring case.
@@ -74,6 +80,8 @@ impl Default for SessionState {
             version: SESSION_VERSION,
             recent_files: Vec::new(),
             last_opened_file: None,
+            open_files: Vec::new(),
+            active_file: 0,
             sql_input: String::new(),
             query_history: Vec::new(),
             saved_queries: Vec::new(),
@@ -209,9 +217,10 @@ impl SessionState {
             *self = Self::default();
             return;
         }
+        // Files and folders (a folder opens as one dataset) that still exist.
         let mut seen = Vec::new();
         self.recent_files.retain(|path| {
-            path.is_file() && !seen.iter().any(|existing| existing == path) && {
+            path.exists() && !seen.iter().any(|existing| existing == path) && {
                 seen.push(path.clone());
                 true
             }
@@ -220,10 +229,22 @@ impl SessionState {
         if self
             .last_opened_file
             .as_ref()
-            .is_some_and(|path| !path.is_file())
+            .is_some_and(|path| !path.exists())
         {
             self.last_opened_file = None;
         }
+        let active = self.open_files.get(self.active_file).cloned();
+        let mut seen = Vec::new();
+        self.open_files.retain(|path| {
+            path.exists() && !seen.iter().any(|existing| existing == path) && {
+                seen.push(path.clone());
+                true
+            }
+        });
+        self.open_files.truncate(MAX_OPEN_FILES);
+        self.active_file = active
+            .and_then(|active| self.open_files.iter().position(|path| *path == active))
+            .unwrap_or(0);
         self.sql_input = bounded_text(&self.sql_input, MAX_QUERY_BYTES);
         self.query_history
             .retain(|entry| !entry.sql.trim().is_empty());

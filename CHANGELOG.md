@@ -20,11 +20,14 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - The SQL editor highlights keywords, strings, numbers and column names, and completes column names and keywords as you type (Tab or Enter takes a suggestion).
 - Save SQL queries under a name from the new Saved menu, and load or delete them later. They are kept with the session.
 - SQL `GROUP BY` takes several columns, e.g. `SELECT carrier, origin, COUNT(*) FROM dataset GROUP BY carrier, origin`.
+- Open a folder (Ctrl+Shift+O, the file menu, or drop it on the window) to read every Parquet file in it as one table. Folders named `key=value`, as Spark, DuckDB, Polars and pyarrow write them, become columns, and filters on them skip the other folders' files. The CLI opens folders too.
+- Tabs: each file or folder opens in its own tab with its own filter, sort, SQL and layout. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab moves between them. The tabs open when PAVI closes are reopened next time.
 
 ### Changed
 - Sorting sorts the whole file instead of showing only the first 100,000 rows. A sort too large for memory writes temporary files (up to 32 GB) and may take a while.
 - Copying cells copies their full values instead of the first 256 characters, quotes values that contain a tab, line break or quote, and allows up to 16 MB instead of 64 KB.
 - In the filter box, quote a value that contains `AND`, `OR`, a comma or brackets, e.g. `title == "war and peace"`. Unquoted, `and` / `or` now join two tests.
+- Opening a file while another is shown opens it in a new tab instead of replacing it. Dropping several files opens each of them.
 
 ### Fixed
 - The window can be resized by dragging its edges and corners.

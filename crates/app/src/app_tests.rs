@@ -1483,7 +1483,7 @@ fn opens_a_file_dropped_on_the_window() {
         }],
         ..Default::default()
     });
-    app.open_dropped_file(&context);
+    app.open_dropped_files(&context);
     let _ = context.end_pass();
 
     poll_until_opened(&mut app);
@@ -1823,4 +1823,139 @@ fn filtered_layout_maps_display_columns_without_reordering_batches() {
     assert_eq!(filtered.display_columns, vec![(1, 1)]);
     assert_eq!(filtered.batches.front().unwrap().num_columns(), 2);
     assert_eq!(app.filtered_cell_text(0, 1).as_deref(), Some("alpha"));
+}
+
+#[test]
+fn opens_files_in_tabs_that_keep_their_own_state() {
+    let (_first_directory, _first, first_path) = source(8);
+    let (_second_directory, _second, second_path) = source(5);
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(first_path.with_extension("session.json")),
+    );
+    app.open_path(first_path.clone());
+    poll_until_opened(&mut app);
+    assert_eq!(app.tab_count(), 1, "an empty tab is reused");
+    app.filter_input = "id == 2".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+
+    // A second file opens in a new tab, which is shown.
+    app.open_path(second_path.clone());
+    assert_eq!((app.tab_count(), app.tabs.active), (2, 1));
+    poll_until_opened(&mut app);
+    assert_eq!(app.grid.rows, 5);
+    assert!(app.filtered.is_none());
+    assert!(app.filter_input.is_empty());
+
+    // The first tab still has its filter and its result.
+    app.switch_tab(0);
+    assert_eq!(app.filter_input, "id == 2");
+    assert_eq!(filtered_ids(&app), vec!["2"]);
+    assert_eq!(
+        app.session.open_files,
+        vec![first_path.clone(), second_path.clone()]
+    );
+    assert_eq!(app.session.active_file, 0);
+
+    // Opening a file that is already open shows its tab.
+    app.open_path(second_path.clone());
+    assert_eq!((app.tab_count(), app.tabs.active), (2, 1));
+
+    // Ctrl+Tab moves to the next tab; Ctrl+W closes the open one.
+    send_command_key(&mut app, egui::Key::Tab);
+    assert_eq!(app.tabs.active, 0);
+    send_command_key(&mut app, egui::Key::W);
+    assert_eq!(app.tab_count(), 1);
+    assert_eq!(
+        app.dataset.as_ref().map(|dataset| dataset.path.clone()),
+        Some(second_path)
+    );
+    // Closing the last tab leaves one empty tab.
+    app.close_tab(0);
+    assert_eq!(app.tab_count(), 1);
+    assert!(app.dataset.is_none());
+    assert!(app.session.open_files.is_empty());
+
+    // Ctrl+T opens empty tabs, up to the limit.
+    send_command_key(&mut app, egui::Key::T);
+    assert_eq!(app.tab_count(), 2);
+    while app.tab_count() < tabs::MAX_TABS {
+        assert!(app.new_tab());
+    }
+    assert!(!app.new_tab());
+    assert!(app.status.contains("close one first"), "{}", app.status);
+}
+
+#[test]
+fn reopens_the_tabs_open_when_the_app_closed() {
+    let (_first_directory, _first, first_path) = source(3);
+    let (_second_directory, _second, second_path) = source(4);
+    let session = first_path.with_extension("session.json");
+    {
+        let mut app = PaviApp::new_with_store(None, SessionStore::new(session.clone()));
+        app.open_path(first_path.clone());
+        poll_until_opened(&mut app);
+        app.open_path(second_path.clone());
+        poll_until_opened(&mut app);
+        app.switch_tab(0);
+    }
+
+    let mut app = PaviApp::new_with_store(None, SessionStore::new(session));
+    assert_eq!((app.tab_count(), app.tabs.active), (2, 0));
+    poll_until_opened(&mut app);
+    assert_eq!(app.grid.rows, 3);
+    // The other tab finishes opening when it is shown.
+    app.switch_tab(1);
+    poll_until_opened(&mut app);
+    assert_eq!(app.grid.rows, 4);
+    assert_eq!(
+        app.tab_labels()
+            .iter()
+            .map(|label| label.path.clone())
+            .collect::<Vec<_>>(),
+        [Some(first_path), Some(second_path)]
+    );
+}
+
+#[test]
+fn opens_a_partitioned_folder_as_one_table() {
+    let directory = TempDir::new().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    for (folder, ids) in [("year=2023", 0..3), ("year=2024", 3..5)] {
+        let path = directory.path().join(folder).join("part-0.parquet");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(
+                &arrow_array::RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from_iter_values(ids))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        writer.close().unwrap();
+    }
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.open_path(directory.path().to_path_buf());
+    poll_until_opened(&mut app);
+
+    assert_eq!(app.grid.rows, 5);
+    assert_eq!(
+        app.dataset.as_ref().unwrap().column_names,
+        ["id".to_string(), "year".to_string()]
+    );
+    assert!(app.status.ends_with("from 2 files"), "{}", app.status);
+    assert!(app.tab_labels()[0].folder);
+    assert_eq!(app.session.recent_files, [directory.path().to_path_buf()]);
+
+    app.filter_input = "year == 2024".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    assert_eq!(filtered_ids(&app), vec!["3", "4"]);
 }

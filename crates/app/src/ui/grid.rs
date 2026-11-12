@@ -533,15 +533,16 @@ impl PaviApp {
     /// No dataset: opening, failed to open, or nothing chosen yet.
     fn show_closed_state(&mut self, ui: &mut egui::Ui) {
         let mut browse = false;
+        let mut browse_folder = false;
         let mut open = None;
         widgets::placeholder(ui, |ui| match &self.grid.loading {
             LoadState::Opening => {
                 ui.add(egui::Spinner::new().color(theme::ACCENT));
-                ui.heading("Opening file…");
-                ui.label(RichText::new("Reading the Parquet footer.").color(theme::MUTED));
+                ui.heading("Opening…");
+                ui.label(RichText::new("Reading the Parquet footers.").color(theme::MUTED));
             }
             LoadState::Error(error) => {
-                ui.heading("This file could not be opened");
+                ui.heading("This could not be opened");
                 widgets::error(ui, error);
                 browse = widgets::primary_button(ui, Some(Icon::Folder), "Choose another file")
                     .clicked();
@@ -550,12 +551,24 @@ impl PaviApp {
                 let (mark, _) =
                     ui.allocate_exact_size(egui::vec2(40.0, 36.0), egui::Sense::hover());
                 widgets::logo(ui, mark.center(), 2.2);
-                ui.heading("Open a Parquet file");
+                ui.heading("Open a Parquet file or folder");
                 ui.label(
-                    RichText::new("Drop a file on this window, or browse (Ctrl+O).")
-                        .color(theme::MUTED),
+                    RichText::new(
+                        "Drop files or folders on this window. A folder opens as one table.",
+                    )
+                    .color(theme::MUTED),
                 );
-                browse = widgets::primary_button(ui, Some(Icon::Folder), "Browse…").clicked();
+                ui.horizontal(|ui| {
+                    browse = widgets::primary_button(ui, Some(Icon::Columns), "Open file…")
+                        .on_hover_text("Ctrl+O")
+                        .clicked();
+                    browse_folder =
+                        widgets::tool_button(ui, Some(Icon::Folder), "Open folder…", false)
+                            .on_hover_text(
+                                "Every Parquet file in a folder as one table (Ctrl+Shift+O)",
+                            )
+                            .clicked();
+                });
                 for path in self.session.recent_files.iter().take(RECENT_ON_START) {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     if widgets::tool_button(ui, Some(Icon::History), &name, false)
@@ -570,8 +583,11 @@ impl PaviApp {
         if browse {
             self.pick_file();
         }
+        if browse_folder {
+            self.pick_folder();
+        }
         if let Some(path) = open {
-            self.begin_open(path);
+            self.open_path(path);
         }
     }
 
