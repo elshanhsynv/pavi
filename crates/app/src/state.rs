@@ -75,6 +75,9 @@ pub struct ColumnLayout {
     hidden: BTreeSet<usize>,
     widths: Vec<f32>,
     visible: Vec<usize>,
+    /// How many of the first shown columns stay in place when the grid scrolls
+    /// sideways. The row numbers always do.
+    pinned: usize,
 }
 
 impl ColumnLayout {
@@ -84,6 +87,7 @@ impl ColumnLayout {
             hidden: BTreeSet::new(),
             widths: vec![width; columns],
             visible: Vec::new(),
+            pinned: 0,
         };
         layout.rebuild_visible();
         layout
@@ -144,6 +148,15 @@ impl ColumnLayout {
         if let Some(stored) = self.widths.get_mut(source) {
             *stored = width.clamp(72.0, 480.0);
         }
+    }
+
+    /// Shown columns pinned to the left, never more than are shown.
+    pub fn pinned(&self) -> usize {
+        self.pinned.min(self.visible.len())
+    }
+
+    pub fn set_pinned(&mut self, count: usize) {
+        self.pinned = count;
     }
 
     pub fn order(&self) -> &[usize] {

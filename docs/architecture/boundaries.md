@@ -26,7 +26,7 @@
 
 ## Platform-specific code
 - No `cfg(target_os)` anywhere. Implicitly Windows-oriented: session path uses `LOCALAPPDATA` (`session.rs:192-199`).
-- Window decorations are disabled on all platforms; the top bar is the drag area and draws its own minimize/maximize/close controls (`show_top_bar`, `window_controls` in `ui/toolbar.rs`).
+- Window decorations are disabled on all platforms; the top bar is the drag area and draws its own minimize/maximize/close controls (`show_top_bar`, `window_controls` in `ui/toolbar.rs`). Without OS decorations Windows gives the window no resize border, so `window_resize_handles` puts drag strips on the edges and corners that send `ViewportCommand::BeginResize`. That command is not supported on macOS by winit.
 - Native dialogs: `rfd` (synchronous). Clipboard: egui/winit.
 
 ## unsafe / FFI

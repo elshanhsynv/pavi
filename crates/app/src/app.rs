@@ -22,6 +22,7 @@ use crate::chart::{
     MAX_INPUT_ROWS,
 };
 use crate::export::{ExportFormat, ExportInput, ExportState, ExportTask};
+use crate::find::{FindOutcome, MAX_FIND_CELLS, Segment, find};
 use crate::inspector::{CellDetails, column_summary, inspect_cell, nested_schema_preview};
 use crate::pages::SourcePages;
 use crate::profile::{ProfileEvent, ProfileState, ProfileTask};
@@ -39,7 +40,7 @@ const MAX_FILTER_VALUE_BYTES: usize = 1024;
 /// Rows a sort without a LIMIT returns: the first ones in sort order. Kept at the
 /// reader's sort budget, so the scan keeps only these rows and works on any file size.
 const SORT_ROW_CAP: usize = pavi_query::SortBudget::DEFAULT_MAX_ROWS;
-const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 
 fn ui_row_count(rows: u64) -> usize {
     rows.min(usize::MAX as u64) as usize
@@ -68,6 +69,13 @@ pub(crate) struct PaviApp {
     cell_action: Option<CellAction>,
     /// Vertical offset to apply to the source grid's table on the next frame.
     grid_scroll_offset: Option<f32>,
+    /// Horizontal offset to apply to the grid on the next frame.
+    grid_scroll_x: Option<f32>,
+    /// The grid's horizontal scroll offset and visible width (right of the row
+    /// numbers) last frame.
+    grid_view_x: (f32, f32),
+    /// The find bar above the grid.
+    find: FindState,
     filtered: Option<FilteredGrid>,
     column_layout: ColumnLayout,
     column_search: String,
@@ -114,6 +122,30 @@ enum HeaderAction {
     Profile(usize),
     /// Copy the column name.
     CopyName(String),
+    /// Pin this many shown columns to the left (0 unpins).
+    Pin(usize),
+}
+
+/// The find bar: text to look for in the loaded rows.
+#[derive(Default)]
+pub(crate) struct FindState {
+    pub(crate) open: bool,
+    pub(crate) query: String,
+    /// Give the find box keyboard focus on the next frame.
+    pub(crate) focus: bool,
+    /// What the last search found, in words.
+    pub(crate) message: Option<String>,
+    /// Where a search that ran out of its cell budget stopped.
+    pub(crate) resume: Option<crate::find::Cell>,
+}
+
+/// One row of the Inspector's Row section.
+pub(crate) struct RowView {
+    pub(crate) row: u64,
+    pub(crate) batch: arrow_array::RecordBatch,
+    pub(crate) offset: usize,
+    /// Column name and batch column, in display order.
+    pub(crate) fields: Vec<(String, usize)>,
 }
 
 /// An action chosen in a grid cell's right-click menu. It applies to the selected
@@ -163,6 +195,9 @@ impl PaviApp {
             header_action: None,
             cell_action: None,
             grid_scroll_offset: None,
+            grid_scroll_x: None,
+            grid_view_x: (0.0, 0.0),
+            find: FindState::default(),
             filtered: None,
             column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
             column_search: String::new(),
@@ -261,6 +296,26 @@ impl PaviApp {
     }
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
+        // Matched on the key event's own modifiers, so a quick Ctrl+Shift+F is not
+        // read as Ctrl+F once Shift is already up.
+        let find_key = |modifiers: egui::Modifiers, key: egui::Key| {
+            ctx.input_mut(|input| input.consume_key(modifiers, key))
+        };
+        if self.dataset.is_some()
+            && find_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::F,
+            )
+        {
+            self.open_find();
+        }
+        if self.find.open {
+            if find_key(egui::Modifiers::SHIFT, egui::Key::F3) {
+                self.find_next(true);
+            } else if find_key(egui::Modifiers::NONE, egui::Key::F3) {
+                self.find_next(false);
+            }
+        }
         let command = ctx.input(|input| input.modifiers.command);
         if !command {
             return;
@@ -359,6 +414,7 @@ impl PaviApp {
             })
             .collect();
         self.column_layout.restore(order, hidden, widths);
+        self.column_layout.set_pinned(saved.pinned);
     }
 
     fn save_column_layout(&mut self) {
@@ -393,6 +449,7 @@ impl PaviApp {
                 .filter_map(|source| dataset.column_names.get(*source).cloned())
                 .collect(),
             widths,
+            pinned: self.column_layout.pinned(),
         });
         self.persist_session();
     }
@@ -622,6 +679,15 @@ impl PaviApp {
             Some(HeaderAction::CopyName(name)) => {
                 ctx.copy_text(name);
                 self.status = "Copied the column name".to_string();
+            }
+            Some(HeaderAction::Pin(count)) => {
+                self.column_layout.set_pinned(count);
+                self.save_column_layout();
+                self.status = match self.column_layout.pinned() {
+                    0 => "Columns unpinned".to_string(),
+                    1 => "1 column pinned".to_string(),
+                    pinned => format!("{pinned} columns pinned"),
+                };
             }
             None => {}
         }
@@ -1632,98 +1698,254 @@ impl PaviApp {
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context, row: bool) {
-        let Some((batch, selected_row)) = self.selected_batch_row() else {
-            self.status = "Selected row is no longer in the bounded grid window".to_string();
-            return;
-        };
         let Some((selected_grid_row, selected_display_column)) = self.grid.selection else {
             return;
         };
-        let text = if row {
-            let mut text = String::new();
-            for (display_column, column) in self.visible_batch_columns().into_iter().enumerate() {
-                let Some(array) = batch.columns().get(column) else {
-                    self.status = "Selected column is unavailable".to_string();
-                    return;
-                };
-                let value = format_cell_with_limit(array.as_ref(), selected_row, CELL_LIMIT);
-                if text
-                    .len()
-                    .saturating_add(value.len())
-                    .saturating_add(usize::from(display_column > 0))
-                    > MAX_CLIPBOARD_BYTES
-                {
-                    self.status = format!(
-                        "Selected row exceeds the {MAX_CLIPBOARD_BYTES}-byte clipboard limit"
-                    );
-                    return;
-                }
-                if display_column > 0 {
-                    text.push('\t');
-                }
-                text.push_str(&value);
+        let visible_columns = self.visible_batch_columns();
+        let range = if row {
+            crate::state::SelectionRange {
+                anchor: (selected_grid_row, 0),
+                focus: (selected_grid_row, visible_columns.len().saturating_sub(1)),
             }
-            text
         } else {
-            let range = self
-                .grid
+            self.grid
                 .selection_range
                 .unwrap_or(crate::state::SelectionRange {
                     anchor: (selected_grid_row, selected_display_column),
                     focus: (selected_grid_row, selected_display_column),
-                });
-            let first_row = range.anchor.0.min(range.focus.0);
-            let last_row = range.anchor.0.max(range.focus.0);
-            let first_column = range.anchor.1.min(range.focus.1);
-            let last_column = range.anchor.1.max(range.focus.1);
-            let visible_columns = self.visible_batch_columns();
-            let mut text = String::new();
-            for row_index in first_row..=last_row {
-                let Some((range_batch, batch_row)) = self.batch_row_at(row_index) else {
-                    self.status =
-                        "Selection is outside the current bounded grid window".to_string();
+                })
+        };
+        let first_row = range.anchor.0.min(range.focus.0);
+        let last_row = range.anchor.0.max(range.focus.0);
+        let first_column = range.anchor.1.min(range.focus.1);
+        let last_column = range.anchor.1.max(range.focus.1);
+        let mut text = String::new();
+        for row_index in first_row..=last_row {
+            let Some((batch, batch_row)) = self.batch_row_at(row_index) else {
+                self.status =
+                    "Part of the selection is no longer loaded; select it again".to_string();
+                return;
+            };
+            if row_index > first_row {
+                text.push('\n');
+            }
+            for display_column in first_column..=last_column {
+                let Some(array) = visible_columns
+                    .get(display_column)
+                    .and_then(|column| batch.columns().get(*column))
+                else {
+                    self.status = "Selected column is unavailable".to_string();
                     return;
                 };
-                for display_column in first_column..=last_column {
-                    let Some(array) = visible_columns
-                        .get(display_column)
-                        .and_then(|column| range_batch.columns().get(*column))
-                    else {
-                        self.status = "Selected column is unavailable".to_string();
-                        return;
-                    };
-                    let value = format_cell_with_limit(array.as_ref(), batch_row, CELL_LIMIT);
-                    let separator = usize::from(display_column > first_column)
-                        + usize::from(row_index > first_row && display_column == first_column);
-                    if text
-                        .len()
-                        .saturating_add(value.len())
-                        .saturating_add(separator)
-                        > MAX_CLIPBOARD_BYTES
-                    {
+                if display_column > first_column {
+                    text.push('\t');
+                }
+                let room = MAX_CLIPBOARD_BYTES.saturating_sub(text.len());
+                match clipboard_field(array.as_ref(), batch_row, room) {
+                    Some(field) => text.push_str(&field),
+                    None => {
                         self.status = format!(
-                            "Selection exceeds the {MAX_CLIPBOARD_BYTES}-byte clipboard limit"
+                            "The selection is larger than the {} MB clipboard limit; \
+                             select fewer cells or export instead",
+                            MAX_CLIPBOARD_BYTES / (1024 * 1024)
                         );
                         return;
                     }
-                    if display_column > first_column {
-                        text.push('\t');
-                    }
-                    if row_index > first_row && display_column == first_column {
-                        text.push('\n');
-                    }
-                    text.push_str(&value);
                 }
             }
-            text
-        };
+        }
+        let cells =
+            (last_row - first_row + 1).saturating_mul((last_column - first_column + 1) as u64);
         ctx.copy_text(text);
         self.status = if row {
             "Selected row copied to clipboard".to_string()
+        } else if cells == 1 {
+            "Cell copied to clipboard".to_string()
         } else {
-            "Selected cells copied to clipboard".to_string()
+            format!("{} cells copied to clipboard", ui::theme::number(cells))
         };
     }
+
+    /// Shows the find bar and puts the cursor in it.
+    fn open_find(&mut self) {
+        self.find.open = true;
+        self.find.focus = true;
+    }
+
+    /// The loaded rows, in row order, for find.
+    fn loaded_segments(&self) -> Vec<Segment<'_>> {
+        let mut segments = Vec::new();
+        if let Some(filtered) = &self.filtered {
+            let mut first_row = filtered.first_result;
+            for batch in &filtered.batches {
+                segments.push(Segment { first_row, batch });
+                first_row += batch.num_rows() as u64;
+            }
+            return segments;
+        }
+        for page in self.pages.loaded() {
+            let mut first_row = page.window.first_row;
+            for batch in &page.batches {
+                segments.push(Segment { first_row, batch });
+                first_row += batch.num_rows() as u64;
+            }
+        }
+        segments.sort_by_key(|segment| segment.first_row);
+        segments
+    }
+
+    /// Moves the selection to the next (or previous) loaded cell containing the
+    /// find text, and scrolls it into view.
+    fn find_next(&mut self, backwards: bool) {
+        let query = self.find.query.trim().to_owned();
+        if query.is_empty() {
+            self.find.message = None;
+            return;
+        }
+        let columns = self.visible_batch_columns();
+        let from = self.find.resume.take().or(self.grid.selection);
+        let outcome = {
+            let segments = self.loaded_segments();
+            let loaded = segments.first().zip(segments.last()).map(|(first, last)| {
+                (
+                    first.first_row,
+                    last.first_row + last.batch.num_rows() as u64,
+                )
+            });
+            (
+                find(&segments, &columns, &query, from, backwards, MAX_FIND_CELLS),
+                loaded,
+            )
+        };
+        self.find.message = Some(match outcome {
+            (FindOutcome::Found((row, column)), _) => {
+                self.grid.select(row, column);
+                self.jump_target = Some(row);
+                self.reveal_column(column);
+                let name = self.display_column_name(column).unwrap_or_default();
+                format!("Row {}, {name}", ui::theme::number(row + 1))
+            }
+            (FindOutcome::Stopped(at), _) => {
+                self.find.resume = Some(at);
+                format!(
+                    "Searched {} cells; press Enter to keep going",
+                    ui::theme::number(MAX_FIND_CELLS as u64)
+                )
+            }
+            (FindOutcome::NotFound, Some((first, end))) if end > first => format!(
+                "Not in the loaded rows ({}–{})",
+                ui::theme::number(first + 1),
+                ui::theme::number(end)
+            ),
+            (FindOutcome::NotFound, _) => "No rows are loaded yet".to_string(),
+        });
+    }
+
+    /// Name of a display column of the grid on screen.
+    fn display_column_name(&self, column: usize) -> Option<String> {
+        if let Some(filtered) = &self.filtered {
+            if filtered.aggregate {
+                return filtered.batches.front().and_then(|batch| {
+                    batch
+                        .schema()
+                        .fields()
+                        .get(column)
+                        .map(|field| field.name().clone())
+                });
+            }
+            let (source, _) = filtered.display_columns.get(column)?;
+            return self.dataset.as_ref()?.column_names.get(*source).cloned();
+        }
+        let source = self.column_layout.visible().get(column)?;
+        self.dataset.as_ref()?.column_names.get(*source).cloned()
+    }
+
+    /// Scrolls the grid sideways on the next frame so display column `column` is
+    /// in view, right of the pinned columns.
+    fn reveal_column(&mut self, column: usize) {
+        let widths = self.display_column_widths();
+        let pinned = self.pinned_columns();
+        let left = widths[..column.min(widths.len())].iter().sum::<f32>();
+        let right = left + widths.get(column).copied().unwrap_or(INITIAL_COLUMN_WIDTH);
+        let pinned_width = widths[..pinned.min(widths.len())].iter().sum::<f32>();
+        let (offset, width) = self.grid_view_x;
+        if column < pinned || width <= 0.0 {
+            return;
+        }
+        // `offset` and `width` are measured right of the row numbers.
+        if left - pinned_width < offset || right > offset + width {
+            self.grid_scroll_x = Some((left - pinned_width).max(0.0));
+        }
+    }
+
+    /// Widths of the grid's display columns, as laid out.
+    fn display_column_widths(&self) -> Vec<f32> {
+        match &self.filtered {
+            Some(filtered) if filtered.aggregate => {
+                vec![INITIAL_COLUMN_WIDTH; filtered.display_columns.len()]
+            }
+            Some(filtered) => filtered
+                .display_columns
+                .iter()
+                .map(|(source, _)| self.column_layout.width(*source, INITIAL_COLUMN_WIDTH))
+                .collect(),
+            None => self
+                .column_layout
+                .visible()
+                .iter()
+                .map(|source| self.column_layout.width(*source, INITIAL_COLUMN_WIDTH))
+                .collect(),
+        }
+    }
+
+    /// Display columns pinned to the left of the grid on screen.
+    fn pinned_columns(&self) -> usize {
+        match &self.filtered {
+            Some(filtered) if filtered.aggregate => 0,
+            Some(filtered) => self
+                .column_layout
+                .pinned()
+                .min(filtered.display_columns.len()),
+            None => self.column_layout.pinned(),
+        }
+    }
+
+    /// The selected row, every shown column, for the Inspector's Row section.
+    fn selected_row_view(&self) -> Option<RowView> {
+        let (row, _) = self.grid.selection?;
+        let (batch, offset) = self.batch_row_at(row)?;
+        let fields = self
+            .visible_batch_columns()
+            .into_iter()
+            .enumerate()
+            .map(|(display, column)| {
+                (
+                    self.display_column_name(display).unwrap_or_default(),
+                    column,
+                )
+            })
+            .collect();
+        Some(RowView {
+            row,
+            batch,
+            offset,
+            fields,
+        })
+    }
+}
+
+/// The full display text of one cell for the clipboard, quoted as spreadsheets
+/// expect when it holds a tab, line break or quote. `None` when it does not fit in
+/// `room` bytes.
+fn clipboard_field(array: &dyn arrow_array::Array, row: usize, room: usize) -> Option<String> {
+    // Formatting stops just past `room`, so a huge value is never built in full.
+    let text = format_cell_with_limit(array, row, room.saturating_add(1));
+    let text = if text.contains(['\t', '\n', '\r', '"']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    };
+    (text.len() <= room).then_some(text)
 }
 
 fn chart_status(model: &ChartModel, source: &str) -> String {
@@ -1767,6 +1989,7 @@ impl eframe::App for PaviApp {
         self.poll_profile();
         self.poll_export();
         self.show_top_bar(ctx);
+        ui::toolbar::window_resize_handles(ctx);
         self.show_chart_window(ctx);
         let compression = self
             .dataset

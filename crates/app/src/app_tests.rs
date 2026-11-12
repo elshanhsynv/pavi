@@ -1013,6 +1013,275 @@ fn cell_menu_adds_to_the_active_filter_and_filters_null_cells() {
     );
 }
 
+/// Text the app last put on the clipboard.
+fn clipboard(ctx: &egui::Context) -> Option<String> {
+    ctx.output(|output| {
+        output
+            .commands
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+    })
+}
+
+#[test]
+fn copies_full_values_with_spreadsheet_quoting() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("notes.parquet");
+    let long = "x".repeat(1_000);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("note", DataType::Utf8, false),
+    ]));
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+    writer
+        .write(
+            &arrow_array::RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..3)),
+                    Arc::new(StringArray::from(vec![long.as_str(), "a\tb", "say \"hi\""])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    writer.close().unwrap();
+    let mut app =
+        PaviApp::new_with_store(None, SessionStore::new(path.with_extension("session.json")));
+    app.begin_open(path);
+    poll_until_opened(&mut app);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    let ctx = egui::Context::default();
+
+    // A long value is copied whole, not cut like the grid shows it.
+    assert!(app.grid.select(0, 1));
+    app.copy_selection(&ctx, false);
+    assert_eq!(clipboard(&ctx).as_deref(), Some(long.as_str()));
+    assert_eq!(app.status, "Cell copied to clipboard");
+
+    // A range is tab-separated; fields with tabs or quotes are quoted.
+    assert!(app.grid.extend_selection(2, 0));
+    app.copy_selection(&ctx, false);
+    assert_eq!(
+        clipboard(&ctx).unwrap(),
+        format!("0\t{long}\n1\t\"a\tb\"\n2\t\"say \"\"hi\"\"\"")
+    );
+    assert_eq!(app.status, "6 cells copied to clipboard");
+
+    assert!(app.grid.select(1, 0));
+    app.copy_selection(&ctx, true);
+    assert_eq!(clipboard(&ctx).as_deref(), Some("1\t\"a\tb\""));
+}
+
+#[test]
+fn finds_text_in_loaded_rows_and_scrolls_to_it() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    app.find.query = "BETA".to_string();
+    app.find_next(false);
+    assert_eq!(app.find.message.as_deref(), Some("No rows are loaded yet"));
+
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    // Pretend the grid shows only 100 px right of the row numbers.
+    app.grid_view_x = (0.0, 100.0);
+    app.find_next(false);
+    assert_eq!(app.grid.selection, Some((1, 1)));
+    assert_eq!(app.jump_target, Some(1));
+    assert_eq!(app.find.message.as_deref(), Some("Row 2, name"));
+    // The match is in the second column, past the visible 100 px: scroll to it.
+    assert_eq!(app.grid_scroll_x, Some(INITIAL_COLUMN_WIDTH));
+    app.find_next(false);
+    assert_eq!(app.grid.selection, Some((3, 1)));
+    app.find_next(true);
+    assert_eq!(app.grid.selection, Some((1, 1)));
+    app.find_next(true);
+    assert_eq!(app.grid.selection, Some((7, 1)), "wraps around backwards");
+
+    app.find.query = "zzz".to_string();
+    app.find_next(false);
+    assert_eq!(app.grid.selection, Some((7, 1)));
+    assert_eq!(
+        app.find.message.as_deref(),
+        Some("Not in the loaded rows (1–8)")
+    );
+
+    // In a filtered result, find looks at the result rows.
+    app.filter_input = "id >= 4".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    app.find.query = "alpha".to_string();
+    app.find_next(false);
+    assert_eq!(app.grid.selection, Some((0, 1)));
+    assert_eq!(app.filtered_cell_text(0, 1).as_deref(), Some("alpha"));
+    assert_eq!(app.selected_row_view().unwrap().batch.num_rows(), 4);
+
+    // Ctrl+Shift+F opens the find bar instead of focusing the filter.
+    app.find = Default::default();
+    let context = egui::Context::default();
+    let modifiers = egui::Modifiers {
+        command: true,
+        shift: true,
+        ..Default::default()
+    };
+    context.begin_pass(egui::RawInput {
+        modifiers,
+        events: vec![egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    });
+    app.handle_global_shortcuts(&context);
+    let _ = context.end_pass();
+    assert!(app.find.open && app.find.focus);
+}
+
+#[test]
+fn row_view_lists_every_shown_column_of_the_selected_row() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    assert!(app.selected_row_view().is_none());
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    assert!(app.grid.select(2, 1));
+    let values = |app: &PaviApp| {
+        let view = app.selected_row_view().unwrap();
+        view.fields
+            .iter()
+            .map(|(name, column)| {
+                format!(
+                    "{name}={}",
+                    parquet_reader::value::format_cell(
+                        view.batch.column(*column).as_ref(),
+                        view.offset
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values(&app), ["id=2", "name=alpha"]);
+
+    // A SQL result lists the columns the grid shows for it, in the grid's order.
+    app.sql_input = "SELECT name, id FROM dataset WHERE id > 5".into();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.grid.select(1, 0));
+    assert_eq!(values(&app), ["id=7", "name=beta"]);
+}
+
+#[test]
+fn pins_columns_and_keeps_them_in_view_when_scrolled_sideways() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path.clone());
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+
+    app.header_action = Some(HeaderAction::Pin(1));
+    app.apply_header_action(&ctx);
+    assert_eq!(app.pinned_columns(), 1);
+    assert_eq!(app.status, "1 column pinned");
+
+    // 300 px is narrower than the row numbers, a 110 px and a 300 px column.
+    app.column_layout.set_width(1, 300.0);
+    let render = |app: &mut PaviApp| {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| app.show_grid(ui));
+            },
+        )
+    };
+    let texts = |output: &egui::FullOutput, text: &str| {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == text => Some(shape.pos.x),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..2 {
+        render(&mut app);
+    }
+    app.grid_scroll_x = Some(60.0);
+    render(&mut app);
+    let output = render(&mut app);
+    assert!(
+        app.grid_view_x.0 > 50.0,
+        "the grid scrolled: {:?}",
+        app.grid_view_x
+    );
+    // Row 1's number and its pinned id (0) are drawn again at the left edge.
+    let numbers = texts(&output, "1");
+    assert!(
+        numbers.iter().any(|x| (0.0..44.0).contains(x)),
+        "{numbers:?}"
+    );
+    let ids = texts(&output, "0");
+    assert!(ids.iter().any(|x| (44.0..160.0).contains(x)), "{ids:?}");
+
+    // Clicking the pinned cell selects that cell, not the one under it.
+    let ids_x = ids.into_iter().fold(f32::MIN, f32::max);
+    let click = egui::pos2(ids_x + 4.0, 28.0 + 12.0);
+    for pressed in [true, false] {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 400.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(click),
+                    egui::Event::PointerButton {
+                        pos: click,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new())
+                    .show(ctx, |ui| app.show_grid(ui));
+            },
+        );
+    }
+    assert_eq!(app.grid.selection, Some((0, 0)));
+
+    // The pin is saved with the column layout and comes back with the file.
+    app.begin_open(path);
+    poll_until_opened(&mut app);
+    assert_eq!(app.pinned_columns(), 1);
+    app.header_action = Some(HeaderAction::Pin(0));
+    app.apply_header_action(&ctx);
+    assert_eq!(app.pinned_columns(), 0);
+    assert_eq!(app.status, "Columns unpinned");
+}
+
 #[test]
 fn header_actions_sort_select_and_hide_columns() {
     let (_directory, source, path) = source(8);

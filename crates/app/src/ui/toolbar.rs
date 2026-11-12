@@ -373,11 +373,26 @@ impl PaviApp {
         let mut resize = None;
         let mut fit = None;
         let mut reset = false;
+        let mut unpin = false;
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_column_types, "Show types");
             ui.add_space(Spacing::Md.px());
             ui.checkbox(&mut self.freeze_header, "Pin header");
+            let pinned = self.column_layout.pinned();
+            if pinned > 0 {
+                ui.add_space(Spacing::Md.px());
+                unpin = ui
+                    .small_button(format!(
+                        "Unpin {pinned} column{}",
+                        if pinned == 1 { "" } else { "s" }
+                    ))
+                    .on_hover_text("Pin columns from a header's right-click menu")
+                    .clicked();
+            }
         });
+        if unpin {
+            self.header_action = Some(HeaderAction::Pin(0));
+        }
         ui.separator();
         ui.horizontal(|ui| {
             if ui
@@ -617,6 +632,87 @@ fn tail(text: &str, max_chars: usize) -> String {
     }
     let kept = text.chars().skip(count - max_chars).collect::<String>();
     format!("…{kept}")
+}
+
+/// Strips along the window edges and corners that resize the window. PAVI draws
+/// its own title bar, so the window has no border of its own to drag.
+pub(in crate::app) fn window_resize_handles(ctx: &egui::Context) {
+    use egui::{CursorIcon, ResizeDirection};
+    let (maximized, fullscreen) = ctx.input(|input| {
+        let viewport = input.viewport();
+        (
+            viewport.maximized.unwrap_or(false),
+            viewport.fullscreen.unwrap_or(false),
+        )
+    });
+    if maximized || fullscreen {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let edge = theme::RESIZE_BORDER;
+    let corner = edge * 3.0;
+    let (left, right, top, bottom) = (screen.left(), screen.right(), screen.top(), screen.bottom());
+    let strip = |x: std::ops::RangeInclusive<f32>, y: std::ops::RangeInclusive<f32>| {
+        egui::Rect::from_x_y_ranges(x, y)
+    };
+    let handles = [
+        (
+            ResizeDirection::North,
+            CursorIcon::ResizeNorth,
+            strip(left + corner..=right - corner, top..=top + edge),
+        ),
+        (
+            ResizeDirection::South,
+            CursorIcon::ResizeSouth,
+            strip(left + corner..=right - corner, bottom - edge..=bottom),
+        ),
+        (
+            ResizeDirection::West,
+            CursorIcon::ResizeWest,
+            strip(left..=left + edge, top + corner..=bottom - corner),
+        ),
+        (
+            ResizeDirection::East,
+            CursorIcon::ResizeEast,
+            strip(right - edge..=right, top + corner..=bottom - corner),
+        ),
+        (
+            ResizeDirection::NorthWest,
+            CursorIcon::ResizeNorthWest,
+            strip(left..=left + corner, top..=top + edge),
+        ),
+        (
+            ResizeDirection::NorthEast,
+            CursorIcon::ResizeNorthEast,
+            strip(right - corner..=right, top..=top + edge),
+        ),
+        (
+            ResizeDirection::SouthWest,
+            CursorIcon::ResizeSouthWest,
+            strip(left..=left + corner, bottom - edge..=bottom),
+        ),
+        (
+            ResizeDirection::SouthEast,
+            CursorIcon::ResizeSouthEast,
+            strip(right - corner..=right, bottom - edge..=bottom),
+        ),
+    ];
+    for (direction, cursor, rect) in handles {
+        egui::Area::new(egui::Id::new(("window_resize", format!("{direction:?}"))))
+            .order(egui::Order::Foreground)
+            .fixed_pos(rect.min)
+            .movable(false)
+            .constrain(false)
+            .show(ctx, |ui| {
+                let (_, response) = ui.allocate_exact_size(rect.size(), egui::Sense::drag());
+                if response.hovered() || response.dragged() {
+                    ctx.set_cursor_icon(cursor);
+                }
+                if response.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                }
+            });
+    }
 }
 
 fn toggle_maximized(ctx: &egui::Context) {

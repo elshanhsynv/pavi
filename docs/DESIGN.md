@@ -45,7 +45,7 @@ icons and shared controls in `crates/app/src/ui/widgets.rs`. This file explains 
 - The row-number gutter is as wide as the last row number needs (44 px minimum). Numeric columns are right-aligned so digits line up.
 - The Inspector opens 280 px wide and can be dragged between 240 and 460 px.
 - Column widths are 72–480 px (`ColumnLayout`).
-- Window: 1448×900 default, 900×600 minimum, no OS decorations (the top bar is the drag area and draws minimize, maximize and close).
+- Window: 1448×900 default, 900×600 minimum, no OS decorations (the top bar is the drag area and draws minimize, maximize and close). Strips `RESIZE_BORDER` (5 px) wide along the edges and corners resize the window (`window_resize_handles`), except when it is maximized.
 
 ## Typography
 
@@ -77,9 +77,10 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 ## Layout
 
 - **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box, Browse, Reload, Copy path, recent files), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (CSV, Parquet, copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `ACCENT`. Below a window width of 1,100 px (`COMPACT_BAR_WIDTH`) Sort, Columns and Export show only their icons, with the name in the tooltip, so the filter box keeps a usable width.
-- **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted.
+- **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted. When the grid scrolls sideways, the row numbers and any pinned columns are drawn again at the left edge, over the columns that slide under them, with a `BORDER` line at their right edge; pinned columns stop at 60% of the grid width (`MAX_PINNED_SHARE`).
+- **Find bar** (`show_find_bar`): opens above the grid with Ctrl+Shift+F. It searches only the rows loaded in memory, says so, and shows where the last match was ("Row 21, ARR_TIME").
 - **SQL workspace** (`ui/sql.rs`): editor, Run, Cancel and the History menu above the result grid.
-- **Inspector** (`ui/inspector.rs`): collapsible sections Cell, Column (with profile), File, Schema, Row groups, Page cache.
+- **Inspector** (`ui/inspector.rs`): collapsible sections Cell, Row (every shown column of the selected row, one per line; click a line to select that cell), Column (with profile), File, Schema, Row groups, Page cache.
 - **Status bar** (`ui/status.rs`): status dot or spinner, the share of the file a running filter, sort or SQL scan has read (e.g. `42%`), and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
 - **Charts** (`ui/charts.rs`) is the only floating window: a form of "label  control" rows (source and type switches, column names that can be typed or picked from the file's columns, title, limits), then Draw chart and the plot.
 
@@ -96,7 +97,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 ## Interaction
 
-- Keyboard: Ctrl+O open, Ctrl+R reload, Ctrl+F focus the filter box, Ctrl+G focus "Go to row", Ctrl+I toggle the Inspector, Ctrl+1 / Ctrl+2 Grid / SQL, Ctrl+C copy selection, Ctrl+Enter run SQL, arrow keys, Page Up/Down, Home and End (+Shift) move/extend the cell selection.
+- Keyboard: Ctrl+O open, Ctrl+R reload, Ctrl+F focus the filter box, Ctrl+Shift+F find in loaded rows (Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes), Ctrl+G focus "Go to row", Ctrl+I toggle the Inspector, Ctrl+1 / Ctrl+2 Grid / SQL, Ctrl+C copy selection, Ctrl+Enter run SQL, arrow keys, Page Up/Down, Home and End (+Shift) move/extend the cell selection.
 - Dropping a file on the window opens it.
 - A header click selects the column: it is underlined in `ACCENT` and the Inspector's Column section describes it. It never starts a scan.
 - A header right-click opens a menu: Sort ascending / descending, Profile column, Fit width, Hide column, Copy name.

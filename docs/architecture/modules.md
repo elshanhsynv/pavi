@@ -77,18 +77,19 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    46 tests driving PaviApp without a window
-├── state.rs        GridState, ColumnLayout, SelectionRange, LoadState, Workspace, ToolbarCommand
+├── app_tests.rs    50 tests driving PaviApp without a window
+├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
+├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
 ├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning)
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
 ├── session.rs      SessionState (serde), SessionStore (JSON at %LOCALAPPDATA%\PAVI\session-v1.json)
 └── ui/             (mounted via #[path = "ui/mod.rs"] inside app.rs; every file is `impl PaviApp`)
-    ├── toolbar.rs     top bar: file menu (path box, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls
-    ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header right-click menu
+    ├── toolbar.rs     top bar: file menu (path box, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls, window resize strips
+    ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header and cell menus, pinned-column overlay, find bar
     ├── sql.rs         SQL workspace, query history menu
-    ├── inspector.rs   right panel: file info, schema, row-group stats, profile
+    ├── inspector.rs   right panel: cell, whole row, column and profile, file info, schema, row-group stats
     ├── charts.rs / profile.rs
     ├── status.rs      status bar: message, dataset facts, jump-to-row
     └── theme.rs, spacing.rs, widgets.rs (colors, fonts and sizes, spacing scale, painted icons and shared controls)

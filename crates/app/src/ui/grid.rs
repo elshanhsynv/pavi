@@ -10,6 +10,10 @@ use super::{
 const RECENT_ON_START: usize = 4;
 /// Height of the pinned header row.
 const HEADER_HEIGHT: f32 = 28.0;
+/// Pinned columns stop once they would cover more than this share of the grid.
+const MAX_PINNED_SHARE: f32 = 0.6;
+/// Width of the find box.
+const FIND_BOX_WIDTH: f32 = 240.0;
 /// Width of the menu a right-click on a cell opens.
 const CELL_MENU_WIDTH: f32 = 220.0;
 /// Width of the menu a right-click on a header opens.
@@ -39,6 +43,9 @@ impl Header {
 
 impl PaviApp {
     pub(in crate::app) fn show_grid(&mut self, ui: &mut egui::Ui) {
+        if self.find.open && self.dataset.is_some() {
+            self.show_find_bar(ui);
+        }
         egui::Frame::new().fill(theme::BACKGROUND).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             ui.spacing_mut().item_spacing = Spacing::None.vec(Spacing::None);
@@ -146,110 +153,114 @@ impl PaviApp {
         } else {
             area
         };
+        let pinned = self.pinned_columns();
+        let scroll_x = self.grid_scroll_x.take();
+        let mut frame = PinnedFrame::default();
         // The table's vertical scroll offset after this frame (egui applies wheel
         // movement at the end of the frame, after the rows were drawn).
-        let table_offset = ui
+        let (body, offset_x, viewport) = ui
             .scope_builder(egui::UiBuilder::new().max_rect(table_area), |ui| {
-                egui::ScrollArea::horizontal()
-                    .id_salt("grid_horizontal")
-                    .show(ui, |ui| {
-                        ui.set_min_width(
-                            (visible.iter().map(|(_, _, width)| width).sum::<f32>() + gutter)
-                                .max(ui.available_width()),
+                let mut sideways = egui::ScrollArea::horizontal().id_salt("grid_horizontal");
+                if let Some(x) = scroll_x {
+                    sideways = sideways.horizontal_scroll_offset(x);
+                }
+                let output = sideways.show(ui, |ui| {
+                    ui.set_min_width(
+                        (visible.iter().map(|(_, _, width)| width).sum::<f32>() + gutter)
+                            .max(ui.available_width()),
+                    );
+                    let mut table = TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .cell_layout(Layout::left_to_right(Align::Center))
+                        .column(Column::exact(gutter));
+                    for (_, _, width) in &visible {
+                        table = table.column(Column::initial(*width).at_least(72.0));
+                    }
+                    // An empty last column takes the leftover width, so data
+                    // columns keep their own widths.
+                    table = table.column(Column::remainder());
+                    if windowed {
+                        table = table.scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
                         );
-                        let mut table = TableBuilder::new(ui)
-                            .striped(true)
-                            .resizable(true)
-                            .cell_layout(Layout::left_to_right(Align::Center))
-                            .column(Column::exact(gutter));
-                        for (_, _, width) in &visible {
-                            table = table.column(Column::initial(*width).at_least(72.0));
-                        }
-                        // An empty last column takes the leftover width, so data
-                        // columns keep their own widths.
-                        table = table.column(Column::remainder());
-                        if windowed {
-                            table = table.scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                            );
-                        }
-                        if let Some(offset) = scroll_offset {
-                            table = table.vertical_scroll_offset(offset);
-                        }
-                        if let Some(row) = jump_row {
-                            table = table.scroll_to_row(
-                                row.saturating_add(header_rows),
-                                Some(Align::Center),
-                            );
-                        }
-                        table
-                            .header(
+                    }
+                    if let Some(offset) = scroll_offset {
+                        table = table.vertical_scroll_offset(offset);
+                    }
+                    if let Some(row) = jump_row {
+                        table = table
+                            .scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
+                    }
+                    table
+                        .header(
+                            if self.freeze_header {
+                                HEADER_HEIGHT
+                            } else {
+                                0.0
+                            },
+                            |header| {
                                 if self.freeze_header {
-                                    HEADER_HEIGHT
-                                } else {
-                                    0.0
-                                },
-                                |header| {
-                                    if self.freeze_header {
-                                        self.render_headers(header, &headers);
+                                    frame.header = Some(self.render_headers(header, &headers));
+                                }
+                            },
+                        )
+                        .body(|body| {
+                            body.rows(
+                                ROW_HEIGHT,
+                                ui_row_count(self.grid.window_rows()).saturating_add(header_rows),
+                                |mut table_row| {
+                                    let index = table_row.index();
+                                    if index < header_rows {
+                                        frame.header =
+                                            Some(self.render_headers(table_row, &headers));
+                                        frame.header_in_body = true;
+                                        return;
                                     }
-                                },
-                            )
-                            .body(|body| {
-                                body.rows(
-                                    ROW_HEIGHT,
-                                    ui_row_count(self.grid.window_rows())
-                                        .saturating_add(header_rows),
-                                    |mut table_row| {
-                                        let index = table_row.index();
-                                        if index < header_rows {
-                                            self.render_headers(table_row, &headers);
-                                            return;
-                                        }
-                                        let row_index = base + (index - header_rows) as u64;
-                                        self.note_drawn_row(row_index);
-                                        let current_row = selected_row == Some(row_index);
-                                        for page in self.grid.visible_pages(row_index, row_index) {
-                                            self.pages.note_visible(page);
-                                            self.request_page(page);
-                                        }
+                                    let row_index = base + (index - header_rows) as u64;
+                                    self.note_drawn_row(row_index);
+                                    let current_row = selected_row == Some(row_index);
+                                    for page in self.grid.visible_pages(row_index, row_index) {
+                                        self.pages.note_visible(page);
+                                        self.request_page(page);
+                                    }
+                                    let (gutter_rect, _) =
                                         table_row.col(|ui| row_number(ui, row_index, current_row));
-                                        for (column, header) in headers.iter().enumerate() {
-                                            table_row.col(|ui| {
-                                                let look = CellLook {
-                                                    selected: self
-                                                        .grid
-                                                        .is_selected(row_index, column),
-                                                    current_row,
-                                                    numeric: header.numeric,
-                                                };
-                                                let text = self
-                                                    .cell_text(row_index, column)
-                                                    .unwrap_or_else(|| "…".to_string());
-                                                let response = cell_value(ui, &text, look);
-                                                if response.clicked()
-                                                    && ui.input(|input| input.modifiers.shift)
-                                                {
-                                                    self.grid.extend_selection(row_index, column);
-                                                } else if response.clicked()
-                                                    || response.secondary_clicked()
-                                                {
-                                                    self.grid.select(row_index, column);
-                                                }
-                                                self.cell_menu(&response);
-                                            });
+                                    let mut cells = Vec::new();
+                                    for (column, header) in headers.iter().enumerate() {
+                                        let look = CellLook {
+                                            selected: self.grid.is_selected(row_index, column),
+                                            current_row,
+                                            numeric: header.numeric,
+                                        };
+                                        let text = self
+                                            .cell_text(row_index, column)
+                                            .unwrap_or_else(|| "…".to_string());
+                                        let (rect, _) = table_row.col(|ui| {
+                                            self.data_cell(ui, row_index, column, &text, look);
+                                        });
+                                        if column < pinned {
+                                            cells.push(PinnedCell { rect, text, look });
                                         }
-                                        table_row.col(|_| {});
-                                    },
-                                );
-                            })
-                            .state
-                            .offset
-                            .y
-                    })
-                    .inner
+                                    }
+                                    table_row.col(|_| {});
+                                    frame.rows.push(PinnedRow {
+                                        row: row_index,
+                                        stripe: index % 2 == 0,
+                                        current: current_row,
+                                        gutter: gutter_rect,
+                                        cells,
+                                    });
+                                },
+                            );
+                        })
+                });
+                (output.inner, output.state.offset.x, output.inner_rect)
             })
             .inner;
+        let table_offset = body.state.offset.y;
+        self.grid_view_x = (offset_x, viewport.width() - gutter);
+        self.draw_pinned(ui, frame, &headers, table_area, body.inner_rect);
         if let (Some(bar), Some((first, last))) = (scrollbar, self.drawn_rows) {
             if let Some(top) = row_scrollbar(ui, bar, self.grid.rows, first, last) {
                 self.scroll_grid_to(top, header_rows);
@@ -382,104 +393,109 @@ impl PaviApp {
         let header_rows = usize::from(!self.freeze_header);
         let gutter = row_number_width(first_result.saturating_add(rows));
         let selected_row = self.grid.selection.map(|(row, _)| row);
-        egui::ScrollArea::horizontal()
-            .id_salt("filtered_grid_horizontal")
-            .show(ui, |ui| {
-                ui.set_min_width(
-                    ((0..columns)
-                        .map(|column| {
-                            if aggregate {
-                                INITIAL_COLUMN_WIDTH
-                            } else {
-                                self.column_layout
-                                    .width(display_columns[column].0, INITIAL_COLUMN_WIDTH)
-                            }
-                        })
-                        .sum::<f32>()
-                        + gutter)
-                        .max(ui.available_width()),
-                );
-                let mut table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(gutter));
-                for (source, _) in &display_columns {
-                    let width = if aggregate {
-                        INITIAL_COLUMN_WIDTH
-                    } else {
-                        self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
-                    };
-                    table = table.column(Column::initial(width).at_least(72.0));
-                }
-                table = table.column(Column::remainder());
-                if let Some(row) = jump_target {
-                    table =
-                        table.scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
-                }
-                table
-                    .header(
-                        if self.freeze_header {
-                            HEADER_HEIGHT
+        let pinned = self.pinned_columns();
+        let scroll_x = self.grid_scroll_x.take();
+        let mut frame = PinnedFrame::default();
+        let area = ui.available_rect_before_wrap();
+        let mut sideways = egui::ScrollArea::horizontal().id_salt("filtered_grid_horizontal");
+        if let Some(x) = scroll_x {
+            sideways = sideways.horizontal_scroll_offset(x);
+        }
+        let output = sideways.show(ui, |ui| {
+            ui.set_min_width(
+                ((0..columns)
+                    .map(|column| {
+                        if aggregate {
+                            INITIAL_COLUMN_WIDTH
                         } else {
-                            0.0
-                        },
-                        |header| {
-                            if self.freeze_header {
-                                self.render_headers(header, &headers);
+                            self.column_layout
+                                .width(display_columns[column].0, INITIAL_COLUMN_WIDTH)
+                        }
+                    })
+                    .sum::<f32>()
+                    + gutter)
+                    .max(ui.available_width()),
+            );
+            let mut table = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::exact(gutter));
+            for (source, _) in &display_columns {
+                let width = if aggregate {
+                    INITIAL_COLUMN_WIDTH
+                } else {
+                    self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
+                };
+                table = table.column(Column::initial(width).at_least(72.0));
+            }
+            table = table.column(Column::remainder());
+            if let Some(row) = jump_target {
+                table = table.scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
+            }
+            table
+                .header(
+                    if self.freeze_header {
+                        HEADER_HEIGHT
+                    } else {
+                        0.0
+                    },
+                    |header| {
+                        if self.freeze_header {
+                            frame.header = Some(self.render_headers(header, &headers));
+                        }
+                    },
+                )
+                .body(|body| {
+                    body.rows(
+                        ROW_HEIGHT,
+                        ui_row_count(rows).saturating_add(header_rows),
+                        |mut table_row| {
+                            let index = table_row.index();
+                            if index < header_rows {
+                                frame.header = Some(self.render_headers(table_row, &headers));
+                                frame.header_in_body = true;
+                                return;
                             }
-                        },
-                    )
-                    .body(|body| {
-                        body.rows(
-                            ROW_HEIGHT,
-                            ui_row_count(rows).saturating_add(header_rows),
-                            |mut table_row| {
-                                let index = table_row.index();
-                                if index < header_rows {
-                                    self.render_headers(table_row, &headers);
-                                    return;
-                                }
-                                let row_index = (index - header_rows) as u64;
-                                if row_index.saturating_add(1) == rows {
-                                    self.request_more_filtered();
-                                }
-                                let result_row = first_result.saturating_add(row_index);
-                                let current_row = selected_row == Some(result_row);
+                            let row_index = (index - header_rows) as u64;
+                            if row_index.saturating_add(1) == rows {
+                                self.request_more_filtered();
+                            }
+                            let result_row = first_result.saturating_add(row_index);
+                            let current_row = selected_row == Some(result_row);
+                            let (gutter_rect, _) =
                                 table_row.col(|ui| row_number(ui, result_row, current_row));
-                                for (column, (_, batch_column)) in
-                                    display_columns.iter().enumerate()
-                                {
-                                    table_row.col(|ui| {
-                                        let look = CellLook {
-                                            selected: self.grid.is_selected(result_row, column),
-                                            current_row,
-                                            numeric: headers[column].numeric,
-                                        };
-                                        let text = self
-                                            .filtered_cell_text(row_index, *batch_column)
-                                            .unwrap_or_else(|| "…".to_string());
-                                        let response = cell_value(ui, &text, look);
-                                        if response.clicked()
-                                            && ui.input(|input| input.modifiers.shift)
-                                        {
-                                            self.grid.extend_selection(result_row, column);
-                                        } else if response.clicked() || response.secondary_clicked()
-                                        {
-                                            self.grid.select_filtered(
-                                                first_result,
-                                                row_index,
-                                                column,
-                                            );
-                                        }
-                                        self.cell_menu(&response);
-                                    });
+                            let mut cells = Vec::new();
+                            for (column, (_, batch_column)) in display_columns.iter().enumerate() {
+                                let look = CellLook {
+                                    selected: self.grid.is_selected(result_row, column),
+                                    current_row,
+                                    numeric: headers[column].numeric,
+                                };
+                                let text = self
+                                    .filtered_cell_text(row_index, *batch_column)
+                                    .unwrap_or_else(|| "…".to_string());
+                                let (rect, _) = table_row.col(|ui| {
+                                    self.data_cell(ui, result_row, column, &text, look);
+                                });
+                                if column < pinned {
+                                    cells.push(PinnedCell { rect, text, look });
                                 }
-                                table_row.col(|_| {});
-                            },
-                        );
-                    });
-            });
+                            }
+                            table_row.col(|_| {});
+                            frame.rows.push(PinnedRow {
+                                row: result_row,
+                                stripe: index % 2 == 0,
+                                current: current_row,
+                                gutter: gutter_rect,
+                                cells,
+                            });
+                        },
+                    );
+                })
+        });
+        self.grid_view_x = (output.state.offset.x, output.inner_rect.width() - gutter);
+        self.draw_pinned(ui, frame, &headers, area, output.inner.inner_rect);
         self.apply_header_action(ui.ctx());
         self.apply_cell_action(ui.ctx());
     }
@@ -653,119 +669,392 @@ impl PaviApp {
             .map(|sort| sort.direction)
     }
 
-    fn render_headers(&mut self, mut row: egui_extras::TableRow<'_, '_>, headers: &[Header]) {
-        row.col(|ui| header_fill(ui, ui.max_rect(), false));
+    /// Draws one header row and returns where its cells went.
+    fn render_headers(
+        &mut self,
+        mut row: egui_extras::TableRow<'_, '_>,
+        headers: &[Header],
+    ) -> HeaderRects {
+        let (gutter, _) = row.col(|ui| {
+            let (rect, _) = ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::hover());
+            header_fill(ui, rect, false);
+        });
         let selected_column = self.grid.selection.map(|(_, column)| column);
-        for (column, header) in headers.iter().enumerate() {
-            row.col(|ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::click());
-                response.widget_info(|| {
-                    egui::WidgetInfo::labeled(
-                        egui::WidgetType::Button,
-                        ui.is_enabled(),
-                        &header.name,
-                    )
-                });
-                header_fill(ui, rect, response.hovered());
-                if selected_column == Some(column) {
-                    // Marks the column the Inspector describes.
-                    ui.painter().hline(
-                        rect.x_range(),
-                        rect.bottom() - 1.0,
-                        egui::Stroke::new(2.0_f32, theme::ACCENT),
-                    );
-                }
-                let pad = Spacing::Md.px();
-                let name = ui.painter_at(rect.shrink2(egui::vec2(pad, 0.0))).text(
-                    egui::pos2(rect.left() + pad, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    &header.name,
-                    theme::strong(12.5),
-                    theme::TEXT,
+        let cells = headers
+            .iter()
+            .enumerate()
+            .map(|(column, header)| {
+                row.col(|ui| self.header_cell(ui, column, header, selected_column))
+                    .0
+            })
+            .collect();
+        row.col(|ui| header_fill(ui, ui.max_rect(), false));
+        HeaderRects { gutter, cells }
+    }
+
+    /// One column header: name, sort arrow and type; click selects the column,
+    /// right-click opens its menu.
+    fn header_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        column: usize,
+        header: &Header,
+        selected_column: Option<usize>,
+    ) {
+        let (rect, response) = ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &header.name)
+        });
+        header_fill(ui, rect, response.hovered());
+        if selected_column == Some(column) {
+            // Marks the column the Inspector describes.
+            ui.painter().hline(
+                rect.x_range(),
+                rect.bottom() - 1.0,
+                egui::Stroke::new(2.0_f32, theme::ACCENT),
+            );
+        }
+        let pad = Spacing::Md.px();
+        let name = ui.painter_at(rect.shrink2(egui::vec2(pad, 0.0))).text(
+            egui::pos2(rect.left() + pad, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &header.name,
+            theme::strong(12.5),
+            theme::TEXT,
+        );
+        let mut used = name.right();
+        if let Some(direction) = header.source.and_then(|source| self.sort_direction(source))
+            && used + 18.0 < rect.right()
+        {
+            widgets::icon(
+                ui,
+                egui::pos2(used + 10.0, rect.center().y),
+                match direction {
+                    SortDirection::Ascending => Icon::ArrowUp,
+                    SortDirection::Descending => Icon::ArrowDown,
+                },
+                theme::ACCENT,
+            );
+            used += 18.0;
+        }
+        if self.show_column_types {
+            // The name wins: the type label is cut on the left when space is short.
+            let room = rect.with_min_x(used + pad).with_max_x(rect.right() - pad);
+            let label =
+                ui.painter()
+                    .layout_no_wrap(header.data_type.clone(), theme::small(), header.color);
+            // A cut-off label is noise; the tooltip still names the type.
+            if label.size().x <= room.width() {
+                ui.painter().galley(
+                    egui::pos2(
+                        room.right() - label.size().x,
+                        room.center().y - label.size().y / 2.0,
+                    ),
+                    label,
+                    header.color,
                 );
-                let mut used = name.right();
-                if let Some(direction) =
-                    header.source.and_then(|source| self.sort_direction(source))
-                    && used + 18.0 < rect.right()
-                {
-                    widgets::icon(
-                        ui,
-                        egui::pos2(used + 10.0, rect.center().y),
-                        match direction {
-                            SortDirection::Ascending => Icon::ArrowUp,
-                            SortDirection::Descending => Icon::ArrowDown,
-                        },
-                        theme::ACCENT,
-                    );
-                    used += 18.0;
+            }
+        }
+        let response = response.on_hover_text(format!(
+            "{}\n{}\nClick to select, right-click for more",
+            header.name, header.data_type,
+        ));
+        if response.clicked() {
+            self.header_action = Some(HeaderAction::Select(column));
+        }
+        response.context_menu(|ui| {
+            ui.set_width(HEADER_MENU_WIDTH);
+            let mut chosen = None;
+            if let Some(source) = header.source {
+                for (label, direction) in [
+                    ("Sort ascending", SortDirection::Ascending),
+                    ("Sort descending", SortDirection::Descending),
+                ] {
+                    if widgets::menu_item(ui, label, "").clicked() {
+                        chosen = Some(HeaderAction::Sort(source, direction));
+                    }
                 }
-                if self.show_column_types {
-                    // The name wins: the type label is cut on the left when space is short.
-                    let room = rect.with_min_x(used + pad).with_max_x(rect.right() - pad);
-                    let label = ui.painter().layout_no_wrap(
-                        header.data_type.clone(),
-                        theme::small(),
-                        header.color,
+                ui.separator();
+                if widgets::menu_item(ui, "Profile column", "").clicked() {
+                    chosen = Some(HeaderAction::Profile(source));
+                }
+                if widgets::menu_item(ui, "Fit width", "").clicked() {
+                    chosen = Some(HeaderAction::Fit(source));
+                }
+                if widgets::menu_item(ui, "Hide column", "").clicked() {
+                    chosen = Some(HeaderAction::Hide(source));
+                }
+                ui.separator();
+                if widgets::menu_item(ui, "Pin columns up to here", "").clicked() {
+                    chosen = Some(HeaderAction::Pin(column + 1));
+                }
+                if self.pinned_columns() > 0
+                    && widgets::menu_item(ui, "Unpin columns", "").clicked()
+                {
+                    chosen = Some(HeaderAction::Pin(0));
+                }
+                ui.separator();
+            }
+            if widgets::menu_item(ui, "Copy name", "").clicked() {
+                chosen = Some(HeaderAction::CopyName(header.name.clone()));
+            }
+            if chosen.is_some() {
+                self.header_action = chosen;
+                ui.close_menu();
+            }
+        });
+    }
+
+    /// One data cell: draws it and handles clicks and its right-click menu.
+    fn data_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: u64,
+        column: usize,
+        text: &str,
+        look: CellLook,
+    ) {
+        let response = cell_value(ui, text, look);
+        if response.clicked() && ui.input(|input| input.modifiers.shift) {
+            self.grid.extend_selection(row, column);
+        } else if response.clicked() || response.secondary_clicked() {
+            self.grid.select(row, column);
+        }
+        self.cell_menu(&response);
+    }
+
+    /// Draws the row numbers and pinned columns again at the left edge of the
+    /// grid, over the columns that scrolled under them. Nothing is drawn while the
+    /// grid is not scrolled sideways: the real cells are already in place.
+    fn draw_pinned(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: PinnedFrame,
+        headers: &[Header],
+        area: egui::Rect,
+        body: egui::Rect,
+    ) {
+        let Some(gutter_left) = frame
+            .rows
+            .first()
+            .map(|row| row.gutter.left())
+            .or_else(|| frame.header.as_ref().map(|header| header.gutter.left()))
+        else {
+            return;
+        };
+        let shift = egui::vec2(area.left() - gutter_left, 0.0);
+        if shift.x < 0.5 {
+            return;
+        }
+        // Pinned columns never cover most of the grid.
+        let limit = area.left() + area.width() * MAX_PINNED_SHARE;
+        let fits = |rect: &egui::Rect| rect.right() + shift.x <= limit;
+        let body_clip = egui::Rect::from_x_y_ranges(area.x_range(), body.y_range());
+        let mut right = area.left();
+        for row in frame.rows {
+            let gutter = row.gutter.translate(shift);
+            let cells = row
+                .cells
+                .into_iter()
+                .take_while(|cell| fits(&cell.rect))
+                .collect::<Vec<_>>();
+            let strip_right = cells
+                .last()
+                .map_or(gutter.right(), |cell| cell.rect.right() + shift.x);
+            right = right.max(strip_right);
+            ui.painter_at(body_clip).rect_filled(
+                egui::Rect::from_x_y_ranges(gutter.left()..=strip_right, gutter.y_range()),
+                0.0,
+                if row.stripe {
+                    theme::STRIPE
+                } else {
+                    theme::BACKGROUND
+                },
+            );
+            pinned_scope(ui, gutter, body_clip, ("pinned_gutter", row.row), |ui| {
+                row_number(ui, row.row, row.current);
+            });
+            for (column, cell) in cells.iter().enumerate() {
+                let rect = cell.rect.translate(shift);
+                pinned_scope(
+                    ui,
+                    rect,
+                    body_clip,
+                    ("pinned_cell", row.row, column),
+                    |ui| {
+                        self.data_cell(ui, row.row, column, &cell.text, cell.look);
+                    },
+                );
+            }
+        }
+        if let Some(header) = frame.header {
+            let clip = if frame.header_in_body {
+                body_clip
+            } else {
+                egui::Rect::from_x_y_ranges(area.x_range(), header.gutter.y_range())
+            };
+            let gutter = header.gutter.translate(shift);
+            pinned_scope(ui, gutter, clip, "pinned_header_gutter", |ui| {
+                header_fill(ui, gutter, false);
+            });
+            let selected_column = self.grid.selection.map(|(_, column)| column);
+            let pinned = self.pinned_columns();
+            for (column, rect) in header.cells.iter().enumerate().take(pinned) {
+                if !fits(rect) {
+                    break;
+                }
+                right = right.max(rect.right() + shift.x);
+                pinned_scope(
+                    ui,
+                    rect.translate(shift),
+                    clip,
+                    ("pinned_header", column),
+                    |ui| {
+                        self.header_cell(ui, column, &headers[column], selected_column);
+                    },
+                );
+            }
+        }
+        // The edge the other columns slide under.
+        ui.painter().vline(
+            right,
+            area.top()..=body.bottom(),
+            egui::Stroke::new(1.0_f32, theme::BORDER),
+        );
+    }
+
+    /// The find bar above the grid.
+    fn show_find_bar(&mut self, ui: &mut egui::Ui) {
+        let mut search = None;
+        let mut close = false;
+        egui::Frame::new()
+            .fill(theme::PANEL)
+            .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = Spacing::Sm.px();
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.find.query)
+                            .id(find_box_id())
+                            .desired_width(FIND_BOX_WIDTH)
+                            .hint_text("Find in loaded rows"),
                     );
-                    // A cut-off label is noise; the tooltip still names the type.
-                    if label.size().x <= room.width() {
-                        ui.painter().galley(
-                            egui::pos2(
-                                room.right() - label.size().x,
-                                room.center().y - label.size().y / 2.0,
-                            ),
-                            label,
-                            header.color,
+                    if std::mem::take(&mut self.find.focus) {
+                        response.request_focus();
+                    }
+                    if response.changed() {
+                        self.find.resume = None;
+                        self.find.message = None;
+                    }
+                    if response.lost_focus() {
+                        if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                            search = Some(ui.input(|input| input.modifiers.shift));
+                            // Keep typing or pressing Enter for the next match.
+                            response.request_focus();
+                        } else if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                            close = true;
+                        }
+                    }
+                    if widgets::tool_button(ui, Some(Icon::ArrowUp), "", false)
+                        .on_hover_text("Previous match (Shift+Enter)")
+                        .clicked()
+                    {
+                        search = Some(true);
+                    }
+                    if widgets::tool_button(ui, Some(Icon::ArrowDown), "", false)
+                        .on_hover_text("Next match (Enter, F3)")
+                        .clicked()
+                    {
+                        search = Some(false);
+                    }
+                    if let Some(message) = &self.find.message {
+                        ui.label(
+                            RichText::new(message)
+                                .font(theme::small())
+                                .color(theme::TEXT),
                         );
                     }
-                }
-                let response = response.on_hover_text(format!(
-                    "{}\n{}\nClick to select, right-click for more",
-                    header.name, header.data_type,
-                ));
-                if response.clicked() {
-                    self.header_action = Some(HeaderAction::Select(column));
-                }
-                response.context_menu(|ui| {
-                    ui.set_width(HEADER_MENU_WIDTH);
-                    let mut chosen = None;
-                    if let Some(source) = header.source {
-                        for (label, direction) in [
-                            ("Sort ascending", SortDirection::Ascending),
-                            ("Sort descending", SortDirection::Descending),
-                        ] {
-                            if widgets::menu_item(ui, label, "").clicked() {
-                                chosen = Some(HeaderAction::Sort(source, direction));
-                            }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::tool_button(ui, Some(Icon::Close), "", false)
+                            .on_hover_text("Close (Esc)")
+                            .clicked()
+                        {
+                            close = true;
                         }
-                        ui.separator();
-                        if widgets::menu_item(ui, "Profile column", "").clicked() {
-                            chosen = Some(HeaderAction::Profile(source));
-                        }
-                        if widgets::menu_item(ui, "Fit width", "").clicked() {
-                            chosen = Some(HeaderAction::Fit(source));
-                        }
-                        if widgets::menu_item(ui, "Hide column", "").clicked() {
-                            chosen = Some(HeaderAction::Hide(source));
-                        }
-                        ui.separator();
-                    }
-                    if widgets::menu_item(ui, "Copy name", "").clicked() {
-                        chosen = Some(HeaderAction::CopyName(header.name.clone()));
-                    }
-                    if chosen.is_some() {
-                        self.header_action = chosen;
-                        ui.close_menu();
-                    }
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
+                                    "Looks only at the rows loaded in memory; filter to search the whole file.",
+                                )
+                                .font(theme::small())
+                                .color(theme::MUTED),
+                            )
+                            .truncate(),
+                        );
+                    });
                 });
             });
+        if let Some(backwards) = search {
+            self.find_next(backwards);
         }
-        row.col(|ui| header_fill(ui, ui.max_rect(), false));
+        if close {
+            self.find = Default::default();
+        }
     }
 }
 
 const SCROLLBAR_WIDTH: f32 = 12.0;
+
+/// Id of the find box, so Ctrl+Shift+F can focus it.
+pub fn find_box_id() -> egui::Id {
+    egui::Id::new("find_box")
+}
+
+/// Where this frame's header cells were drawn.
+struct HeaderRects {
+    gutter: egui::Rect,
+    cells: Vec<egui::Rect>,
+}
+
+/// What was drawn this frame in the columns that stay put, to draw again over
+/// the scrolled columns.
+#[derive(Default)]
+struct PinnedFrame {
+    header: Option<HeaderRects>,
+    /// The header is a scrolling row (not pinned to the top).
+    header_in_body: bool,
+    rows: Vec<PinnedRow>,
+}
+
+struct PinnedRow {
+    row: u64,
+    /// egui striped this row.
+    stripe: bool,
+    current: bool,
+    gutter: egui::Rect,
+    cells: Vec<PinnedCell>,
+}
+
+struct PinnedCell {
+    rect: egui::Rect,
+    text: String,
+    look: CellLook,
+}
+
+/// Runs `body` in a child Ui covering `rect`, clipped to `clip`, with a stable id.
+fn pinned_scope(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    clip: egui::Rect,
+    id: impl std::hash::Hash,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect).id_salt(id), |ui| {
+        ui.set_clip_rect(clip.intersect(rect));
+        body(ui);
+    });
+}
 
 /// PAVI's scrollbar for windowed grids. It shows the drawn rows `first..=last`
 /// within all `total` rows and, when clicked or dragged, returns the row to show
@@ -844,7 +1133,8 @@ fn header_fill(ui: &egui::Ui, rect: egui::Rect, hovered: bool) {
 
 /// The row-number gutter cell.
 fn row_number(ui: &mut egui::Ui, row: u64, current: bool) {
-    let rect = ui.max_rect();
+    // Allocated, not only painted, so the table reports where the cell is.
+    let (rect, _) = ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     if current {
         painter.rect_filled(rect, 0.0, theme::HEADER);
