@@ -28,6 +28,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
+| Saved queries | 100, each ≤ 16 KB, names ≤ 80 characters | `session::MAX_SAVED_QUERIES`, `MAX_QUERY_BYTES`, `MAX_SAVED_NAME_CHARS` |
+| SQL completions shown | 8 | `sql_editor::MAX_SUGGESTIONS` |
 
 ## Responsiveness rules
 

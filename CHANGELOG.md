@@ -17,6 +17,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Decimal and time-of-day columns can be filtered (`price > 12.50`, `at < 08:30:00`), sorted, grouped, profiled and charted, and used in MIN/MAX. Decimals also work with SUM and AVG.
 - A list, struct or map cell opens as a tree in the Inspector.
 - Sort by several columns: right-click a header and choose "Then by", or write `ORDER BY a DESC, b` in SQL.
+- The SQL editor highlights keywords, strings, numbers and column names, and completes column names and keywords as you type (Tab or Enter takes a suggestion).
+- Save SQL queries under a name from the new Saved menu, and load or delete them later. They are kept with the session.
 - SQL `GROUP BY` takes several columns, e.g. `SELECT carrier, origin, COUNT(*) FROM dataset GROUP BY carrier, origin`.
 
 ### Changed

@@ -1283,6 +1283,65 @@ fn pins_columns_and_keeps_them_in_view_when_scrolled_sideways() {
 }
 
 #[test]
+fn sql_editor_completes_column_names_with_the_keyboard() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    app.workspace = Workspace::Sql;
+    app.sql_input.clear();
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    let key = |key: egui::Key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let frame = |app: &mut PaviApp, events: Vec<egui::Event>| {
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.show_sql_workspace(ui));
+            },
+        );
+    };
+    frame(&mut app, vec![]);
+    ctx.memory_mut(|memory| memory.request_focus(ui::sql::sql_editor_id()));
+    frame(&mut app, vec![]);
+
+    frame(&mut app, vec![egui::Event::Text("SELECT na".into())]);
+    let completion = app.sql_completion.clone().expect("completions for `na`");
+    assert_eq!(completion.items[0].insert, "name");
+    // Tab takes the chosen completion instead of inserting a tab.
+    frame(&mut app, vec![key(egui::Key::Tab)]);
+    assert_eq!(app.sql_input, "SELECT name");
+    assert!(app.sql_completion.is_none());
+    // Typing goes on after the completed word.
+    frame(&mut app, vec![egui::Event::Text(" FROM da".into())]);
+    assert_eq!(
+        app.sql_completion.as_ref().unwrap().items[0].insert,
+        "dataset"
+    );
+    // Esc closes the list and leaves the text alone.
+    frame(&mut app, vec![key(egui::Key::Escape)]);
+    assert!(app.sql_completion.is_none());
+    assert_eq!(app.sql_input, "SELECT name FROM da");
+    // No list inside a string.
+    frame(
+        &mut app,
+        vec![egui::Event::Text("taset WHERE name = 'na".into())],
+    );
+    assert!(app.sql_completion.is_none());
+}
+
+#[test]
 fn header_actions_sort_select_and_hide_columns() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);

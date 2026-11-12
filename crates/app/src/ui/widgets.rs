@@ -21,6 +21,7 @@ pub enum Icon {
     Maximize,
     ArrowUp,
     ArrowDown,
+    Bookmark,
 }
 
 const ICON_STROKE: f32 = 1.3;
@@ -131,6 +132,14 @@ pub fn icon(ui: &egui::Ui, center: Pos2, glyph: Icon, color: Color32) {
             line(&[(0.0, -5.0), (0.0, 5.0)]);
             line(&[(-3.5, 1.5), (0.0, 5.0), (3.5, 1.5)]);
         }
+        Icon::Bookmark => line(&[
+            (-4.5, -6.0),
+            (4.5, -6.0),
+            (4.5, 6.0),
+            (0.0, 2.5),
+            (-4.5, 6.0),
+            (-4.5, -6.0),
+        ]),
     }
 }
 
