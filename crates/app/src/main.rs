@@ -4,6 +4,7 @@
 
 mod app;
 mod chart;
+mod compare;
 mod export;
 mod find;
 mod inspector;

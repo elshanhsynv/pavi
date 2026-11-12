@@ -89,8 +89,9 @@ crates/app/src/                (pavi)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV and JSON Lines writers, Parquet ArrowWriter, Arrow IPC FileWriter, temp-file + rename
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
-├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator
-├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning)
+├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator
+├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
+├── compare.rs      CompareState, SchemaDiff, key_query (SQL for rows only in one tab)
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
 ├── session.rs      SessionState (serde: recent files, history, saved queries, layouts), SessionStore (JSON at %LOCALAPPDATA%\PAVI\session-v1.json)
 ├── sql_editor.rs   SQL tokens for highlighting, word-at-cursor completions, column quoting
@@ -100,7 +101,7 @@ crates/app/src/                (pavi)
     ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header and cell menus, pinned-column overlay, find bar
     ├── sql.rs         SQL workspace: highlighted editor with completions, History and Saved menus
     ├── inspector.rs   right panel: cell, whole row, column and profile, file info, schema, row-group stats
-    ├── charts.rs / profile.rs
+    ├── charts.rs / profile.rs / file_profile.rs / compare.rs
     ├── status.rs      status bar: message, dataset facts, jump-to-row
     └── theme.rs, spacing.rs, widgets.rs (colors, fonts and sizes, spacing scale, painted icons and shared controls)
 ```
@@ -139,14 +140,14 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | `show_filtered_grid` | Same, over `FilteredGrid.batches`; asks for more when the last row is rendered | `ui/grid.rs:198-386` |
 | `render_headers` | Painted header with name/type. A click selects the column; a right-click opens a menu (sort, profile, fit, hide, copy name). The choice is stored as a `HeaderAction` and run by `apply_header_action` after the table is drawn | `ui/grid.rs`, `app.rs` |
 | `show_inspector_panel` | File props, schema, nested preview, per-row-group stats (virtualized `show_rows`), selected cell, profile | `ui/inspector.rs` |
-| `show_sql_workspace`, `show_chart_window`, `status::show` | SQL editor (highlighting, completions) with history and saved queries, charts, status bar with dataset facts and jump-to-row (returns `true` when Enter was pressed in the row box) | `ui/sql.rs`, `ui/charts.rs`, `ui/status.rs` |
+| `show_sql_workspace`, `show_chart_window`, `show_file_profile_window`, `show_compare_window`, `status::show` | SQL editor (highlighting, completions) with history and saved queries, charts, the whole-file profile, comparing two tabs, status bar with dataset facts and jump-to-row (returns `true` when Enter was pressed in the row box) | `ui/sql.rs`, `ui/charts.rs`, `ui/file_profile.rs`, `ui/compare.rs`, `ui/status.rs` |
 | `theme`, `spacing`, `widgets` | Static palette, fonts and widget sizes, spacing scale, painted icons and shared controls | `ui/theme.rs`, `ui/spacing.rs`, `ui/widgets.rs` |
 
 ### Application state
 
 | Type | Holds | Ref |
 |---|---|---|
-| `PaviApp` | runtime, the open tab's id and the parked tabs (`tabs: Tabs`), dataset, open task, `pages: SourcePages`, `filtered: Option<FilteredGrid>`, column layout, grid window offsets, `export: ExportState`, chart/profile state, text inputs, session, UI toggles, status string | `app.rs` |
+| `PaviApp` | runtime, the open tab's id and the parked tabs (`tabs: Tabs`), the Compare window (`compare: CompareState`, shared by all tabs), dataset, open task, `pages: SourcePages`, `filtered: Option<FilteredGrid>`, column layout, grid window offsets, `export: ExportState`, chart/profile state (the profile includes the whole-file one), text inputs, session, UI toggles, status string | `app.rs` |
 | `TabState`, `Tabs` | One parked tab: the same fields as `PaviApp` from `tab_id` to `workspace` (dataset, pages, result, layout, inputs, chart, profile, export). Switching swaps them with `PaviApp`'s; nothing is re-run. `Tabs` holds the parked tabs (≤16) and the open tab's position | `tabs.rs` |
 | `SourcePages` | page reads in flight, loaded pages (LRU ≤8), this frame's requests and drawn page range; `poll`, `track`, `cancel_offscreen`, `clear` | `pages.rs` |
 | `Dataset` | `Arc<ParquetSource>`, path, column names | `app.rs:45-49` |

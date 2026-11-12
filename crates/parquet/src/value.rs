@@ -537,6 +537,98 @@ fn format_binary(value: &[u8], limit: usize) -> String {
     out
 }
 
+/// A chart axis tick label for `value`: decimals to suit `step` (the distance
+/// between ticks), and k, M, G or T for large values.
+pub fn axis_number(value: f64, step: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let magnitude = value.abs();
+    for (scale, suffix) in [(1e12, "T"), (1e9, "G"), (1e6, "M")] {
+        if magnitude >= scale {
+            return format!("{}{suffix}", trim_zeros(format!("{:.2}", value / scale)));
+        }
+    }
+    if magnitude >= 1e4 && step >= 1e3 {
+        return format!("{}k", trim_zeros(format!("{:.1}", value / 1e3)));
+    }
+    let decimals = if step > 0.0 && step < 1.0 {
+        (-step.log10()).ceil().clamp(0.0, 9.0) as usize
+    } else {
+        0
+    };
+    // `-0` reads oddly on an axis.
+    let text = format!("{value:.decimals$}");
+    if text
+        .trim_start_matches('-')
+        .chars()
+        .all(|c| c == '0' || c == '.')
+    {
+        return text.trim_start_matches('-').to_owned();
+    }
+    text
+}
+
+fn trim_zeros(text: String) -> String {
+    if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_owned()
+    } else {
+        text
+    }
+}
+
+/// The text of a stored date, timestamp or time-of-day value (days, or the
+/// type's unit), formatted as a cell of `data_type` is. `None` for other types
+/// or values outside the type's range.
+pub fn temporal_text(data_type: &DataType, value: f64) -> Option<String> {
+    use arrow_array::{
+        Date32Array, Date64Array, Time32MillisecondArray, Time32SecondArray,
+        Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+        TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow_schema::TimeUnit;
+
+    if !value.is_finite() {
+        return None;
+    }
+    let whole = value.round();
+    let array: std::sync::Arc<dyn Array> = match data_type {
+        DataType::Date32 => {
+            std::sync::Arc::new(Date32Array::from(vec![i32::try_from(whole as i64).ok()?]))
+        }
+        DataType::Date64 => std::sync::Arc::new(Date64Array::from(vec![whole as i64])),
+        DataType::Timestamp(unit, zone) => {
+            let zone = zone.clone();
+            match unit {
+                TimeUnit::Second => std::sync::Arc::new(
+                    TimestampSecondArray::from(vec![whole as i64]).with_timezone_opt(zone),
+                ),
+                TimeUnit::Millisecond => std::sync::Arc::new(
+                    TimestampMillisecondArray::from(vec![whole as i64]).with_timezone_opt(zone),
+                ),
+                TimeUnit::Microsecond => std::sync::Arc::new(
+                    TimestampMicrosecondArray::from(vec![whole as i64]).with_timezone_opt(zone),
+                ),
+                TimeUnit::Nanosecond => std::sync::Arc::new(
+                    TimestampNanosecondArray::from(vec![whole as i64]).with_timezone_opt(zone),
+                ),
+            }
+        }
+        DataType::Time32(TimeUnit::Second) => std::sync::Arc::new(Time32SecondArray::from(vec![
+            i32::try_from(whole as i64).ok()?,
+        ])),
+        DataType::Time32(_) => std::sync::Arc::new(Time32MillisecondArray::from(vec![
+            i32::try_from(whole as i64).ok()?,
+        ])),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            std::sync::Arc::new(Time64MicrosecondArray::from(vec![whole as i64]))
+        }
+        DataType::Time64(_) => std::sync::Arc::new(Time64NanosecondArray::from(vec![whole as i64])),
+        _ => return None,
+    };
+    scalar_text(array.as_ref(), 0).ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{
@@ -802,5 +894,29 @@ mod tests {
         assert!(formatted.contains("..."));
         assert!(formatted.len() <= 24);
         assert!(format_cell_with_limit(&values, 0, 200).contains("..."));
+    }
+
+    #[test]
+    fn formats_chart_axis_labels() {
+        assert_eq!(axis_number(0.0, 0.5), "0.0");
+        assert_eq!(axis_number(2.5, 0.5), "2.5");
+        assert_eq!(axis_number(-0.0001, 0.5), "0.0");
+        assert_eq!(axis_number(1200.0, 200.0), "1200");
+        assert_eq!(axis_number(25_000.0, 5_000.0), "25k");
+        assert_eq!(axis_number(1_500_000.0, 500_000.0), "1.5M");
+        assert_eq!(axis_number(3e9, 1e9), "3G");
+        assert_eq!(
+            temporal_text(&DataType::Date32, 13_149.0).as_deref(),
+            Some("2006-01-01")
+        );
+        assert_eq!(
+            temporal_text(
+                &DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+                86_400.0
+            )
+            .as_deref(),
+            Some("1970-01-02T00:00:00")
+        );
+        assert_eq!(temporal_text(&DataType::Int32, 1.0), None);
     }
 }

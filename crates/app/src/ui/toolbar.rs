@@ -143,6 +143,7 @@ impl PaviApp {
         let mut browse_folder = false;
         let mut new_tab = false;
         let mut refresh = false;
+        let mut compare = false;
         let response = widgets::menu(ui, "file", Some(Icon::Folder), &label, false, 420.0, |ui| {
             let path_box = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
@@ -167,6 +168,11 @@ impl PaviApp {
                     ui.ctx().copy_text(dataset.path.display().to_string());
                     widgets::close_menu(ui);
                 }
+                if self.tab_count() > 1 {
+                    compare = widgets::menu_item(ui, "Compare with another tab…", "")
+                        .on_hover_text("Columns and rows of this tab against another one")
+                        .clicked();
+                }
             }
             if !self.session.recent_files.is_empty() {
                 ui.separator();
@@ -185,7 +191,7 @@ impl PaviApp {
                     }
                 }
             }
-            if open.is_some() || browse || browse_folder || new_tab || refresh {
+            if open.is_some() || browse || browse_folder || new_tab || refresh || compare {
                 widgets::close_menu(ui);
             }
         });
@@ -207,6 +213,9 @@ impl PaviApp {
         }
         if refresh {
             self.refresh_document();
+        }
+        if compare {
+            self.open_compare();
         }
         if let Some(path) = open {
             self.open_path(path);

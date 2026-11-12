@@ -12,7 +12,7 @@ const DISTRIBUTION_BINS: usize = 20;
 pub fn show(
     ui: &mut egui::Ui,
     profile: &ColumnProfile,
-    draw_chart: impl FnOnce(&mut egui::Ui, &ChartModel, &ChartConfig),
+    draw_chart: impl FnOnce(&mut egui::Ui, &ChartModel, &ChartConfig) -> egui::Rect,
 ) {
     let caption = |ui: &mut egui::Ui, text: &str| {
         ui.add_space(Spacing::Sm.px());
@@ -96,7 +96,7 @@ pub fn show(
         let config = ChartConfig {
             kind: ChartKind::Histogram,
             x_column: profile.name.clone(),
-            y_column: String::new(),
+            y_columns: Vec::new(),
             point_limit: MAX_INPUT_ROWS,
             bins: DISTRIBUTION_BINS,
             title: String::new(),

@@ -1583,7 +1583,7 @@ fn charts_execute_sql_through_the_existing_runtime_and_reduce_results() {
     app.chart.config = ChartConfig {
         kind: ChartKind::Line,
         x_column: "id".to_string(),
-        y_column: "id".to_string(),
+        y_columns: vec!["id".to_string()],
         point_limit: 4,
         bins: 4,
         title: "IDs".to_string(),
@@ -1614,7 +1614,7 @@ fn charts_support_bar_scatter_and_histogram_query_results() {
         app.chart.config = ChartConfig {
             kind,
             x_column: x.to_string(),
-            y_column: y.to_string(),
+            y_columns: vec![y.to_string()],
             point_limit: 8,
             bins: 4,
             title: String::new(),
@@ -1644,7 +1644,7 @@ fn chart_current_result_and_errors_are_bounded_and_clear() {
     app.chart.config = ChartConfig {
         kind: ChartKind::Scatter,
         x_column: "id".to_string(),
-        y_column: "id".to_string(),
+        y_columns: vec!["id".to_string()],
         point_limit: 2,
         bins: 2,
         title: String::new(),
@@ -1673,7 +1673,7 @@ fn chart_replacement_cancellation_and_stale_results_are_safe() {
     app.chart.config = ChartConfig {
         kind: ChartKind::Line,
         x_column: "id".to_string(),
-        y_column: "id".to_string(),
+        y_columns: vec!["id".to_string()],
         point_limit: 8,
         bins: 2,
         title: String::new(),
@@ -1708,7 +1708,7 @@ fn chart_surfaces_runtime_read_failures() {
     app.chart.config = ChartConfig {
         kind: ChartKind::Line,
         x_column: "id".to_string(),
-        y_column: "id".to_string(),
+        y_columns: vec!["id".to_string()],
         point_limit: 8,
         bins: 2,
         title: String::new(),
@@ -1734,7 +1734,7 @@ fn chart_sampling_stops_at_the_configured_bounded_input_window() {
     app.chart.config = ChartConfig {
         kind: ChartKind::Line,
         x_column: "id".to_string(),
-        y_column: "id".to_string(),
+        y_columns: vec!["id".to_string()],
         point_limit: DEFAULT_POINT_LIMIT,
         bins: 2,
         title: String::new(),
@@ -2116,4 +2116,126 @@ fn names_open_tabs_as_sql_tables_and_joins_them() {
     app.run_sql();
     poll_until_idle(&mut app);
     assert_eq!(filtered_ids(&app), vec!["2"]);
+}
+
+#[test]
+fn profiles_every_column_and_compares_two_tabs() {
+    use crate::compare::{KeyMatch, SchemaDiff, key_query};
+
+    let directory = TempDir::new().unwrap();
+    let write = |name: &str, batch: arrow_array::RecordBatch| {
+        let path = directory.path().join(name);
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    };
+    let before = write(
+        "before.parquet",
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as arrow_array::ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("a"),
+                ])),
+            ),
+        ])
+        .unwrap(),
+    );
+    let after = write(
+        "after.parquet",
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![3, 4, 5])) as arrow_array::ArrayRef,
+            ),
+            ("score", Arc::new(Int32Array::from(vec![7, 8, 9]))),
+        ])
+        .unwrap(),
+    );
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.open_compare();
+    assert!(!app.compare.visible, "nothing to compare with yet");
+    app.open_path(after);
+    poll_until_opened(&mut app);
+    app.open_path(before);
+    poll_until_opened(&mut app);
+
+    // Every column in one scan.
+    app.run_file_profile();
+    assert!(app.profile.file.visible);
+    for _ in 0..2_000 {
+        app.poll_file_profile();
+        if app.profile.file.task.is_none() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        app.profile.file.error.is_none(),
+        "{:?}",
+        app.profile.file.error
+    );
+    let profiles = app.profile.file.result.as_ref().unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(profiles[0].min.as_deref(), Some("1"));
+    assert_eq!(profiles[0].max.as_deref(), Some("4"));
+    assert_eq!(profiles[1].null_count, 1);
+    assert_eq!(profiles[1].distinct_count, 2);
+    assert!(!profiles[1].distinct_capped);
+
+    // The other tab by its table name, and the rows only this tab has.
+    app.open_compare();
+    assert!(app.compare.visible);
+    let tables = app.compare_tables();
+    let names = tables
+        .iter()
+        .map(|(name, _, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["after", "before"]);
+    let schema = |source: &ParquetSource| {
+        source
+            .metadata()
+            .columns()
+            .iter()
+            .map(|column| (column.name.clone(), column.data_type.clone()))
+            .collect::<Vec<_>>()
+    };
+    let diff = SchemaDiff::new(&schema(&tables[1].1), &schema(&tables[0].1));
+    assert_eq!(diff.key_candidates(), vec!["id"]);
+    assert_eq!(diff.only_left.len(), 1);
+    assert_eq!(diff.only_right.len(), 1);
+
+    // The windows draw without a real window.
+    let context = egui::Context::default();
+    ui::theme::apply(&context);
+    context.begin_pass(egui::RawInput::default());
+    app.show_compare_window(&context);
+    app.show_file_profile_window(&context);
+    let _ = context.end_pass();
+    assert_eq!(app.compare.other.as_deref(), Some("after"));
+    assert_eq!(app.compare.key.as_deref(), Some("id"));
+
+    for (matching, expected) in [
+        (KeyMatch::OnlyLeft, vec!["1", "2"]),
+        (KeyMatch::OnlyRight, vec!["5"]),
+        (KeyMatch::Both, vec!["3", "4"]),
+    ] {
+        app.sql_input = format!("{} ORDER BY id", key_query("id", "after", matching));
+        app.run_sql();
+        poll_until_idle(&mut app);
+        assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+        assert_eq!(filtered_ids(&app), expected, "{matching:?}");
+    }
 }
