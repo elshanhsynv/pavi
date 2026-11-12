@@ -21,14 +21,18 @@ use pavi_query::{Filter, LogicalPlan, Planner, QueryEngine, QueryPoll, SqlAst};
 use pavi_runtime::{GenerationId, OpenOutcome, OpenTask, Runtime, RuntimeConfig};
 
 use crate::chart::{
-    ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartSource, ChartState, ChartValues,
-    MAX_INPUT_ROWS,
+    AxisFormat, ChartAccumulator, ChartConfig, ChartKind, ChartModel, ChartSource, ChartState,
+    ChartValues, MAX_INPUT_ROWS, MAX_SERIES,
 };
+use crate::compare::CompareState;
 use crate::export::{ExportFormat, ExportInput, ExportState, ExportTask};
 use crate::find::{FindOutcome, MAX_FIND_CELLS, Segment, find};
 use crate::inspector::{CellDetails, column_summary, inspect_cell, nested_schema_preview};
 use crate::pages::SourcePages;
-use crate::profile::{ProfileEvent, ProfileState, ProfileTask};
+use crate::profile::{
+    FileProfileEvent, FileProfileTask, MAX_FILE_PROFILE_COLUMNS, ProfileEvent, ProfileState,
+    ProfileTask,
+};
 use crate::results::{FilteredGrid, QueryKind};
 use crate::session::{GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore};
 use crate::state::{
@@ -60,6 +64,8 @@ pub(crate) struct PaviApp {
     tab_id: u64,
     /// The other tabs, parked.
     tabs: tabs::Tabs,
+    /// The Compare window; it belongs to no one tab.
+    compare: CompareState,
     grid: GridState,
     dataset: Option<Dataset>,
     opening: Option<OpenTask>,
@@ -211,6 +217,7 @@ impl PaviApp {
             runtime: runtime.ok(),
             tab_id: 0,
             tabs: tabs::Tabs::default(),
+            compare: CompareState::default(),
             grid: GridState::default(),
             dataset: None,
             opening: None,
@@ -690,11 +697,13 @@ impl PaviApp {
                     self.dataset.as_ref().map(|dataset| &dataset.column_names)
                 {
                     self.chart.config.x_column = chart_columns.first().cloned().unwrap_or_default();
-                    self.chart.config.y_column = chart_columns
-                        .get(1)
-                        .or_else(|| chart_columns.first())
-                        .cloned()
-                        .unwrap_or_default();
+                    self.chart.config.y_columns = vec![
+                        chart_columns
+                            .get(1)
+                            .or_else(|| chart_columns.first())
+                            .cloned()
+                            .unwrap_or_default(),
+                    ];
                 }
                 let files = self
                     .dataset
@@ -1657,6 +1666,72 @@ impl PaviApp {
         }
     }
 
+    /// Profiles every column (up to `MAX_FILE_PROFILE_COLUMNS`) in one scan and
+    /// shows the result in the Profile window.
+    fn run_file_profile(&mut self) {
+        let Some(dataset) = &self.dataset else {
+            return;
+        };
+        let Some(runtime) = self.runtime.as_ref().map(Runtime::handle) else {
+            self.profile.file.error = Some("Background runtime is unavailable".to_string());
+            return;
+        };
+        let count = dataset.source.column_count();
+        let columns = (0..count.min(MAX_FILE_PROFILE_COLUMNS)).collect::<Vec<_>>();
+        let source = Arc::clone(&dataset.source);
+        if let Some(task) = &self.profile.file.task {
+            task.cancel();
+        }
+        let generation = self.profile.next_generation();
+        self.profile.file.visible = true;
+        self.profile.file.result = None;
+        self.profile.file.error = None;
+        self.profile.file.skipped_columns = count - columns.len();
+        match FileProfileTask::start(source, columns, runtime, generation) {
+            Ok(task) => self.profile.file.task = Some(task),
+            Err(error) => {
+                self.profile.file.task = None;
+                self.profile.file.error = Some(format!("start profile: {error}"));
+            }
+        }
+    }
+
+    fn poll_file_profile(&mut self) {
+        let Some(task) = &self.profile.file.task else {
+            return;
+        };
+        let event = match task.try_recv() {
+            Ok(Some(event)) => event,
+            Ok(None) => return,
+            Err(error) => {
+                self.profile.file.task = None;
+                self.profile.file.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        let generation = match &event {
+            FileProfileEvent::Finished { generation, .. }
+            | FileProfileEvent::Cancelled { generation }
+            | FileProfileEvent::Failed { generation, .. } => *generation,
+        };
+        if generation != self.profile.generation {
+            return;
+        }
+        self.profile.file.task = None;
+        match event {
+            FileProfileEvent::Finished { profiles, .. } => {
+                self.status = format!("Profiled {} columns", profiles.len());
+                self.profile.file.result = Some(profiles);
+            }
+            FileProfileEvent::Cancelled { .. } => {
+                self.profile.file.error = Some("Profile cancelled".to_string());
+            }
+            FileProfileEvent::Failed { error, .. } => {
+                self.profile.file.error = Some(format!("Profile failed: {error}"));
+            }
+        }
+    }
+
     fn poll_profile(&mut self) {
         let Some(task) = &self.profile.task else {
             return;
@@ -2093,10 +2168,13 @@ impl eframe::App for PaviApp {
         self.poll_filtered();
         self.poll_chart();
         self.poll_profile();
+        self.poll_file_profile();
         self.poll_export();
         self.show_top_bar(ctx);
         ui::toolbar::window_resize_handles(ctx);
         self.show_chart_window(ctx);
+        self.show_file_profile_window(ctx);
+        self.show_compare_window(ctx);
         let compression = self
             .dataset
             .as_ref()

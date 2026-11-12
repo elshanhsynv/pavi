@@ -44,6 +44,7 @@ impl PaviApp {
         let mut select_field = None;
         let mut start_profile = None;
         let mut cancel_profile = false;
+        let mut profile_all = false;
         let Some(dataset) = &self.dataset else {
             widgets::placeholder(ui, |ui| {
                 ui.label(
@@ -289,6 +290,16 @@ impl PaviApp {
             &format!("{} columns", metadata.column_count),
             true,
             |ui| {
+                profile_all = widgets::tool_button(
+                    ui,
+                    Some(Icon::Chart),
+                    "Profile all columns",
+                    false,
+                )
+                .on_hover_text(
+                    "Nulls, distinct values, min, max and mean of every column, in one scan",
+                )
+                .clicked();
                 egui::ScrollArea::vertical()
                     .id_salt("schema_rows")
                     .max_height(260.0)
@@ -382,6 +393,9 @@ impl PaviApp {
         }
         if let Some(column) = start_profile {
             self.run_profile(column);
+        }
+        if profile_all {
+            self.run_file_profile();
         }
     }
 }

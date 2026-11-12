@@ -429,6 +429,19 @@ impl PaviApp {
         Some((tables, names))
     }
 
+    /// Every open tab's dataset by its SQL table name, in tab order, with the
+    /// open one marked. The names match [`Self::sql_tables`].
+    pub(super) fn compare_tables(&self) -> Vec<(String, Arc<ParquetSource>, bool)> {
+        let mut names = Vec::new();
+        let mut tables = Vec::new();
+        for (tab, open) in self.tab_datasets() {
+            let name = table_name(&tab.path, &names);
+            names.push(name.clone());
+            tables.push((name, Arc::clone(&tab.source), open));
+        }
+        tables
+    }
+
     /// Column names for SQL completions: the open tab's, then other tabs' that
     /// are not already listed.
     pub(super) fn sql_columns(&self) -> Vec<String> {

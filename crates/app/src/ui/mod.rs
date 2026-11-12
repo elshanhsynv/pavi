@@ -1,4 +1,6 @@
 pub mod charts;
+pub mod compare;
+pub mod file_profile;
 pub mod grid;
 pub mod inspector;
 pub mod profile;

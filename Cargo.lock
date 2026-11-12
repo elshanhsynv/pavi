@@ -3012,6 +3012,7 @@ dependencies = [
  "parquet_reader",
  "pavi_query",
  "pavi_runtime",
+ "png",
  "rfd",
  "serde",
  "serde_json",

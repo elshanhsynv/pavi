@@ -58,8 +58,18 @@ pub const SQL_NUMBER: Color32 = TYPE_NUMBER;
 /// Comments, and names that are not columns of the file (often a typo).
 pub const SQL_MUTED: Color32 = MUTED;
 
-/// Line and scatter chart marks.
-pub const CHART_POINT: Color32 = TYPE_NUMBER;
+/// Chart series, in order: the first Y column gets the first colour.
+pub const CHART_SERIES: [Color32; 6] = [
+    TYPE_NUMBER,
+    ACCENT,
+    TYPE_BOOL,
+    TYPE_TEMPORAL,
+    Color32::from_rgb(232, 128, 160),
+    Color32::from_rgb(120, 200, 200),
+];
+/// Chart grid lines behind the marks.
+pub const CHART_GRID: Color32 = Color32::from_rgb(44, 42, 39);
+
 /// Bar chart and histogram marks.
 pub const CHART_BAR: Color32 = ACCENT;
 

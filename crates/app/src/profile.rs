@@ -25,6 +25,13 @@ pub const MAX_DISTINCT_VALUES: usize = 4_096;
 pub const MAX_DISTINCT_BYTES: usize = 1_024 * 1_024;
 pub const MAX_PROFILE_VALUE_BYTES: usize = 128;
 const FREQUENT_VALUE_LIMIT: usize = 10;
+/// Columns one whole-file profile covers; wider files are profiled in part.
+pub const MAX_FILE_PROFILE_COLUMNS: usize = 256;
+/// Distinct values counted exactly per column in a whole-file profile; past it
+/// the count reads "more than".
+pub const FILE_PROFILE_DISTINCT_VALUES: usize = 1_000;
+/// Bytes of distinct values kept per column in a whole-file profile.
+pub const FILE_PROFILE_DISTINCT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrequentValue {
@@ -48,6 +55,9 @@ pub struct ColumnProfile {
     pub null_count: u64,
     pub metadata_null_count: Option<u64>,
     pub distinct_count: usize,
+    /// The column has more distinct values than were counted: `distinct_count`
+    /// is a lower bound (whole-file profiles only).
+    pub distinct_capped: bool,
     pub min: Option<String>,
     pub max: Option<String>,
     pub mean: Option<f64>,
@@ -201,6 +211,11 @@ struct ProfileAccumulator {
     string_length_sum: u64,
     chart: Option<ChartAccumulator>,
     distribution_sampled: bool,
+    distinct_limit: usize,
+    distinct_bytes_limit: usize,
+    /// Past the distinct limits, stop counting instead of failing.
+    lenient: bool,
+    distinct_capped: bool,
 }
 
 impl ProfileAccumulator {
@@ -218,7 +233,7 @@ impl ProfileAccumulator {
                 ChartAccumulator::new(ChartConfig {
                     kind: ChartKind::Histogram,
                     x_column: name.clone(),
-                    y_column: String::new(),
+                    y_columns: Vec::new(),
                     point_limit: MAX_INPUT_ROWS,
                     bins: 20,
                     title: String::new(),
@@ -248,7 +263,27 @@ impl ProfileAccumulator {
             string_length_sum: 0,
             chart,
             distribution_sampled: false,
+            distinct_limit: MAX_DISTINCT_VALUES,
+            distinct_bytes_limit: MAX_DISTINCT_BYTES,
+            lenient: false,
+            distinct_capped: false,
         })
+    }
+
+    /// An accumulator for a whole-file profile: no distribution chart, and a
+    /// smaller distinct count that caps instead of failing.
+    fn for_file(
+        column: usize,
+        name: String,
+        data_type: DataType,
+        metadata_null_count: Option<u64>,
+    ) -> Result<Self> {
+        let mut accumulator = Self::new(column, name, data_type, metadata_null_count)?;
+        accumulator.chart = None;
+        accumulator.distinct_limit = FILE_PROFILE_DISTINCT_VALUES;
+        accumulator.distinct_bytes_limit = FILE_PROFILE_DISTINCT_BYTES;
+        accumulator.lenient = true;
+        Ok(accumulator)
     }
 
     fn push_batch(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -282,20 +317,39 @@ impl ProfileAccumulator {
     }
 
     fn record_distinct(&mut self, value: &str) -> Result<()> {
-        if value.len() > MAX_PROFILE_VALUE_BYTES {
-            bail!(
-                "distinct values longer than {MAX_PROFILE_VALUE_BYTES} bytes are not retained exactly"
-            );
+        if self.distinct_capped {
+            return Ok(());
         }
-        if !self.distinct.contains_key(value) {
-            if self.distinct.len() == MAX_DISTINCT_VALUES {
-                bail!("exact distinct count exceeds the {MAX_DISTINCT_VALUES}-value profile limit");
-            }
+        let over = if value.len() > MAX_PROFILE_VALUE_BYTES {
+            Some(format!(
+                "distinct values longer than {MAX_PROFILE_VALUE_BYTES} bytes are not retained exactly"
+            ))
+        } else if !self.distinct.contains_key(value) {
             let next_bytes = self.distinct_bytes.saturating_add(value.len());
-            if next_bytes > MAX_DISTINCT_BYTES {
-                bail!("exact distinct values exceed the {MAX_DISTINCT_BYTES}-byte profile limit");
+            if self.distinct.len() == self.distinct_limit {
+                Some(format!(
+                    "exact distinct count exceeds the {}-value profile limit",
+                    self.distinct_limit
+                ))
+            } else if next_bytes > self.distinct_bytes_limit {
+                Some(format!(
+                    "exact distinct values exceed the {}-byte profile limit",
+                    self.distinct_bytes_limit
+                ))
+            } else {
+                self.distinct_bytes = next_bytes;
+                None
             }
-            self.distinct_bytes = next_bytes;
+        } else {
+            None
+        };
+        if let Some(reason) = over {
+            if !self.lenient {
+                bail!(reason);
+            }
+            // Keep the count reached; stop tracking values to bound memory.
+            self.distinct_capped = true;
+            return Ok(());
         }
         let count = self.distinct.entry(value.to_owned()).or_default();
         *count = count.saturating_add(1);
@@ -353,6 +407,7 @@ impl ProfileAccumulator {
 
     fn finish(self) -> ColumnProfile {
         let distinct_count = self.distinct.len();
+        let distinct_capped = self.distinct_capped;
         let mut frequent_values = self
             .distinct
             .into_iter()
@@ -379,6 +434,7 @@ impl ProfileAccumulator {
             null_count: self.null_count,
             metadata_null_count: self.metadata_null_count,
             distinct_count,
+            distinct_capped,
             min: self.min,
             max: self.max,
             mean: (self.numeric_count > 0).then(|| self.numeric_sum / self.numeric_count as f64),
@@ -480,8 +536,199 @@ fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {
     }))
 }
 
+/// What a whole-file profile reports.
+pub enum FileProfileEvent {
+    Finished {
+        generation: GenerationId,
+        profiles: Vec<ColumnProfile>,
+    },
+    Cancelled {
+        generation: GenerationId,
+    },
+    Failed {
+        generation: GenerationId,
+        error: String,
+    },
+}
+
+/// Every column of a file profiled in one scan, on its own thread.
+pub struct FileProfileTask {
+    receiver: Receiver<FileProfileEvent>,
+    cancellation: CancellationToken,
+    scanned: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl FileProfileTask {
+    /// Profiles `columns` (at most [`MAX_FILE_PROFILE_COLUMNS`]). Columns whose
+    /// type can't be profiled are listed with their type and metadata only.
+    pub fn start(
+        source: std::sync::Arc<ParquetSource>,
+        columns: Vec<usize>,
+        runtime: RuntimeHandle,
+        generation: GenerationId,
+    ) -> std::io::Result<Self> {
+        let cancellation = CancellationToken::default();
+        let worker_cancellation = cancellation.clone();
+        let scanned = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_scanned = std::sync::Arc::clone(&scanned);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("pavi-file-profile".to_string())
+            .spawn(move || {
+                let result = profile_file(
+                    source,
+                    columns,
+                    runtime,
+                    generation,
+                    &worker_cancellation,
+                    &worker_scanned,
+                );
+                let event = match result {
+                    Ok(_) | Err(_) if worker_cancellation.is_cancelled() => {
+                        FileProfileEvent::Cancelled { generation }
+                    }
+                    Ok(profiles) => FileProfileEvent::Finished {
+                        generation,
+                        profiles,
+                    },
+                    Err(error) => FileProfileEvent::Failed {
+                        generation,
+                        error: format!("{error:#}"),
+                    },
+                };
+                let _ = sender.send(event);
+            })?;
+        Ok(Self {
+            receiver,
+            cancellation,
+            scanned,
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Rows read so far.
+    pub fn scanned_rows(&self) -> u64 {
+        self.scanned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn try_recv(&self) -> Result<Option<FileProfileEvent>> {
+        match self.receiver.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => bail!("profile worker stopped without a result"),
+        }
+    }
+}
+
+fn profile_file(
+    source: std::sync::Arc<ParquetSource>,
+    columns: Vec<usize>,
+    runtime: RuntimeHandle,
+    generation: GenerationId,
+    cancellation: &CancellationToken,
+    scanned: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<ColumnProfile>> {
+    if columns.len() > MAX_FILE_PROFILE_COLUMNS {
+        bail!("a profile covers at most {MAX_FILE_PROFILE_COLUMNS} columns");
+    }
+    let metadata = source.metadata();
+    let mut accumulators = Vec::new();
+    let mut profiles: Vec<Option<ColumnProfile>> = Vec::new();
+    for &column in &columns {
+        let info = metadata
+            .columns()
+            .get(column)
+            .context("profile column is out of range")?;
+        let null_count = metadata_null_count(info);
+        if is_comparable(&info.data_type) {
+            accumulators.push(ProfileAccumulator::for_file(
+                column,
+                info.name.clone(),
+                info.data_type.clone(),
+                null_count,
+            )?);
+            profiles.push(None);
+        } else {
+            // Lists, structs and maps: their type and what the footer says.
+            profiles.push(Some(ColumnProfile {
+                column,
+                name: info.name.clone(),
+                data_type: info.data_type.clone(),
+                row_count: source.row_count(),
+                null_count: null_count.unwrap_or(0),
+                metadata_null_count: null_count,
+                distinct_count: 0,
+                distinct_capped: false,
+                min: None,
+                max: None,
+                mean: None,
+                string_lengths: None,
+                frequent_values: Vec::new(),
+                distribution: None,
+                distribution_sampled: false,
+                non_finite_count: 0,
+            }));
+        }
+    }
+    if !accumulators.is_empty() {
+        let read = accumulators
+            .iter()
+            .map(|accumulator| accumulator.column)
+            .collect::<Vec<_>>();
+        let plan = LogicalPlan::scan(source).project(read);
+        let engine = QueryEngine::from_handle(runtime);
+        let mut execution = engine.execute(&plan, generation)?;
+        loop {
+            if cancellation.is_cancelled() {
+                execution.cancel();
+                bail!("profile cancelled");
+            }
+            match execution.poll_next_batch()? {
+                QueryPoll::Batch(batch) => {
+                    let batch = batch.batch;
+                    scanned.fetch_add(
+                        batch.num_rows() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    for (index, accumulator) in accumulators.iter_mut().enumerate() {
+                        accumulator.push_batch(&batch.project(&[index])?)?;
+                    }
+                }
+                QueryPoll::Finished => break,
+                QueryPoll::Pending => thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+    let mut finished = accumulators.into_iter().map(ProfileAccumulator::finish);
+    profiles
+        .into_iter()
+        .map(|profile| match profile {
+            Some(profile) => Ok(profile),
+            None => finished
+                .next()
+                .context("profile accumulators and columns disagree"),
+        })
+        .collect()
+}
+
+/// The whole-file profile of a tab: shown in its own window.
+#[derive(Default)]
+pub(crate) struct FileProfileState {
+    pub(crate) visible: bool,
+    pub(crate) task: Option<FileProfileTask>,
+    pub(crate) result: Option<Vec<ColumnProfile>>,
+    pub(crate) error: Option<String>,
+    /// Columns the file has beyond those profiled.
+    pub(crate) skipped_columns: usize,
+}
+
 /// Inspector profile state: the running task and its result.
 pub(crate) struct ProfileState {
+    /// Every column at once.
+    pub(crate) file: FileProfileState,
     pub(crate) generation: GenerationId,
     pub(crate) task: Option<ProfileTask>,
     pub(crate) column: Option<usize>,
@@ -493,6 +740,7 @@ pub(crate) struct ProfileState {
 impl Default for ProfileState {
     fn default() -> Self {
         Self {
+            file: FileProfileState::default(),
             generation: GenerationId(0),
             task: None,
             column: None,
@@ -505,7 +753,7 @@ impl Default for ProfileState {
 
 impl ProfileState {
     pub(crate) fn loading(&self) -> bool {
-        self.task.is_some()
+        self.task.is_some() || self.file.task.is_some()
     }
 
     pub(crate) fn cancel(&mut self) {
@@ -513,10 +761,19 @@ impl ProfileState {
             task.cancel();
         }
         self.task = None;
+        if let Some(task) = &self.file.task {
+            task.cancel();
+        }
+        self.file.task = None;
     }
 
     pub(crate) fn reset(&mut self) {
         self.cancel();
+        let visible = self.file.visible;
+        self.file = FileProfileState {
+            visible,
+            ..FileProfileState::default()
+        };
         self.generation = GenerationId(self.generation.0.saturating_add(1));
         self.column = None;
         self.result = None;
@@ -784,6 +1041,38 @@ mod tests {
         assert_eq!(views.string_lengths.map(|lengths| lengths.max), Some(4));
 
         assert!(ProfileAccumulator::new(0, "b".to_string(), DataType::Binary, None).is_err());
+    }
+
+    #[test]
+    fn whole_file_profiles_cap_distinct_counts_instead_of_failing() {
+        let values = (FILE_PROFILE_DISTINCT_VALUES + 500) as i32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "number",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..values))],
+        )
+        .unwrap();
+        let mut file =
+            ProfileAccumulator::for_file(0, "number".to_string(), DataType::Int32, None).unwrap();
+        file.push_batch(&batch).unwrap();
+        let profile = file.finish();
+        assert!(profile.distinct_capped);
+        assert_eq!(profile.distinct_count, FILE_PROFILE_DISTINCT_VALUES);
+        // Min, max and mean still cover every row.
+        assert_eq!(
+            profile.max.as_deref(),
+            Some(values - 1).map(|max| max.to_string()).as_deref()
+        );
+        assert!(profile.distribution.is_none());
+
+        let mut column =
+            ProfileAccumulator::new(0, "number".to_string(), DataType::Int32, None).unwrap();
+        column.push_batch(&batch).unwrap();
+        assert!(!column.finish().distinct_capped);
     }
 
     #[test]

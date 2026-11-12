@@ -26,8 +26,13 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - SQL can join open tabs and use subqueries: every tab is a table named after its file (`dataset` is still the tab you are in), e.g. `SELECT f.ORIGIN, a.name FROM dataset f JOIN airports a ON f.ORIGIN = a.code`. `INNER` and `LEFT` joins on equal columns, `FROM (SELECT …) AS t`, `WHERE x [NOT] IN (SELECT …)` and `WHERE x > (SELECT AVG(…) …)` work. One side of a join, after its filters, must fit in memory (1,000,000 rows).
 - Open remote files by URL: `https://…`, `s3://bucket/key`, `gs://bucket/key` or `az://account/container/blob`, in the file menu's path box or on the command line. Parquet files are read in place with range requests, so only the parts you look at are downloaded. Credentials come from the usual environment variables (`AWS_ACCESS_KEY_ID`, `~/.aws/credentials`, `GOOGLE_OAUTH_ACCESS_TOKEN`, `AZURE_STORAGE_SAS_TOKEN`); pre-signed URLs work as they are.
 - Tabs: each file or folder opens in its own tab with its own filter, sort, SQL and layout. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab moves between them. The tabs open when PAVI closes are reopened next time.
+- Charts can draw up to six Y columns at once, each in its own colour with a legend. Axes have round ticks, names, shortened numbers (12k, 3.4M) and date or time labels.
+- Save a chart as PNG (as on screen) or SVG (960 × 540) from the Charts window.
+- Profile all columns at once: the Inspector's Schema section has "Profile all columns", which shows nulls, distinct values, min, max and mean of every column in one scan.
+- Compare two open tabs (file menu ▸ Compare with another tab): see the columns only one has or with another type, and list the rows whose key is only in one tab, or in both.
 
 ### Changed
+- Line charts join their points from left to right instead of in the order the rows came in.
 - Sorting sorts the whole file instead of showing only the first 100,000 rows. A sort too large for memory writes temporary files (up to 32 GB) and may take a while.
 - Copying cells copies their full values instead of the first 256 characters, quotes values that contain a tab, line break or quote, and allows up to 16 MB instead of 64 KB.
 - In the filter box, quote a value that contains `AND`, `OR`, a comma or brackets, e.g. `title == "war and peace"`. Unquoted, `and` / `or` now join two tests.

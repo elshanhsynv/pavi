@@ -198,6 +198,7 @@ sequenceDiagram
 - **Metadata/schema/stats** are computed once at open (`statistics::metadata_statistics`; min/max rebuilt as typed values and formatted like grid cells, byte strings capped at 128 chars) and rendered from memory each frame; long lists use `ScrollArea::show_rows` (virtualized) (`ui/inspector.rs:203-240`). Each top-level column is mapped to its Parquet leaf (`statistics::leaf_columns`); a nested column (several leaves, or one leaf under a group) has no statistics, and the other columns keep theirs. The selected cell, when it is a list, struct or map, is shown as a tree (`value::value_tree`, bounded).
 - **Selected cell:** `selected_cell_details` → `inspect_cell` on the in-memory batch (`app.rs:1560-1603`).
 - **Profile column:** `run_profile` (`app.rs:1482-1503`) → `ProfileTask::start` spawns thread `pavi-profile` (`profile.rs:83-119`), which runs a `scan().project([col])` query and polls it with a 5 ms sleep loop (`profile.rs:143-176`), building exact distinct counts, min/max/mean, string lengths and a distribution chart. Result returns via a capacity-1 channel; UI polls in `poll_profile` (`app.rs:1513-1543`). Exact distinct counting is capped at 4,096 values and 128 bytes per value; past that the profile ends with an error (`profile.rs:275-294`).
+- **Profile all columns:** `run_file_profile` → `FileProfileTask::start` spawns thread `pavi-file-profile`, which runs one `scan().project(columns)` query over the first 256 columns and feeds each batch's columns to one `ProfileAccumulator` each (no distribution chart). Lists, structs and maps get their type and footer null count only. Each column counts at most 1,000 distinct values / 64 KB and then stops counting and marks the count as a lower bound instead of failing, so the whole profile holds about 256 × 64 KB at most. Rows read are shared through an atomic counter for the progress text; cancellation is checked every batch. `poll_file_profile` drops results of an older generation; the Profile window shows the rest.
 
 ```mermaid
 sequenceDiagram
@@ -245,7 +246,13 @@ sequenceDiagram
 
 ## 4.8 Charts
 
-`run_chart` (`app.rs:1352-1414`): either uses the current 8-batch result window synchronously on the UI thread (small), or runs a chart SQL query whose batches are fed to `ChartAccumulator` in `poll_chart` (`app.rs:1433-1480`) until 16,384 input rows, then cancels the query. Rendering is custom painting in `ui/charts.rs`.
+`run_chart` (`app.rs:1352-1414`): either uses the current 8-batch result window synchronously on the UI thread (small), or runs a chart SQL query whose batches are fed to `ChartAccumulator` in `poll_chart` (`app.rs:1433-1480`) until 16,384 input rows, then cancels the query. Up to six Y columns (`MAX_SERIES`) are read in the same query and become one series each; bars group them per label. Rendering is custom painting in `ui/charts.rs` through a `Canvas` trait with two implementations: the egui painter and an SVG writer, so a saved SVG matches the screen.
+
+**Save image:** SVG is built from the last model and written by a background thread (`ChartState::save_image`: `.pavi-image.tmp`, then rename). PNG asks the window for a screenshot (`ViewportCommand::Screenshot`); when `Event::Screenshot` arrives, the image is cropped to the plot's rect, encoded with `png` and written the same way.
+
+## 4.8a Compare
+
+`Compare with another tab` (file menu) opens a window that reads only footer schemas: `compare::SchemaDiff` matches columns by name. Rows are compared by the SQL workspace, not by new code: Only here / Only there / In both write `SELECT * FROM dataset WHERE k [NOT] IN (SELECT k FROM other)` (`compare::key_query`) into the editor and call `run_sql`, so the anti or semi join is bounded as ADR 0009 describes.
 
 ## 4.9 CLI
 
