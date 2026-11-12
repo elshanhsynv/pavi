@@ -34,7 +34,9 @@ use crate::profile::{
     ProfileTask,
 };
 use crate::results::{FilteredGrid, QueryKind};
-use crate::session::{GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore};
+use crate::session::{
+    GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore, ThemeChoice,
+};
 use crate::state::{
     ColumnLayout, GridState, LoadState, ToolbarAvailability, ToolbarCommand, Workspace,
 };
@@ -109,6 +111,8 @@ pub(crate) struct PaviApp {
     session: SessionState,
     running_sql: Option<RunningSql>,
     show_inspector: bool,
+    /// The palette last applied (`true` for light); `None` before the first frame.
+    light_applied: Option<bool>,
     show_safe_full_selection: bool,
     show_nested_selection: bool,
     workspace: Workspace,
@@ -121,6 +125,18 @@ pub(crate) struct PaviApp {
 /// set during a frame only take effect on the next one.
 pub(crate) fn apply_theme(ctx: &egui::Context) {
     ui::theme::apply(ctx);
+}
+
+/// Whether the window keeps the operating system's title bar and border. Only
+/// on macOS: winit can't start a window resize there, so without the system
+/// border the window could not be resized. Elsewhere PAVI draws its own title
+/// bar (the top bar) with window buttons, and resize strips along the edges.
+pub(crate) fn native_window_frame() -> bool {
+    native_window_frame_on(std::env::consts::OS)
+}
+
+fn native_window_frame_on(os: &str) -> bool {
+    os == "macos"
 }
 
 /// An action chosen on a grid column header.
@@ -254,6 +270,7 @@ impl PaviApp {
             session,
             running_sql: None,
             show_inspector,
+            light_applied: None,
             show_safe_full_selection: false,
             show_nested_selection: false,
             workspace: Workspace::default(),
@@ -279,6 +296,24 @@ impl PaviApp {
             app.begin_open(path);
         }
         app
+    }
+
+    /// Draws with the palette the user picked. With "System" it follows the
+    /// operating system, also when that changes while PAVI runs.
+    fn apply_theme_choice(&mut self, ctx: &egui::Context) {
+        let system_light = ctx.system_theme().map(|theme| theme == egui::Theme::Light);
+        let light = self.session.preferences.theme.is_light(system_light);
+        if self.light_applied != Some(light) {
+            ui::theme::set_light(ctx, light);
+            self.light_applied = Some(light);
+        }
+    }
+
+    pub(super) fn set_theme_choice(&mut self, choice: ThemeChoice) {
+        if self.session.preferences.theme != choice {
+            self.session.preferences.theme = choice;
+            self.persist_session();
+        }
     }
 
     fn persist_session(&mut self) {
@@ -2156,6 +2191,7 @@ impl eframe::App for PaviApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme_choice(ctx);
         self.pages.begin_frame();
         self.handle_global_shortcuts(ctx);
         self.open_dropped_files(ctx);
@@ -2207,7 +2243,7 @@ impl eframe::App for PaviApp {
         }
         self.show_inspector_panel(ctx);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(ui::theme::BACKGROUND))
+            .frame(egui::Frame::new().fill(ui::theme::background()))
             .show(ctx, |ui| {
                 // Each tab keeps its own scroll positions.
                 ui.push_id(("tab", self.tab_id), |ui| match self.workspace {

@@ -25,7 +25,7 @@ impl PaviApp {
             .exact_height(theme::BAR_HEIGHT)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin {
                         left: Spacing::Md as i8,
                         ..egui::Margin::ZERO
@@ -67,8 +67,10 @@ impl PaviApp {
                     }
                     widgets::divider(ui);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        self.window_controls(ui);
-                        ui.add_space(Spacing::Sm.px());
+                        if !native_window_frame() {
+                            self.window_controls(ui);
+                            ui.add_space(Spacing::Sm.px());
+                        }
                         self.panel_toggles(ui, available);
                         widgets::divider(ui);
                         ui.add_enabled_ui(available.enabled(ToolbarCommand::Export), |ui| {
@@ -110,7 +112,7 @@ impl PaviApp {
             egui::TopBottomPanel::top("filter_error")
                 .frame(
                     egui::Frame::new()
-                        .fill(theme::PANEL)
+                        .fill(theme::panel())
                         .inner_margin(Spacing::Lg.symmetric(Spacing::Sm)),
                 )
                 .show(ctx, |ui| {
@@ -144,6 +146,7 @@ impl PaviApp {
         let mut new_tab = false;
         let mut refresh = false;
         let mut compare = false;
+        let mut theme_choice = None;
         let response = widgets::menu(ui, "file", Some(Icon::Folder), &label, false, 420.0, |ui| {
             let path_box = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
@@ -174,6 +177,23 @@ impl PaviApp {
                         .clicked();
                 }
             }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add_space(Spacing::Md.px());
+                ui.label(RichText::new("Theme").color(theme::muted()));
+                ui.add_space(Spacing::Sm.px());
+                if let Some(choice) = widgets::segmented(
+                    ui,
+                    self.session.preferences.theme,
+                    &[
+                        (ThemeChoice::Dark, "Dark", true),
+                        (ThemeChoice::Light, "Light", true),
+                        (ThemeChoice::System, "System", true),
+                    ],
+                ) {
+                    theme_choice = Some(choice);
+                }
+            });
             if !self.session.recent_files.is_empty() {
                 ui.separator();
                 widgets::menu_caption(ui, "Recent");
@@ -217,6 +237,9 @@ impl PaviApp {
         if compare {
             self.open_compare();
         }
+        if let Some(choice) = theme_choice {
+            self.set_theme_choice(choice);
+        }
         if let Some(path) = open {
             self.open_path(path);
         }
@@ -256,16 +279,16 @@ impl PaviApp {
             egui::pos2(rect.left() + 15.0, rect.center().y),
             Icon::Search,
             if filtering {
-                theme::ACCENT
+                theme::accent()
             } else {
-                theme::MUTED
+                theme::muted()
             },
         );
         if filtering {
             ui.painter().rect_stroke(
                 rect,
                 theme::RADIUS,
-                egui::Stroke::new(1.0_f32, theme::ACCENT),
+                egui::Stroke::new(1.0_f32, theme::accent()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -285,7 +308,8 @@ impl PaviApp {
                 .interact(clear, ui.id().with("clear_filter"), egui::Sense::click())
                 .on_hover_text("Clear filter");
             if clear_response.hovered() {
-                ui.painter().rect_filled(clear, theme::RADIUS, theme::HOVER);
+                ui.painter()
+                    .rect_filled(clear, theme::RADIUS, theme::hover());
             }
             ui.painter().text(
                 clear.center(),
@@ -293,9 +317,9 @@ impl PaviApp {
                 "×",
                 theme::body(),
                 if clear_response.hovered() {
-                    theme::TEXT
+                    theme::text()
                 } else {
-                    theme::MUTED
+                    theme::muted()
                 },
             );
             if clear_response.clicked() {
@@ -669,9 +693,13 @@ fn tail(text: &str, max_chars: usize) -> String {
 }
 
 /// Strips along the window edges and corners that resize the window. PAVI draws
-/// its own title bar, so the window has no border of its own to drag.
+/// its own title bar, so the window has no border of its own to drag (except
+/// on macOS, which keeps the system's; see `native_window_frame`).
 pub(in crate::app) fn window_resize_handles(ctx: &egui::Context) {
     use egui::{CursorIcon, ResizeDirection};
+    if native_window_frame() {
+        return;
+    }
     let (maximized, fullscreen) = ctx.input(|input| {
         let viewport = input.viewport();
         (

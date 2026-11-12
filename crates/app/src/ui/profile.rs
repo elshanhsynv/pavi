@@ -16,7 +16,11 @@ pub fn show(
 ) {
     let caption = |ui: &mut egui::Ui, text: &str| {
         ui.add_space(Spacing::Sm.px());
-        ui.label(RichText::new(text).font(theme::small()).color(theme::MUTED));
+        ui.label(
+            RichText::new(text)
+                .font(theme::small())
+                .color(theme::muted()),
+        );
     };
     caption(ui, &format!("Profile of {}", profile.name));
     widgets::detail(ui, "Rows", theme::number(profile.row_count));
@@ -75,7 +79,7 @@ pub fn show(
         for value in &profile.frequent_values {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(value.count.to_string()).color(theme::MUTED));
+                    ui.label(RichText::new(value.count.to_string()).color(theme::muted()));
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(egui::Label::new(&value.value).truncate())
                             .on_hover_text(&value.value);

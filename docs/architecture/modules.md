@@ -93,7 +93,7 @@ crates/app/src/                (pavi)
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
 ├── compare.rs      CompareState, SchemaDiff, key_query (SQL for rows only in one tab)
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
-├── session.rs      SessionState (serde: recent files, history, saved queries, layouts), SessionStore (JSON at %LOCALAPPDATA%\PAVI\session-v1.json)
+├── session.rs      SessionState (serde: recent files, history, saved queries, layouts), SessionStore (JSON in the platform's folder, `session_dir`), ThemeChoice
 ├── sql_editor.rs   SQL tokens for highlighting, word-at-cursor completions, column quoting
 └── ui/             (mounted via #[path = "ui/mod.rs"] inside app.rs; every file is `impl PaviApp`)
     ├── toolbar.rs     top bar: file menu (path box, open file or folder, new tab, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls, window resize strips
@@ -141,7 +141,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | `render_headers` | Painted header with name/type. A click selects the column; a right-click opens a menu (sort, profile, fit, hide, copy name). The choice is stored as a `HeaderAction` and run by `apply_header_action` after the table is drawn | `ui/grid.rs`, `app.rs` |
 | `show_inspector_panel` | File props, schema, nested preview, per-row-group stats (virtualized `show_rows`), selected cell, profile | `ui/inspector.rs` |
 | `show_sql_workspace`, `show_chart_window`, `show_file_profile_window`, `show_compare_window`, `status::show` | SQL editor (highlighting, completions) with history and saved queries, charts, the whole-file profile, comparing two tabs, status bar with dataset facts and jump-to-row (returns `true` when Enter was pressed in the row box) | `ui/sql.rs`, `ui/charts.rs`, `ui/file_profile.rs`, `ui/compare.rs`, `ui/status.rs` |
-| `theme`, `spacing`, `widgets` | Static palette, fonts and widget sizes, spacing scale, painted icons and shared controls | `ui/theme.rs`, `ui/spacing.rs`, `ui/widgets.rs` |
+| `theme`, `spacing`, `widgets` | Dark and light `Palette` read through colour functions (ADR 0010), system fonts per platform and widget sizes, spacing scale, painted icons and shared controls | `ui/theme.rs`, `ui/spacing.rs`, `ui/widgets.rs` |
 
 ### Application state
 

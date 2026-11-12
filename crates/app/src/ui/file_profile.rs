@@ -34,7 +34,7 @@ impl PaviApp {
                 ui.spacing_mut().item_spacing = Spacing::Md.vec(Spacing::Sm);
                 ui.horizontal(|ui| {
                     if let Some(task) = &self.profile.file.task {
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
                         let done = if rows == 0 {
                             String::new()
                         } else {
@@ -47,7 +47,7 @@ impl PaviApp {
                         };
                         ui.label(
                             RichText::new(format!("Scanning every column…{done}"))
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         );
                         cancel =
                             widgets::tool_button(ui, Some(Icon::Close), "Cancel", false).clicked();
@@ -64,7 +64,7 @@ impl PaviApp {
                                 self.profile.file.skipped_columns
                             ))
                             .font(theme::small())
-                            .color(theme::MUTED),
+                            .color(theme::muted()),
                         );
                     }
                 });
@@ -100,7 +100,7 @@ fn shorten(text: &str) -> String {
 }
 
 fn profile_table(ui: &mut egui::Ui, profiles: &[ColumnProfile]) {
-    let muted = |text: String| RichText::new(text).color(theme::MUTED);
+    let muted = |text: String| RichText::new(text).color(theme::muted());
     egui_extras::TableBuilder::new(ui)
         .striped(true)
         .resizable(true)

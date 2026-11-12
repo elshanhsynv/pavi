@@ -10,34 +10,36 @@ icons and shared controls in `crates/app/src/ui/widgets.rs`. This file explains 
 2. **Dense but readable.** Developer-tool density: 13 px text, 24 px rows, small gaps.
 3. **Always responsive.** The UI never freezes on data work. Anything not ready shows a placeholder (`…` in a cell, a spinner or status text) and fills in when it arrives.
 4. **Say what happened.** Errors and limits appear where the user acted (under the filter box, in the SQL workspace, in the grid) and in the status bar, in plain words with the limit that was hit and what to do next.
-5. **One dark theme, one accent.** Warm graphite surfaces and a single oak accent. There is no light theme. Do not add per-widget colors; extend the theme.
+5. **One palette type, one accent.** Warm surfaces (graphite in the dark theme, paper in the light one) and a single oak accent. Dark is the default; Light and System are picked in the file menu (ADR 0010). Do not add per-widget colors or "light only" tweaks; extend `Palette`, which gives every colour a dark and a light value.
 6. **One filled button per view.** `primary_button` marks the main action (Browse, Run, Draw chart); everything else is a flat `tool_button` or a menu.
 
 ## Color tokens (`ui/theme.rs`)
 
+Each token is a field of `Palette` (`theme::DARK`, `theme::LIGHT`), read in UI code through a function of the same name: `theme::muted()`, `theme::chart_series()`. Both palettes are held to WCAG contrast by a test: 7:1 for body text, 4.5:1 for muted text, the accent, errors and type colours on every surface.
+
 | Token | Use |
 |---|---|
-| `BACKGROUND` | Deepest surface: text inputs, grid body (`extreme_bg_color`) |
-| `STRIPE` | Alternate grid rows |
-| `PANEL` | Bars, the Inspector, popups and windows |
-| `HEADER` | Grid header, resting control fill, the row of the selected cell |
-| `HOVER` | A control or header under the pointer |
-| `BORDER` | Panel, popup and control outlines |
-| `GRID_LINE` | Lines between grid cells |
-| `TEXT` | Primary text |
-| `MUTED` | Secondary text, labels, resting icons, `null` cells |
-| `DISABLED` | Disabled controls and text, `…` placeholders |
-| `ACCENT` | Focus and selection outline, switched-on tools, the primary button |
-| `ON_ACCENT` | Text and icons on an `ACCENT` fill |
-| `SELECTED` | Selected cells, switched-on tools |
-| `ERROR` | Errors, everywhere |
-| `SUCCESS` | The idle status dot |
-| `CLOSE_HOVER` | The window close button under the pointer |
-| `TYPE_NUMBER`, `TYPE_TEMPORAL`, `TYPE_BOOL` | Type labels in grid headers and the schema list, by type family (other types use `MUTED`) |
-| `CHART_SERIES` (6), `CHART_BAR`, `CHART_GRID` | Chart series in order (the first Y column takes the first colour, also in the form's swatches and the legend), histogram bars, grid lines behind the marks |
-| `SQL_KEYWORD`, `SQL_FUNCTION`, `SQL_STRING`, `SQL_NUMBER`, `SQL_MUTED` | SQL editor highlighting; column names and `dataset` use `TEXT`, unknown names and comments `SQL_MUTED` so a typo stands out |
+| `background()` | Deepest surface: text inputs, grid body (`extreme_bg_color`) |
+| `stripe()` | Alternate grid rows |
+| `panel()` | Bars, the Inspector, popups and windows |
+| `header()` | Grid header, resting control fill, the row of the selected cell |
+| `hover()` | A control or header under the pointer |
+| `border()` | Panel, popup and control outlines |
+| `grid_line()` | Lines between grid cells |
+| `text()` | Primary text |
+| `muted()` | Secondary text, labels, resting icons, `null` cells |
+| `disabled()` | Disabled controls and text, `…` placeholders |
+| `accent()` | Focus and selection outline, switched-on tools, the primary button |
+| `on_accent()` | Text and icons on an `accent()` fill |
+| `selected()` | Selected cells, switched-on tools |
+| `error()` | Errors, everywhere |
+| `success()` | The idle status dot |
+| `close_hover()` | The window close button under the pointer |
+| `type_number()`, `type_temporal()`, `type_bool()` | Type labels in grid headers and the schema list, by type family (other types use `muted()`) |
+| `chart_series()` (6), `chart_bar()`, `chart_grid()` | Chart series in order (the first Y column takes the first colour, also in the form's swatches and the legend), histogram bars, grid lines behind the marks |
+| `sql_keyword()`, `sql_function()`, `sql_string()`, `sql_number()`, `sql_muted()` | SQL editor highlighting; column names and `dataset` use `text()`, unknown names and comments `sql_muted()` so a typo stands out |
 
-**Rule:** UI code uses `theme::*` constants only. A new color is a new named constant in `theme.rs` with a one-line comment saying what it is for.
+**Rule:** UI code uses these `theme::*` functions only. A new color is a new `Palette` field with a dark and a light value, a one-line comment saying what it is for, and a function to read it.
 
 ## Spacing and sizes
 
@@ -46,7 +48,7 @@ icons and shared controls in `crates/app/src/ui/widgets.rs`. This file explains 
 - The row-number gutter is as wide as the last row number needs (44 px minimum). Numeric columns are right-aligned so digits line up.
 - The Inspector opens 280 px wide and can be dragged between 240 and 460 px.
 - Column widths are 72–480 px (`ColumnLayout`).
-- Window: 1448×900 default, 900×600 minimum, no OS decorations (the top bar is the drag area and draws minimize, maximize and close). Strips `RESIZE_BORDER` (5 px) wide along the edges and corners resize the window (`window_resize_handles`), except when it is maximized.
+- Window: 1448×900 default, 900×600 minimum, no OS decorations (the top bar is the drag area and draws minimize, maximize and close). Strips `RESIZE_BORDER` (5 px) wide along the edges and corners resize the window (`window_resize_handles`), except when it is maximized. On macOS the window keeps the system title bar and border instead, and PAVI's window buttons and resize strips are left out (`native_window_frame`): winit can't start a resize there.
 
 ## Typography
 
@@ -59,7 +61,7 @@ icons and shared controls in `crates/app/src/ui/widgets.rs`. This file explains 
 
 Fonts come from `theme.rs` only: use `TextStyle` or these three functions, never `FontId::proportional(n)` in UI code.
 
-On Windows the text is Segoe UI and Segoe UI Semibold, read once from the system font folder before the first frame (`app::apply_theme`, called from `main`). A font file that is missing or larger than 16 MB (`MAX_FONT_BYTES`) is skipped and egui's built-in font is used, as on other platforms.
+The text font comes from the system, read once before the first frame (`app::apply_theme`, called from `main`; the files to try are `theme::font_files`): Segoe UI and Segoe UI Semibold on Windows, Arial and Arial Bold on macOS, and on Linux the first of Noto Sans (Regular and SemiBold; Fedora's variable Noto Sans draws regular only) or DejaVu Sans (and Bold) that is installed. A font file that is missing or larger than 16 MB (`MAX_FONT_BYTES`) is skipped; with none found, egui's built-in font is used. Without a semibold file, `strong` text uses the regular one.
 
 ## Components (`ui/widgets.rs`)
 
@@ -78,15 +80,15 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 
 ## Layout
 
-- **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box for a file or folder path or an `https`/`s3`/`gs`/`az` URL, Open file, Open folder, New tab, Reload, Copy path, Compare with another tab when more than one is open, recent files and folders), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (the result or the selected row as CSV, Parquet, JSON Lines or Arrow; copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `ACCENT`. Below a window width of 1,100 px (`COMPACT_BAR_WIDTH`) Sort, Columns and Export show only their icons, with the name in the tooltip, so the filter box keeps a usable width.
-- **Tab strip** (`ui/tabs.rs`): under the top bar once a second tab is open (`TAB_BAR_HEIGHT`, 32 px). One tab per file or folder, with a table or folder icon and the name cut at 220 px; the open tab has the `BACKGROUND` fill of the grid and an `ACCENT` line on top. × (shown on the open tab and under the pointer) or a middle click closes a tab; + opens an empty one. The tooltip is the full path.
-- **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted. When the grid scrolls sideways, the row numbers and any pinned columns are drawn again at the left edge, over the columns that slide under them, with a `BORDER` line at their right edge; pinned columns stop at 60% of the grid width (`MAX_PINNED_SHARE`).
+- **Top bar** (`ui/toolbar.rs`), left to right: logo, file menu (path box for a file or folder path or an `https`/`s3`/`gs`/`az` URL, Open file, Open folder, New tab, Reload, Copy path, Compare with another tab when more than one is open, the Theme switch (Dark / Light / System), recent files and folders), Grid / SQL switch, filter box, Sort, Columns (show types, pin header, find, show/hide, reorder, width, fit, reset), Export (the result or the selected row as CSV, Parquet, JSON Lines or Arrow; copy cell/row), Reload, Charts, Inspector, window buttons. An active filter or sort is outlined or named in `accent()`. Below a window width of 1,100 px (`COMPACT_BAR_WIDTH`) Sort, Columns and Export show only their icons, with the name in the tooltip, so the filter box keeps a usable width.
+- **Tab strip** (`ui/tabs.rs`): under the top bar once a second tab is open (`TAB_BAR_HEIGHT`, 32 px). One tab per file or folder, with a table or folder icon and the name cut at 220 px; the open tab has the `background()` fill of the grid and an `accent()` line on top. × (shown on the open tab and under the pointer) or a middle click closes a tab; + opens an empty one. The tooltip is the full path.
+- **Grid** (`ui/grid.rs`): striped rows, pinned header with name, sort arrow and colored type label, row-number gutter. Above a filter, SQL or sort result a thin strip names the result and its row range. The row of the selected cell is tinted. When the grid scrolls sideways, the row numbers and any pinned columns are drawn again at the left edge, over the columns that slide under them, with a `border()` line at their right edge; pinned columns stop at 60% of the grid width (`MAX_PINNED_SHARE`).
 - **Find bar** (`show_find_bar`): opens above the grid with Ctrl+Shift+F. It searches only the rows loaded in memory, says so, and shows where the last match was ("Row 21, ARR_TIME").
 - **SQL workspace** (`ui/sql.rs`): editor, Run, Cancel, the History menu and the Saved menu above the result grid. The editor highlights keywords, functions, strings, numbers, table names and the open tabs' column names, and lists completions (columns first, then keywords, functions and table names) under the cursor while a word is typed. The line under it names the tables: `dataset` for this tab and every open tab by a name from its file: ↑/↓ choose, Tab or Enter take one, Esc closes the list. A completed column name is quoted when it needs to be. The Saved menu saves the editor's query under a name (the same name replaces it), and loads or deletes saved ones; loading does not run the query.
 - **Inspector** (`ui/inspector.rs`): collapsible sections Cell (a list, struct or map value opens as a tree, first level expanded; "As text" shows it on one line), Row (every shown column of the selected row, one per line; click a line to select that cell), Column (with profile), File (Folder for a folder dataset, with its file count and partition columns; Size is all its files together. A CSV, JSON or Arrow file shows Format instead of Compression, with a note that it was read into a temporary Parquet file), Schema (with "Profile all columns", which opens the Profile window), Row groups, Page cache.
 - **Status bar** (`ui/status.rs`): status dot or spinner, the share of the file a running filter, sort or SQL scan has read (e.g. `42%`), and message on the left (the activity word is left out when the message already starts with it); selection, row/column/row-group counts, compression and the "Go to row" box on the right.
 - **Floating windows.** Three, each opened on demand and closed with its ×:
-  - **Charts** (`ui/charts.rs`): a form of "label  control" rows (source and type switches, column names that can be typed or picked from the file's columns, one Y row per series with its colour swatch and a × to remove it, "+ Add series" up to six, title, limits), then Draw chart, the Save image menu (PNG as on screen, or a 960 × 540 SVG) and the plot. The plot has a title, a legend when there are several series, round axis ticks with names under and beside the axes, numbers shortened to k/M/G/T, and date or time labels on a date or time X axis. Lines, points and grouped bars use `CHART_SERIES`; the screen and the SVG are drawn by the same code (`paint_chart` on a `Canvas`).
+  - **Charts** (`ui/charts.rs`): a form of "label  control" rows (source and type switches, column names that can be typed or picked from the file's columns, one Y row per series with its colour swatch and a × to remove it, "+ Add series" up to six, title, limits), then Draw chart, the Save image menu (PNG as on screen, or a 960 × 540 SVG) and the plot. The plot has a title, a legend when there are several series, round axis ticks with names under and beside the axes, numbers shortened to k/M/G/T, and date or time labels on a date or time X axis. Lines, points and grouped bars use `chart_series()`; the screen and the SVG are drawn by the same code (`paint_chart` on a `Canvas`).
   - **Profile** (`ui/file_profile.rs`): one row per column (name, type, nulls with their share, distinct values, min, max, mean); "> 1,000" when a column has more distinct values than a whole-file profile counts. While it runs, a spinner, the share of rows read and Cancel; afterwards, Profile again.
   - **Compare** (`ui/compare.rs`): this tab against another open tab picked by its SQL table name; row and column counts of both; the columns only here, only there or with another type; then a "Match rows by" column (same name and type in both) and Only here / Only there / In both, which put the matching query in the SQL editor, run it and close the window.
 
@@ -99,7 +101,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 | Empty result | Say so ("No rows match") rather than an empty grid |
 | Error | Red text in the area that failed, plus the status bar; the rest of the UI keeps working |
 | Limit reached | Name the limit and the way out (e.g. "add a LIMIT or a filter") |
-| Disabled | `DISABLED` color; `ToolbarAvailability` decides toolbar enablement |
+| Disabled | `disabled()` color; `ToolbarAvailability` decides toolbar enablement |
 
 ## Interaction
 
@@ -107,7 +109,7 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 - Opening a file or folder uses the open tab when it is empty and a new tab otherwise; one that is already open is shown instead. Each dropped file or folder opens in its own tab. The tabs open when the app closed are reopened at start.
 - A URL is shown everywhere (tab, file button, Inspector, status bar, errors) without its query string, which may carry a signature or token; "Copy path" copies it whole.
 - Each tab keeps its own filter, sort, SQL text and result, scroll position, column layout and Inspector state; switching tabs does not re-run anything.
-- A header click selects the column: it is underlined in `ACCENT` and the Inspector's Column section describes it. It never starts a scan.
+- A header click selects the column: it is underlined in `accent()` and the Inspector's Column section describes it. It never starts a scan.
 - A header right-click opens a menu: Sort ascending / descending (by this column alone), Then by ascending / descending (once something is sorted: this column breaks its ties), Profile column, Fit width, Hide column, Pin columns, Copy name. With several sort keys each sorted header shows its arrow and its position (1, 2, …).
 - A cell right-click selects the cell and opens a menu: Filter to this value, Exclude this value, Copy cell, Copy row. While a filter is applied it also offers "Add to filter: this value" and "Add to filter: not this value", which narrow that filter. A null cell filters to or away from nulls. When the cell cannot be filtered by (an unsupported type, an aggregate result) the filter rows are disabled and a caption says why.
 - Sorting is always an explicit choice (the Sort menu or the header menu), because it scans the whole file. It sorts every row; a large sort shows its scan progress and may take a while, because it writes temporary files. "Back to file order" in the Sort menu clears it.

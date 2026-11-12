@@ -151,8 +151,8 @@ pub fn icon(ui: &egui::Ui, center: Pos2, glyph: Icon, color: Color32) {
 /// The PAVI mark: four planks of a herringbone parquet floor.
 pub fn logo(ui: &egui::Ui, center: Pos2, scale: f32) {
     for (side, color) in [
-        (-1.0_f32, theme::ACCENT),
-        (1.0_f32, theme::ACCENT.gamma_multiply(0.55)),
+        (-1.0_f32, theme::accent()),
+        (1.0_f32, theme::accent().gamma_multiply(0.55)),
     ] {
         for top in [-3.5_f32, 3.0] {
             let p = |x: f32, y: f32| center + egui::vec2(side * x, y) * scale;
@@ -207,7 +207,7 @@ fn tool(
     has_menu: bool,
 ) -> Response {
     const ICON: f32 = 16.0;
-    let text = (!label.is_empty()).then(|| elided(ui, label, theme::body(), theme::TEXT, 240.0));
+    let text = (!label.is_empty()).then(|| elided(ui, label, theme::body(), theme::text(), 240.0));
     let icon_only = text.is_none() && !has_menu;
     let padding = if icon_only {
         (theme::CONTROL_HEIGHT - ICON) / 2.0
@@ -238,21 +238,21 @@ fn tool(
     });
     let hovered = response.hovered();
     let fill = if selected {
-        theme::SELECTED
+        theme::selected()
     } else if response.is_pointer_button_down_on() {
-        theme::HEADER
+        theme::header()
     } else if hovered {
-        theme::HOVER
+        theme::hover()
     } else {
         Color32::TRANSPARENT
     };
     ui.painter().rect_filled(rect, theme::RADIUS, fill);
     let quiet = if selected {
-        theme::ACCENT
+        theme::accent()
     } else if hovered {
-        theme::TEXT
+        theme::text()
     } else {
-        theme::MUTED
+        theme::muted()
     };
     let mut x = rect.left() + padding;
     if let Some(glyph) = glyph {
@@ -266,7 +266,7 @@ fn tool(
     }
     if let Some(text) = text {
         let position = egui::pos2(x, rect.center().y - text.size().y / 2.0);
-        ui.painter().galley(position, text, theme::TEXT);
+        ui.painter().galley(position, text, theme::text());
     }
     if has_menu {
         chevron(
@@ -333,11 +333,19 @@ pub fn menu_item(ui: &mut egui::Ui, label: &str, hint: &str) -> Response {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
     if response.hovered() {
-        ui.painter().rect_filled(rect, theme::RADIUS, theme::HOVER);
+        ui.painter()
+            .rect_filled(rect, theme::RADIUS, theme::hover());
     }
     let inner = rect.shrink2(Spacing::Md.vec(Spacing::None));
-    let hint = (!hint.is_empty())
-        .then(|| elided(ui, hint, theme::small(), theme::MUTED, inner.width() * 0.5));
+    let hint = (!hint.is_empty()).then(|| {
+        elided(
+            ui,
+            hint,
+            theme::small(),
+            theme::muted(),
+            inner.width() * 0.5,
+        )
+    });
     let hint_width = hint
         .as_ref()
         .map_or(0.0, |hint| hint.size().x + Spacing::Lg.px());
@@ -345,13 +353,13 @@ pub fn menu_item(ui: &mut egui::Ui, label: &str, hint: &str) -> Response {
         ui,
         label,
         theme::body(),
-        theme::TEXT,
+        theme::text(),
         inner.width() - hint_width,
     );
     ui.painter().galley(
         egui::pos2(inner.left(), rect.center().y - text.size().y / 2.0),
         text,
-        theme::TEXT,
+        theme::text(),
     );
     if let Some(hint) = hint {
         ui.painter().galley(
@@ -360,7 +368,7 @@ pub fn menu_item(ui: &mut egui::Ui, label: &str, hint: &str) -> Response {
                 rect.center().y - hint.size().y / 2.0,
             ),
             hint,
-            theme::MUTED,
+            theme::muted(),
         );
     }
     response
@@ -374,7 +382,7 @@ pub fn menu_caption(ui: &mut egui::Ui, text: &str) {
         ui.label(
             egui::RichText::new(text)
                 .font(theme::small())
-                .color(theme::MUTED),
+                .color(theme::muted()),
         );
     });
 }
@@ -387,7 +395,7 @@ pub fn segmented<T: Copy + PartialEq>(
 ) -> Option<T> {
     let texts = options
         .iter()
-        .map(|(_, label, _)| elided(ui, label, theme::body(), theme::TEXT, 160.0))
+        .map(|(_, label, _)| elided(ui, label, theme::body(), theme::text(), 160.0))
         .collect::<Vec<_>>();
     let widths = texts
         .iter()
@@ -398,11 +406,11 @@ pub fn segmented<T: Copy + PartialEq>(
         egui::Sense::hover(),
     );
     ui.painter()
-        .rect_filled(rect, theme::RADIUS, theme::BACKGROUND);
+        .rect_filled(rect, theme::RADIUS, theme::background());
     ui.painter().rect_stroke(
         rect,
         theme::RADIUS,
-        Stroke::new(1.0_f32, theme::BORDER),
+        Stroke::new(1.0_f32, theme::border()),
         egui::StrokeKind::Inside,
     );
     let mut clicked = None;
@@ -430,14 +438,14 @@ pub fn segmented<T: Copy + PartialEq>(
         });
         if selected {
             ui.painter()
-                .rect_filled(segment.shrink(2.0), theme::RADIUS - 1, theme::HOVER);
+                .rect_filled(segment.shrink(2.0), theme::RADIUS - 1, theme::hover());
         }
         let color = if !*enabled {
-            theme::DISABLED
+            theme::disabled()
         } else if selected || response.hovered() {
-            theme::TEXT
+            theme::text()
         } else {
-            theme::MUTED
+            theme::muted()
         };
         ui.painter().galley_with_override_text_color(
             segment.center() - text.size() / 2.0,
@@ -457,7 +465,7 @@ pub fn divider(ui: &mut egui::Ui) {
     ui.painter().vline(
         rect.center().x,
         rect.y_range(),
-        Stroke::new(1.0_f32, theme::BORDER),
+        Stroke::new(1.0_f32, theme::border()),
     );
 }
 
@@ -472,9 +480,9 @@ pub fn window_button(ui: &mut egui::Ui, glyph: Icon, label: &str, danger: bool) 
             rect,
             0.0,
             if danger {
-                theme::CLOSE_HOVER
+                theme::close_hover()
             } else {
-                theme::HOVER
+                theme::hover()
             },
         );
     }
@@ -482,14 +490,18 @@ pub fn window_button(ui: &mut egui::Ui, glyph: Icon, label: &str, danger: bool) 
         ui,
         rect.center(),
         glyph,
-        if hovered { theme::TEXT } else { theme::MUTED },
+        if hovered {
+            theme::text()
+        } else {
+            theme::muted()
+        },
     );
     response.on_hover_text(label)
 }
 
 /// The one filled button per view: the main action.
 pub fn primary_button(ui: &mut egui::Ui, glyph: Option<Icon>, label: &str) -> Response {
-    let text = elided(ui, label, theme::strong(13.0), theme::ON_ACCENT, 240.0);
+    let text = elided(ui, label, theme::strong(13.0), theme::on_accent(), 240.0);
     let icon_width = if glyph.is_some() { 20.0 } else { 0.0 };
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(
@@ -505,9 +517,9 @@ pub fn primary_button(ui: &mut egui::Ui, glyph: Option<Icon>, label: &str) -> Re
         rect,
         theme::RADIUS,
         if response.hovered() {
-            theme::ACCENT.gamma_multiply(0.9)
+            theme::accent().gamma_multiply(0.9)
         } else {
-            theme::ACCENT
+            theme::accent()
         },
     );
     let left = rect.left() + Spacing::Lg.px();
@@ -516,13 +528,13 @@ pub fn primary_button(ui: &mut egui::Ui, glyph: Option<Icon>, label: &str) -> Re
             ui,
             egui::pos2(left + 6.0, rect.center().y),
             glyph,
-            theme::ON_ACCENT,
+            theme::on_accent(),
         );
     }
     ui.painter().galley(
         egui::pos2(left + icon_width, rect.center().y - text.size().y / 2.0),
         text,
-        theme::ON_ACCENT,
+        theme::on_accent(),
     );
     response
 }
@@ -543,20 +555,20 @@ pub fn section(
         egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, ui.is_enabled(), title)
     });
     if response.hovered() {
-        ui.painter().rect_filled(rect, 0.0, theme::HEADER);
+        ui.painter().rect_filled(rect, 0.0, theme::header());
     }
     chevron(
         ui,
         egui::pos2(rect.left() + 14.0, rect.center().y),
         open,
-        theme::MUTED,
+        theme::muted(),
     );
     ui.painter().text(
         egui::pos2(rect.left() + 26.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         title,
         theme::strong(12.5),
-        theme::TEXT,
+        theme::text(),
     );
     if !note.is_empty() {
         ui.painter().text(
@@ -564,7 +576,7 @@ pub fn section(
             egui::Align2::RIGHT_CENTER,
             note,
             theme::small(),
-            theme::MUTED,
+            theme::muted(),
         );
     }
     if response.clicked() {
@@ -589,7 +601,7 @@ pub fn section(
     ui.painter().hline(
         line.x_range(),
         line.top(),
-        Stroke::new(1.0_f32, theme::BORDER),
+        Stroke::new(1.0_f32, theme::border()),
     );
     ui.add_space(1.0);
 }
@@ -604,7 +616,7 @@ pub fn detail(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
             egui::Align2::LEFT_CENTER,
             label,
             theme::body(),
-            theme::MUTED,
+            theme::muted(),
         );
         ui.add(egui::Label::new(&value).truncate())
             .on_hover_text(&value);
@@ -613,7 +625,7 @@ pub fn detail(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
 
 /// Error text in the one error color.
 pub fn error(ui: &mut egui::Ui, text: &str) -> Response {
-    ui.label(egui::RichText::new(text).color(theme::ERROR))
+    ui.label(egui::RichText::new(text).color(theme::error()))
 }
 
 /// Centres a short column of content (an empty or loading state) in the free space.

@@ -45,8 +45,11 @@ Export writes CSV, Parquet, JSON Lines (`.jsonl`) and Arrow IPC file format (`.a
 | Large files | Row counts are `u64`. The source grid shows files over 500,000 rows through a moving 500,000-row window with its own scrollbar, so every row (including the last of a billion) is reachable. Filtered results are ≤ 32,768 rows and are never windowed |
 
 ## Platform-specific code
-- No `cfg(target_os)` anywhere. Implicitly Windows-oriented: session path uses `LOCALAPPDATA` (`session.rs:192-199`).
-- Window decorations are disabled on all platforms; the top bar is the drag area and draws its own minimize/maximize/close controls (`show_top_bar`, `window_controls` in `ui/toolbar.rs`). Without OS decorations Windows gives the window no resize border, so `window_resize_handles` puts drag strips on the edges and corners that send `ViewportCommand::BeginResize`. That command is not supported on macOS by winit.
+- No `cfg(target_os)` anywhere. The few platform differences are decided at run time from `std::env::consts::OS` by small functions that take the OS name, so every platform's branch is tested on any machine:
+  - Session folder (`session::session_dir`): `%LOCALAPPDATA%\PAVI` on Windows, `~/Library/Application Support/PAVI` on macOS, `$XDG_STATE_HOME/pavi` or `~/.local/state/pavi` on Linux and the BSDs; the temp folder when none of these can be found.
+  - Text font (`theme::font_files`): Segoe UI on Windows, Arial on macOS, Noto Sans or DejaVu Sans on Linux; egui's built-in font otherwise.
+  - Window frame (`app::native_window_frame`): decorations are disabled except on macOS. Elsewhere the top bar is the drag area and draws its own minimize/maximize/close controls (`show_top_bar`, `window_controls` in `ui/toolbar.rs`), and `window_resize_handles` puts drag strips on the edges and corners that send `ViewportCommand::BeginResize`. winit doesn't support that command on macOS, so there the system title bar and border stay.
+- Builds and tests run on Windows and Ubuntu in CI. macOS is not built in CI; its branches above are unit-tested by name only.
 - Native dialogs: `rfd` (synchronous). Clipboard: egui/winit.
 
 ## unsafe / FFI

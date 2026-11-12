@@ -97,10 +97,10 @@ impl PaviApp {
                     .num_columns(2)
                     .spacing(Spacing::Lg.vec(Spacing::Sm))
                     .show(ui, |ui| {
-                        ui.label(RichText::new("This tab").color(theme::MUTED));
+                        ui.label(RichText::new("This tab").color(theme::muted()));
                         ui.label(table_summary(&this_name, &this_source));
                         ui.end_row();
-                        ui.label(RichText::new("Compare with").color(theme::MUTED));
+                        ui.label(RichText::new("Compare with").color(theme::muted()));
                         ui.horizontal(|ui| {
                             egui::ComboBox::from_id_salt("compare_other")
                                 .selected_text(&other_name)
@@ -125,7 +125,7 @@ impl PaviApp {
                             "Both have the same {} columns with the same types.",
                             diff.same.len()
                         ))
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                     );
                 } else {
                     ui.label(
@@ -136,7 +136,7 @@ impl PaviApp {
                             diff.only_right.len(),
                             diff.type_differs.len()
                         ))
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                     );
                     egui::ScrollArea::vertical()
                         .id_salt("compare_diff")
@@ -151,12 +151,12 @@ impl PaviApp {
                         RichText::new(
                             "No column has the same name and a comparable type in both, so rows can't be matched.",
                         )
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                     );
                     return;
                 }
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Match rows by").color(theme::MUTED));
+                    ui.label(RichText::new("Match rows by").color(theme::muted()));
                     egui::ComboBox::from_id_salt("compare_key")
                         .selected_text(self.compare.key.as_deref().unwrap_or_default())
                         .show_ui(ui, |ui| {
@@ -198,7 +198,7 @@ impl PaviApp {
                 ui.label(
                     RichText::new("Runs the query in the SQL workspace, where you can change it.")
                         .font(theme::small())
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             });
         self.compare.visible = open;
@@ -240,17 +240,17 @@ fn diff_list(ui: &mut egui::Ui, diff: &SchemaDiff, other: &str) {
         .spacing(Spacing::Lg.vec(Spacing::Xs))
         .show(ui, |ui| {
             for (name, data_type) in &diff.only_left {
-                ui.label(RichText::new("only here").color(theme::MUTED));
+                ui.label(RichText::new("only here").color(theme::muted()));
                 column(ui, name, data_type);
                 ui.end_row();
             }
             for (name, data_type) in &diff.only_right {
-                ui.label(RichText::new(format!("only in {other}")).color(theme::MUTED));
+                ui.label(RichText::new(format!("only in {other}")).color(theme::muted()));
                 column(ui, name, data_type);
                 ui.end_row();
             }
             for (name, here, there) in &diff.type_differs {
-                ui.label(RichText::new("another type").color(theme::MUTED));
+                ui.label(RichText::new("another type").color(theme::muted()));
                 ui.label(name);
                 ui.label(
                     RichText::new(format!(
@@ -259,7 +259,7 @@ fn diff_list(ui: &mut egui::Ui, diff: &SchemaDiff, other: &str) {
                         type_label(there)
                     ))
                     .font(theme::small())
-                    .color(theme::ERROR),
+                    .color(theme::error()),
                 );
                 ui.end_row();
             }

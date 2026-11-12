@@ -31,7 +31,7 @@ impl PaviApp {
             .exact_height(theme::TAB_BAR_HEIGHT)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::PANEL)
+                    .fill(theme::panel())
                     .inner_margin(egui::Margin {
                         left: Spacing::Md as i8,
                         ..egui::Margin::ZERO
@@ -78,9 +78,9 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
     let height = theme::TAB_BAR_HEIGHT;
     let icon_space = 22.0;
     let text_color = if label.active {
-        theme::TEXT
+        theme::text()
     } else {
-        theme::MUTED
+        theme::muted()
     };
     let galley = widgets::elided(
         ui,
@@ -103,11 +103,11 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
     let hovered = response.hovered();
     let painter = ui.painter();
     let fill = if label.active {
-        theme::BACKGROUND
+        theme::background()
     } else if hovered {
-        theme::HOVER
+        theme::hover()
     } else {
-        theme::PANEL
+        theme::panel()
     };
     painter.rect_filled(
         rect,
@@ -122,7 +122,7 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
     if label.active {
         painter.line_segment(
             [rect.left_top(), rect.right_top()],
-            egui::Stroke::new(2.0_f32, theme::ACCENT),
+            egui::Stroke::new(2.0_f32, theme::accent()),
         );
     }
     let left = rect.left() + Spacing::Sm.px();
@@ -135,9 +135,9 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
             Icon::Columns
         },
         if label.active {
-            theme::ACCENT
+            theme::accent()
         } else {
-            theme::MUTED
+            theme::muted()
         },
     );
     painter.galley(
@@ -164,9 +164,9 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
     if label.active || hovered || close.hovered() {
         if close.hovered() {
             ui.painter()
-                .rect_filled(close_rect, theme::RADIUS, theme::HOVER);
+                .rect_filled(close_rect, theme::RADIUS, theme::hover());
         }
-        widgets::icon(ui, close_rect.center(), Icon::Close, theme::MUTED);
+        widgets::icon(ui, close_rect.center(), Icon::Close, theme::muted());
     }
     if close.clicked() || response.middle_clicked() {
         return Some(TabAction::Close(index));
