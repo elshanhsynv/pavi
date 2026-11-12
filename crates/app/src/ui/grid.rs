@@ -35,7 +35,7 @@ impl Header {
             source,
             name: name.to_owned(),
             data_type: data_type.map(type_label).unwrap_or_default(),
-            color: data_type.map_or(theme::MUTED, type_color),
+            color: data_type.map_or(theme::muted(), type_color),
             numeric: data_type.is_some_and(arrow_schema::DataType::is_numeric),
         }
     }
@@ -46,7 +46,7 @@ impl PaviApp {
         if self.find.open && self.dataset.is_some() {
             self.show_find_bar(ui);
         }
-        egui::Frame::new().fill(theme::BACKGROUND).show(ui, |ui| {
+        egui::Frame::new().fill(theme::background()).show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             ui.spacing_mut().item_spacing = Spacing::None.vec(Spacing::None);
             ui.spacing_mut().interact_size.y = ROW_HEIGHT;
@@ -68,7 +68,7 @@ impl PaviApp {
                 ui.heading("This file has no rows");
                 ui.label(
                     RichText::new("Its schema and metadata are in the Inspector (Ctrl+I).")
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             });
             return;
@@ -113,7 +113,7 @@ impl PaviApp {
             widgets::placeholder(ui, |ui| {
                 ui.heading("Every column is hidden");
                 ui.label(
-                    RichText::new("Show one from Columns in the top bar.").color(theme::MUTED),
+                    RichText::new("Show one from Columns in the top bar.").color(theme::muted()),
                 );
             });
             return;
@@ -305,7 +305,7 @@ impl PaviApp {
                 } else if finished {
                     ui.heading(kind.empty_message());
                 } else {
-                    ui.add(egui::Spinner::new().color(theme::ACCENT));
+                    ui.add(egui::Spinner::new().color(theme::accent()));
                     ui.label(
                         RichText::new(match scanned {
                             Some(fraction) if preparing => format!(
@@ -320,7 +320,7 @@ impl PaviApp {
                             ),
                             None => format!("{} query running…", kind.label()),
                         })
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                     );
                 }
             });
@@ -372,7 +372,7 @@ impl PaviApp {
             .and_then(|row| row.checked_sub(first_result))
             .map(ui_row_count);
         egui::Frame::new()
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -387,7 +387,7 @@ impl PaviApp {
                         theme::number(first_result + rows),
                     ))
                     .font(theme::small())
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
             });
         let header_rows = usize::from(!self.freeze_header);
@@ -547,7 +547,7 @@ impl PaviApp {
         let mut open = None;
         widgets::placeholder(ui, |ui| match &self.grid.loading {
             LoadState::Opening => {
-                ui.add(egui::Spinner::new().color(theme::ACCENT));
+                ui.add(egui::Spinner::new().color(theme::accent()));
                 ui.heading("Opening…");
                 let format = self
                     .opening_path
@@ -565,7 +565,7 @@ impl PaviApp {
                         format.name()
                     ),
                 };
-                ui.label(RichText::new(detail).color(theme::MUTED));
+                ui.label(RichText::new(detail).color(theme::muted()));
             }
             LoadState::Error(error) => {
                 ui.heading("This could not be opened");
@@ -583,7 +583,7 @@ impl PaviApp {
                         "Parquet, CSV, JSON or Arrow/Feather. Drop files or folders on this \
                          window; a folder of Parquet files opens as one table.",
                     )
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
                 ui.horizontal(|ui| {
                     browse = widgets::primary_button(ui, Some(Icon::Columns), "Open file…")
@@ -745,7 +745,7 @@ impl PaviApp {
             ui.painter().hline(
                 rect.x_range(),
                 rect.bottom() - 1.0,
-                egui::Stroke::new(2.0_f32, theme::ACCENT),
+                egui::Stroke::new(2.0_f32, theme::accent()),
             );
         }
         let pad = Spacing::Md.px();
@@ -754,7 +754,7 @@ impl PaviApp {
             egui::Align2::LEFT_CENTER,
             &header.name,
             theme::strong(12.5),
-            theme::TEXT,
+            theme::text(),
         );
         let mut used = name.right();
         if let Some((order, direction)) =
@@ -768,7 +768,7 @@ impl PaviApp {
                     SortDirection::Ascending => Icon::ArrowUp,
                     SortDirection::Descending => Icon::ArrowDown,
                 },
-                theme::ACCENT,
+                theme::accent(),
             );
             used += 18.0;
             // With several keys, a small number says which one this is.
@@ -778,7 +778,7 @@ impl PaviApp {
                     egui::Align2::LEFT_CENTER,
                     (order + 1).to_string(),
                     theme::small(),
-                    theme::ACCENT,
+                    theme::accent(),
                 );
                 used = number.right() + 2.0;
             }
@@ -930,9 +930,9 @@ impl PaviApp {
                 egui::Rect::from_x_y_ranges(gutter.left()..=strip_right, gutter.y_range()),
                 0.0,
                 if row.stripe {
-                    theme::STRIPE
+                    theme::stripe()
                 } else {
-                    theme::BACKGROUND
+                    theme::background()
                 },
             );
             pinned_scope(ui, gutter, body_clip, ("pinned_gutter", row.row), |ui| {
@@ -983,7 +983,7 @@ impl PaviApp {
         ui.painter().vline(
             right,
             area.top()..=bottom.min(body.bottom()),
-            egui::Stroke::new(1.0_f32, theme::BORDER),
+            egui::Stroke::new(1.0_f32, theme::border()),
         );
     }
 
@@ -992,7 +992,7 @@ impl PaviApp {
         let mut search = None;
         let mut close = false;
         egui::Frame::new()
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1036,7 +1036,7 @@ impl PaviApp {
                         ui.label(
                             RichText::new(message)
                                 .font(theme::small())
-                                .color(theme::TEXT),
+                                .color(theme::text()),
                         );
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1052,7 +1052,7 @@ impl PaviApp {
                                     "Looks only at the rows loaded in memory; filter to search the whole file.",
                                 )
                                 .font(theme::small())
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                             )
                             .truncate(),
                         );
@@ -1156,7 +1156,11 @@ pub(in crate::app) fn row_scrollbar(
     painter.rect_filled(
         thumb,
         4.0,
-        if active { theme::MUTED } else { theme::BORDER },
+        if active {
+            theme::muted()
+        } else {
+            theme::border()
+        },
     );
     let response = response.on_hover_text(format!(
         "Rows {}–{} of {}",
@@ -1188,9 +1192,13 @@ fn header_fill(ui: &egui::Ui, rect: egui::Rect, hovered: bool) {
     painter.rect_filled(
         rect,
         0.0,
-        if hovered { theme::HOVER } else { theme::HEADER },
+        if hovered {
+            theme::hover()
+        } else {
+            theme::header()
+        },
     );
-    let line = egui::Stroke::new(1.0_f32, theme::BORDER);
+    let line = egui::Stroke::new(1.0_f32, theme::border());
     painter.vline(rect.right(), rect.y_range(), line);
     painter.hline(rect.x_range(), rect.bottom(), line);
 }
@@ -1201,19 +1209,23 @@ fn row_number(ui: &mut egui::Ui, row: u64, current: bool) {
     let (rect, _) = ui.allocate_exact_size(ui.max_rect().size(), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     if current {
-        painter.rect_filled(rect, 0.0, theme::HEADER);
+        painter.rect_filled(rect, 0.0, theme::header());
     }
     painter.vline(
         rect.right(),
         rect.y_range(),
-        egui::Stroke::new(1.0_f32, theme::BORDER),
+        egui::Stroke::new(1.0_f32, theme::border()),
     );
     painter.text(
         egui::pos2(rect.right() - Spacing::Md.px(), rect.center().y),
         egui::Align2::RIGHT_CENTER,
         (row + 1).to_string(),
         theme::small(),
-        if current { theme::TEXT } else { theme::MUTED },
+        if current {
+            theme::text()
+        } else {
+            theme::muted()
+        },
     );
 }
 
@@ -1240,28 +1252,28 @@ fn cell_value(ui: &mut egui::Ui, text: &str, look: CellLook) -> egui::Response {
     });
     let painter = ui.painter_at(rect);
     if look.selected {
-        painter.rect_filled(rect, 0.0, theme::SELECTED);
+        painter.rect_filled(rect, 0.0, theme::selected());
     } else if look.current_row {
-        painter.rect_filled(rect, 0.0, theme::HEADER);
+        painter.rect_filled(rect, 0.0, theme::header());
     }
     painter.vline(
         rect.right(),
         rect.y_range(),
-        egui::Stroke::new(1.0_f32, theme::GRID_LINE),
+        egui::Stroke::new(1.0_f32, theme::grid_line()),
     );
     if look.selected {
         painter.rect_stroke(
             rect,
             0.0,
-            egui::Stroke::new(1.0_f32, theme::ACCENT),
+            egui::Stroke::new(1.0_f32, theme::accent()),
             egui::StrokeKind::Inside,
         );
     }
     let pad = Spacing::Md.px();
     let color = match text {
-        "null" => theme::MUTED,
-        "…" => theme::DISABLED,
-        _ => theme::TEXT,
+        "null" => theme::muted(),
+        "…" => theme::disabled(),
+        _ => theme::text(),
     };
     let drawn = if look.numeric {
         painter.text(

@@ -30,6 +30,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Save a chart as PNG (as on screen) or SVG (960 × 540) from the Charts window.
 - Profile all columns at once: the Inspector's Schema section has "Profile all columns", which shows nulls, distinct values, min, max and mean of every column in one scan.
 - Compare two open tabs (file menu ▸ Compare with another tab): see the columns only one has or with another type, and list the rows whose key is only in one tab, or in both.
+- A light theme: file menu ▸ Theme ▸ Light, or System to follow the operating system's setting, also when it changes while PAVI runs. The choice is kept with the session.
+- macOS and Linux: PAVI uses a system font (Arial on macOS, Noto Sans or DejaVu Sans on Linux) and keeps the session in the platform's own folder (`~/Library/Application Support/PAVI`, or `$XDG_STATE_HOME/pavi`, by default `~/.local/state/pavi`) instead of the temp folder. On macOS the window keeps the system title bar, so it can be resized.
 
 ### Changed
 - Line charts join their points from left to right instead of in the order the rows came in.

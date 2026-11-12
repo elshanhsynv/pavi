@@ -49,7 +49,7 @@ Only the open tab is polled. A parked tab keeps its `OpenTask`, page tasks, `Que
 
 ## Persistence
 
-Custom JSON session at `%LOCALAPPDATA%\PAVI\session-v1.json` (falls back to the temp dir on systems without `LOCALAPPDATA`) (`session.rs:192-199`), written atomically via `.tmp` + rename (`session.rs:213-229`). It stores recent files and folders, last file, the files and folders open in tabs (reopened at start), SQL input, query history, inspector/chart visibility and per-schema grid layouts (order, hidden, widths). It's saved synchronously on many actions (open, SQL run/finish, layout change, inspector toggle). eframe's own storage is unused: `App::save` is implemented but eframe only calls it with the `persistence` feature, which is off; window size/position are not persisted.
+Custom JSON session at `session-v1.json` in the platform's folder (`session::session_dir`: `%LOCALAPPDATA%\PAVI` on Windows, `~/Library/Application Support/PAVI` on macOS, `$XDG_STATE_HOME/pavi` or `~/.local/state/pavi` elsewhere; the temp dir when none can be found), written atomically via `.tmp` + rename (`session.rs:213-229`). It stores recent files and folders, last file, the files and folders open in tabs (reopened at start), SQL input, query history, inspector/chart visibility and per-schema grid layouts (order, hidden, widths). It's saved synchronously on many actions (open, SQL run/finish, layout change, inspector toggle). eframe's own storage is unused: `App::save` is implemented but eframe only calls it with the `persistence` feature, which is off; window size/position are not persisted.
 
 
 ## Dependency graph

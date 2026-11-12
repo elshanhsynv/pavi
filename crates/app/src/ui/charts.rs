@@ -154,7 +154,7 @@ impl PaviApp {
                         if widgets::tool_button(ui, Some(Icon::Close), "Cancel", false).clicked() {
                             cancel = true;
                         }
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
                     }
                     ui.add_enabled_ui(self.chart.model.is_some(), |ui| {
                         widgets::menu(
@@ -181,7 +181,7 @@ impl PaviApp {
                         egui::Label::new(
                             RichText::new(&self.chart.status)
                                 .font(theme::small())
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         )
                         .truncate(),
                     )
@@ -197,11 +197,11 @@ impl PaviApp {
                     ui.set_min_height(EMPTY_PLOT_HEIGHT);
                     widgets::placeholder(ui, |ui| {
                         if self.chart.loading() {
-                            ui.add(egui::Spinner::new().color(theme::ACCENT));
+                            ui.add(egui::Spinner::new().color(theme::accent()));
                         } else {
                             ui.label(
                                 RichText::new("Pick a source and columns, then draw the chart.")
-                                    .color(theme::MUTED),
+                                    .color(theme::muted()),
                             );
                         }
                     });
@@ -293,7 +293,7 @@ fn series_field(
         ui.painter().rect_filled(
             swatch,
             2.0,
-            theme::CHART_SERIES[index % theme::CHART_SERIES.len()],
+            theme::chart_series()[index % theme::chart_series().len()],
         );
         if removable
             && widgets::tool_button(ui, Some(Icon::Close), "", false)
@@ -318,7 +318,7 @@ fn field(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
             egui::Align2::LEFT_CENTER,
             label,
             theme::body(),
-            theme::MUTED,
+            theme::muted(),
         );
         body(ui);
     });
@@ -365,7 +365,11 @@ fn column_field(
 }
 
 fn caption(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::small()).color(theme::MUTED));
+    ui.label(
+        RichText::new(text)
+            .font(theme::small())
+            .color(theme::muted()),
+    );
 }
 
 fn chart_notice(ui: &mut egui::Ui, model: &ChartModel) {
@@ -679,7 +683,7 @@ impl Scale {
 }
 
 fn series_color(index: usize) -> egui::Color32 {
-    theme::CHART_SERIES[index % theme::CHART_SERIES.len()]
+    theme::chart_series()[index % theme::chart_series().len()]
 }
 
 /// Up to 4 significant digits, for tooltips.
@@ -699,7 +703,7 @@ pub(in crate::app) fn paint_chart(
     model: &ChartModel,
     config: &ChartConfig,
 ) -> Vec<(egui::Rect, String)> {
-    canvas.rect(rect, theme::BACKGROUND);
+    canvas.rect(rect, theme::background());
     let title = if config.title.trim().is_empty() {
         format!("{} chart", model.kind.label())
     } else {
@@ -710,7 +714,7 @@ pub(in crate::app) fn paint_chart(
         egui::Align2::LEFT_TOP,
         &title,
         ChartText::Title,
-        theme::TEXT,
+        theme::text(),
     );
     if model.is_empty() {
         canvas.text(
@@ -718,7 +722,7 @@ pub(in crate::app) fn paint_chart(
             egui::Align2::CENTER_CENTER,
             "No chartable values",
             ChartText::Title,
-            theme::MUTED,
+            theme::muted(),
         );
         return Vec::new();
     }
@@ -734,7 +738,7 @@ pub(in crate::app) fn paint_chart(
                 egui::Align2::RIGHT_TOP,
                 name,
                 ChartText::Small,
-                theme::TEXT,
+                theme::text(),
             );
             right -= width + 6.0;
             canvas.rect(
@@ -859,7 +863,7 @@ pub(in crate::app) fn paint_chart(
                         egui::Align2::CENTER_TOP,
                         &short,
                         ChartText::Small,
-                        theme::MUTED,
+                        theme::muted(),
                     );
                 }
             }
@@ -886,7 +890,7 @@ pub(in crate::app) fn paint_chart(
                     egui::pos2(left, scale.y(bin.count as f64)),
                     egui::pos2((left + width - 2.0).max(left + 1.0), plot.bottom()),
                 );
-                canvas.rect(shape, theme::CHART_BAR);
+                canvas.rect(shape, theme::chart_bar());
                 targets.push((
                     shape,
                     format!(
@@ -917,7 +921,7 @@ fn axes(
         let y = scale.y(tick);
         canvas.line(
             &[egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            theme::CHART_GRID,
+            theme::chart_grid(),
             1.0,
         );
         canvas.text(
@@ -925,7 +929,7 @@ fn axes(
             egui::Align2::RIGHT_CENTER,
             &AxisFormat::Number.label(tick, y_step),
             ChartText::Small,
-            theme::MUTED,
+            theme::muted(),
         );
     }
     if let Some(format) = x_axis {
@@ -937,7 +941,7 @@ fn axes(
             let x = scale.x(tick);
             canvas.line(
                 &[egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
-                theme::CHART_GRID,
+                theme::chart_grid(),
                 1.0,
             );
             canvas.text(
@@ -945,13 +949,13 @@ fn axes(
                 egui::Align2::CENTER_TOP,
                 &format.label(tick, x_step),
                 ChartText::Small,
-                theme::MUTED,
+                theme::muted(),
             );
         }
     }
     canvas.line(
         &[plot.left_top(), plot.left_bottom(), plot.right_bottom()],
-        theme::MUTED,
+        theme::muted(),
         1.0,
     );
     canvas.text(
@@ -959,7 +963,7 @@ fn axes(
         egui::Align2::CENTER_TOP,
         x_name,
         ChartText::Small,
-        theme::TEXT,
+        theme::text(),
     );
     if let Some(y_name) = y_name {
         canvas.text(
@@ -967,7 +971,7 @@ fn axes(
             egui::Align2::LEFT_BOTTOM,
             y_name,
             ChartText::Small,
-            theme::TEXT,
+            theme::text(),
         );
     }
 }
@@ -1027,9 +1031,19 @@ mod tests {
         assert!(svg.contains(">low<"));
         assert!(svg.contains("high &lt;&amp;&gt;"));
         assert!(!svg.contains("<&>"));
-        for color in &theme::CHART_SERIES[..2] {
-            let hex = format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b());
-            assert!(svg.contains(&hex), "{hex} missing");
+        // The first two series colours, from whichever palette was in use (a
+        // test elsewhere switches it for a moment).
+        let hex =
+            |color: egui::Color32| format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b());
+        for (dark, light) in [
+            (theme::DARK.type_number, theme::LIGHT.type_number),
+            (theme::DARK.accent, theme::LIGHT.accent),
+        ] {
+            assert!(
+                svg.contains(&hex(dark)) || svg.contains(&hex(light)),
+                "{} missing",
+                hex(dark)
+            );
         }
     }
 }

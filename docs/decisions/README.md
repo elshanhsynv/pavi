@@ -35,3 +35,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0007](0007-other-formats.md) | CSV, JSON and Arrow files are converted to a temporary Parquet file when opened |
 | [0008](0008-remote-files.md) | Remote files (S3, GCS, Azure, HTTPS) are read with blocking HTTP range requests |
 | [0009](0009-joins-and-subqueries.md) | Joins and subqueries are evaluated into a temporary table, then queried (amends 0004) |
+| [0010](0010-light-theme.md) | A light theme beside the dark one, from one `Palette` type (amends DESIGN.md principle 5) |

@@ -2239,3 +2239,52 @@ fn profiles_every_column_and_compares_two_tabs() {
         assert_eq!(filtered_ids(&app), expected, "{matching:?}");
     }
 }
+
+#[test]
+fn applies_and_saves_the_theme_choice() {
+    use crate::session::ThemeChoice;
+
+    let directory = TempDir::new().unwrap();
+    let store = SessionStore::new(directory.path().join("session.json"));
+    let mut app = PaviApp::new_with_store(None, store.clone());
+    let context = egui::Context::default();
+    ui::theme::apply(&context);
+    // Only this test switches the palette; the dark one is restored before
+    // any assertion can fail, so tests running at the same time see dark.
+    app.set_theme_choice(ThemeChoice::Light);
+    app.apply_theme_choice(&context);
+    let light = (
+        app.light_applied,
+        ui::theme::panel(),
+        context.style().visuals.panel_fill,
+    );
+    app.set_theme_choice(ThemeChoice::System);
+    app.apply_theme_choice(&context);
+    let system = (app.light_applied, ui::theme::panel());
+    app.set_theme_choice(ThemeChoice::Dark);
+    app.apply_theme_choice(&context);
+
+    assert_eq!(
+        light,
+        (Some(true), ui::theme::LIGHT.panel, ui::theme::LIGHT.panel)
+    );
+    // A context with no system theme reported draws dark.
+    assert_eq!(system, (Some(false), ui::theme::DARK.panel));
+    assert_eq!(ui::theme::panel(), ui::theme::DARK.panel);
+    assert_eq!(
+        context.style_of(egui::Theme::Light).visuals.panel_fill,
+        ui::theme::DARK.panel
+    );
+    assert_eq!(store.load().preferences.theme, ThemeChoice::Dark);
+    app.set_theme_choice(ThemeChoice::Light);
+    assert_eq!(store.load().preferences.theme, ThemeChoice::Light);
+}
+
+#[test]
+fn only_macos_keeps_the_system_window_frame() {
+    use crate::app::native_window_frame_on;
+    assert!(native_window_frame_on("macos"));
+    for os in ["windows", "linux", "freebsd"] {
+        assert!(!native_window_frame_on(os), "{os}");
+    }
+}

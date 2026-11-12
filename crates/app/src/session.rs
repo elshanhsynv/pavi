@@ -21,6 +21,42 @@ pub const MAX_SAVED_QUERIES: usize = 100;
 /// Characters of a saved query's name.
 pub const MAX_SAVED_NAME_CHARS: usize = 80;
 
+/// The colour theme the user picked (ADR 0010).
+#[derive(Clone, Copy, Debug, Default, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
+    /// Light or dark as the operating system is set.
+    System,
+}
+
+impl ThemeChoice {
+    /// Whether to draw with the light palette, given the system's theme
+    /// (`None` when the platform doesn't say).
+    pub fn is_light(self, system_light: Option<bool>) -> bool {
+        match self {
+            Self::Dark => false,
+            Self::Light => true,
+            Self::System => system_light.unwrap_or(false),
+        }
+    }
+}
+
+/// An unknown name (from a newer version, or a hand edit) reads as the
+/// default instead of discarding the whole session.
+impl<'de> Deserialize<'de> for ThemeChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(match name.as_str() {
+            "light" => Self::Light,
+            "system" => Self::System,
+            _ => Self::Dark,
+        })
+    }
+}
+
 /// A SQL query the user saved under a name.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -46,6 +82,7 @@ pub struct Preferences {
     pub inspector_visible: bool,
     pub chart_visible: bool,
     pub grid_layouts: Vec<GridLayoutPreference>,
+    pub theme: ThemeChoice,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -299,17 +336,41 @@ impl SessionState {
     }
 }
 
+/// The folder for the session file on `os` (as `std::env::consts::OS` names
+/// it), from the environment `env` reads: `%LOCALAPPDATA%\\PAVI` on Windows,
+/// `~/Library/Application Support/PAVI` on macOS, and `$XDG_STATE_HOME/pavi`
+/// (by default `~/.local/state/pavi`) elsewhere. `None` when the variables it
+/// needs are missing or not absolute paths.
+pub fn session_dir(os: &str, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let absolute = |name: &str| {
+        env(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() || path.starts_with("/"))
+    };
+    match os {
+        "windows" => absolute("LOCALAPPDATA").map(|base| base.join("PAVI")),
+        "macos" => absolute("HOME").map(|home| {
+            home.join("Library")
+                .join("Application Support")
+                .join("PAVI")
+        }),
+        _ => absolute("XDG_STATE_HOME")
+            .or_else(|| absolute("HOME").map(|home| home.join(".local").join("state")))
+            .map(|base| base.join("pavi")),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     path: PathBuf,
 }
 
 impl SessionStore {
+    /// Where the session is kept on this machine.
     pub fn default_path() -> PathBuf {
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("PAVI")
+        let env = |name: &str| std::env::var_os(name);
+        session_dir(std::env::consts::OS, &env)
+            .unwrap_or_else(|| std::env::temp_dir().join("PAVI"))
             .join("session-v1.json")
     }
 
@@ -411,6 +472,91 @@ mod tests {
         store.save(&state).unwrap();
 
         assert_eq!(store.load(), state);
+    }
+
+    #[test]
+    fn keeps_the_theme_choice_and_reads_unknown_ones_as_dark() {
+        let (_directory, store) = store();
+        let mut state = SessionState::default();
+        assert_eq!(state.preferences.theme, ThemeChoice::Dark);
+        state.preferences.theme = ThemeChoice::System;
+        store.save(&state).unwrap();
+        assert_eq!(store.load().preferences.theme, ThemeChoice::System);
+
+        let read = |json: &str| {
+            serde_json::from_str::<SessionState>(json)
+                .unwrap()
+                .preferences
+                .theme
+        };
+        assert_eq!(
+            read(r#"{"preferences":{"theme":"light"}}"#),
+            ThemeChoice::Light
+        );
+        assert_eq!(
+            read(r#"{"preferences":{"theme":"sepia"}}"#),
+            ThemeChoice::Dark
+        );
+        // Sessions written before themes existed.
+        assert_eq!(
+            read(r#"{"preferences":{"chart_visible":true}}"#),
+            ThemeChoice::Dark
+        );
+
+        assert!(!ThemeChoice::Dark.is_light(Some(true)));
+        assert!(ThemeChoice::Light.is_light(Some(false)));
+        assert!(ThemeChoice::System.is_light(Some(true)));
+        assert!(!ThemeChoice::System.is_light(Some(false)));
+        assert!(!ThemeChoice::System.is_light(None));
+    }
+
+    #[test]
+    fn keeps_the_session_in_each_platforms_own_folder() {
+        use std::ffi::OsString;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        let windows = env(&[
+            ("LOCALAPPDATA", "C:\\Users\\a\\AppData\\Local"),
+            ("HOME", "/home/a"),
+        ]);
+        assert_eq!(
+            session_dir("windows", &windows),
+            Some(PathBuf::from("C:\\Users\\a\\AppData\\Local").join("PAVI"))
+        );
+        let home = env(&[("HOME", "/Users/a")]);
+        assert_eq!(
+            session_dir("macos", &home),
+            Some(PathBuf::from("/Users/a/Library/Application Support/PAVI"))
+        );
+        assert_eq!(
+            session_dir("linux", &env(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.local/state/pavi"))
+        );
+        assert_eq!(
+            session_dir(
+                "linux",
+                &env(&[("HOME", "/home/a"), ("XDG_STATE_HOME", "/state")])
+            ),
+            Some(PathBuf::from("/state/pavi"))
+        );
+        // A relative XDG_STATE_HOME is ignored, as the XDG spec says.
+        assert_eq!(
+            session_dir(
+                "freebsd",
+                &env(&[("HOME", "/home/a"), ("XDG_STATE_HOME", "state")])
+            ),
+            Some(PathBuf::from("/home/a/.local/state/pavi"))
+        );
+        // Nothing to go on: the caller falls back to the temp folder.
+        assert_eq!(session_dir("linux", &env(&[])), None);
+        assert_eq!(session_dir("windows", &env(&[("HOME", "/home/a")])), None);
+        assert!(SessionStore::default_path().ends_with("session-v1.json"));
     }
 
     #[test]

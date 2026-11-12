@@ -27,7 +27,7 @@ impl PaviApp {
             .default_width(INSPECTOR_WIDTH)
             .width_range(INSPECTOR_WIDTHS)
             .resizable(true)
-            .frame(egui::Frame::new().fill(theme::PANEL))
+            .frame(egui::Frame::new().fill(theme::panel()))
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing = Spacing::None.vec(Spacing::None);
                 egui::ScrollArea::vertical()
@@ -49,7 +49,7 @@ impl PaviApp {
             widgets::placeholder(ui, |ui| {
                 ui.label(
                     RichText::new("Open a file to see its schema and metadata.")
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             });
             return;
@@ -58,15 +58,17 @@ impl PaviApp {
 
         widgets::section(ui, "Cell", "", true, |ui| {
             let Some(cell) = &selected_cell else {
-                ui.label(RichText::new("Click a cell to see its full value.").color(theme::MUTED));
+                ui.label(
+                    RichText::new("Click a cell to see its full value.").color(theme::muted()),
+                );
                 return;
             };
             widgets::detail(ui, "Row", theme::number(cell.row + 1));
             widgets::detail(ui, "Column", &cell.name);
             ui.add_space(Spacing::Xs.px());
             egui::Frame::new()
-                .fill(theme::BACKGROUND)
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .fill(theme::background())
+                .stroke(egui::Stroke::new(1.0_f32, theme::border()))
                 .corner_radius(theme::RADIUS)
                 .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
                 .show(ui, |ui| {
@@ -108,7 +110,7 @@ impl PaviApp {
             let Some(view) = &row_view else {
                 ui.label(
                     RichText::new("Click a cell to see its whole row, one column per line.")
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
                 return;
             };
@@ -133,13 +135,13 @@ impl PaviApp {
             let Some(index) = selected_column else {
                 ui.label(
                     RichText::new("Click a cell to see its column's statistics.")
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
                 return;
             };
             let Some(column) = metadata.columns().get(index) else {
                 ui.label(
-                    RichText::new("This result column has no file metadata.").color(theme::MUTED),
+                    RichText::new("This result column has no file metadata.").color(theme::muted()),
                 );
                 return;
             };
@@ -167,8 +169,8 @@ impl PaviApp {
             ui.add_space(Spacing::Sm.px());
             if self.profile.loading() && self.profile.column == Some(index) {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                    ui.label(RichText::new(&self.profile.status).color(theme::MUTED));
+                    ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                    ui.label(RichText::new(&self.profile.status).color(theme::muted()));
                     if ui.button("Cancel").clicked() {
                         cancel_profile = true;
                     }
@@ -177,7 +179,7 @@ impl PaviApp {
                 ui.label(
                     RichText::new("Profiling needs a column of plain values.")
                         .font(theme::small())
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             } else if widgets::tool_button(ui, Some(Icon::Chart), "Profile this column", false)
                 .on_hover_text("Scan the column for nulls, distinct values and distribution")
@@ -196,14 +198,14 @@ impl PaviApp {
                 ui.label(
                     RichText::new("A nested column has no single min and max per row group.")
                         .font(theme::small())
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
             } else if !column.row_group_statistics.is_empty() {
                 ui.add_space(Spacing::Sm.px());
                 ui.label(
                     RichText::new("Min and max per row group")
                         .font(theme::small())
-                        .color(theme::MUTED),
+                        .color(theme::muted()),
                 );
                 egui::ScrollArea::vertical()
                     .id_salt("inspector_statistics")
@@ -264,7 +266,7 @@ impl PaviApp {
                             "Read into a temporary Parquet file when opened. Reload to see \
                              changes to the file.",
                         )
-                        .color(theme::MUTED)
+                        .color(theme::muted())
                         .small(),
                     );
                 }
@@ -325,7 +327,7 @@ impl PaviApp {
                                     egui::Align2::LEFT_CENTER,
                                     &column.name,
                                     theme::body(),
-                                    theme::TEXT,
+                                    theme::text(),
                                 );
                             response.on_hover_text(nested_schema_preview(
                                 &column.name,
@@ -414,11 +416,11 @@ fn value_tree_ui(
     }
     egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open)
         .show_header(ui, |ui| {
-            ui.label(RichText::new(&node.label).color(theme::TEXT));
+            ui.label(RichText::new(&node.label).color(theme::text()));
             ui.label(
                 RichText::new(&node.text)
                     .font(theme::small())
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
             );
         })
         .body(|ui| {
@@ -432,7 +434,7 @@ fn value_tree_ui(
                         theme::number(node.hidden as u64)
                     ))
                     .font(theme::small())
-                    .color(theme::MUTED),
+                    .color(theme::muted()),
                 );
             }
         });
@@ -449,9 +451,10 @@ fn field_row(ui: &mut egui::Ui, name: &str, value: &str, selected: bool) -> egui
     });
     if selected {
         ui.painter()
-            .rect_filled(rect, theme::RADIUS, theme::SELECTED);
+            .rect_filled(rect, theme::RADIUS, theme::selected());
     } else if response.hovered() {
-        ui.painter().rect_filled(rect, theme::RADIUS, theme::HOVER);
+        ui.painter()
+            .rect_filled(rect, theme::RADIUS, theme::hover());
     }
     let split = rect.left() + (rect.width() * 0.42).max(FIELD_NAME_MIN_WIDTH);
     let pad = Spacing::Sm.px();
@@ -460,12 +463,12 @@ fn field_row(ui: &mut egui::Ui, name: &str, value: &str, selected: bool) -> egui
         egui::Align2::LEFT_CENTER,
         name,
         theme::body(),
-        theme::MUTED,
+        theme::muted(),
     );
     let color = if value == "null" {
-        theme::DISABLED
+        theme::disabled()
     } else {
-        theme::TEXT
+        theme::text()
     };
     let drawn = ui.painter_at(rect.with_min_x(split)).text(
         egui::pos2(split, rect.center().y),
@@ -484,13 +487,13 @@ fn field_row(ui: &mut egui::Ui, name: &str, value: &str, selected: bool) -> egui
 /// Text color of a type label, by type family.
 pub fn type_color(data_type: &DataType) -> egui::Color32 {
     if data_type.is_numeric() {
-        theme::TYPE_NUMBER
+        theme::type_number()
     } else if data_type.is_temporal() {
-        theme::TYPE_TEMPORAL
+        theme::type_temporal()
     } else if matches!(data_type, DataType::Boolean) {
-        theme::TYPE_BOOL
+        theme::type_bool()
     } else {
-        theme::MUTED
+        theme::muted()
     }
 }
 

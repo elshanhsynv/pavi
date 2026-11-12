@@ -24,7 +24,7 @@ impl PaviApp {
         let mut run = false;
         ui.spacing_mut().item_spacing.y = 0.0;
         egui::Frame::new()
-            .fill(theme::PANEL)
+            .fill(theme::panel())
             .inner_margin(Spacing::Md.margin())
             .show(ui, |ui| {
                 let editor = self.sql_editor(ui);
@@ -48,8 +48,8 @@ impl PaviApp {
                         if widgets::tool_button(ui, Some(Icon::Close), "Cancel", false).clicked() {
                             self.cancel_sql();
                         }
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
-                        ui.label(RichText::new("Running…").color(theme::MUTED));
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                        ui.label(RichText::new("Running…").color(theme::muted()));
                     }
                     self.history_menu(ui);
                     self.saved_menu(ui);
@@ -71,7 +71,7 @@ impl PaviApp {
                         ui.label(
                             RichText::new(others)
                                 .font(theme::small())
-                                .color(theme::MUTED),
+                                .color(theme::muted()),
                         );
                     }
                 });
@@ -183,7 +183,7 @@ impl PaviApp {
                                 ui.painter().rect_stroke(
                                     row.rect,
                                     theme::RADIUS,
-                                    egui::Stroke::new(1.0_f32, theme::ACCENT),
+                                    egui::Stroke::new(1.0_f32, theme::accent()),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -402,12 +402,12 @@ fn highlight(
     let mut job = egui::text::LayoutJob::default();
     for (range, kind) in sql_editor::tokens(text, columns, tables) {
         let color = match kind {
-            TokenKind::Keyword => theme::SQL_KEYWORD,
-            TokenKind::Function => theme::SQL_FUNCTION,
-            TokenKind::String => theme::SQL_STRING,
-            TokenKind::Number => theme::SQL_NUMBER,
-            TokenKind::Column | TokenKind::Table => theme::TEXT,
-            TokenKind::Comment | TokenKind::Plain => theme::SQL_MUTED,
+            TokenKind::Keyword => theme::sql_keyword(),
+            TokenKind::Function => theme::sql_function(),
+            TokenKind::String => theme::sql_string(),
+            TokenKind::Number => theme::sql_number(),
+            TokenKind::Column | TokenKind::Table => theme::text(),
+            TokenKind::Comment | TokenKind::Plain => theme::sql_muted(),
         };
         job.append(
             &text[range],

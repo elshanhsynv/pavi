@@ -39,7 +39,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
         .resizable(false)
         .frame(
             egui::Frame::new()
-                .fill(theme::PANEL)
+                .fill(theme::panel())
                 .inner_margin(Spacing::Lg.symmetric(Spacing::None)),
         )
         .show(ctx, |ui| {
@@ -48,7 +48,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                 ui.spacing_mut().interact_size.y = 20.0;
                 let small = |text: String| RichText::new(text).font(theme::small());
                 if status.activity.is_some() {
-                    ui.add(egui::Spinner::new().size(11.0).color(theme::ACCENT));
+                    ui.add(egui::Spinner::new().size(11.0).color(theme::accent()));
                 } else {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -56,9 +56,9 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                         rect.center(),
                         3.5,
                         if status.has_error {
-                            theme::ERROR
+                            theme::error()
                         } else {
-                            theme::SUCCESS
+                            theme::success()
                         },
                     );
                 }
@@ -74,10 +74,10 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                 if let Some(activity) = status.activity
                     && !message.starts_with(activity)
                 {
-                    ui.label(small(activity.to_owned()).color(theme::TEXT));
+                    ui.label(small(activity.to_owned()).color(theme::text()));
                 }
                 if let Some(progress) = status.progress {
-                    ui.label(small(percent(progress)).color(theme::TEXT))
+                    ui.label(small(percent(progress)).color(theme::text()))
                         .on_hover_text("Share of the file scanned, or of the joins done, so far");
                 }
                 let right_width = if status.dataset.is_some() { 560.0 } else { 0.0 };
@@ -90,9 +90,9 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                     |ui| {
                         ui.add(
                             egui::Label::new(small(message.clone()).color(if status.has_error {
-                                theme::ERROR
+                                theme::error()
                             } else {
-                                theme::MUTED
+                                theme::muted()
                             }))
                             .truncate(),
                         )
@@ -129,7 +129,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                         format!("{} rows", theme::number(dataset.rows)),
                     ] {
                         widgets::divider(ui);
-                        ui.label(small(fact).color(theme::MUTED));
+                        ui.label(small(fact).color(theme::muted()));
                     }
                     if let Some((row, column)) = status.selection {
                         widgets::divider(ui);
@@ -139,7 +139,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                                 theme::number(row + 1),
                                 column + 1
                             ))
-                            .color(theme::TEXT),
+                            .color(theme::text()),
                         );
                     }
                 });

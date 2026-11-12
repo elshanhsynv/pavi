@@ -23,7 +23,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         centered: true,
         viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
+            .with_decorations(app::native_window_frame())
             .with_inner_size([1_448.0, 900.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
