@@ -267,6 +267,7 @@ sequenceDiagram
     M->>M: validate_head (≤1000)
     M->>PS: open(FILE)
     M->>M: parse_columns (indexes only)
+    M->>PS: parse_filter → FilterExpr::parse + validate_filter
     M->>Shell: Rows / Columns / Row groups / Schema / ≤10 row-group ranges
     alt --filter
         M->>PS: read_filtered_window(filter, 0, N, proj)
@@ -274,7 +275,7 @@ sequenceDiagram
         M->>PS: read_window(0, N, proj)
     end
     M->>O: print_batch → box table to stdout
-    M-->>Shell: exit 0, or anyhow error → stderr, exit 1
+    M-->>Shell: exit 0 (also when stdout's reader closed), or anyhow error → stderr, exit 1
 ```
 
-All of it runs on the main thread; memory is ≤1,000 rows of the projected columns (a selective filter may still scan the whole file).
+All of it runs on the main thread; memory is ≤1,000 rows of the projected columns (a selective filter may still scan the whole file). Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.

@@ -128,7 +128,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | `main()` (GUI) | Takes optional path from `argv[1]`; window 1448×900 (min 900×600), **`with_decorations(false)`** (custom title bar), centered; `run_native("PAVI", …)` | `crates/app/src/main.rs:12-27` |
 | `PaviApp::new` / `new_with_store` | Starts `Runtime` (worker count = CPU count, queue 32), loads session, reopens `argv[1]` or last file | `app.rs:335-396` |
 | `eframe::App for PaviApp` | `update()` = poll everything then draw; `save()` = `persist_session()` but **never called** (eframe `persistence` feature off) | `app.rs:1775-1831` |
-| `main()` (CLI) | `Args::parse` → open → print → preview | `crates/cli/src/main.rs:10-60` |
+| `main()` / `run()` (CLI) | `Args::parse` → open → check columns and filter → print summary → preview | `crates/cli/src/main.rs` |
 
 ### UI layer
 
@@ -193,9 +193,9 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 
 | Arg | Meaning |
 |---|---|
-| `FILE` (positional, required) | Parquet file or folder |
-| `--head N` (default 10) | Preview rows; rejected if >1000 (`main.rs:62-67`) |
+| `FILE` (positional, required) | Anything `ParquetSource::open` opens: a Parquet file, a folder, a CSV/JSON/Arrow file or a remote URL |
+| `--head N` (default 10) | Preview rows; rejected if >1000 (`validate_head`, `MAX_HEAD_ROWS`) |
 | `--columns 0,3,5` | **Column indexes only** (names not accepted) |
 | `--filter "col OP value"` | Same `FilterExpr` grammar as the GUI filter box |
 
-Output goes to stdout: for a folder, its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges, then a box-drawn table with cells truncated to 4–32 chars. Exit codes: `0` success; `1` for any `anyhow` error (printed by Rust's `main` as `Error: …` with Debug formatting on stderr); `2` for clap usage errors.
+Output goes to stdout: for a folder, its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges, then a box-drawn table with headers and cells cut to 4–32 terminal columns (numbers right-aligned, control characters escaped). Arguments are all checked before the first line is written. Exit codes: `0` success, also when the reader of stdout closes early (broken pipe); `1` for any `anyhow` error (printed as `Error: …` with Debug formatting on stderr, the same text Rust prints for an error returned from `main`); `2` for clap usage errors.

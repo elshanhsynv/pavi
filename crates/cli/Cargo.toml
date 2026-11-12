@@ -9,6 +9,14 @@ anyhow.workspace = true
 arrow-array.workspace = true
 clap.workspace = true
 parquet_reader = { path = "../parquet" }
+# Terminal column widths for the preview table (CJK and most emoji take two
+# columns). Already in the tree through egui's dependencies.
+unicode-width = "0.1"
+
+[dev-dependencies]
+arrow-schema.workspace = true
+parquet.workspace = true
+tempfile = "3"
 
 [lints]
 workspace = true

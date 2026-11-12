@@ -1006,8 +1006,12 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-schema",
  "clap",
+ "parquet",
  "parquet_reader",
+ "tempfile",
+ "unicode-width",
 ]
 
 [[package]]
