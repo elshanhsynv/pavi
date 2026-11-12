@@ -35,6 +35,10 @@ Opening a new file cancels all of the above (`app.rs:643-660`). If the user acts
 - Atomics: task ID counter, shutdown flag, cancellation flags.
 - No `RwLock`, no locks touched by the UI thread except via `ParquetSource::cache_stats` (Inspector). No lock is held across rendering.
 
+## Network reads
+
+Remote reads (ADR 0008) are blocking HTTP requests made on the worker that runs the read, through one shared `ureq` agent (connection pool). The range cache of a `RemoteObject` is behind a `Mutex` held only to look up or insert a range, never during a request. Cancellation is checked between batches as for local files; a request already sent runs until it answers or times out.
+
 ## Tabs
 
 Only the open tab is polled. A parked tab keeps its `OpenTask`, page tasks, `QueryExecution` and export/profile receivers; workers finish their reads and send into those one-slot channels, which never block because each holds one response. The results are picked up, and checked against the tab's own `GridState.generation`, when the tab is shown again. An export keeps writing while its tab is parked. Closing a tab cancels all of its work.

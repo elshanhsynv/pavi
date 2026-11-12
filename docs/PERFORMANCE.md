@@ -36,6 +36,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Folder dataset footers in memory | 256 MB for all files together | `dataset::MAX_DATASET_METADATA_BYTES` |
 | CSV / JSON type inference (ADR 0007) | first 10,000 records | `convert::MAX_INFER_ROWS` |
 | Reading CSV, JSON, Arrow into Parquet | 8,192-row batches; a row group is written at 262,144 rows or 64 MB buffered; the temporary file ≤ 32 GiB | `convert::BATCH_ROWS`, `ROW_GROUP_ROWS`, `MAX_BUFFERED_BYTES`, `MAX_CONVERTED_BYTES` |
+| Remote range cache (ADR 0008) | 256 MB per object; ranges over 128 MB are not kept | `remote::REMOTE_CACHE_BYTES`, `MAX_CACHED_RANGE_BYTES` |
+| Remote download (no range requests; CSV, JSON, Arrow) | 32 GiB | `remote::MAX_DOWNLOAD_BYTES` |
 | Arrow file metadata message / decompressed buffer | 64 MB / 1 GB | `convert::MAX_ARROW_MESSAGE_BYTES`, `MAX_ARROW_BUFFER_BYTES` |
 | JSON export nesting | 64 levels | `export::MAX_JSON_DEPTH` |
 

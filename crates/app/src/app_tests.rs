@@ -1983,3 +1983,46 @@ fn opens_a_csv_file_and_filters_it() {
     poll_until_idle(&mut app);
     assert_eq!(filtered_ids(&app), vec!["2", "3"]);
 }
+
+#[test]
+fn keeps_a_url_as_typed_and_reports_when_it_cannot_be_read() {
+    use std::io::{BufRead, BufReader, Write};
+
+    // A server that refuses every request with 403.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let mut stream = stream;
+            let _ = stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    let directory = TempDir::new().unwrap();
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    let url = PathBuf::from(format!("http://{address}/dir/data.parquet?token=secret"));
+    app.open_path(url.clone());
+    assert_eq!(app.opening_path.as_ref(), Some(&url), "not made absolute");
+    // Shown without the query string, which may carry a token.
+    assert_eq!(app.tab_labels()[0].title, "data.parquet");
+    assert!(!app.status.contains("secret"), "{}", app.status);
+    assert!(!app.path_input.contains("secret"), "{}", app.path_input);
+    poll_until_opened(&mut app);
+    assert!(app.dataset.is_none());
+    let LoadState::Error(error) = &app.grid.loading else {
+        panic!("expected an open error, got {:?}", app.grid.loading);
+    };
+    assert!(error.contains("denied"), "{error}");
+    assert!(error.contains("/dir/data.parquet"), "{error}");
+    assert!(!error.contains("secret"), "{error}");
+    assert!(app.session.recent_files.is_empty());
+}

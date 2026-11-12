@@ -226,16 +226,13 @@ impl PaviApp {
         });
 
         let folder = dataset.source.is_folder();
+        // A URL is shown without its query string, which may carry a token.
+        let shown = parquet_reader::display_path(&dataset.path);
         widgets::section(ui, if folder { "Folder" } else { "File" }, "", true, |ui| {
-            let file = dataset
-                .path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
+            let file = shown.file_name().unwrap_or_default().to_string_lossy();
             widgets::detail(ui, "Name", file.to_string());
             widgets::detail(ui, if folder { "In" } else { "Folder" }, {
-                dataset
-                    .path
+                shown
                     .parent()
                     .map(|parent| parent.display().to_string())
                     .unwrap_or_default()
@@ -274,12 +271,12 @@ impl PaviApp {
             widgets::detail(
                 ui,
                 "Created",
-                format_time(dataset.source.file_info().created()),
+                format_time(dataset.source.file_info().created),
             );
             widgets::detail(
                 ui,
                 "Modified",
-                format_time(dataset.source.file_info().modified()),
+                format_time(dataset.source.file_info().modified),
             );
             if widgets::tool_button(ui, Some(Icon::Copy), "Copy path", false).clicked() {
                 ui.ctx().copy_text(dataset.path.display().to_string());
@@ -523,13 +520,15 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     }
 }
-fn format_time(time: std::io::Result<std::time::SystemTime>) -> String {
-    time.map(|time| {
-        chrono::DateTime::<chrono::Utc>::from(time)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string()
-    })
-    .unwrap_or_else(|_| "Unavailable".into())
+fn format_time(time: Option<std::time::SystemTime>) -> String {
+    time.map_or_else(
+        || "Unavailable".into(),
+        |time| {
+            chrono::DateTime::<chrono::Utc>::from(time)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -539,7 +538,7 @@ mod tests {
     fn formats_real_metadata_and_nested_types() {
         assert_eq!(format_bytes(12_400_000_000), "12.40 GB");
         assert_eq!(
-            format_time(Ok(std::time::UNIX_EPOCH)),
+            format_time(Some(std::time::UNIX_EPOCH)),
             "1970-01-01 00:00:00"
         );
         assert_eq!(

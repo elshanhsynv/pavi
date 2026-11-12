@@ -23,6 +23,12 @@ arrow-cast = "60"
 arrow-csv = "60"
 arrow-json = "60"
 arrow-ipc = { version = "60", features = ["lz4", "zstd"] }
+# Remote files (ADR 0008): a blocking HTTP client (no async runtime, ADR 0001), TLS with the
+# operating system's certificates, and ring for TLS and S3 request signing.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "_ring"] }
+rustls-native-certs = "0.8"
+ring = "0.17"
+bytes = "1"
 arrow-schema = "60"
 arrow-select = "60"
 arrow-ord = "60"

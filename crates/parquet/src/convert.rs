@@ -60,6 +60,7 @@ impl FileFormat {
 
     /// The format for `path`'s extension; anything not listed is read as Parquet.
     pub fn from_path(path: &Path) -> Self {
+        let path = crate::remote::path_part(path);
         let extension = path
             .extension()
             .map(|extension| extension.to_string_lossy().to_ascii_lowercase())

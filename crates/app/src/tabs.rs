@@ -128,6 +128,7 @@ fn tab_title(path: Option<&Path>) -> String {
     path.map_or_else(
         || "New tab".to_string(),
         |path| {
+            let path = parquet_reader::display_path(path);
             path.file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string())
@@ -206,7 +207,7 @@ impl PaviApp {
                 };
                 TabLabel {
                     title: tab_title(path),
-                    path: path.map(Path::to_path_buf),
+                    path: path.map(parquet_reader::display_path),
                     folder,
                     active: index == self.tabs.active,
                 }
@@ -245,7 +246,7 @@ impl PaviApp {
         self.tabs.active = index;
         self.path_input = self
             .tab_path_at(index)
-            .map(|path| path.display().to_string())
+            .map(|path| parquet_reader::display_path(path).display().to_string())
             .unwrap_or_default();
         self.status = match &self.dataset {
             Some(dataset) => format!(
@@ -335,7 +336,12 @@ impl PaviApp {
     /// Opens a file or folder the user chose: in the open tab when it is empty,
     /// otherwise in a new tab. A file already open in a tab is shown instead.
     pub(super) fn open_path(&mut self, path: PathBuf) {
-        let path = std::path::absolute(&path).unwrap_or(path);
+        // A URL is kept as typed; a local path gets one spelling.
+        let path = if parquet_reader::is_remote(&path) {
+            path
+        } else {
+            std::path::absolute(&path).unwrap_or(path)
+        };
         if let Some(index) =
             (0..self.tab_count()).find(|index| self.tab_path_at(*index) == Some(path.as_path()))
         {

@@ -33,3 +33,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0005](0005-external-sort.md) | Sorts larger than memory spill to temporary files (amends 0002) |
 | [0006](0006-folder-datasets.md) | A folder of Parquet files (with `key=value` partitions) is one table |
 | [0007](0007-other-formats.md) | CSV, JSON and Arrow files are converted to a temporary Parquet file when opened |
+| [0008](0008-remote-files.md) | Remote files (S3, GCS, Azure, HTTPS) are read with blocking HTTP range requests |

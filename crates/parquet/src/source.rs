@@ -38,8 +38,9 @@ use crate::{
     filter::FilterExpr,
     metadata::ColumnStatistics,
     page::PAGE_ROWS,
+    remote::{self, RemoteObject, RemoteReader, redact},
     sort::validate_sort_keys,
-    spill::{RunWriter, SortKeys, SortMerge},
+    spill::{RunWriter, SortKeys, SortMerge, TempFolder},
     statistics::{leaf_columns, metadata_statistics},
     types::{
         is_comparable, is_decimal, is_float, is_signed_integer, is_summable, is_unsigned_integer,
@@ -59,7 +60,7 @@ const SCAN_RUN_ROWS: u64 = 1 << 20;
 /// from the Parquet schema alone, so the file still opens. If that fails too, report the
 /// original error. (Before arrow-rs 60, corrupt hints panicked; found by the `parquet_file`
 /// fuzz target.)
-fn load_arrow_metadata(file: &File) -> Result<ArrowReaderMetadata> {
+fn load_arrow_metadata(file: &Handle) -> Result<ArrowReaderMetadata> {
     match ArrowReaderMetadata::load(file, ArrowReaderOptions::new()) {
         Ok(metadata) => Ok(metadata),
         Err(error) => ArrowReaderMetadata::load(
@@ -118,10 +119,10 @@ const PAGE_HEADER_FIRST_READ_BYTES: u64 = 1024;
 /// Checks the first page of a column chunk if it is a dictionary page.
 /// Anything this can't read or decode is left for the parquet crate to report.
 fn check_dictionary_page(
-    mut file: &File,
+    file: &Handle,
     column: &parquet::file::metadata::ColumnChunkMetaData,
 ) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
+    use parquet::file::reader::{ChunkReader, Length};
 
     let offset = column
         .dictionary_page_offset()
@@ -134,12 +135,10 @@ fn check_dictionary_page(
     };
     // Read more until the header decodes, up to the whole chunk, so padding a header with
     // unknown fields can't push it past this check.
-    let limit = chunk.min(file.metadata()?.len().saturating_sub(offset));
+    let limit = chunk.min(file.len().saturating_sub(offset));
     let mut len = PAGE_HEADER_FIRST_READ_BYTES.min(limit);
     let sizes = loop {
-        let mut header = vec![0_u8; usize::try_from(len)?];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut header)?;
+        let header = file.get_bytes(offset, usize::try_from(len)?)?;
         if let Some(sizes) = crate::footer::page_header_sizes(&header) {
             break sizes;
         }
@@ -185,9 +184,89 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or("decoder panicked")
 }
 
+/// Where a Parquet file's bytes are.
+#[derive(Clone, Debug)]
+enum Location {
+    Local(PathBuf),
+    /// Read with HTTP range requests (ADR 0008).
+    Remote(Arc<RemoteObject>),
+}
+
+impl Location {
+    /// The file's path or URL, for messages (a URL without its query string).
+    fn describe(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::Remote(object) => redact(object.url()).to_owned(),
+        }
+    }
+
+    fn open(&self) -> Result<Handle> {
+        match self {
+            Self::Local(path) => Ok(Handle::Local(
+                File::open(path).with_context(|| format!("open {}", path.display()))?,
+            )),
+            Self::Remote(object) => Ok(Handle::Remote(RemoteReader(Arc::clone(object)))),
+        }
+    }
+}
+
+/// An open file or remote object, read by the `parquet` crate.
+enum Handle {
+    Local(File),
+    Remote(RemoteReader),
+}
+
+impl parquet::file::reader::Length for Handle {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Local(file) => file.len(),
+            Self::Remote(remote) => remote.len(),
+        }
+    }
+}
+
+impl parquet::file::reader::ChunkReader for Handle {
+    type T = Box<dyn std::io::Read + Send>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(match self {
+            Self::Local(file) => Box::new(file.get_read(start)?),
+            Self::Remote(remote) => Box::new(remote.get_read(start)?),
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+        match self {
+            Self::Local(file) => file.get_bytes(start, length),
+            Self::Remote(remote) => remote.get_bytes(start, length),
+        }
+    }
+}
+
+/// Size and times of the file, folder or remote object a source was opened from.
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+    pub len: u64,
+    pub created: Option<std::time::SystemTime>,
+    pub modified: Option<std::time::SystemTime>,
+    pub is_dir: bool,
+}
+
+impl From<std::fs::Metadata> for FileInfo {
+    fn from(metadata: std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+            is_dir: metadata.is_dir(),
+        }
+    }
+}
+
 /// One Parquet file of a source: the only file, or one file of a folder dataset.
 struct SourceFile {
-    path: PathBuf,
+    location: Location,
     bytes: u64,
     metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
@@ -207,7 +286,7 @@ struct SourceFile {
 /// columns followed by the partition columns taken from `key=value` folder names.
 pub struct ParquetSource {
     path: PathBuf,
-    file_info: std::fs::Metadata,
+    file_info: FileInfo,
     compression: String,
     dataset_metadata: DatasetMetadata,
     files: Vec<SourceFile>,
@@ -225,18 +304,26 @@ pub struct ParquetSource {
     /// The temporary Parquet copy of a CSV, JSON or Arrow file (ADR 0007),
     /// deleted with the source.
     converted: Option<ConvertedFile>,
+    /// A downloaded copy of a remote Parquet file whose server doesn't answer
+    /// range requests (ADR 0008), deleted with the source.
+    downloaded: Option<TempFolder>,
 }
 
 /// Reads one file's footer.
-fn open_file(path: &Path) -> Result<(u64, ArrowReaderMetadata)> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let bytes = file.metadata().context("read file properties")?.len();
+fn open_file(location: &Location, name: &Path) -> Result<(u64, ArrowReaderMetadata)> {
+    use parquet::file::reader::Length;
+
+    let file = location.open()?;
+    let bytes = file.len();
     crate::footer::check_footer(&file)
-        .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
+        .with_context(|| format!("read Parquet metadata from {}", name.display()))?;
     let arrow_metadata = load_arrow_metadata(&file)
-        .with_context(|| format!("read Parquet metadata from {}", path.display()))?;
+        .with_context(|| format!("read Parquet metadata from {}", name.display()))?;
     Ok((bytes, arrow_metadata))
 }
+
+/// Remote downloads go in `<temp>/pavi-download-<pid>-<n>/`.
+const DOWNLOAD_PREFIX: &str = "pavi-download-";
 
 impl ParquetSource {
     /// Opens a Parquet file, a CSV, JSON or Arrow file (read into a temporary
@@ -253,30 +340,23 @@ impl ParquetSource {
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
         let path = path.as_ref().to_owned();
-        let file_info =
-            std::fs::metadata(&path).with_context(|| format!("open {}", path.display()))?;
+        if remote::is_remote(&path) {
+            return Self::open_remote(path, checkpoint);
+        }
+        let file_info = FileInfo::from(
+            std::fs::metadata(&path).with_context(|| format!("open {}", path.display()))?,
+        );
         let format = FileFormat::from_path(&path);
-        if !file_info.is_dir() && format != FileFormat::Parquet {
-            let converted = convert::convert(&path, format, checkpoint)
-                .with_context(|| format!("open {} as {}", path.display(), format.name()))?;
-            let (bytes, arrow_metadata) = open_file(&converted.path)?;
-            let mut source = Self::from_files(
+        if !file_info.is_dir && format != FileFormat::Parquet {
+            return Self::open_converted(path.clone(), &path, file_info, format, checkpoint);
+        }
+        if !file_info.is_dir {
+            let location = Location::Local(path.clone());
+            let (bytes, arrow_metadata) = open_file(&location, &path)?;
+            return Self::from_files(
                 path,
                 file_info,
-                vec![(converted.path.clone(), bytes, arrow_metadata, Vec::new())],
-                Vec::new(),
-            )?;
-            source.compression = format.name().to_string();
-            source.format = format;
-            source.converted = Some(converted);
-            return Ok(source);
-        }
-        if !file_info.is_dir() {
-            let (bytes, arrow_metadata) = open_file(&path)?;
-            return Self::from_files(
-                path.clone(),
-                file_info,
-                vec![(path, bytes, arrow_metadata, Vec::new())],
+                vec![(location, bytes, arrow_metadata, Vec::new())],
                 Vec::new(),
             );
         }
@@ -289,7 +369,8 @@ impl ParquetSource {
             if checkpoint(index as f64 / file_count as f64) {
                 return Err(Cancelled.into());
             }
-            let (bytes, arrow_metadata) = open_file(&file.path)?;
+            let location = Location::Local(file.path.clone());
+            let (bytes, arrow_metadata) = open_file(&location, &file.path)?;
             metadata_bytes = metadata_bytes.saturating_add(arrow_metadata.metadata().memory_size());
             if metadata_bytes > MAX_DATASET_METADATA_BYTES {
                 bail!(
@@ -303,16 +384,97 @@ impl ParquetSource {
                 .into_iter()
                 .map(|(_, value)| value)
                 .collect();
-            files.push((file.path, bytes, arrow_metadata, values));
+            files.push((location, bytes, arrow_metadata, values));
         }
         Self::from_files(path, file_info, files, partition_columns)
+    }
+
+    /// Reads `input` (a CSV, JSON or Arrow file) into a temporary Parquet file
+    /// and opens that as `path` (ADR 0007).
+    fn open_converted(
+        path: PathBuf,
+        input: &Path,
+        file_info: FileInfo,
+        format: FileFormat,
+        checkpoint: &dyn Fn(f64) -> bool,
+    ) -> Result<Self> {
+        let converted = convert::convert(input, format, checkpoint)
+            .with_context(|| format!("open {} as {}", path.display(), format.name()))?;
+        let location = Location::Local(converted.path.clone());
+        let (bytes, arrow_metadata) = open_file(&location, &path)?;
+        let mut source = Self::from_files(
+            path,
+            file_info,
+            vec![(location, bytes, arrow_metadata, Vec::new())],
+            Vec::new(),
+        )?;
+        source.compression = format.name().to_string();
+        source.format = format;
+        source.converted = Some(converted);
+        Ok(source)
+    }
+
+    /// Opens an `https`, `http`, `s3`, `gs` or `az` URL (ADR 0008). A Parquet
+    /// object is read with range requests; anything else, or a Parquet object
+    /// on a server without range requests, is downloaded first.
+    fn open_remote(path: PathBuf, checkpoint: &dyn Fn(f64) -> bool) -> Result<Self> {
+        let url = path
+            .to_str()
+            .ok_or_else(|| anyhow!("the URL is not valid text"))?
+            .to_owned();
+        let object = Arc::new(RemoteObject::open(&url)?);
+        let file_info = FileInfo {
+            len: object.len(),
+            created: None,
+            modified: object.modified(),
+            is_dir: false,
+        };
+        let format = FileFormat::from_path(&path);
+        if format == FileFormat::Parquet && object.supports_ranges() {
+            let location = Location::Remote(object);
+            let (bytes, arrow_metadata) = open_file(&location, &path)?;
+            return Self::from_files(
+                path,
+                file_info,
+                vec![(location, bytes, arrow_metadata, Vec::new())],
+                Vec::new(),
+            );
+        }
+        let folder = TempFolder::create(DOWNLOAD_PREFIX)?;
+        let name = remote::path_part(&path)
+            .file_name()
+            .map_or_else(|| "download".into(), ToOwned::to_owned);
+        let downloaded = folder.path.join(name);
+        if format != FileFormat::Parquet {
+            // Downloading is the first half of the work, converting the second.
+            object
+                .download(&downloaded, &|done| checkpoint(done / 2.0))
+                .with_context(|| format!("download {}", redact(&url)))?;
+            // The download is not needed once it is converted.
+            return Self::open_converted(path, &downloaded, file_info, format, &|done| {
+                checkpoint(0.5 + done / 2.0)
+            });
+        }
+        object
+            .download(&downloaded, checkpoint)
+            .with_context(|| format!("download {}", redact(&url)))?;
+        let location = Location::Local(downloaded);
+        let (bytes, arrow_metadata) = open_file(&location, &path)?;
+        let mut source = Self::from_files(
+            path,
+            file_info,
+            vec![(location, bytes, arrow_metadata, Vec::new())],
+            Vec::new(),
+        )?;
+        source.downloaded = Some(folder);
+        Ok(source)
     }
 
     /// Builds the source from opened files, which must have the same columns.
     fn from_files(
         path: PathBuf,
-        file_info: std::fs::Metadata,
-        opened: Vec<(PathBuf, u64, ArrowReaderMetadata, Vec<Option<String>>)>,
+        file_info: FileInfo,
+        opened: Vec<(Location, u64, ArrowReaderMetadata, Vec<Option<String>>)>,
         partition_columns: Vec<PartitionColumn>,
     ) -> Result<Self> {
         let Some((first_path, _, first_metadata, _)) = opened.first() else {
@@ -359,8 +521,8 @@ impl ParquetSource {
             if let Some(mismatch) = mismatch {
                 bail!(
                     "{} does not have the same columns as {}: {mismatch}",
-                    other_path.display(),
-                    first_path.display()
+                    other_path.describe(),
+                    first_path.describe()
                 );
             }
             for (field, other) in fields.iter_mut().zip(other_fields.iter()) {
@@ -447,7 +609,7 @@ impl ParquetSource {
                 statistics[column].extend(file_statistics);
             }
             files.push(SourceFile {
-                path: file_path,
+                location: file_path,
                 bytes,
                 leaf_columns: leaf_columns(&metadata, file_columns),
                 metadata,
@@ -478,6 +640,7 @@ impl ParquetSource {
             checked_dictionaries: Mutex::new(HashSet::new()),
             format: FileFormat::Parquet,
             converted: None,
+            downloaded: None,
         })
     }
 
@@ -488,7 +651,7 @@ impl ParquetSource {
 
     /// `true` when this source is a folder of files.
     pub fn is_folder(&self) -> bool {
-        self.file_info.is_dir()
+        self.file_info.is_dir
     }
 
     /// How many Parquet files the source reads.
@@ -499,7 +662,7 @@ impl ParquetSource {
     /// Size of the file opened, or of all the Parquet files of a folder together.
     pub fn total_bytes(&self) -> u64 {
         if self.converted.is_some() {
-            return self.file_info.len();
+            return self.file_info.len;
         }
         self.files.iter().map(|file| file.bytes).sum()
     }
@@ -508,6 +671,12 @@ impl ParquetSource {
     /// temporary Parquet file.
     pub fn format(&self) -> FileFormat {
         self.format
+    }
+
+    /// Whether a remote file was downloaded rather than read with range requests.
+    #[cfg(test)]
+    pub(crate) fn is_downloaded(&self) -> bool {
+        self.downloaded.is_some()
     }
 
     /// Where the temporary Parquet copy of a converted file is.
@@ -544,7 +713,7 @@ impl ParquetSource {
         &self.dataset_metadata
     }
 
-    pub fn file_info(&self) -> &std::fs::Metadata {
+    pub fn file_info(&self) -> &FileInfo {
         &self.file_info
     }
 
@@ -1255,8 +1424,7 @@ impl ParquetSource {
         row_groups: Vec<usize>,
         selection: Option<RowSelection>,
     ) -> Result<GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
-        let file = File::open(&source_file.path)
-            .with_context(|| format!("open {}", source_file.path.display()))?;
+        let file = source_file.location.open()?;
         let parquet_columns = self.decoded_columns(projection);
         self.check_dictionary_pages(&file, source_file, &parquet_columns, &row_groups)?;
         let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
@@ -1283,7 +1451,7 @@ impl ParquetSource {
     /// gigabytes, and a failed allocation aborts the process. Each chunk is checked once.
     fn check_dictionary_pages(
         &self,
-        file: &File,
+        file: &Handle,
         source_file: &SourceFile,
         root_columns: &[usize],
         row_groups: &[usize],
