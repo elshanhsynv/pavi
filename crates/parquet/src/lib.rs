@@ -4,6 +4,7 @@ pub mod convert;
 pub mod dataset;
 pub mod filter;
 mod footer;
+pub mod join;
 pub mod metadata;
 pub mod page;
 pub mod projection;
@@ -25,10 +26,17 @@ pub use dataset::{
     MAX_DATASET_FILES, MAX_DATASET_METADATA_BYTES, MAX_FOLDER_DEPTH, MAX_FOLDER_ENTRIES,
 };
 pub use filter::{Comparison, FilterExpr, FilterOp};
+pub use join::{
+    JoinKind, JoinSide, MAX_JOIN_BUILD_BYTES, MAX_JOIN_BUILD_ROWS, MAX_JOIN_KEYS,
+    MAX_PREPARED_BYTES, TempTableWriter,
+};
 pub use metadata::{ColumnInfo, ColumnStatistics, DatasetMetadata, RowGroupInfo};
 pub use page::{DataPage, PAGE_ROWS, PageKey, RowWindow};
 pub use projection::Projection;
 pub use remote::{MAX_DOWNLOAD_BYTES, REMOTE_CACHE_BYTES, display_path, is_remote};
 pub use sort::{MAX_SORT_KEYS, NullOrder, SortBudget, SortDirection, SortSpec, validate_sort_keys};
-pub use source::{Cancelled, FileInfo, FilteredWindow, ParquetSource, SortOutput};
+pub use source::{
+    Cancelled, FileInfo, FilteredWindow, ParquetSource, SortOutput, aggregate_output_schema,
+    check_aggregate, check_sort,
+};
 pub use spill::{MAX_SPILL_BYTES, SortMerge};

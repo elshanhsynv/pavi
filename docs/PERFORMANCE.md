@@ -40,6 +40,9 @@ Each budget is a named constant. Change it in one place and update this table.
 | Remote download (no range requests; CSV, JSON, Arrow) | 32 GiB | `remote::MAX_DOWNLOAD_BYTES` |
 | Arrow file metadata message / decompressed buffer | 64 MB / 1 GB | `convert::MAX_ARROW_MESSAGE_BYTES`, `MAX_ARROW_BUFFER_BYTES` |
 | JSON export nesting | 64 levels | `export::MAX_JSON_DEPTH` |
+| Join, side kept in memory (ADR 0009) | 1,000,000 rows / 256 MB after its filters | `join::MAX_JOIN_BUILD_ROWS`, `MAX_JOIN_BUILD_BYTES` |
+| Joined or subquery rows written to disk | 32 GiB per temporary table | `join::MAX_PREPARED_BYTES` |
+| Joins, join keys, subquery nesting | 4 joins, 4 `ON` pairs each, 3 levels | `prep::MAX_JOINS`, `join::MAX_JOIN_KEYS`, `prep::MAX_SUBQUERY_DEPTH` |
 
 ## Responsiveness rules
 

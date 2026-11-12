@@ -52,6 +52,7 @@ crates/parquet/src/            (parquet_reader)
 │                   GroupCollector/Accumulator/Scalar (aggregation)
 ├── dataset.rs      folder datasets (ADR 0006): find the files, `key=value` partition columns, their values and statistics
 ├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007)
+├── join.rs         hash joins (inner, left, semi, anti) into a temporary table; TempTableWriter (ADR 0009)
 ├── remote.rs       URLs (ADR 0008): resolving s3/gs/az URLs, SigV4, RemoteObject (range requests, range cache, download), RemoteReader (ChunkReader)
 ├── statistics.rs   row-group statistics → display text, typed by the column's Arrow type
 ├── metadata.rs     DatasetMetadata, RowGroupInfo, ColumnInfo, ColumnStatistics; row→row-group math
@@ -72,17 +73,18 @@ crates/runtime/src/            (pavi_runtime)
 └── cancellation.rs CancellationToken(Arc<AtomicBool>), ScanProgress(Arc<AtomicU64>): source rows a scan has passed
 
 crates/query/src/              (pavi_query)
-├── sql.rs          SqlAst::parse, to_logical_plan, column resolution
-├── logical.rs      LogicalPlan tree (Scan/Projection/Filter/Limit/Sort/Aggregate), replace_sort
-├── planner.rs      Planner::plan → PhysicalPlan (single flat struct, validated)
-└── execution.rs    QueryEngine, QueryExecution (next_batch / poll_next_batch), QueryPoll
+├── sql.rs          SqlAst::parse, Tables, to_logical_plan(_with): direct plans, and prepared plans for joins and subqueries
+├── prep.rs         Prep tree (tables, subqueries, filters, joins) and PrepTask, the thread that runs it (ADR 0009)
+├── logical.rs      LogicalPlan tree (Scan/Prepared/Projection/Filter/Limit/Sort/Aggregate), replace_sort, bind
+├── planner.rs      Planner::validate (schema only, also for prepared plans) and Planner::plan → PhysicalPlan
+└── execution.rs    QueryEngine, QueryExecution (a preparing stage, then Running: next_batch / poll_next_batch), QueryPoll
 
 crates/app/src/                (pavi)
 ├── main.rs         NativeOptions + eframe::run_native
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    56 tests driving PaviApp without a window
+├── app_tests.rs    57 tests driving PaviApp without a window
 ├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV and JSON Lines writers, Parquet ArrowWriter, Arrow IPC FileWriter, temp-file + rename

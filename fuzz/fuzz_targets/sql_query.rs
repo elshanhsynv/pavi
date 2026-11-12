@@ -1,10 +1,12 @@
 //! Arbitrary text in the SQL workspace: parse, plan, then run the plan's read directly
-//! against a small fixture file and format the result.
+//! against a small fixture file and format the result. Joins and subqueries
+//! (ADR 0009) run through the query engine, which prepares their rows first.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use parquet_reader::{GroupBudget, Projection, SortBudget, SortOutput};
-use pavi_query::{Planner, SqlAst};
+use pavi_query::{Planner, QueryEngine, SqlAst};
+use pavi_runtime::GenerationId;
 
 fuzz_target!(
     init: pavi_fuzz::allow_contained_panics(),
@@ -22,6 +24,22 @@ fn check(data: &[u8]) {
     let Ok(logical) = ast.to_logical_plan(source.clone()) else {
         return;
     };
+    if logical.is_prepared() {
+        let engine = QueryEngine::from_handle(pavi_fuzz::runtime());
+        let Ok(mut execution) = engine.execute(&logical, GenerationId(0)) else {
+            return;
+        };
+        let mut rows = 0;
+        while let Ok(Some(batch)) = execution.next_batch() {
+            pavi_fuzz::format_all(&batch.batch);
+            rows += batch.batch.num_rows();
+            if rows > 256 {
+                execution.cancel();
+                break;
+            }
+        }
+        return;
+    }
     let Ok(plan) = Planner::plan(&logical) else {
         return;
     };

@@ -1,6 +1,6 @@
 # 0004. Small custom query engine
 
-- Status: accepted
+- Status: accepted; queries over several tables are amended by [0009](0009-joins-and-subqueries.md)
 - Date: 2026-11-08 (recorded after the fact)
 
 ## Context

@@ -17,6 +17,7 @@ arrow-ipc = "60"
 parquet = { version = "60", features = ["arrow"] }
 parquet_reader = { path = "../crates/parquet" }
 pavi_query = { path = "../crates/query" }
+pavi_runtime = { path = "../crates/runtime" }
 
 # Kept out of the main workspace: it needs nightly and libFuzzer.
 [workspace]

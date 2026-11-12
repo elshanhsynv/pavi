@@ -11,10 +11,11 @@ pub(crate) const MAX_SUGGESTIONS: usize = 8;
 const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "LIMIT", "AND", "OR", "NOT", "IN",
     "BETWEEN", "LIKE", "IS", "NULL", "ASC", "DESC", "NULLS", "FIRST", "LAST", "TRUE", "FALSE",
+    "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS",
 ];
 /// Aggregate functions, highlighted apart from keywords.
 const FUNCTIONS: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX"];
-/// The one table name.
+/// The tab running the query, always a table name.
 const TABLE: &str = "dataset";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,7 +24,7 @@ pub(crate) enum TokenKind {
     Function,
     /// A name of the open file's columns, plain or quoted.
     Column,
-    /// `dataset`.
+    /// `dataset` or another open tab's table name.
     Table,
     /// `'text'`.
     String,
@@ -35,7 +36,11 @@ pub(crate) enum TokenKind {
 }
 
 /// Splits `text` into byte ranges and their kinds, covering all of it in order.
-pub(crate) fn tokens(text: &str, columns: &[String]) -> Vec<(Range<usize>, TokenKind)> {
+pub(crate) fn tokens(
+    text: &str,
+    columns: &[String],
+    tables: &[String],
+) -> Vec<(Range<usize>, TokenKind)> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut at = 0;
@@ -89,7 +94,7 @@ pub(crate) fn tokens(text: &str, columns: &[String]) -> Vec<(Range<usize>, Token
                 while bytes.get(at).copied().is_some_and(is_word_byte) {
                     at += 1;
                 }
-                word_kind(&text[start..at], columns)
+                word_kind(&text[start..at], columns, tables)
             }
             _ => {
                 // Up to the next character that could start another token.
@@ -112,7 +117,7 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
 }
 
-fn word_kind(word: &str, columns: &[String]) -> TokenKind {
+fn word_kind(word: &str, columns: &[String], tables: &[String]) -> TokenKind {
     // A column wins: a file may well have a column called `count` or `name`.
     if columns
         .iter()
@@ -129,7 +134,9 @@ fn word_kind(word: &str, columns: &[String]) -> TokenKind {
         .any(|function| function.eq_ignore_ascii_case(word))
     {
         TokenKind::Function
-    } else if word.eq_ignore_ascii_case(TABLE) {
+    } else if word.eq_ignore_ascii_case(TABLE)
+        || tables.iter().any(|table| table.eq_ignore_ascii_case(word))
+    {
         TokenKind::Table
     } else {
         TokenKind::Plain
@@ -150,7 +157,7 @@ pub(crate) fn word_before(text: &str, cursor: usize) -> Option<(usize, String)> 
         .char_indices()
         .nth(cursor)
         .map_or(text.len(), |(at, _)| at);
-    let in_literal = tokens(&text[..end], &[])
+    let in_literal = tokens(&text[..end], &[], &[])
         .last()
         .is_some_and(|(range, kind)| {
             range.end == end && matches!(kind, TokenKind::String | TokenKind::Comment)
@@ -171,10 +178,10 @@ pub(crate) fn word_before(text: &str, cursor: usize) -> Option<(usize, String)> 
     Some((text[..start].chars().count(), word.to_owned()))
 }
 
-/// Columns, keywords, functions and `dataset` that start with `prefix` (ignoring
-/// case), columns first. Then columns that only contain it. A word already typed
-/// out in full is not offered.
-pub(crate) fn suggestions(prefix: &str, columns: &[String]) -> Vec<Suggestion> {
+/// Columns, keywords, functions and table names that start with `prefix`
+/// (ignoring case), columns first. Then columns that only contain it. A word
+/// already typed out in full is not offered.
+pub(crate) fn suggestions(prefix: &str, columns: &[String], tables: &[String]) -> Vec<Suggestion> {
     if prefix.is_empty() {
         return Vec::new();
     }
@@ -198,6 +205,12 @@ pub(crate) fn suggestions(prefix: &str, columns: &[String]) -> Vec<Suggestion> {
                 kind,
             });
         }
+    }
+    for table in tables.iter().filter(|table| starts(table)) {
+        found.push(Suggestion {
+            insert: table.clone(),
+            kind: TokenKind::Table,
+        });
     }
     for column in columns.iter().filter(|column| {
         !starts(column)
@@ -260,7 +273,7 @@ mod tests {
     #[test]
     fn tokenizes_the_sql_subset() {
         let text = "SELECT DEP_DELAY, COUNT(*) FROM dataset -- busy\nWHERE \"dest city\" = 'it''s' AND id >= 12.5";
-        let kinds = tokens(text, &columns())
+        let kinds = tokens(text, &columns(), &[])
             .into_iter()
             .filter(|(_, kind)| *kind != TokenKind::Plain)
             .map(|(range, kind)| (&text[range], kind))
@@ -285,7 +298,7 @@ mod tests {
         );
         // Tokens cover the text exactly, also with unfinished quotes and non-ASCII text.
         for text in ["SELECT 'open", "x = \"unclosed", "é -- ü", ""] {
-            let ranges = tokens(text, &columns());
+            let ranges = tokens(text, &columns(), &[]);
             let mut at = 0;
             for (range, _) in ranges {
                 assert_eq!(range.start, at, "{text}");
@@ -313,7 +326,7 @@ mod tests {
     #[test]
     fn suggests_columns_first_then_words_then_partial_matches() {
         let names = |prefix: &str| {
-            suggestions(prefix, &columns())
+            suggestions(prefix, &columns(), &[])
                 .into_iter()
                 .map(|suggestion| suggestion.insert)
                 .collect::<Vec<_>>()
@@ -332,7 +345,7 @@ mod tests {
         let many = (0..20)
             .map(|index| format!("col{index}"))
             .collect::<Vec<_>>();
-        assert_eq!(suggestions("col", &many).len(), MAX_SUGGESTIONS);
+        assert_eq!(suggestions("col", &many, &[]).len(), MAX_SUGGESTIONS);
     }
 
     #[test]
