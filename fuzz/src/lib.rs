@@ -215,6 +215,41 @@ pub fn parquet_seeds() -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+/// File extensions the `other_formats` target picks from with its first byte.
+pub const OTHER_FORMAT_EXTENSIONS: &[&str] = &["csv", "tsv", "jsonl", "arrow"];
+
+/// Seeds for `other_formats`: the selector byte, then a small file of that format.
+pub fn other_format_seeds() -> Vec<(String, Vec<u8>)> {
+    let with = |selector: u8, bytes: &[u8]| {
+        let mut seed = vec![selector];
+        seed.extend_from_slice(bytes);
+        seed
+    };
+    let mut arrow = Vec::new();
+    let batch = fixture_batch(12);
+    let mut writer =
+        arrow_ipc::writer::FileWriter::try_new(&mut arrow, &batch.schema()).expect("ipc writer");
+    writer.write(&batch).expect("write ipc");
+    writer.finish().expect("finish ipc");
+    drop(writer);
+    vec![
+        (
+            "seed-csv".to_string(),
+            with(0, b"id,name,score,day\n1,\"a, b\",1.5,2024-01-02\n2,,x,\n"),
+        ),
+        ("seed-tsv".to_string(), with(1, b"a\tb\n1\ttrue\n")),
+        (
+            "seed-jsonl".to_string(),
+            with(2, b"{\"id\": 1, \"tags\": [1, 2], \"point\": {\"x\": 0.5}}\n{\"id\": null}\n"),
+        ),
+        (
+            "seed-json-array".to_string(),
+            with(2, b"[{\"id\": 1, \"s\": \"]\\\"[\"}, {\"id\": 2}]"),
+        ),
+        ("seed-arrow".to_string(), with(3, &arrow)),
+    ]
+}
+
 pub const FILTER_SEEDS: &[&str] = &[
     "id >= 3",
     "small != 2",

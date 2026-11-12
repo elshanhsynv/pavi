@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [parquet_file, filter_expr, sql_query]
+        target: [parquet_file, other_formats, filter_expr, sql_query]
     steps:
       - uses: actions/checkout@v4
       # Fuzzing needs nightly; the pinned toolchain is used everywhere else.

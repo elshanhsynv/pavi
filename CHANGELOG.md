@@ -21,6 +21,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Save SQL queries under a name from the new Saved menu, and load or delete them later. They are kept with the session.
 - SQL `GROUP BY` takes several columns, e.g. `SELECT carrier, origin, COUNT(*) FROM dataset GROUP BY carrier, origin`.
 - Open a folder (Ctrl+Shift+O, the file menu, or drop it on the window) to read every Parquet file in it as one table. Folders named `key=value`, as Spark, DuckDB, Polars and pyarrow write them, become columns, and filters on them skip the other folders' files. The CLI opens folders too.
+- Open CSV, TSV, JSON (one object per line, or an array) and Arrow/Feather files. Column types are guessed from the first 10,000 records; the file is read into a temporary Parquet file while it opens, with progress in the status bar, so filters, sorts, SQL and charts work on it as on Parquet.
+- Export to JSON Lines and Arrow, besides CSV and Parquet.
 - Tabs: each file or folder opens in its own tab with its own filter, sort, SQL and layout. Ctrl+T opens a tab, Ctrl+W closes one, Ctrl+Tab moves between them. The tabs open when PAVI closes are reopened next time.
 
 ### Changed

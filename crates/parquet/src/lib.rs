@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod cache;
+pub mod convert;
 pub mod dataset;
 pub mod filter;
 mod footer;
@@ -15,6 +16,10 @@ pub mod value;
 
 pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
 pub use cache::{PageCache, PageCacheLimits, PageCacheStats};
+pub use convert::{
+    FileFormat, MAX_ARROW_BUFFER_BYTES, MAX_ARROW_MESSAGE_BYTES, MAX_CONVERTED_BYTES,
+    MAX_INFER_ROWS,
+};
 pub use dataset::{
     MAX_DATASET_FILES, MAX_DATASET_METADATA_BYTES, MAX_FOLDER_DEPTH, MAX_FOLDER_ENTRIES,
 };

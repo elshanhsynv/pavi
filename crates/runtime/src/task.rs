@@ -20,6 +20,7 @@ pub struct PageTask {
 /// Its task and generation IDs arrive with the response.
 pub struct OpenTask {
     cancellation: CancellationToken,
+    progress: ScanProgress,
     response: Receiver<OpenResponse>,
 }
 
@@ -59,11 +60,23 @@ impl PageTask {
 }
 
 impl OpenTask {
-    pub(crate) fn new(cancellation: CancellationToken, response: Receiver<OpenResponse>) -> Self {
+    pub(crate) fn new(
+        cancellation: CancellationToken,
+        progress: ScanProgress,
+        response: Receiver<OpenResponse>,
+    ) -> Self {
         Self {
             cancellation,
+            progress,
             response,
         }
+    }
+
+    /// How much of the open is done, from 0 to 1: the files of a folder opened,
+    /// or the share of a CSV, JSON or Arrow file read. 0 for a Parquet file.
+    pub fn progress(&self) -> f32 {
+        (self.progress.scanned_rows() as f64 / crate::scheduler::OPEN_PROGRESS_SCALE).min(1.0)
+            as f32
     }
 
     pub fn cancel(&self) {

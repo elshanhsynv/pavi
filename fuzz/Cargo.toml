@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arrow-array = { version = "60", features = ["chrono-tz"] }
 arrow-schema = "60"
+arrow-ipc = "60"
 parquet = { version = "60", features = ["arrow"] }
 parquet_reader = { path = "../crates/parquet" }
 pavi_query = { path = "../crates/query" }
@@ -41,6 +42,13 @@ bench = false
 [[bin]]
 name = "sql_query"
 path = "fuzz_targets/sql_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "other_formats"
+path = "fuzz_targets/other_formats.rs"
 test = false
 doc = false
 bench = false

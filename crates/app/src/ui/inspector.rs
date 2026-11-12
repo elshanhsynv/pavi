@@ -255,7 +255,22 @@ impl PaviApp {
             widgets::detail(ui, "Rows", theme::number(metadata.row_count));
             widgets::detail(ui, "Columns", metadata.column_count.to_string());
             widgets::detail(ui, "Row groups", metadata.row_groups.len().to_string());
-            widgets::detail(ui, "Compression", dataset.source.compression());
+            match dataset.source.format() {
+                parquet_reader::FileFormat::Parquet => {
+                    widgets::detail(ui, "Compression", dataset.source.compression());
+                }
+                format => {
+                    widgets::detail(ui, "Format", format.name());
+                    ui.label(
+                        RichText::new(
+                            "Read into a temporary Parquet file when opened. Reload to see \
+                             changes to the file.",
+                        )
+                        .color(theme::MUTED)
+                        .small(),
+                    );
+                }
+            }
             widgets::detail(
                 ui,
                 "Created",
