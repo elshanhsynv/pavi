@@ -2,13 +2,17 @@ use std::cmp::Ordering;
 
 use anyhow::{Result, anyhow, bail};
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
+    RecordBatch, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
     timezone::Tz,
-    types::{Date32Type, Date64Type},
+    types::{
+        Date32Type, Date64Type, Time32MillisecondType, Time32SecondType, Time64MicrosecondType,
+        Time64NanosecondType,
+    },
 };
 use arrow_cast::parse::{Parser, string_to_datetime};
 use arrow_schema::{DataType, Schema, TimeUnit};
@@ -653,6 +657,21 @@ impl Comparison {
                 parse_timestamp(value, *unit, timezone.as_deref())
                     .map(|ticks| Number::Int(ticks.into()))
             }
+            DataType::Time32(TimeUnit::Second) => {
+                Time32SecondType::parse(value).map(|ticks| Number::Int(ticks.into()))
+            }
+            DataType::Time32(TimeUnit::Millisecond) => {
+                Time32MillisecondType::parse(value).map(|ticks| Number::Int(ticks.into()))
+            }
+            DataType::Time64(TimeUnit::Microsecond) => {
+                Time64MicrosecondType::parse(value).map(|ticks| Number::Int(ticks.into()))
+            }
+            DataType::Time64(TimeUnit::Nanosecond) => {
+                Time64NanosecondType::parse(value).map(|ticks| Number::Int(ticks.into()))
+            }
+            DataType::Decimal32(_, scale)
+            | DataType::Decimal64(_, scale)
+            | DataType::Decimal128(_, scale) => decimal_value(value, *scale),
             // A Float32 column holds the nearest f32 to what was written; read the
             // filter value the same way, so `x == 9.083333` matches the cell that
             // displays as 9.083333.
@@ -669,6 +688,9 @@ impl Comparison {
             }
             DataType::Timestamp(_, _) => {
                 anyhow!("'{value}' is not a timestamp (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)")
+            }
+            DataType::Time32(_) | DataType::Time64(_) => {
+                anyhow!("'{value}' is not a time of day (expected HH:MM:SS or HH:MM:SS.fff)")
             }
             _ => anyhow!("'{value}' is not a number"),
         })
@@ -731,6 +753,19 @@ impl Comparison {
                     DataType::Timestamp(TimeUnit::Nanosecond, _) => {
                         ordered!(TimestampNanosecondArray, Number::Int)
                     }
+                    DataType::Time32(TimeUnit::Second) => ordered!(Time32SecondArray, Number::Int),
+                    DataType::Time32(TimeUnit::Millisecond) => {
+                        ordered!(Time32MillisecondArray, Number::Int)
+                    }
+                    DataType::Time64(TimeUnit::Microsecond) => {
+                        ordered!(Time64MicrosecondArray, Number::Int)
+                    }
+                    DataType::Time64(TimeUnit::Nanosecond) => {
+                        ordered!(Time64NanosecondArray, Number::Int)
+                    }
+                    DataType::Decimal32(_, _) => ordered!(Decimal32Array, Number::Int),
+                    DataType::Decimal64(_, _) => ordered!(Decimal64Array, Number::Int),
+                    DataType::Decimal128(_, _) => ordered!(Decimal128Array, Number::Int),
                     other => bail!("filtering is not supported for {other:?} columns"),
                 }
             }
@@ -806,6 +841,8 @@ impl Comparison {
                 expected(),
                 &self.op,
             ),
+            // Byte-array statistics of a decimal are its big-endian bytes, not text.
+            Statistics::ByteArray(_) if !is_string(data_type) => true,
             Statistics::ByteArray(stats) => {
                 let min = stats
                     .min_bytes_opt()
@@ -930,6 +967,42 @@ impl Number {
             _ => self.as_f64().partial_cmp(&other.as_f64()),
         }
     }
+}
+
+/// A decimal literal in the column's unscaled units: an exact integer when the
+/// literal has no more fractional digits than `scale`, otherwise (it falls between
+/// two representable values) the nearest float, so `<` and `>` still work and
+/// `==` matches nothing.
+fn decimal_value(value: &str, scale: i8) -> Option<Number> {
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let plain = |part: &str| part.chars().all(|c| c.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !plain(whole) || !plain(fraction) {
+        return None;
+    }
+    let inexact = || {
+        let float = value.parse::<f64>().ok()?;
+        Some(Number::Float(float * 10_f64.powi(scale.into())))
+    };
+    if scale < 0 {
+        return inexact();
+    }
+    let scale = usize::from(scale.unsigned_abs());
+    let kept = fraction.trim_end_matches('0');
+    if kept.len() > scale {
+        return inexact();
+    }
+    let unscaled = format!("{whole}{kept:0<scale$}");
+    let unscaled = unscaled.trim_start_matches('0');
+    let magnitude = if unscaled.is_empty() {
+        0
+    } else {
+        unscaled.parse::<i128>().ok()?
+    };
+    Some(Number::Int(if negative { -magnitude } else { magnitude }))
 }
 
 /// Parses a timestamp literal into ticks of `unit`. Text without an offset is read
@@ -1337,6 +1410,32 @@ mod tests {
         let built = FilterExpr::Or(vec![test("x", FilterOp::Eq, "1"); MAX_FILTER_TERMS + 1]);
         let schema = Schema::new(vec![Field::new("x", DataType::Int32, true)]);
         assert!(built.validate_schema(&schema).is_err());
+    }
+
+    #[test]
+    fn reads_decimal_literals_in_the_column_scale() {
+        use Number::{Float, Int};
+        for (literal, scale, expected) in [
+            ("12.34", 2, Some(Int(1234))),
+            ("12.3", 2, Some(Int(1230))),
+            ("12", 2, Some(Int(1200))),
+            ("-0.5", 2, Some(Int(-50))),
+            ("+.5", 1, Some(Int(5))),
+            ("0.000", 2, Some(Int(0))),
+            ("1.230", 2, Some(Int(123))),
+            ("12.345", 2, Some(Float(1234.5))),
+            ("1200", -2, Some(Float(12.0))),
+            ("1e3", 2, None),
+            ("1.2.3", 2, None),
+            ("", 2, None),
+            (".", 2, None),
+        ] {
+            assert_eq!(
+                decimal_value(literal, scale),
+                expected,
+                "{literal} at scale {scale}"
+            );
+        }
     }
 
     #[test]

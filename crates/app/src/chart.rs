@@ -300,7 +300,9 @@ fn numeric_type(data_type: &DataType) -> bool {
             | DataType::Date32
             | DataType::Date64
             | DataType::Timestamp(_, _)
-    )
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+    ) || parquet_reader::types::is_decimal(data_type)
 }
 
 fn label_type(data_type: &DataType) -> bool {
@@ -338,6 +340,18 @@ fn numeric(array: &ArrayRef, row: usize) -> Result<Option<f64>> {
             arrow_schema::TimeUnit::Microsecond => value!(TimestampMicrosecondArray),
             arrow_schema::TimeUnit::Nanosecond => value!(TimestampNanosecondArray),
         },
+        // Times of day are plotted in their stored unit (seconds, ms, µs or ns).
+        DataType::Time32(arrow_schema::TimeUnit::Second) => {
+            value!(arrow_array::Time32SecondArray)
+        }
+        DataType::Time32(_) => value!(arrow_array::Time32MillisecondArray),
+        DataType::Time64(arrow_schema::TimeUnit::Microsecond) => {
+            value!(arrow_array::Time64MicrosecondArray)
+        }
+        DataType::Time64(_) => value!(arrow_array::Time64NanosecondArray),
+        data_type if parquet_reader::types::is_decimal(data_type) => {
+            parquet_reader::value::decimal_f64(array.as_ref(), row)
+        }
         other => bail!("unsupported chart numeric type {other:?}"),
     };
     value.map_or_else(

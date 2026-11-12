@@ -132,6 +132,13 @@ pub fn fixture_batch(rows: i32) -> RecordBatch {
         ),
         ("ts", Arc::new(timestamps)),
         ("amount", Arc::new(amounts)),
+        (
+            "at",
+            Arc::new(arrow_array::Time64MicrosecondArray::from_iter(
+                ids.clone()
+                    .map(|id| (id % 6 != 0).then_some(i64::from(id) * 600_000_000)),
+            )),
+        ),
         ("category", Arc::new(category)),
         ("tags", Arc::new(tags)),
         ("point", Arc::new(point)),
@@ -225,6 +232,8 @@ pub const FILTER_SEEDS: &[&str] = &[
     "id >= 3 AND (name contains me OR active == true)",
     "category IN (red, \"dark blue\") OR score NOT BETWEEN 1 AND 2.5",
     "name LIKE me-_% AND text IS NOT NULL OR amount IS NULL",
+    "amount > 10.5 AND at < 01:30:00",
+    "amount == 12.340 OR at BETWEEN 00:10:00 AND 00:20:00.5",
 ];
 
 pub const SQL_SEEDS: &[&str] = &[
@@ -240,4 +249,7 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT id FROM dataset WHERE (id < 5 OR id > 30) AND active = true",
     "SELECT name FROM dataset WHERE category IN ('red', 'blue') AND score NOT BETWEEN 1 AND 2",
     "SELECT COUNT(*) FROM dataset WHERE name LIKE 'me-_%' AND amount IS NOT NULL",
+    "SELECT SUM(amount), AVG(amount), MIN(at), MAX(at) FROM dataset WHERE at > '00:30:00'",
+    "SELECT at, COUNT(*) FROM dataset GROUP BY at",
+    "SELECT id FROM dataset ORDER BY amount DESC LIMIT 5",
 ];

@@ -14,6 +14,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Find in the loaded rows (Ctrl+Shift+F): Enter or F3 moves to the next match, Shift+Enter or Shift+F3 to the previous one.
 - Pin columns: right-click a header and choose "Pin columns up to here". Pinned columns and the row numbers stay in place when the grid scrolls sideways. The pin is saved with the column layout.
 - The Inspector has a Row section listing every shown column of the selected row; click a line to select that cell.
+- Decimal and time-of-day columns can be filtered (`price > 12.50`, `at < 08:30:00`), sorted, grouped, profiled and charted, and used in MIN/MAX. Decimals also work with SUM and AVG.
+- A list, struct or map cell opens as a tree in the Inspector.
 
 ### Changed
 - Copying cells copies their full values instead of the first 256 characters, quotes values that contain a tab, line break or quote, and allows up to 16 MB instead of 64 KB.
@@ -21,6 +23,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ### Fixed
 - The window can be resized by dragging its edges and corners.
+- Files with a list, struct or map column now show row-group statistics for their other columns, and filters on those columns skip row groups again.
 
 ## [0.2.0] - 2026-11-10
 

@@ -9,6 +9,8 @@ use arrow_schema::DataType;
 /// Width the Inspector opens at; the user can drag it within `INSPECTOR_WIDTHS`.
 const INSPECTOR_WIDTH: f32 = 280.0;
 const INSPECTOR_WIDTHS: std::ops::RangeInclusive<f32> = 240.0..=460.0;
+/// Most height the nested-value tree takes before it scrolls.
+const TREE_HEIGHT: f32 = 260.0;
 /// Height of one line of the Row section.
 const FIELD_HEIGHT: f32 = 20.0;
 /// Most height the Row section takes before it scrolls.
@@ -76,8 +78,19 @@ impl PaviApp {
                     ui.ctx().copy_text(cell.value.clone());
                 }
                 ui.checkbox(&mut self.show_safe_full_selection, "Full value");
-                ui.checkbox(&mut self.show_nested_selection, "Nested");
+                if cell.tree.is_some() {
+                    ui.checkbox(&mut self.show_nested_selection, "As text");
+                }
             });
+            if let Some(tree) = &cell.tree {
+                ui.add_space(Spacing::Xs.px());
+                let id = ui.make_persistent_id(("cell_tree", cell.row, cell.column));
+                egui::ScrollArea::vertical()
+                    .id_salt("cell_tree_scroll")
+                    .max_height(TREE_HEIGHT)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| value_tree_ui(ui, tree, id, true));
+            }
             for extra in [&cell.full_value, &cell.expanded_value]
                 .into_iter()
                 .flatten()
@@ -159,6 +172,12 @@ impl PaviApp {
                         cancel_profile = true;
                     }
                 });
+            } else if !parquet_reader::types::is_comparable(&column.data_type) {
+                ui.label(
+                    RichText::new("Profiling needs a column of plain values.")
+                        .font(theme::small())
+                        .color(theme::MUTED),
+                );
             } else if widgets::tool_button(ui, Some(Icon::Chart), "Profile this column", false)
                 .on_hover_text("Scan the column for nulls, distinct values and distribution")
                 .clicked()
@@ -171,7 +190,14 @@ impl PaviApp {
             if let Some(profile) = &self.profile.result {
                 super::profile::show(ui, profile, super::charts::draw_chart);
             }
-            if !column.row_group_statistics.is_empty() {
+            if parquet_reader::value::is_nested(&column.data_type) {
+                ui.add_space(Spacing::Sm.px());
+                ui.label(
+                    RichText::new("A nested column has no single min and max per row group.")
+                        .font(theme::small())
+                        .color(theme::MUTED),
+                );
+            } else if !column.row_group_statistics.is_empty() {
                 ui.add_space(Spacing::Sm.px());
                 ui.label(
                     RichText::new("Min and max per row group")
@@ -336,6 +362,44 @@ impl PaviApp {
     }
 }
 
+/// A nested value as collapsible lines: one per list item, struct field or map
+/// entry. Only the first level starts open.
+fn value_tree_ui(
+    ui: &mut egui::Ui,
+    node: &parquet_reader::value::ValueNode,
+    id: egui::Id,
+    open: bool,
+) {
+    if node.children.is_empty() && node.hidden == 0 {
+        widgets::detail(ui, &node.label, &node.text);
+        return;
+    }
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open)
+        .show_header(ui, |ui| {
+            ui.label(RichText::new(&node.label).color(theme::TEXT));
+            ui.label(
+                RichText::new(&node.text)
+                    .font(theme::small())
+                    .color(theme::MUTED),
+            );
+        })
+        .body(|ui| {
+            for (index, child) in node.children.iter().enumerate() {
+                value_tree_ui(ui, child, id.with(index), false);
+            }
+            if node.hidden > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "… {} more not shown",
+                        theme::number(node.hidden as u64)
+                    ))
+                    .font(theme::small())
+                    .color(theme::MUTED),
+                );
+            }
+        });
+}
+
 /// One "column  value" line of the Row section; click it to select that cell.
 fn field_row(ui: &mut egui::Ui, name: &str, value: &str, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
@@ -410,6 +474,13 @@ pub fn type_label(data_type: &DataType) -> String {
         DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
             format!("list<{}>", type_label(field.data_type()))
         }
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale)
+        | DataType::Decimal256(precision, scale) => format!("dec({precision},{scale})"),
+        DataType::Time32(_) | DataType::Time64(_) => "time".into(),
+        DataType::Struct(fields) => format!("struct<{}>", fields.len()),
+        DataType::Map(_, _) => "map".into(),
         _ => data_type.to_string(),
     }
 }
@@ -451,6 +522,11 @@ mod tests {
                 true
             )))),
             "list<str>"
+        );
+        assert_eq!(type_label(&DataType::Decimal128(10, 2)), "dec(10,2)");
+        assert_eq!(
+            type_label(&DataType::Time64(arrow_schema::TimeUnit::Microsecond)),
+            "time"
         );
     }
 }

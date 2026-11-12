@@ -179,7 +179,7 @@ sequenceDiagram
 
 ## 4.6 Inspector: schema, metadata, row-group statistics, profiling
 
-- **Metadata/schema/stats** are computed once at open (`statistics::metadata_statistics`; min/max rebuilt as typed values and formatted like grid cells, byte strings capped at 128 chars) and rendered from memory each frame; long lists use `ScrollArea::show_rows` (virtualized) (`ui/inspector.rs:203-240`). For schemas with nested columns (top-level count ≠ leaf count), **all statistics are dropped** (`statistics.rs`).
+- **Metadata/schema/stats** are computed once at open (`statistics::metadata_statistics`; min/max rebuilt as typed values and formatted like grid cells, byte strings capped at 128 chars) and rendered from memory each frame; long lists use `ScrollArea::show_rows` (virtualized) (`ui/inspector.rs:203-240`). Each top-level column is mapped to its Parquet leaf (`statistics::leaf_columns`); a nested column (several leaves, or one leaf under a group) has no statistics, and the other columns keep theirs. The selected cell, when it is a list, struct or map, is shown as a tree (`value::value_tree`, bounded).
 - **Selected cell:** `selected_cell_details` → `inspect_cell` on the in-memory batch (`app.rs:1560-1603`).
 - **Profile column:** `run_profile` (`app.rs:1482-1503`) → `ProfileTask::start` spawns thread `pavi-profile` (`profile.rs:83-119`), which runs a `scan().project([col])` query and polls it with a 5 ms sleep loop (`profile.rs:143-176`), building exact distinct counts, min/max/mean, string lengths and a distribution chart. Result returns via a capacity-1 channel; UI polls in `poll_profile` (`app.rs:1513-1543`). Exact distinct counting is capped at 4,096 values and 128 bytes per value; past that the profile ends with an error (`profile.rs:275-294`).
 

@@ -851,8 +851,14 @@ impl PaviApp {
         let fits = |rect: &egui::Rect| rect.right() + shift.x <= limit;
         let body_clip = egui::Rect::from_x_y_ranges(area.x_range(), body.y_range());
         let mut right = area.left();
+        // The edge line stops at the last drawn row, not at the bottom of the area.
+        let mut bottom = frame
+            .header
+            .as_ref()
+            .map_or(area.top(), |header| header.gutter.bottom());
         for row in frame.rows {
             let gutter = row.gutter.translate(shift);
+            bottom = bottom.max(gutter.bottom());
             let cells = row
                 .cells
                 .into_iter()
@@ -918,7 +924,7 @@ impl PaviApp {
         // The edge the other columns slide under.
         ui.painter().vline(
             right,
-            area.top()..=body.bottom(),
+            area.top()..=bottom.min(body.bottom()),
             egui::Stroke::new(1.0_f32, theme::BORDER),
         );
     }

@@ -2,9 +2,10 @@ use std::fmt::Display;
 
 use anyhow::{Result, anyhow, bail};
 use arrow_array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
-    FixedSizeListArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray, MapArray,
-    PrimitiveArray, StringArray, StringViewArray, StructArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Decimal32Array, Decimal64Array,
+    Decimal128Array, DictionaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray,
+    LargeListArray, LargeStringArray, ListArray, MapArray, PrimitiveArray, StringArray,
+    StringViewArray, StructArray,
     types::{
         ArrowDictionaryKeyType, ArrowPrimitiveType, Float32Type, Float64Type, Int8Type, Int16Type,
         Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -16,6 +17,171 @@ use arrow_schema::DataType;
 pub const DEFAULT_CELL_LIMIT: usize = 1024;
 pub const MAX_NESTED_DEPTH: usize = 8;
 pub const MAX_NESTED_ITEMS: usize = 16;
+/// Children one node of a [`ValueNode`] tree lists before "… N more".
+pub const MAX_TREE_ITEMS: usize = 100;
+/// Nodes one [`ValueNode`] tree holds in total.
+pub const MAX_TREE_NODES: usize = 2_000;
+/// Characters of each leaf value in a [`ValueNode`] tree.
+const TREE_TEXT_LIMIT: usize = 256;
+
+/// One cell as a tree, for browsing nested values: a list's items, a struct's
+/// fields, a map's entries. Leaves hold the same text the grid shows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValueNode {
+    /// Field name, `[index]` for a list item, or the key of a map entry.
+    pub label: String,
+    /// The value for a leaf; a short summary ("3 items") for a nested value.
+    pub text: String,
+    pub children: Vec<ValueNode>,
+    /// Children not listed because of [`MAX_TREE_ITEMS`] or [`MAX_TREE_NODES`].
+    pub hidden: usize,
+}
+
+/// `true` for list, struct and map values, which [`value_tree`] opens up.
+pub fn is_nested(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    )
+}
+
+/// The value at `row` as a tree labelled `label`. Bounded: at most
+/// [`MAX_NESTED_DEPTH`] levels, [`MAX_TREE_ITEMS`] children per node and
+/// [`MAX_TREE_NODES`] nodes in all.
+pub fn value_tree(array: &dyn Array, row: usize, label: &str) -> ValueNode {
+    let mut budget = MAX_TREE_NODES;
+    tree_node(array, row, label.to_owned(), 0, &mut budget)
+}
+
+fn tree_node(
+    array: &dyn Array,
+    row: usize,
+    label: String,
+    depth: usize,
+    budget: &mut usize,
+) -> ValueNode {
+    *budget = budget.saturating_sub(1);
+    let leaf = |text: String| ValueNode {
+        label: label.clone(),
+        text,
+        children: Vec::new(),
+        hidden: 0,
+    };
+    if row >= array.len() {
+        return leaf("<out of bounds>".to_owned());
+    }
+    if array.is_null(row) {
+        return leaf("null".to_owned());
+    }
+    if depth >= MAX_NESTED_DEPTH || !is_nested(array.data_type()) {
+        return leaf(format_cell_with_limit(array, row, TREE_TEXT_LIMIT));
+    }
+    // (child label, values array, index in it) for every child of this value.
+    let children: Vec<(String, std::sync::Arc<dyn Array>, usize)> = match array.data_type() {
+        DataType::List(_) => match array.as_any().downcast_ref::<ListArray>() {
+            Some(list) => {
+                let values = list.value(row);
+                (0..values.len())
+                    .map(|index| (format!("[{index}]"), values.clone(), index))
+                    .collect()
+            }
+            None => Vec::new(),
+        },
+        DataType::LargeList(_) => match array.as_any().downcast_ref::<LargeListArray>() {
+            Some(list) => {
+                let values = list.value(row);
+                (0..values.len())
+                    .map(|index| (format!("[{index}]"), values.clone(), index))
+                    .collect()
+            }
+            None => Vec::new(),
+        },
+        DataType::FixedSizeList(_, _) => {
+            match array.as_any().downcast_ref::<FixedSizeListArray>() {
+                Some(list) => {
+                    let values = list.value(row);
+                    (0..values.len())
+                        .map(|index| (format!("[{index}]"), values.clone(), index))
+                        .collect()
+                }
+                None => Vec::new(),
+            }
+        }
+        DataType::Struct(fields) => match array.as_any().downcast_ref::<StructArray>() {
+            Some(record) => fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| (field.name().clone(), record.column(index).clone(), row))
+                .collect(),
+            None => Vec::new(),
+        },
+        DataType::Map(_, _) => match array.as_any().downcast_ref::<MapArray>() {
+            Some(map) => {
+                let entries = map.value(row);
+                if entries.num_columns() < 2 {
+                    Vec::new()
+                } else {
+                    let (keys, values) = (entries.column(0).clone(), entries.column(1).clone());
+                    (0..entries.len())
+                        .map(|index| {
+                            let key = format_cell_with_limit(keys.as_ref(), index, TREE_TEXT_LIMIT);
+                            (key, values.clone(), index)
+                        })
+                        .collect()
+                }
+            }
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let total = children.len();
+    let summary = match array.data_type() {
+        DataType::Struct(_) => format!("{total} field{}", if total == 1 { "" } else { "s" }),
+        DataType::Map(_, _) => format!("{total} entr{}", if total == 1 { "y" } else { "ies" }),
+        _ => format!("{total} item{}", if total == 1 { "" } else { "s" }),
+    };
+    let mut nodes = Vec::new();
+    for (label, values, index) in children.into_iter().take(MAX_TREE_ITEMS) {
+        if *budget == 0 {
+            break;
+        }
+        nodes.push(tree_node(values.as_ref(), index, label, depth + 1, budget));
+    }
+    ValueNode {
+        label,
+        text: summary,
+        hidden: total - nodes.len(),
+        children: nodes,
+    }
+}
+
+/// A decimal cell as a float in the column's units (`12.34`, not `1234`), for
+/// charts and profile means. `None` for null cells and other types.
+pub fn decimal_f64(array: &dyn Array, row: usize) -> Option<f64> {
+    if row >= array.len() || array.is_null(row) {
+        return None;
+    }
+    let (unscaled, scale) = match array.data_type() {
+        DataType::Decimal32(_, scale) => (
+            f64::from(array.as_any().downcast_ref::<Decimal32Array>()?.value(row)),
+            *scale,
+        ),
+        DataType::Decimal64(_, scale) => (
+            array.as_any().downcast_ref::<Decimal64Array>()?.value(row) as f64,
+            *scale,
+        ),
+        DataType::Decimal128(_, scale) => (
+            array.as_any().downcast_ref::<Decimal128Array>()?.value(row) as f64,
+            *scale,
+        ),
+        _ => return None,
+    };
+    Some(unscaled / 10_f64.powi(scale.into()))
+}
 
 /// Bounded display text for one cell (grid, CLI, clipboard, Inspector).
 pub fn format_cell(array: &dyn Array, row: usize) -> String {
@@ -385,6 +551,97 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn opens_nested_values_as_a_bounded_tree() {
+        use arrow_array::{
+            ArrayRef, Int32Array, ListArray, StringArray, StructArray, types::Int32Type,
+        };
+        use arrow_schema::Field;
+        use std::sync::Arc;
+
+        let scores = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(3), None]),
+            Some((0..150).map(Some).collect()),
+        ]);
+        let record = StructArray::from(vec![
+            (
+                Arc::new(Field::new("name", DataType::Utf8, false)),
+                Arc::new(StringArray::from(vec!["ada", "bob"])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("scores", scores.data_type().clone(), true)),
+                Arc::new(scores) as ArrayRef,
+            ),
+        ]);
+        let tree = value_tree(&record, 0, "person");
+        assert_eq!(
+            (tree.label.as_str(), tree.text.as_str()),
+            ("person", "2 fields")
+        );
+        assert_eq!(tree.children[0].label, "name");
+        assert_eq!(tree.children[0].text, "ada");
+        let list = &tree.children[1];
+        assert_eq!(
+            (list.label.as_str(), list.text.as_str()),
+            ("scores", "2 items")
+        );
+        assert_eq!(list.children[0].label, "[0]");
+        assert_eq!(list.children[0].text, "3");
+        assert_eq!(list.children[1].text, "null");
+
+        // Long lists list the first MAX_TREE_ITEMS items and count the rest.
+        let long = &value_tree(&record, 1, "person").children[1];
+        assert_eq!(long.text, "150 items");
+        assert_eq!(long.children.len(), MAX_TREE_ITEMS);
+        assert_eq!(long.hidden, 50);
+
+        // A plain value is a single leaf; the whole tree is capped.
+        let plain = Int32Array::from(vec![7]);
+        assert!(!is_nested(plain.data_type()));
+        assert_eq!(value_tree(&plain, 0, "x").text, "7");
+        // One cell holding 50 lists of 100 numbers: more than MAX_TREE_NODES.
+        let mut builder = arrow_array::builder::ListBuilder::new(
+            arrow_array::builder::ListBuilder::new(arrow_array::builder::Int32Builder::new()),
+        );
+        for _ in 0..50 {
+            for value in 0..100 {
+                builder.values().values().append_value(value);
+            }
+            builder.values().append(true);
+        }
+        builder.append(true);
+        let nested = builder.finish();
+        let tree = value_tree(&nested, 0, "grid");
+        let count = |node: &ValueNode| {
+            fn walk(node: &ValueNode) -> usize {
+                1 + node.children.iter().map(walk).sum::<usize>()
+            }
+            walk(node)
+        };
+        assert!(count(&tree) <= MAX_TREE_NODES, "{}", count(&tree));
+        assert!(
+            tree.children
+                .iter()
+                .map(|child| child.hidden)
+                .sum::<usize>()
+                > 0
+        );
+    }
+
+    #[test]
+    fn converts_decimals_to_floats_in_their_units() {
+        use arrow_array::Decimal128Array;
+        let prices = Decimal128Array::from(vec![Some(-1_975), None])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        assert_eq!(decimal_f64(&prices, 0), Some(-19.75));
+        assert_eq!(decimal_f64(&prices, 1), None);
+        assert_eq!(
+            decimal_f64(&arrow_array::Int32Array::from(vec![1]), 0),
+            None
+        );
+    }
 
     #[test]
     fn formats_basic_values_and_nulls() {
