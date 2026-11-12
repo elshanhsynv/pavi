@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-12
+
 ### Added
 - Filters can combine tests with `AND`, `OR` and brackets, in the filter box and in SQL `WHERE`.
 - New filter tests: `IN (…)`, `BETWEEN … AND …`, `LIKE` with `%` and `_`, `IS NULL`, and their `NOT` forms. The filter box also accepts `=` and `<>`.
@@ -101,6 +103,7 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/elshanhsynv/pavi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.2.0
 [0.1.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.1.0
