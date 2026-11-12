@@ -18,28 +18,57 @@ use crate::{ColumnStatistics, value::scalar_text};
 
 const STAT_VALUE_LIMIT: usize = 128;
 
-/// Per top-level column, per row group: display statistics, or `None` when absent.
+/// For each top-level column, the Parquet leaf column that stores it, or `None`
+/// for a nested column (a list, struct or map is stored in one or more leaves
+/// under a group, and has no single min/max).
 ///
-/// Statistics are only mapped when every top-level column is a single Parquet leaf;
-/// nested schemas get no statistics.
+/// Leaf statistics are indexed by leaf column, so in a file with nested columns
+/// the top-level and leaf positions differ; this is the map between them.
+pub(crate) fn leaf_columns(
+    metadata: &ParquetMetaData,
+    top_level_columns: usize,
+) -> Vec<Option<usize>> {
+    let schema = metadata.file_metadata().schema_descr();
+    let roots = schema.root_schema().get_fields();
+    if roots.len() != top_level_columns {
+        return vec![None; top_level_columns];
+    }
+    let mut leaves = vec![(0_usize, None); roots.len()];
+    for leaf in 0..schema.num_columns() {
+        if let Some((count, first)) = leaves.get_mut(schema.get_column_root_idx(leaf)) {
+            *count += 1;
+            first.get_or_insert(leaf);
+        }
+    }
+    roots
+        .iter()
+        .zip(leaves)
+        .map(|(root, (count, leaf))| {
+            (root.is_primitive() && count == 1)
+                .then_some(leaf)
+                .flatten()
+        })
+        .collect()
+}
+
+/// Per top-level column, per row group: display statistics, or `None` when absent.
+/// Nested columns have none; the other columns of a nested schema keep theirs.
 pub(crate) fn metadata_statistics(
     metadata: &ParquetMetaData,
     schema: &Schema,
 ) -> Vec<Vec<Option<ColumnStatistics>>> {
-    let top_level_columns = schema.fields().len();
     let row_groups = metadata.num_row_groups();
-    if top_level_columns != metadata.file_metadata().schema_descr().num_columns() {
-        return vec![vec![None; row_groups]; top_level_columns];
-    }
-    (0..top_level_columns)
-        .map(|column| {
+    leaf_columns(metadata, schema.fields().len())
+        .into_iter()
+        .enumerate()
+        .map(|(column, leaf)| {
             let data_type = schema.field(column).data_type();
             (0..row_groups)
                 .map(|row_group| {
                     metadata
                         .row_group(row_group)
                         .columns()
-                        .get(column)
+                        .get(leaf?)
                         .and_then(|column| column.statistics())
                         .map(|statistics| statistics_summary(statistics, data_type))
                 })

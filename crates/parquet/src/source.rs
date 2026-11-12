@@ -9,11 +9,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, RecordBatch, StringArray,
-    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
+    Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, RecordBatch, StringArray, StringViewArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 use arrow_schema::{DataType, Field, Schema, SortOptions, TimeUnit};
@@ -33,8 +34,10 @@ use crate::{
     RowWindow, SortBudget, SortDirection, SortSpec,
     filter::FilterExpr,
     page::PAGE_ROWS,
-    statistics::metadata_statistics,
-    types::{is_comparable, is_numeric, is_signed_integer, is_unsigned_integer},
+    statistics::{leaf_columns, metadata_statistics},
+    types::{
+        is_comparable, is_decimal, is_float, is_signed_integer, is_summable, is_unsigned_integer,
+    },
 };
 
 const BATCH_SIZE: usize = 4096;
@@ -183,6 +186,8 @@ pub struct ParquetSource {
     /// `(row group, leaf column)` chunks whose dictionary page header passed
     /// [`ParquetSource::check_dictionary_pages`].
     checked_dictionaries: Mutex<HashSet<(usize, usize)>>,
+    /// The Parquet leaf column of each top-level column; `None` when nested.
+    leaf_columns: Vec<Option<usize>>,
 }
 
 impl ParquetSource {
@@ -213,6 +218,7 @@ impl ParquetSource {
             .with_context(|| format!("build row-group index for {}", path.display()))?
             .with_column_statistics(metadata_statistics(&metadata, &schema));
 
+        let leaf_columns = leaf_columns(&metadata, schema.fields().len());
         Ok(Self {
             path,
             file_info,
@@ -222,6 +228,7 @@ impl ParquetSource {
             arrow_metadata,
             cache: Mutex::new(PageCache::default()),
             checked_dictionaries: Mutex::new(HashSet::new()),
+            leaf_columns,
         })
     }
 
@@ -689,7 +696,7 @@ impl ParquetSource {
             match (expression.function(), field) {
                 (AggregateFunction::Count, _) => {}
                 (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
-                    if is_numeric(field.data_type()) => {}
+                    if is_summable(field.data_type()) => {}
                 (AggregateFunction::Min | AggregateFunction::Max, Some(field))
                     if is_comparable(field.data_type()) => {}
                 (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
@@ -872,15 +879,13 @@ impl ParquetSource {
 
     /// `false` only when the row group's statistics prove no row can pass `filter`.
     fn row_group_might_match(&self, filter: &FilterExpr, row_group: &RowGroupInfo) -> bool {
-        // Nested columns: Parquet leaf columns no longer line up with Arrow fields.
-        if self.column_count() != self.metadata.file_metadata().schema_descr().num_columns() {
-            return true;
-        }
         let schema = &self.dataset_metadata.schema;
-        let columns = self.metadata.row_group(row_group.index).columns();
+        let chunks = self.metadata.row_group(row_group.index).columns();
         filter.might_match(schema, &|column| {
-            columns
-                .get(column)
+            // A nested column has no single min/max; it never rules a group out.
+            let leaf = self.leaf_columns.get(column).copied().flatten()?;
+            chunks
+                .get(leaf)
                 .map(|chunk| (chunk.statistics(), schema.field(column).data_type()))
         })
     }
@@ -1041,6 +1046,10 @@ enum Scalar {
     Date32(i32),
     Date64(i64),
     Timestamp(i64),
+    /// Time of day in the column's unit.
+    Time(i64),
+    /// Unscaled decimal; one column always has one scale.
+    Decimal(i128),
 }
 
 impl Scalar {
@@ -1060,6 +1069,8 @@ impl Scalar {
             Self::F64(value) => Ok(f64::from_bits(*value)),
             Self::I64(value) => Ok(*value as f64),
             Self::U64(value) => Ok(*value as f64),
+            // Unscaled: AVG divides by the scale (`Accumulator::Avg::divisor`).
+            Self::Decimal(value) => Ok(*value as f64),
             _ => bail!("aggregate encountered an incompatible numeric value"),
         }
     }
@@ -1070,7 +1081,14 @@ enum Accumulator {
     SumI64(Option<i64>),
     SumU64(Option<u64>),
     SumF64(Option<f64>),
-    Avg { sum: f64, count: u64 },
+    /// Unscaled decimal sum.
+    SumDecimal(Option<i128>),
+    Avg {
+        sum: f64,
+        count: u64,
+        /// 10^scale for decimals, so the mean comes out in the column's units.
+        divisor: f64,
+    },
     Min(Option<Scalar>),
     Max(Option<Scalar>),
 }
@@ -1080,12 +1098,17 @@ impl Accumulator {
         match expression.function() {
             AggregateFunction::Count => Ok(Self::Count(0)),
             AggregateFunction::Sum => match data_type {
+                Some(data_type) if is_decimal(data_type) => Ok(Self::SumDecimal(None)),
                 Some(data_type) if is_signed_integer(data_type) => Ok(Self::SumI64(None)),
                 Some(data_type) if is_unsigned_integer(data_type) => Ok(Self::SumU64(None)),
                 Some(DataType::Float32 | DataType::Float64) => Ok(Self::SumF64(None)),
                 _ => bail!("SUM needs a numeric column"),
             },
-            AggregateFunction::Avg => Ok(Self::Avg { sum: 0.0, count: 0 }),
+            AggregateFunction::Avg => Ok(Self::Avg {
+                sum: 0.0,
+                count: 0,
+                divisor: data_type.map_or(1.0, decimal_divisor),
+            }),
             AggregateFunction::Min => Ok(Self::Min(None)),
             AggregateFunction::Max => Ok(Self::Max(None)),
         }
@@ -1126,6 +1149,20 @@ impl Accumulator {
                         .context("SUM overflow for unsigned integer")?,
                 );
             }
+            Self::SumDecimal(sum) => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let Scalar::Decimal(value) = value else {
+                    bail!("SUM encountered an incompatible decimal value");
+                };
+                *sum = Some(
+                    sum.unwrap_or(0)
+                        .checked_add(value)
+                        .filter(|sum| sum.unsigned_abs() < DECIMAL128_LIMIT)
+                        .context("SUM overflow for decimal (more than 38 digits)")?,
+                );
+            }
             Self::SumF64(sum) => {
                 let Some(value) = value.filter(|value| !value.is_null()) else {
                     return Ok(());
@@ -1137,7 +1174,7 @@ impl Accumulator {
                 }
                 *sum = Some(next);
             }
-            Self::Avg { sum, count } => {
+            Self::Avg { sum, count, .. } => {
                 let Some(value) = value.filter(|value| !value.is_null()) else {
                     return Ok(());
                 };
@@ -1180,9 +1217,12 @@ impl Accumulator {
             Self::SumI64(value) => value.map(Scalar::I64),
             Self::SumU64(value) => value.map(Scalar::U64),
             Self::SumF64(value) => value.map(|value| Scalar::F64(value.to_bits())),
-            Self::Avg { sum, count } if *count > 0 => {
-                Some(Scalar::F64((sum / *count as f64).to_bits()))
-            }
+            Self::SumDecimal(value) => value.map(Scalar::Decimal),
+            Self::Avg {
+                sum,
+                count,
+                divisor,
+            } if *count > 0 => Some(Scalar::F64((sum / *count as f64 / divisor).to_bits())),
             Self::Avg { .. } => None,
             Self::Min(value) | Self::Max(value) => value.clone(),
         }
@@ -1443,15 +1483,18 @@ fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) ->
     match expression.function() {
         AggregateFunction::Count => Ok(DataType::UInt64),
         AggregateFunction::Sum if input.is_some_and(is_signed_integer) => Ok(DataType::Int64),
-        AggregateFunction::Sum if input.is_some_and(is_unsigned_integer) => Ok(DataType::UInt64),
-        AggregateFunction::Sum | AggregateFunction::Avg
-            if input.is_some_and(|data_type| {
-                matches!(data_type, DataType::Float32 | DataType::Float64)
-            }) =>
-        {
-            Ok(DataType::Float64)
-        }
-        AggregateFunction::Avg if input.is_some_and(is_numeric) => Ok(DataType::Float64),
+        // A sum keeps the scale and gets the widest decimal precision.
+        AggregateFunction::Sum => match input {
+            Some(
+                DataType::Decimal32(_, scale)
+                | DataType::Decimal64(_, scale)
+                | DataType::Decimal128(_, scale),
+            ) => Ok(DataType::Decimal128(38, *scale)),
+            _ if input.is_some_and(is_unsigned_integer) => Ok(DataType::UInt64),
+            _ if input.is_some_and(is_float) => Ok(DataType::Float64),
+            _ => bail!("aggregate expression has an unsupported input type"),
+        },
+        AggregateFunction::Avg if input.is_some_and(is_summable) => Ok(DataType::Float64),
         AggregateFunction::Min | AggregateFunction::Max => {
             input.cloned().context("MIN/MAX needs a source column")
         }
@@ -1624,6 +1667,59 @@ fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scal
                 .context("read nanosecond timestamp aggregate value")?
                 .value(row),
         )),
+        DataType::Time32(TimeUnit::Second) => Ok(Scalar::Time(
+            array
+                .as_any()
+                .downcast_ref::<Time32SecondArray>()
+                .context("read time aggregate value")?
+                .value(row)
+                .into(),
+        )),
+        DataType::Time32(TimeUnit::Millisecond) => Ok(Scalar::Time(
+            array
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .context("read time aggregate value")?
+                .value(row)
+                .into(),
+        )),
+        DataType::Time64(TimeUnit::Microsecond) => Ok(Scalar::Time(
+            array
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .context("read time aggregate value")?
+                .value(row),
+        )),
+        DataType::Time64(TimeUnit::Nanosecond) => Ok(Scalar::Time(
+            array
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .context("read time aggregate value")?
+                .value(row),
+        )),
+        DataType::Decimal32(_, _) => Ok(Scalar::Decimal(
+            array
+                .as_any()
+                .downcast_ref::<Decimal32Array>()
+                .context("read decimal aggregate value")?
+                .value(row)
+                .into(),
+        )),
+        DataType::Decimal64(_, _) => Ok(Scalar::Decimal(
+            array
+                .as_any()
+                .downcast_ref::<Decimal64Array>()
+                .context("read decimal aggregate value")?
+                .value(row)
+                .into(),
+        )),
+        DataType::Decimal128(_, _) => Ok(Scalar::Decimal(
+            array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .context("read decimal aggregate value")?
+                .value(row),
+        )),
         _ => bail!("aggregate cannot read unsupported {data_type:?} values"),
     }
 }
@@ -1640,6 +1736,8 @@ fn scalar_compare(left: &Scalar, right: &Scalar) -> std::cmp::Ordering {
         (Scalar::Date32(left), Scalar::Date32(right)) => left.cmp(right),
         (Scalar::Date64(left), Scalar::Date64(right)) => left.cmp(right),
         (Scalar::Timestamp(left), Scalar::Timestamp(right)) => left.cmp(right),
+        (Scalar::Time(left), Scalar::Time(right)) => left.cmp(right),
+        (Scalar::Decimal(left), Scalar::Decimal(right)) => left.cmp(right),
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -1751,8 +1849,66 @@ fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayR
             }))
             .with_timezone_opt(timezone.clone()),
         ),
+        DataType::Time32(TimeUnit::Second) => Arc::new(Time32SecondArray::from(values!(
+            |value: &Scalar| match value {
+                Scalar::Time(value) => i32::try_from(*value).context("time out of range"),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        ))),
+        DataType::Time32(TimeUnit::Millisecond) => Arc::new(Time32MillisecondArray::from(values!(
+            |value: &Scalar| match value {
+                Scalar::Time(value) => i32::try_from(*value).context("time out of range"),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        ))),
+        DataType::Time64(TimeUnit::Microsecond) => Arc::new(Time64MicrosecondArray::from(values!(
+            |value: &Scalar| match value {
+                Scalar::Time(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        ))),
+        DataType::Time64(TimeUnit::Nanosecond) => Arc::new(Time64NanosecondArray::from(values!(
+            |value: &Scalar| match value {
+                Scalar::Time(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        ))),
+        DataType::Decimal32(precision, scale) => Arc::new(
+            Decimal32Array::from(values!(|value: &Scalar| match value {
+                Scalar::Decimal(value) => i32::try_from(*value).context("decimal out of range"),
+                _ => bail!("aggregate output type mismatch"),
+            }))
+            .with_precision_and_scale(*precision, *scale)?,
+        ),
+        DataType::Decimal64(precision, scale) => Arc::new(
+            Decimal64Array::from(values!(|value: &Scalar| match value {
+                Scalar::Decimal(value) => i64::try_from(*value).context("decimal out of range"),
+                _ => bail!("aggregate output type mismatch"),
+            }))
+            .with_precision_and_scale(*precision, *scale)?,
+        ),
+        DataType::Decimal128(precision, scale) => Arc::new(
+            Decimal128Array::from(values!(|value: &Scalar| match value {
+                Scalar::Decimal(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            }))
+            .with_precision_and_scale(*precision, *scale)?,
+        ),
         _ => bail!("aggregate output is not supported for {data_type:?}"),
     })
+}
+
+/// One more than the largest unscaled `Decimal128(38, _)`: 10^38.
+const DECIMAL128_LIMIT: u128 = 100_000_000_000_000_000_000_000_000_000_000_000_000;
+
+/// What an AVG divides its sum by to undo a decimal's scale; 1 for other types.
+fn decimal_divisor(data_type: &DataType) -> f64 {
+    match data_type {
+        DataType::Decimal32(_, scale)
+        | DataType::Decimal64(_, scale)
+        | DataType::Decimal128(_, scale) => 10_f64.powi((*scale).into()),
+        _ => 1.0,
+    }
 }
 
 fn projected_position(projection: &Projection, column: usize, purpose: &str) -> Result<usize> {
@@ -2556,6 +2712,236 @@ mod tests {
         assert_eq!(
             crate::value::format_cell(counted.column(0).as_ref(), 0),
             "3"
+        );
+    }
+
+    /// 40 rows in row groups of 10: `id`; `tags` (a list, so the file is nested);
+    /// `price` Decimal128(9, 2) = id - 20 + 0.25 (INT32 storage); `big`
+    /// Decimal128(30, 2) (byte-array storage); `at` Time64(µs) = 08:00:00 + id
+    /// minutes; `alarm` Time32(s), null for odd ids.
+    fn typed_file() -> (TempDir, ParquetSource) {
+        use arrow_array::{
+            Decimal128Array, Time32SecondArray, Time64MicrosecondArray, builder::ListBuilder,
+        };
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("typed.parquet");
+        let ids = 0..40_i32;
+        let mut tags = ListBuilder::new(Int32Builder::new());
+        for id in ids.clone() {
+            tags.values().append_value(id);
+            tags.append(true);
+        }
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(ids.clone())) as ArrayRef,
+            ),
+            ("tags", Arc::new(tags.finish())),
+            (
+                "price",
+                Arc::new(
+                    Decimal128Array::from_iter_values(
+                        ids.clone().map(|id| i128::from(id - 20) * 100 + 25),
+                    )
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+                ),
+            ),
+            (
+                "big",
+                Arc::new(
+                    Decimal128Array::from_iter_values(
+                        ids.clone().map(|id| 10_i128.pow(27) + i128::from(id)),
+                    )
+                    .with_precision_and_scale(30, 2)
+                    .unwrap(),
+                ),
+            ),
+            (
+                "at",
+                Arc::new(Time64MicrosecondArray::from_iter_values(
+                    ids.clone()
+                        .map(|id| (8 * 3_600 + i64::from(id) * 60) * 1_000_000),
+                )),
+            ),
+            (
+                "alarm",
+                Arc::new(Time32SecondArray::from_iter(
+                    ids.clone()
+                        .map(|id| (id % 2 == 0).then_some(6 * 3_600 + id)),
+                )),
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(10))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (directory, ParquetSource::open(path).unwrap())
+    }
+
+    #[test]
+    fn filters_sorts_and_aggregates_decimals_and_times() {
+        let (_directory, source) = typed_file();
+        let projection = Projection::columns(vec![0], 6).unwrap();
+        let matches = |filter: &str| {
+            let filter = FilterExpr::parse(filter).unwrap();
+            source.validate_filter(&filter).unwrap();
+            ids(&source
+                .read_filtered_from(&filter, 0, 100, &projection, &|_| false)
+                .unwrap()
+                .batch)
+        };
+        // price is id - 19.75.
+        assert_eq!(matches("price > 18"), [38, 39]);
+        assert_eq!(matches("price == -0.75"), [19]);
+        assert_eq!(matches("price == -0.750"), [19], "trailing zeros are exact");
+        assert_eq!(
+            matches("price == 0.251"),
+            Vec::<i32>::new(),
+            "between two cents"
+        );
+        assert_eq!(matches("price > 0.251 AND price < 2"), [21]);
+        assert_eq!(matches("price BETWEEN -1 AND 1"), [19, 20]);
+        assert_eq!(matches("big >= 10000000000000000000000000.38"), [38, 39]);
+        // at is 08:00 + id minutes; alarm is 06:00:00 + id seconds, null for odd ids.
+        assert_eq!(matches("at >= 08:38:00"), [38, 39]);
+        assert_eq!(matches("at == 08:05:00.000000"), [5]);
+        assert_eq!(matches("alarm < 06:00:04"), [0, 2]);
+        assert_eq!(matches("alarm IS NULL AND id < 4"), [1, 3]);
+        for (filter, message) in [
+            ("price == ten", "not a number"),
+            ("at > noon", "not a time of day"),
+            ("at contains 08", "contains is only supported for text"),
+        ] {
+            let error = source
+                .validate_filter(&FilterExpr::parse(filter).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(message), "{filter}: {error}");
+        }
+
+        // Pruning uses decimal and time statistics, and skips the right groups.
+        let groups = source.row_groups().to_vec();
+        let might = |filter: &str| {
+            let filter = FilterExpr::parse(filter).unwrap();
+            groups
+                .iter()
+                .map(|group| source.row_group_might_match(&filter, group))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(might("price > 18"), [false, false, false, true]);
+        assert_eq!(might("at < 08:10:00"), [true, false, false, false]);
+        // Byte-array decimal statistics are not read as text: nothing is skipped.
+        assert_eq!(might("big < 0"), [true, true, true, true]);
+
+        let sorted = source
+            .read_sorted(
+                None,
+                &projection,
+                SortSpec::new(2, SortDirection::Descending, NullOrder::Last),
+                SortBudget::default(),
+                Some(3),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(
+            sorted.iter().flat_map(ids).collect::<Vec<_>>(),
+            [39, 38, 37]
+        );
+        let sorted = source
+            .read_sorted(
+                None,
+                &projection,
+                SortSpec::new(5, SortDirection::Ascending, NullOrder::Last),
+                SortBudget::default(),
+                Some(2),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(sorted.iter().flat_map(ids).collect::<Vec<_>>(), [0, 2]);
+
+        let aggregate = AggregateSpec::new(vec![
+            AggregateExpr::sum(2),
+            AggregateExpr::avg(2),
+            AggregateExpr::min(2),
+            AggregateExpr::max(4),
+            AggregateExpr::min(5),
+            AggregateExpr::sum(3),
+        ])
+        .unwrap();
+        source.validate_aggregate(&aggregate).unwrap();
+        let result = source
+            .read_aggregated(None, &aggregate, GroupBudget::default(), &|_| false)
+            .unwrap();
+        let text = |column: usize| crate::value::format_cell(result.column(column).as_ref(), 0);
+        // Sum of id - 19.75 over 0..40: 780 - 790 = -10.00.
+        assert_eq!(text(0), "-10.00");
+        assert_eq!(
+            result.schema().field(0).data_type(),
+            &DataType::Decimal128(38, 2)
+        );
+        assert_eq!(text(1), "-0.25");
+        assert_eq!(text(2), "-19.75");
+        assert_eq!(text(3), "08:39:00");
+        assert_eq!(text(4), "06:00:00");
+        assert_eq!(text(5), "400000000000000000000000007.80");
+        // Times can be compared but not summed.
+        assert!(
+            source
+                .validate_aggregate(&AggregateSpec::new(vec![AggregateExpr::sum(4)]).unwrap())
+                .is_err()
+        );
+
+        // GROUP BY a decimal keeps its type.
+        let grouped = source
+            .read_aggregated(
+                Some(&FilterExpr::parse("id < 2").unwrap()),
+                &AggregateSpec::grouped(2, vec![AggregateExpr::count_all()]).unwrap(),
+                GroupBudget::default(),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::value::format_cell(grouped.column(0).as_ref(), 1),
+            "-18.75"
+        );
+    }
+
+    #[test]
+    fn nested_files_keep_statistics_and_pruning_for_their_plain_columns() {
+        let (_directory, source) = typed_file();
+        let columns = source.metadata().columns();
+        let stats = |column: usize| columns[column].row_group_statistics.clone();
+        // The list column has none; the columns after it still have theirs.
+        assert!(stats(1).iter().all(Option::is_none));
+        let price = stats(2)[3].clone().unwrap();
+        assert_eq!(price.min.as_deref(), Some("10.25"));
+        assert_eq!(price.max.as_deref(), Some("19.25"));
+        let at = stats(4)[0].clone().unwrap();
+        assert_eq!(at.max.as_deref(), Some("08:09:00"));
+        assert_eq!(stats(0)[1].clone().unwrap().min.as_deref(), Some("10"));
+        assert_eq!(stats(5)[0].clone().unwrap().null_count, Some(5));
+
+        let groups = source.row_groups().to_vec();
+        let filter = FilterExpr::parse("id >= 35").unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| source.row_group_might_match(&filter, group))
+                .collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+        // A filter on the list column itself never rules a group out.
+        let filter = FilterExpr::parse("tags IS NULL").unwrap();
+        assert!(
+            groups
+                .iter()
+                .all(|group| source.row_group_might_match(&filter, group))
         );
     }
 

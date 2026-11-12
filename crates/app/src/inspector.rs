@@ -122,6 +122,8 @@ pub struct CellDetails {
     pub value: String,
     pub full_value: Option<String>,
     pub expanded_value: Option<String>,
+    /// A list, struct or map value opened up, for browsing.
+    pub tree: Option<parquet_reader::value::ValueNode>,
 }
 
 pub fn inspect_cell(
@@ -145,6 +147,8 @@ pub fn inspect_cell(
             .then(|| format_cell_with_limit(array.as_ref(), offset, PREVIEW_LIMIT)),
         expanded_value: (show_nested_value && !is_null && nested_data_type(array.data_type()))
             .then(|| format_cell_with_limit(array.as_ref(), offset, EXPANDED_NESTED_LIMIT)),
+        tree: (!is_null && parquet_reader::value::is_nested(array.data_type()))
+            .then(|| parquet_reader::value::value_tree(array.as_ref(), offset, name)),
     }
 }
 
@@ -186,6 +190,33 @@ mod tests {
     use parquet_reader::ColumnStatistics;
 
     use super::*;
+
+    #[test]
+    fn opens_nested_cells_as_a_tree() {
+        let list: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), Some(2)]),
+            None,
+        ]));
+        let detail = inspect_cell(0, 0, "items", &list, 0, false, false);
+        let tree = detail.tree.unwrap();
+        assert_eq!(
+            (tree.label.as_str(), tree.text.as_str()),
+            ("items", "2 items")
+        );
+        assert_eq!(tree.children[1].text, "2");
+        // Null and plain cells have no tree.
+        assert!(
+            inspect_cell(1, 0, "items", &list, 1, false, false)
+                .tree
+                .is_none()
+        );
+        let plain: ArrayRef = Arc::new(Int32Array::from(vec![5]));
+        assert!(
+            inspect_cell(0, 0, "n", &plain, 0, false, false)
+                .tree
+                .is_none()
+        );
+    }
 
     #[test]
     fn summarizes_available_and_missing_statistics_without_guessing_nulls() {

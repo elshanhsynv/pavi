@@ -8,12 +8,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use arrow_array::{
     Array, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray,
+    Int64Array, RecordBatch, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
     UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
-use parquet_reader::types::{is_comparable, is_string};
+use parquet_reader::types::{is_comparable, is_decimal, is_string};
 use parquet_reader::{ColumnInfo, ParquetSource};
 use pavi_query::{LogicalPlan, QueryEngine, QueryPoll};
 use pavi_runtime::{CancellationToken, GenerationId, RuntimeHandle};
@@ -405,6 +406,7 @@ fn numeric_type(data_type: &DataType) -> Option<()> {
             | DataType::Float64
     )
     .then_some(())
+    .or_else(|| is_decimal(data_type).then_some(()))
 }
 
 /// Profile text for one non-null value, from the shared scalar formatter.
@@ -416,7 +418,8 @@ fn scalar_text(array: &dyn Array, row: usize) -> Result<String> {
     parquet_reader::value::scalar_text(array, row)?.context("profile value is unexpectedly null")
 }
 
-/// The stored value of a date or timestamp, for ordering; `None` for other types.
+/// The stored value of a date, timestamp or time of day, for ordering; `None` for
+/// other types.
 fn temporal_key(array: &dyn Array, row: usize) -> Result<Option<i64>> {
     macro_rules! key {
         ($array:ty) => {
@@ -437,6 +440,10 @@ fn temporal_key(array: &dyn Array, row: usize) -> Result<Option<i64>> {
         DataType::Timestamp(TimeUnit::Millisecond, _) => key!(TimestampMillisecondArray),
         DataType::Timestamp(TimeUnit::Microsecond, _) => key!(TimestampMicrosecondArray),
         DataType::Timestamp(TimeUnit::Nanosecond, _) => key!(TimestampNanosecondArray),
+        DataType::Time32(TimeUnit::Second) => key!(Time32SecondArray),
+        DataType::Time32(TimeUnit::Millisecond) => key!(Time32MillisecondArray),
+        DataType::Time64(TimeUnit::Microsecond) => key!(Time64MicrosecondArray),
+        DataType::Time64(TimeUnit::Nanosecond) => key!(Time64NanosecondArray),
         _ => None,
     })
 }
@@ -465,6 +472,9 @@ fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {
         DataType::UInt64 => value!(UInt64Array),
         DataType::Float32 => value!(Float32Array),
         DataType::Float64 => value!(Float64Array),
+        data_type if is_decimal(data_type) => {
+            parquet_reader::value::decimal_f64(array, row).context("read decimal profile value")?
+        }
         data_type if is_comparable(data_type) => return Ok(None),
         data_type => bail!("profiling does not support {data_type:?}"),
     }))
@@ -622,6 +632,48 @@ mod tests {
             })
         );
         assert!(profile.distribution.is_none());
+    }
+
+    #[test]
+    fn profiles_decimals_as_numbers_and_times_in_time_order() {
+        use arrow_array::{Decimal128Array, Time32SecondArray};
+        let decimals = Decimal128Array::from(vec![Some(1_050), Some(-200), Some(950), None])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        let mut accumulator =
+            ProfileAccumulator::new(0, "price".to_string(), decimals.data_type().clone(), None)
+                .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            decimals.data_type().clone(),
+            true,
+        )]));
+        accumulator
+            .push_batch(&RecordBatch::try_new(schema, vec![Arc::new(decimals)]).unwrap())
+            .unwrap();
+        let profile = accumulator.finish();
+        // Ordered as numbers, not as text ("-2.00" < "10.50" < "9.50" by text).
+        assert_eq!(profile.min.as_deref(), Some("-2.00"));
+        assert_eq!(profile.max.as_deref(), Some("10.50"));
+        assert_eq!(profile.mean, Some(6.0));
+        assert!(profile.distribution.is_some());
+
+        // 10:00:00 sorts after 9:00:00 although "10" < "9" as text.
+        let times = Time32SecondArray::from(vec![36_000, 32_400]);
+        let mut accumulator =
+            ProfileAccumulator::new(0, "at".to_string(), times.data_type().clone(), None).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "at",
+            times.data_type().clone(),
+            false,
+        )]));
+        accumulator
+            .push_batch(&RecordBatch::try_new(schema, vec![Arc::new(times)]).unwrap())
+            .unwrap();
+        let profile = accumulator.finish();
+        assert_eq!(profile.min.as_deref(), Some("09:00:00"));
+        assert_eq!(profile.max.as_deref(), Some("10:00:00"));
+        assert!(profile.mean.is_none());
     }
 
     #[test]
