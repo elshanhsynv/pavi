@@ -28,6 +28,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Copying cells copies their full values instead of the first 256 characters, quotes values that contain a tab, line break or quote, and allows up to 16 MB instead of 64 KB.
 - In the filter box, quote a value that contains `AND`, `OR`, a comma or brackets, e.g. `title == "war and peace"`. Unquoted, `and` / `or` now join two tests.
 - Opening a file while another is shown opens it in a new tab instead of replacing it. Dropping several files opens each of them.
+- Filtering, sorting and aggregating are faster on files and folders with many small row groups: consecutive row groups of a file are read together instead of one at a time.
 
 ### Fixed
 - The window can be resized by dragging its edges and corners.
