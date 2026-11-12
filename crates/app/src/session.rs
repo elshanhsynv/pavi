@@ -342,10 +342,22 @@ impl SessionState {
 /// (by default `~/.local/state/pavi`) elsewhere. `None` when the variables it
 /// needs are missing or not absolute paths.
 pub fn session_dir(os: &str, env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    // Absolute as `os` spells it (`C:\…` or `\\server\…` on Windows, `/…`
+    // elsewhere), whatever this machine is, so every branch is testable here.
     let absolute = |name: &str| {
-        env(name)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute() || path.starts_with("/"))
+        env(name).map(PathBuf::from).filter(|path| {
+            let text = path.to_string_lossy();
+            if os == "windows" {
+                let bytes = text.as_bytes();
+                text.starts_with("\\\\")
+                    || (bytes.len() >= 3
+                        && bytes[0].is_ascii_alphabetic()
+                        && bytes[1] == b':'
+                        && (bytes[2] == b'\\' || bytes[2] == b'/'))
+            } else {
+                text.starts_with('/')
+            }
+        })
     };
     match os {
         "windows" => absolute("LOCALAPPDATA").map(|base| base.join("PAVI")),
@@ -556,6 +568,16 @@ mod tests {
         // Nothing to go on: the caller falls back to the temp folder.
         assert_eq!(session_dir("linux", &env(&[])), None);
         assert_eq!(session_dir("windows", &env(&[("HOME", "/home/a")])), None);
+        assert_eq!(
+            session_dir("windows", &env(&[("LOCALAPPDATA", "Local")])),
+            None
+        );
+        assert!(session_dir("windows", &env(&[("LOCALAPPDATA", "\\\\server\\a")])).is_some());
+        // A Windows path means nothing on Linux, and the other way round.
+        assert_eq!(
+            session_dir("linux", &env(&[("HOME", "C:\\Users\\a")])),
+            None
+        );
         assert!(SessionStore::default_path().ends_with("session-v1.json"));
     }
 
