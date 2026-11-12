@@ -12,19 +12,15 @@
 //! here only rejects claims that valid data can never make; anything it cannot decode is left to
 //! the `parquet` crate to report, so it never rejects a file the real parser would accept.
 
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-};
-
 use anyhow::{Result, bail};
+use parquet::file::reader::ChunkReader;
 
 /// Nesting deeper than this is left to the `parquet` crate, which has its own depth limit.
 const MAX_DEPTH: u32 = 64;
 
 /// Reads the footer of `file` and checks every collection's claimed size and every schema
 /// element's claimed number of children.
-pub(crate) fn check_footer(file: &File) -> Result<()> {
+pub(crate) fn check_footer(file: &impl ChunkReader) -> Result<()> {
     let Some(footer) = read_footer(file)? else {
         return Ok(());
     };
@@ -48,14 +44,12 @@ pub(crate) fn check_footer(file: &File) -> Result<()> {
 
 /// The plaintext footer bytes, or `None` when there is nothing this check can read
 /// (too short, not `PAR1`, encrypted footer, or a length that doesn't fit the file).
-fn read_footer(mut file: &File) -> Result<Option<Vec<u8>>> {
-    let len = file.metadata()?.len();
+fn read_footer(file: &impl ChunkReader) -> Result<Option<Vec<u8>>> {
+    let len = file.len();
     if len < 12 {
         return Ok(None);
     }
-    let mut tail = [0_u8; 8];
-    file.seek(SeekFrom::Start(len - 8))?;
-    file.read_exact(&mut tail)?;
+    let tail = file.get_bytes(len - 8, 8)?;
     if &tail[4..] != b"PAR1" {
         return Ok(None);
     }
@@ -63,10 +57,10 @@ fn read_footer(mut file: &File) -> Result<Option<Vec<u8>>> {
     if footer_len + 8 > len {
         return Ok(None);
     }
-    let mut footer = vec![0_u8; usize::try_from(footer_len)?];
-    file.seek(SeekFrom::Start(len - 8 - footer_len))?;
-    file.read_exact(&mut footer)?;
-    Ok(Some(footer))
+    Ok(Some(
+        file.get_bytes(len - 8 - footer_len, usize::try_from(footer_len)?)?
+            .to_vec(),
+    ))
 }
 
 /// The fields of a page header that size allocations.

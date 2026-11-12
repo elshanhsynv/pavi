@@ -65,7 +65,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                 let message = if status.status.starts_with("Ready:") {
                     status.path.map_or_else(
                         || status.status.to_string(),
-                        |path| format!("Loaded {}", path.display()),
+                        |path| format!("Loaded {}", parquet_reader::display_path(path).display()),
                     )
                 } else {
                     status.status.to_string()

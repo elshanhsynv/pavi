@@ -18,6 +18,7 @@ PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), eac
 | Clipboard | egui's `ctx.copy_text` (no extra crate) | `app.rs:1745`, `ui/inspector.rs:66,127` |
 | Parquet/Arrow | `parquet 60` (feature `arrow`), `arrow-array/-schema/-select/-ord 60`, `arrow-cast 60` (value display rules), `arrow-csv`/`arrow-json`/`arrow-ipc 60` (opening CSV, JSON and Arrow files, Arrow export; ADR 0007), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
 | SQL | `sqlparser 0.62` (GenericDialect) used only for parsing; execution is custom | `crates/query/src/sql.rs` |
+| Network | `ureq 3` (blocking HTTP), `rustls` with `ring` and `rustls-native-certs` (system root certificates); `ring` also signs S3 requests (SigV4). ADR 0008 | `crates/parquet/src/remote.rs` |
 | Threading | `std::thread` + `std::sync::mpsc::sync_channel` + `Arc<AtomicBool>` cancellation. No tokio, no rayon. | `crates/runtime/` |
 | CLI | `clap 4` derive | `crates/cli/src/args.rs` |
 | Errors | `anyhow` everywhere; small hand-written error enums in the runtime (`RuntimeConfigError`, `SubmitError`). No `thiserror`. | |
@@ -51,6 +52,7 @@ crates/parquet/src/            (parquet_reader)
 │                   GroupCollector/Accumulator/Scalar (aggregation)
 ├── dataset.rs      folder datasets (ADR 0006): find the files, `key=value` partition columns, their values and statistics
 ├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007)
+├── remote.rs       URLs (ADR 0008): resolving s3/gs/az URLs, SigV4, RemoteObject (range requests, range cache, download), RemoteReader (ChunkReader)
 ├── statistics.rs   row-group statistics → display text, typed by the column's Arrow type
 ├── metadata.rs     DatasetMetadata, RowGroupInfo, ColumnInfo, ColumnStatistics; row→row-group math
 ├── page.rs         PAGE_ROWS = 4096, PageKey, RowWindow, DataPage
@@ -80,7 +82,7 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    55 tests driving PaviApp without a window
+├── app_tests.rs    56 tests driving PaviApp without a window
 ├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), CSV and JSON Lines writers, Parquet ArrowWriter, Arrow IPC FileWriter, temp-file + rename
@@ -170,7 +172,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 
 | Function | What it reads | Ref |
 |---|---|---|
-| `ParquetSource::open` | A file, or every `.parquet` file in a folder (`open_cancellable` stops between files). Footers only (`ArrowReaderMetadata::load`, default options → **no page index**); builds row-group index + statistics strings | `source.rs:125-159` |
+| `ParquetSource::open` | A file, a URL (read with range requests or downloaded, ADR 0008), or every `.parquet` file in a folder (`open_cancellable` stops between files). Bytes are read through `Handle` (a local `File` or a `RemoteReader`), the `ChunkReader` every read path uses. Footers only (`ArrowReaderMetadata::load`, default options → **no page index**); builds row-group index + statistics strings | `source.rs:125-159` |
 | `reader_for` | **Re-opens the row group's file** for every read (a window that crosses files uses one reader per file; partition columns are added by `reorder_batch`), builds a `ParquetRecordBatchReader` with `ProjectionMask::roots`, row groups, optional `RowSelection`, batch size 4096 | `source.rs:664-686` |
 | `read_window_batches` / `read_window` | Rows `[first, first+n)` → overlapping row groups + skip/select `RowSelection` | `source.rs:613-662` |
 | `read_page` | `read_window` for page `i` through the `Mutex<PageCache>` | `source.rs:223-242` |

@@ -113,6 +113,9 @@ impl SessionState {
     }
 
     pub fn record_recent_file(&mut self, path: PathBuf) {
+        if is_secret_url(&path) {
+            return;
+        }
         self.recent_files.retain(|existing| existing != &path);
         self.recent_files.insert(0, path.clone());
         self.recent_files.truncate(MAX_RECENT_FILES);
@@ -205,6 +208,19 @@ impl SessionState {
         }
     }
 
+    /// Keeps only paths that may be saved: a URL with a query string may carry
+    /// a signature or token, so it is never written to the session file.
+    pub fn set_open_files(&mut self, files: Vec<PathBuf>, active: usize) {
+        let active_path = files.get(active).cloned();
+        self.open_files = files
+            .into_iter()
+            .filter(|path| !is_secret_url(path))
+            .collect();
+        self.active_file = active_path
+            .and_then(|active| self.open_files.iter().position(|path| *path == active))
+            .unwrap_or(0);
+    }
+
     pub fn remove_recent_file(&mut self, path: &Path) {
         self.recent_files.retain(|existing| existing != path);
         if self.last_opened_file.as_deref() == Some(path) {
@@ -217,10 +233,11 @@ impl SessionState {
             *self = Self::default();
             return;
         }
-        // Files and folders (a folder opens as one dataset) that still exist.
+        // Files and folders (a folder opens as one dataset) that still exist,
+        // and URLs (ADR 0008).
         let mut seen = Vec::new();
         self.recent_files.retain(|path| {
-            path.exists() && !seen.iter().any(|existing| existing == path) && {
+            still_there(path) && !seen.iter().any(|existing| existing == path) && {
                 seen.push(path.clone());
                 true
             }
@@ -229,14 +246,14 @@ impl SessionState {
         if self
             .last_opened_file
             .as_ref()
-            .is_some_and(|path| !path.exists())
+            .is_some_and(|path| !still_there(path))
         {
             self.last_opened_file = None;
         }
         let active = self.open_files.get(self.active_file).cloned();
         let mut seen = Vec::new();
         self.open_files.retain(|path| {
-            path.exists() && !seen.iter().any(|existing| existing == path) && {
+            still_there(path) && !seen.iter().any(|existing| existing == path) && {
                 seen.push(path.clone());
                 true
             }
@@ -353,6 +370,22 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
+/// A URL with a query string, which may carry a signature or token
+/// (pre-signed S3 URLs, Azure SAS URLs). Never saved in the session.
+pub fn is_secret_url(path: &Path) -> bool {
+    parquet_reader::is_remote(path) && path.to_string_lossy().contains('?')
+}
+
+/// A local path that still exists, or a URL that may be saved (whether it is
+/// still there is only known by opening it).
+fn still_there(path: &Path) -> bool {
+    if parquet_reader::is_remote(path) {
+        !is_secret_url(path)
+    } else {
+        path.exists()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -450,6 +483,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(store.load(), state);
+    }
+
+    #[test]
+    fn keeps_urls_but_never_saves_ones_with_a_query_string() {
+        let plain = PathBuf::from("s3://bucket/data.parquet");
+        let signed = PathBuf::from("https://bucket.s3.amazonaws.com/d.parquet?X-Amz-Signature=abc");
+        let mut state = SessionState::default();
+        state.record_recent_file(plain.clone());
+        state.record_recent_file(signed.clone());
+        assert_eq!(state.recent_files, std::slice::from_ref(&plain));
+
+        state.set_open_files(vec![signed.clone(), plain.clone()], 1);
+        assert_eq!(state.open_files, std::slice::from_ref(&plain));
+        assert_eq!(state.active_file, 0);
+
+        // A URL can't be checked for existence, so loading keeps it; a signed
+        // one that got into the file anyway is dropped.
+        state.recent_files.push(signed);
+        state.normalize();
+        assert_eq!(state.recent_files, std::slice::from_ref(&plain));
+        assert_eq!(state.open_files, [plain]);
     }
 
     #[test]

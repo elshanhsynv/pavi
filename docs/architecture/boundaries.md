@@ -7,6 +7,13 @@
 - Each file is **re-opened by path for every read** (a read that crosses files opens each) (`source.rs:670-671`); metadata is cached from open time. If the file changes on disk, reads use stale metadata against new bytes.
 - Writes: export target (+ temp file next to it) and the session JSON.
 
+## Network (ADR 0008)
+- `https://`, `http://`, `s3://bucket/key`, `gs://bucket/key` and `az://account/container/blob` URLs, one object each (no prefix listing). Requests are blocking `ureq` GETs on the worker threads; TLS uses `rustls` with the operating system's root certificates.
+- A Parquet object on a server that answers `Range` requests is read in place: the footer at open, then the column chunks each read needs, through `remote::RemoteReader` (a `ChunkReader`). Ranges up to 128 MB are cached per object, 256 MB together (`REMOTE_CACHE_BYTES`). Otherwise, and for CSV, JSON and Arrow objects, the object is downloaded to `<temp>/pavi-download-<pid>-<n>/` (≤ 32 GiB, `MAX_DOWNLOAD_BYTES`) and opened as a local file.
+- Credentials only from the environment: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` or `~/.aws/credentials` (`AWS_PROFILE`), signed with SigV4; `AWS_REGION`, `AWS_ENDPOINT_URL` for S3-compatible stores; `GOOGLE_OAUTH_ACCESS_TOKEN`; `AZURE_STORAGE_SAS_TOKEN`. Pre-signed URLs work as they are. Without credentials requests are anonymous.
+- Timeouts: 15 s to connect, 30 s for the response headers, 300 s for a body; 3 attempts on connection errors and 5xx answers. A request in flight can't be interrupted.
+- A URL is shown without its query string, and a URL with a query string is never saved in the session.
+
 ## Other file formats (ADR 0007)
 
 | Format | Extensions | Read as | Limits |

@@ -229,9 +229,9 @@ impl PaviApp {
             jump_row_input: String::new(),
             jump_target: None,
             export: ExportState::default(),
-            path_input: reopened_path
-                .as_ref()
-                .map_or_else(String::new, |path| path.display().to_string()),
+            path_input: reopened_path.as_ref().map_or_else(String::new, |path| {
+                parquet_reader::display_path(path).display().to_string()
+            }),
             filter_input: String::new(),
             filter_error: None,
             sql_input: session.sql_input.clone(),
@@ -276,8 +276,7 @@ impl PaviApp {
 
     fn persist_session(&mut self) {
         let (open_files, active_file) = self.open_tab_paths();
-        self.session.open_files = open_files;
-        self.session.active_file = active_file;
+        self.session.set_open_files(open_files, active_file);
         self.session.sql_input = self.sql_input.clone();
         self.session.preferences.inspector_visible = self.show_inspector;
         self.session.preferences.chart_visible = self.chart.visible;
@@ -608,7 +607,12 @@ impl PaviApp {
     fn begin_open(&mut self, path: PathBuf) {
         // One spelling per file, so a relative and an absolute path to the same
         // file do not become two recent entries. This does not touch the disk.
-        let path = std::path::absolute(&path).unwrap_or(path);
+        // A URL is kept as typed; a local path gets one spelling.
+        let path = if parquet_reader::is_remote(&path) {
+            path
+        } else {
+            std::path::absolute(&path).unwrap_or(path)
+        };
         self.cancel_tab_work();
         self.show_safe_full_selection = false;
         self.show_nested_selection = false;
@@ -617,8 +621,9 @@ impl PaviApp {
         self.filter_error = None;
         self.sql_error = None;
         let generation = self.grid.reset();
-        self.path_input = path.display().to_string();
-        self.status = format!("Opening {}…", path.display());
+        let shown = parquet_reader::display_path(&path);
+        self.path_input = shown.display().to_string();
+        self.status = format!("Opening {}…", shown.display());
 
         let Some(runtime) = self.runtime.as_ref().map(Runtime::handle) else {
             self.open_error("background runtime is unavailable".to_string());
@@ -822,8 +827,7 @@ impl PaviApp {
             self.status = "Open a dataset before exporting".to_string();
             return;
         };
-        let suggested = dataset
-            .path
+        let suggested = parquet_reader::display_path(&dataset.path)
             .file_stem()
             .and_then(|name| name.to_str())
             .map_or_else(

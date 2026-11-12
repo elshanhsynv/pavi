@@ -43,9 +43,8 @@ fn main() -> Result<()> {
     let columns = source.column_count();
     let all = Projection::all(columns);
     let first_column = Projection::columns(vec![0], columns)?;
-    let file_bytes = std::fs::metadata(path)
-        .with_context(|| format!("read metadata for {}", path.display()))?
-        .len();
+    // Also works for a remote file (ADR 0008) or a folder.
+    let file_bytes = source.total_bytes();
 
     println!("file_bytes,{file_bytes}");
     println!("rows,{}", source.row_count());

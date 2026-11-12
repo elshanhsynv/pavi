@@ -121,8 +121,7 @@ impl PaviApp {
 
     fn file_menu(&mut self, ui: &mut egui::Ui) {
         let name = self.dataset.as_ref().map(|dataset| {
-            dataset
-                .path
+            parquet_reader::display_path(&dataset.path)
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
@@ -148,7 +147,7 @@ impl PaviApp {
             let path_box = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Paste a file or folder path and press Enter"),
+                    .hint_text("A path, or an https, s3, gs or az URL, then Enter"),
             );
             if path_box.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 let path = self.path_input.trim();
@@ -191,7 +190,11 @@ impl PaviApp {
             }
         });
         if let Some(dataset) = &self.dataset {
-            response.on_hover_text(dataset.path.display().to_string());
+            response.on_hover_text(
+                parquet_reader::display_path(&dataset.path)
+                    .display()
+                    .to_string(),
+            );
         }
         if browse {
             self.pick_file();
