@@ -5,7 +5,7 @@ Read this first; open a deep-dive below only when your task touches that area.
 
 ## TL;DR
 
-- **What it is.** PAVI is a native Parquet explorer. The desktop app (`pavi`, egui/eframe) opens Parquet files, or a folder of them (with `key=value` partitions) as one table, each in its own tab, shows each in a virtualized grid that loads 4,096-row pages on demand, and offers a filter of tests joined by `AND`/`OR`, a small SQL subset (`SELECT … FROM dataset [WHERE …] [ORDER BY up to 8 columns] [LIMIT n]`, plus `COUNT/SUM/AVG/MIN/MAX` with up to 8 `GROUP BY` columns), sorting by several columns on files of any size (spilling to temporary files past the memory budget), find in loaded rows, charts, single-column profiling, an Inspector (schema, row-group statistics, file info), clipboard copy, and CSV/Parquet export. A separate `cli` binary prints metadata, schema and the first ≤1,000 rows (optionally filtered) as a box-drawn table.
+- **What it is.** PAVI is a native Parquet explorer. The desktop app (`pavi`, egui/eframe) opens Parquet files, CSV, JSON and Arrow/Feather files (read into a temporary Parquet file, ADR 0007), or a folder of Parquet files (with `key=value` partitions) as one table, each in its own tab, shows each in a virtualized grid that loads 4,096-row pages on demand, and offers a filter of tests joined by `AND`/`OR`, a small SQL subset (`SELECT … FROM dataset [WHERE …] [ORDER BY up to 8 columns] [LIMIT n]`, plus `COUNT/SUM/AVG/MIN/MAX` with up to 8 `GROUP BY` columns), sorting by several columns on files of any size (spilling to temporary files past the memory budget), find in loaded rows, charts, single-column profiling, an Inspector (schema, row-group statistics, file info), clipboard copy, and CSV, Parquet, JSON Lines and Arrow export. A separate `cli` binary prints metadata, schema and the first ≤1,000 rows (optionally filtered) as a box-drawn table.
 - **Shape.** A layered Cargo workspace: `parquet_reader` (all Arrow/Parquet I/O, filter, sort, aggregate, cell formatting) → `pavi_runtime` (fixed std-thread worker pool with bounded channels) → `pavi_query` (SQL parser → logical plan → flattened physical plan → incremental execution) → `pavi` (GUI). The CLI uses **only** `parquet_reader`, synchronously.
 - **Concurrency.** No async runtime. All file I/O runs on `pavi-page-N` worker threads (one per CPU). The UI thread submits tasks and **polls** `mpsc` receivers with `try_recv()` every frame, requesting a repaint every 16 ms while anything is pending. Stale results are discarded with a `GenerationId`. Export and profiling each get one extra short-lived thread that drives a query through the same pool.
 - **Memory model.** Everything is "bounded": ≤8 UI pages + ≤8 cached source pages (128 MB), ≤8 result batches for filter/SQL/sort windows, sort ≤100,000 rows / 128 MB in memory (larger sorts spill to ≤32 GiB of temporary files, ADR 0005), group-by ≤10,000 groups / 8 MB, profile ≤4,096 distinct values, charts ≤16,384 input rows, clipboard ≤16 MB.
@@ -25,7 +25,7 @@ flowchart TB
         PQ["parquet_reader<br/>ParquetSource, PageCache, filter/sort/aggregate, value formatting"]
     end
     ARROW["arrow-rs 60 / parquet 60"]
-    FS[("Local .parquet files and folders")]
+    FS[("Local Parquet, CSV, JSON, Arrow files and folders")]
 
     GUI --> QUERY
     GUI --> RUNTIME

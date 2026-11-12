@@ -296,6 +296,11 @@ impl PaviApp {
     /// How much of the file the running filter, sort or SQL scan has passed, from
     /// 0 to 1. `None` when no scan is running.
     fn scan_fraction(&self) -> Option<f32> {
+        // Reading a CSV, JSON or Arrow file, or the files of a folder.
+        if let Some(task) = &self.opening {
+            let done = task.progress();
+            return (done > 0.0).then_some(done);
+        }
         let scanned = self.filtered.as_ref()?.execution.as_ref()?.scanned_rows()?;
         let total = self.dataset.as_ref()?.source.row_count();
         (total > 0).then(|| (scanned as f64 / total as f64).min(1.0) as f32)

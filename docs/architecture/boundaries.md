@@ -7,6 +7,18 @@
 - Each file is **re-opened by path for every read** (a read that crosses files opens each) (`source.rs:670-671`); metadata is cached from open time. If the file changes on disk, reads use stale metadata against new bytes.
 - Writes: export target (+ temp file next to it) and the session JSON.
 
+## Other file formats (ADR 0007)
+
+| Format | Extensions | Read as | Limits |
+|---|---|---|---|
+| CSV | `.csv`, `.tsv` | Header row required. Delimiter: tab for `.tsv`, else the most frequent of `,` `;` tab `|` in the first line. Types inferred from the first 10,000 records (`MAX_INFER_ROWS`): integers, floats, booleans, dates, timestamps, else text; empty fields are null | A later value that does not fit its column's type stops the open with an error. UTF-8 only |
+| JSON | `.json`, `.jsonl`, `.ndjson` | One object per line, or one array of objects. Types inferred like CSV; nested objects become structs, arrays become lists | Same as CSV |
+| Arrow IPC | `.arrow`, `.feather`, `.ipc`, `.arrows` | File format (Feather v2, `ARROW1` magic) or stream format; LZ4 and Zstd buffers | Feather v1 is refused. Each record batch is read whole. Before reading, every block and message must lie inside the file; metadata messages are capped at 64 MB and a compressed buffer at 1 GB uncompressed |
+
+All are read into a temporary Parquet file of at most 32 GiB (`MAX_CONVERTED_BYTES`) before the first row shows. Other extensions are opened as Parquet. ORC is not supported (see the ADR).
+
+Export writes CSV, Parquet, JSON Lines (`.jsonl`) and Arrow IPC file format (`.arrow`).
+
 ## Parquet/Arrow features
 | Feature | Status |
 |---|---|

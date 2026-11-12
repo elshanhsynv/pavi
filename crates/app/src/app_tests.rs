@@ -1959,3 +1959,27 @@ fn opens_a_partitioned_folder_as_one_table() {
     poll_until_idle(&mut app);
     assert_eq!(filtered_ids(&app), vec!["3", "4"]);
 }
+
+#[test]
+fn opens_a_csv_file_and_filters_it() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("people.csv");
+    std::fs::write(&path, "id,name\n1,Ann\n2,Bo\n3,Cy\n").unwrap();
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.open_path(path.clone());
+    poll_until_opened(&mut app);
+
+    assert_eq!(app.grid.rows, 3);
+    let dataset = app.dataset.as_ref().unwrap();
+    assert_eq!(dataset.source.format(), parquet_reader::FileFormat::Csv);
+    assert_eq!(dataset.column_names, ["id".to_string(), "name".to_string()]);
+    assert_eq!(app.session.recent_files, [path]);
+
+    app.filter_input = "id >= 2".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    assert_eq!(filtered_ids(&app), vec!["2", "3"]);
+}

@@ -19,6 +19,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 arrow-array = { version = "60", features = ["chrono-tz"] }
 arrow-cast = "60"
+# Opening CSV, JSON and Arrow IPC files (ADR 0007).
+arrow-csv = "60"
+arrow-json = "60"
+arrow-ipc = { version = "60", features = ["lz4", "zstd"] }
 arrow-schema = "60"
 arrow-select = "60"
 arrow-ord = "60"

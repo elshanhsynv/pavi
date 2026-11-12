@@ -497,19 +497,24 @@ impl PaviApp {
 
     fn export_menu(&mut self, ui: &mut egui::Ui) {
         let has_row = self.selected_batch_row().is_some();
-        for (format, label, selected) in [
-            (ExportFormat::Csv, "Result as CSV…", false),
-            (ExportFormat::Parquet, "Result as Parquet…", false),
-            (ExportFormat::Csv, "Selected row as CSV…", true),
-            (ExportFormat::Parquet, "Selected row as Parquet…", true),
-        ] {
-            if ui
-                .add_enabled_ui(!selected || has_row, |ui| widgets::menu_item(ui, label, ""))
-                .inner
-                .clicked()
-            {
-                self.start_export(format, selected);
-                widgets::close_menu(ui);
+        for (caption, selected) in [("Result", false), ("Selected row", true)] {
+            if selected {
+                ui.separator();
+            }
+            widgets::menu_caption(ui, caption);
+            for format in ExportFormat::ALL {
+                let label = format!("{}…", format.label());
+                let hint = format!(".{}", format.extension());
+                if ui
+                    .add_enabled_ui(!selected || has_row, |ui| {
+                        widgets::menu_item(ui, &label, &hint)
+                    })
+                    .inner
+                    .clicked()
+                {
+                    self.start_export(format, selected);
+                    widgets::close_menu(ui);
+                }
             }
         }
         ui.separator();
@@ -586,7 +591,11 @@ impl PaviApp {
 
     pub(in crate::app) fn pick_file(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Data files", parquet_reader::FileFormat::EXTENSIONS)
             .add_filter("Parquet", &["parquet"])
+            .add_filter("CSV", &["csv", "tsv"])
+            .add_filter("JSON", &["json", "jsonl", "ndjson"])
+            .add_filter("Arrow / Feather", &["arrow", "feather", "ipc", "arrows"])
             .pick_file()
         {
             self.open_path(path);

@@ -13,6 +13,9 @@ fn main() {
     for (name, bytes) in pavi_fuzz::parquet_seeds() {
         write(&corpus.join("parquet_file"), &name, &bytes);
     }
+    for (name, bytes) in pavi_fuzz::other_format_seeds() {
+        write(&corpus.join("other_formats"), &name, &bytes);
+    }
     for (index, text) in pavi_fuzz::FILTER_SEEDS.iter().enumerate() {
         write(
             &corpus.join("filter_expr"),

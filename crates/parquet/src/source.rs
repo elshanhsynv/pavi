@@ -31,6 +31,7 @@ use crate::{
     AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
     PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo, RowWindow,
     SortBudget, SortSpec,
+    convert::{self, ConvertedFile, FileFormat},
     dataset::{
         self, MAX_DATASET_METADATA_BYTES, PartitionColumn, constant_array, partition_statistics,
     },
@@ -76,12 +77,12 @@ fn load_arrow_metadata(file: &File) -> Result<ArrowReaderMetadata> {
 /// docs/FUZZING.md). Guarding here protects every caller, including the CLI and bench, which do
 /// not run inside the runtime's worker guard. After a panic the decoder's state is unknown,
 /// so the reader stops.
-struct GuardedReader<R> {
+pub(crate) struct GuardedReader<R> {
     inner: Option<R>,
 }
 
 impl<R> GuardedReader<R> {
-    fn new(inner: R) -> Self {
+    pub(crate) fn new(inner: R) -> Self {
         Self { inner: Some(inner) }
     }
 }
@@ -176,7 +177,7 @@ fn check_dictionary_page(
     Ok(())
 }
 
-fn panic_message(payload: &(dyn Any + Send)) -> &str {
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
         .copied()
@@ -219,6 +220,11 @@ pub struct ParquetSource {
     /// `(row group, leaf column)` chunks whose dictionary page header passed
     /// [`ParquetSource::check_dictionary_pages`].
     checked_dictionaries: Mutex<HashSet<(usize, usize)>>,
+    /// The format of the file opened; not Parquet when it was converted.
+    format: FileFormat,
+    /// The temporary Parquet copy of a CSV, JSON or Arrow file (ADR 0007),
+    /// deleted with the source.
+    converted: Option<ConvertedFile>,
 }
 
 /// Reads one file's footer.
@@ -233,17 +239,38 @@ fn open_file(path: &Path) -> Result<(u64, ArrowReaderMetadata)> {
 }
 
 impl ParquetSource {
-    /// Opens a Parquet file, or every Parquet file in a folder as one table.
+    /// Opens a Parquet file, a CSV, JSON or Arrow file (read into a temporary
+    /// Parquet file, ADR 0007), or every Parquet file in a folder as one table.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_cancellable(path, &|| false)
+        Self::open_cancellable(path, &|_| false)
     }
 
-    /// Like [`Self::open`]; a folder is opened file by file, and when `cancelled`
-    /// returns `true` between files the open ends with a [`Cancelled`] error.
-    pub fn open_cancellable(path: impl AsRef<Path>, cancelled: &dyn Fn() -> bool) -> Result<Self> {
+    /// Like [`Self::open`]. `checkpoint` is called with the share of the work done
+    /// (0 to 1) between the files of a folder and between the batches of a
+    /// conversion; when it returns `true` the open ends with a [`Cancelled`] error.
+    pub fn open_cancellable(
+        path: impl AsRef<Path>,
+        checkpoint: &dyn Fn(f64) -> bool,
+    ) -> Result<Self> {
         let path = path.as_ref().to_owned();
         let file_info =
             std::fs::metadata(&path).with_context(|| format!("open {}", path.display()))?;
+        let format = FileFormat::from_path(&path);
+        if !file_info.is_dir() && format != FileFormat::Parquet {
+            let converted = convert::convert(&path, format, checkpoint)
+                .with_context(|| format!("open {} as {}", path.display(), format.name()))?;
+            let (bytes, arrow_metadata) = open_file(&converted.path)?;
+            let mut source = Self::from_files(
+                path,
+                file_info,
+                vec![(converted.path.clone(), bytes, arrow_metadata, Vec::new())],
+                Vec::new(),
+            )?;
+            source.compression = format.name().to_string();
+            source.format = format;
+            source.converted = Some(converted);
+            return Ok(source);
+        }
         if !file_info.is_dir() {
             let (bytes, arrow_metadata) = open_file(&path)?;
             return Self::from_files(
@@ -253,12 +280,13 @@ impl ParquetSource {
                 Vec::new(),
             );
         }
-        let found = dataset::find_files(&path, cancelled)?;
+        let found = dataset::find_files(&path, &|| checkpoint(0.0))?;
+        let file_count = found.len().max(1);
         let partition_columns = dataset::partition_columns(&found);
         let mut files = Vec::with_capacity(found.len());
         let mut metadata_bytes = 0_usize;
-        for file in found {
-            if cancelled() {
+        for (index, file) in found.into_iter().enumerate() {
+            if checkpoint(index as f64 / file_count as f64) {
                 return Err(Cancelled.into());
             }
             let (bytes, arrow_metadata) = open_file(&file.path)?;
@@ -448,6 +476,8 @@ impl ParquetSource {
             partition_columns,
             cache: Mutex::new(PageCache::default()),
             checked_dictionaries: Mutex::new(HashSet::new()),
+            format: FileFormat::Parquet,
+            converted: None,
         })
     }
 
@@ -466,9 +496,26 @@ impl ParquetSource {
         self.files.len()
     }
 
-    /// Size of all its Parquet files together.
+    /// Size of the file opened, or of all the Parquet files of a folder together.
     pub fn total_bytes(&self) -> u64 {
+        if self.converted.is_some() {
+            return self.file_info.len();
+        }
         self.files.iter().map(|file| file.bytes).sum()
+    }
+
+    /// The format of the file opened. Not Parquet means it was read into a
+    /// temporary Parquet file.
+    pub fn format(&self) -> FileFormat {
+        self.format
+    }
+
+    /// Where the temporary Parquet copy of a converted file is.
+    #[cfg(test)]
+    pub(crate) fn converted_path(&self) -> Option<&Path> {
+        self.converted
+            .as_ref()
+            .map(|converted| converted.path.as_path())
     }
 
     /// Names of the columns made from `key=value` folders, in column order.
@@ -3088,7 +3135,7 @@ mod tests {
 
         // Cancelled between files.
         assert!(
-            ParquetSource::open_cancellable(root, &|| true)
+            ParquetSource::open_cancellable(root, &|_| true)
                 .err()
                 .unwrap()
                 .downcast_ref::<Cancelled>()

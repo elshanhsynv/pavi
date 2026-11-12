@@ -95,45 +95,45 @@ fn concat(batches: &[RecordBatch]) -> Result<RecordBatch> {
     }
 }
 
-/// A per-sort folder in the temp directory, removed when dropped.
+/// A folder in the temp directory for one sort's runs or one converted file,
+/// removed when dropped.
 #[derive(Debug)]
-struct SpillDir {
-    path: PathBuf,
+pub(crate) struct TempFolder {
+    pub(crate) path: PathBuf,
 }
 
-impl SpillDir {
-    fn create() -> Result<Self> {
+impl TempFolder {
+    /// Creates `<temp>/<prefix><pid>-<n>/`, first removing folders with the same
+    /// prefix that a crashed PAVI left behind.
+    pub(crate) fn create(prefix: &str) -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir();
-        remove_stale_spill_dirs(&temp);
+        remove_stale_dirs(&temp, prefix);
         let path = temp.join(format!(
-            "{SPILL_PREFIX}{}-{}",
+            "{prefix}{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&path)
-            .with_context(|| format!("create sort spill folder {}", path.display()))?;
+            .with_context(|| format!("create temporary folder {}", path.display()))?;
         Ok(Self { path })
     }
 }
 
-impl Drop for SpillDir {
+impl Drop for TempFolder {
     fn drop(&mut self) {
-        // Best effort: a file still open elsewhere is cleaned up by a later sort.
+        // Best effort: a file still open elsewhere is cleaned up by a later run.
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-/// Removes spill folders a crashed PAVI left behind (older than a day).
-fn remove_stale_spill_dirs(temp: &Path) {
+/// Removes `prefix` folders a crashed PAVI left behind (older than a day).
+fn remove_stale_dirs(temp: &Path, prefix: &str) {
     let Ok(entries) = std::fs::read_dir(temp) else {
         return;
     };
     for entry in entries.flatten() {
-        let stale = entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(SPILL_PREFIX)
+        let stale = entry.file_name().to_string_lossy().starts_with(prefix)
             && entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
@@ -154,7 +154,7 @@ struct Run {
 
 /// Writes sorted runs and keeps count of the disk space they take.
 pub(crate) struct RunWriter {
-    dir: Arc<SpillDir>,
+    dir: Arc<TempFolder>,
     runs: Vec<Run>,
     bytes: u64,
     next: usize,
@@ -163,7 +163,7 @@ pub(crate) struct RunWriter {
 impl RunWriter {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            dir: Arc::new(SpillDir::create()?),
+            dir: Arc::new(TempFolder::create(SPILL_PREFIX)?),
             runs: Vec::new(),
             bytes: 0,
             next: 0,
@@ -383,7 +383,7 @@ impl Merger {
 /// The final merge of a spilled sort, handing out rows as they are asked for.
 /// Dropping it deletes the spill files.
 pub struct SortMerge {
-    _dir: Arc<SpillDir>,
+    _dir: Arc<TempFolder>,
     merger: Merger,
     /// Batch columns that make up the output, in output order.
     output_positions: Vec<usize>,
@@ -605,7 +605,7 @@ mod tests {
         let other = temp.path().join("not-pavi");
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        remove_stale_spill_dirs(temp.path());
+        remove_stale_dirs(temp.path(), SPILL_PREFIX);
         assert!(
             fresh.exists() && other.exists(),
             "a fresh folder may belong to a running sort"

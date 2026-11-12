@@ -539,7 +539,23 @@ impl PaviApp {
             LoadState::Opening => {
                 ui.add(egui::Spinner::new().color(theme::ACCENT));
                 ui.heading("Opening…");
-                ui.label(RichText::new("Reading the Parquet footers.").color(theme::MUTED));
+                let format = self
+                    .opening_path
+                    .as_deref()
+                    .map_or(parquet_reader::FileFormat::Parquet, |path| {
+                        parquet_reader::FileFormat::from_path(path)
+                    });
+                let detail = match format {
+                    parquet_reader::FileFormat::Parquet => {
+                        "Reading the Parquet footers.".to_string()
+                    }
+                    format => format!(
+                        "Reading the {} file into a temporary Parquet file, so it can be \
+                         filtered and sorted. The status bar shows how far it has got.",
+                        format.name()
+                    ),
+                };
+                ui.label(RichText::new(detail).color(theme::MUTED));
             }
             LoadState::Error(error) => {
                 ui.heading("This could not be opened");
@@ -551,10 +567,11 @@ impl PaviApp {
                 let (mark, _) =
                     ui.allocate_exact_size(egui::vec2(40.0, 36.0), egui::Sense::hover());
                 widgets::logo(ui, mark.center(), 2.2);
-                ui.heading("Open a Parquet file or folder");
+                ui.heading("Open a data file or folder");
                 ui.label(
                     RichText::new(
-                        "Drop files or folders on this window. A folder opens as one table.",
+                        "Parquet, CSV, JSON or Arrow/Feather. Drop files or folders on this \
+                         window; a folder of Parquet files opens as one table.",
                     )
                     .color(theme::MUTED),
                 );

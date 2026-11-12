@@ -34,6 +34,10 @@ Each budget is a named constant. Change it in one place and update this table.
 | Open tabs | 16; each parked tab keeps its own bounded pages, result window and footer metadata, so the per-dataset budgets above apply per tab | `tabs::MAX_TABS` (= `session::MAX_OPEN_FILES`) |
 | Folder dataset search (ADR 0006) | 4,096 files, 16 folder levels, 100,000 directory entries looked at | `dataset::MAX_DATASET_FILES`, `MAX_FOLDER_DEPTH`, `MAX_FOLDER_ENTRIES` |
 | Folder dataset footers in memory | 256 MB for all files together | `dataset::MAX_DATASET_METADATA_BYTES` |
+| CSV / JSON type inference (ADR 0007) | first 10,000 records | `convert::MAX_INFER_ROWS` |
+| Reading CSV, JSON, Arrow into Parquet | 8,192-row batches; a row group is written at 262,144 rows or 64 MB buffered; the temporary file ≤ 32 GiB | `convert::BATCH_ROWS`, `ROW_GROUP_ROWS`, `MAX_BUFFERED_BYTES`, `MAX_CONVERTED_BYTES` |
+| Arrow file metadata message / decompressed buffer | 64 MB / 1 GB | `convert::MAX_ARROW_MESSAGE_BYTES`, `MAX_ARROW_BUFFER_BYTES` |
+| JSON export nesting | 64 levels | `export::MAX_JSON_DEPTH` |
 
 ## Responsiveness rules
 

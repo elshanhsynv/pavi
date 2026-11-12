@@ -134,6 +134,8 @@ struct OpenRequest {
     generation_id: GenerationId,
     path: PathBuf,
     cancellation: CancellationToken,
+    /// Share of the open done, in millionths (see [`OpenTask::progress`]).
+    progress: ScanProgress,
     response: SyncSender<OpenResponse>,
 }
 
@@ -282,17 +284,19 @@ impl RuntimeHandle {
         let sender = self.sender()?;
         let task_id = self.next_task_id()?;
         let cancellation = CancellationToken::default();
+        let progress = ScanProgress::default();
         let (response_sender, response_receiver) = mpsc::sync_channel(1);
         let request = OpenRequest {
             task_id,
             generation_id,
             path: path.into(),
             cancellation: cancellation.clone(),
+            progress: progress.clone(),
             response: response_sender,
         };
 
         match sender.try_send(Request::Open(request)) {
-            Ok(()) => Ok(OpenTask::new(cancellation, response_receiver)),
+            Ok(()) => Ok(OpenTask::new(cancellation, progress, response_receiver)),
             Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
             Err(TrySendError::Disconnected(_)) => Err(SubmitError::Shutdown),
         }
@@ -490,13 +494,23 @@ fn worker_loop(receiver: Arc<Mutex<Receiver<Request>>>, shutdown: Arc<AtomicBool
     }
 }
 
+/// An open's progress is kept as millionths of the work.
+pub(crate) const OPEN_PROGRESS_SCALE: f64 = 1_000_000.0;
+
 fn execute_open(request: OpenRequest, shutdown: &AtomicBool) {
     let outcome = if shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled() {
         OpenOutcome::Cancelled
     } else {
         let cancelled = || shutdown.load(Ordering::Acquire) || request.cancellation.is_cancelled();
-        // A folder is opened file by file and stops between files when cancelled.
-        match guarded(|| ParquetSource::open_cancellable(&request.path, &cancelled)) {
+        // A folder is opened file by file and a CSV, JSON or Arrow file is read
+        // batch by batch; both report how far they are and stop when cancelled.
+        let checkpoint = |done: f64| {
+            request
+                .progress
+                .set_scanned_rows((done.clamp(0.0, 1.0) * OPEN_PROGRESS_SCALE) as u64);
+            cancelled()
+        };
+        match guarded(|| ParquetSource::open_cancellable(&request.path, &checkpoint)) {
             Ok(_) if cancelled() => OpenOutcome::Cancelled,
             Ok(source) => OpenOutcome::Opened(Arc::new(source)),
             Err(error) if error.downcast_ref::<parquet_reader::Cancelled>().is_some() => {

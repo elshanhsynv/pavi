@@ -16,7 +16,7 @@ PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), eac
 | GUI | `eframe 0.31.1` with default features → **glow** (OpenGL) renderer, winit, accesskit. **No `persistence` feature.** `egui_extras 0.31` (`TableBuilder`) for the grid. No `egui_plot` — charts are hand-painted. | `Cargo.toml`, `crates/app/Cargo.toml` |
 | Dialogs | `rfd 0.15` synchronous `FileDialog` (open/save) | `app.rs:444`, `app.rs:855`, `ui/toolbar.rs:115` |
 | Clipboard | egui's `ctx.copy_text` (no extra crate) | `app.rs:1745`, `ui/inspector.rs:66,127` |
-| Parquet/Arrow | `parquet 60` (feature `arrow`), `arrow-array/-schema/-select/-ord 60`, `arrow-cast 60` (value display rules), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
+| Parquet/Arrow | `parquet 60` (feature `arrow`), `arrow-array/-schema/-select/-ord 60`, `arrow-cast 60` (value display rules), `arrow-csv`/`arrow-json`/`arrow-ipc 60` (opening CSV, JSON and Arrow files, Arrow export; ADR 0007), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
 | SQL | `sqlparser 0.62` (GenericDialect) used only for parsing; execution is custom | `crates/query/src/sql.rs` |
 | Threading | `std::thread` + `std::sync::mpsc::sync_channel` + `Arc<AtomicBool>` cancellation. No tokio, no rayon. | `crates/runtime/` |
 | CLI | `clap 4` derive | `crates/cli/src/args.rs` |
@@ -50,6 +50,7 @@ crates/parquet/src/            (parquet_reader)
 ├── source.rs       ParquetSource (1,924 lines): open, read_page/window/filtered/sorted/aggregated,
 │                   GroupCollector/Accumulator/Scalar (aggregation)
 ├── dataset.rs      folder datasets (ADR 0006): find the files, `key=value` partition columns, their values and statistics
+├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007)
 ├── statistics.rs   row-group statistics → display text, typed by the column's Arrow type
 ├── metadata.rs     DatasetMetadata, RowGroupInfo, ColumnInfo, ColumnStatistics; row→row-group math
 ├── page.rs         PAGE_ROWS = 4096, PageKey, RowWindow, DataPage
@@ -79,10 +80,10 @@ crates/app/src/                (pavi)
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
-├── app_tests.rs    54 tests driving PaviApp without a window
+├── app_tests.rs    55 tests driving PaviApp without a window
 ├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
-├── export.rs       ExportState, ExportTask (own thread), CSV writer, Parquet ArrowWriter, temp-file + rename
+├── export.rs       ExportState, ExportTask (own thread), CSV and JSON Lines writers, Parquet ArrowWriter, Arrow IPC FileWriter, temp-file + rename
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
 ├── profile.rs      ProfileState, ProfileTask (own thread), ProfileAccumulator
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning)
