@@ -804,6 +804,7 @@ dependencies = [
  "parquet",
  "parquet_reader",
  "pavi_query",
+ "pavi_runtime",
 ]
 
 [[package]]

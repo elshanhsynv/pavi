@@ -56,8 +56,20 @@ impl PaviApp {
                     if let Some(error) = &self.sql_error {
                         widgets::error(ui, error);
                     } else if self.running_sql.is_none() {
+                        let tables = self
+                            .sql_tables()
+                            .map(|(_, names)| names)
+                            .unwrap_or_default();
+                        let others = if tables.len() > 1 {
+                            format!(
+                                "Tables: dataset (this tab), {}. Combine them with JOIN … ON.",
+                                tables.join(", ")
+                            )
+                        } else {
+                            "This tab's table is dataset; open more tabs to JOIN them.".to_string()
+                        };
                         ui.label(
-                            RichText::new("The table is always named dataset.")
+                            RichText::new(others)
                                 .font(theme::small())
                                 .color(theme::MUTED),
                         );
@@ -74,10 +86,10 @@ impl PaviApp {
     /// keywords under the cursor (↑/↓ choose, Tab or Enter take, Esc closes).
     fn sql_editor(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let id = sql_editor_id();
-        let columns = self
-            .dataset
-            .as_ref()
-            .map(|dataset| dataset.column_names.clone())
+        let columns = self.sql_columns();
+        let tables = self
+            .sql_tables()
+            .map(|(_, names)| names)
             .unwrap_or_default();
         // Keys for the list are taken before the editor sees them.
         let mut accept = None;
@@ -108,7 +120,7 @@ impl PaviApp {
 
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
-            let mut job = highlight(text, &columns, font.clone());
+            let mut job = highlight(text, &columns, &tables, font.clone());
             job.wrap.max_width = wrap_width;
             ui.fonts(|fonts| fonts.layout_job(job))
         };
@@ -127,7 +139,7 @@ impl PaviApp {
         } else if output.response.changed() {
             self.sql_completion = cursor.and_then(|cursor| {
                 let (start, word) = sql_editor::word_before(&self.sql_input, cursor)?;
-                let items = sql_editor::suggestions(&word, &columns);
+                let items = sql_editor::suggestions(&word, &columns, &tables);
                 (!items.is_empty()).then_some(SqlCompletion {
                     start,
                     cursor,
@@ -381,9 +393,14 @@ impl PaviApp {
 }
 
 /// `text` laid out in the editor's font, colored by token kind.
-fn highlight(text: &str, columns: &[String], font: egui::FontId) -> egui::text::LayoutJob {
+fn highlight(
+    text: &str,
+    columns: &[String],
+    tables: &[String],
+    font: egui::FontId,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
-    for (range, kind) in sql_editor::tokens(text, columns) {
+    for (range, kind) in sql_editor::tokens(text, columns, tables) {
         let color = match kind {
             TokenKind::Keyword => theme::SQL_KEYWORD,
             TokenKind::Function => theme::SQL_FUNCTION,

@@ -42,6 +42,8 @@ pub(crate) struct FilteredGrid {
     pub(crate) sort: Vec<SortSpec>,
     /// The filter-box filter this result shows, kept so a cell menu can add to it.
     pub(crate) filter: Option<parquet_reader::FilterExpr>,
+    /// The result's columns are not the file's: an aggregate, a join or a
+    /// subquery (ADR 0009). They are shown as the result names them.
     pub(crate) aggregate: bool,
     pub(crate) projected_columns: Vec<usize>,
     pub(crate) display_columns: Vec<(usize, usize)>,

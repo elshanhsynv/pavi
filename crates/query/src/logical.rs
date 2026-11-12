@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
+use arrow_schema::SchemaRef;
 use parquet_reader::{
-    AggregateExpr, AggregateSpec, FilterExpr, NullOrder, ParquetSource, SortDirection, SortSpec,
+    AggregateExpr, AggregateFunction, AggregateSpec, FilterExpr, NullOrder, ParquetSource,
+    SortDirection, SortSpec,
 };
+
+use crate::prep::{Prep, Relation};
 
 #[derive(Clone)]
 pub struct Scan {
@@ -36,9 +40,19 @@ pub struct Aggregate {
     pub(crate) spec: AggregateSpec,
 }
 
+/// Rows prepared before the query runs: joined tables and subqueries (ADR 0009).
+/// `schema` is what they will look like; column indexes above this leaf refer
+/// to its columns.
+#[derive(Clone)]
+pub struct Prepared {
+    pub(crate) prep: Arc<Prep>,
+    pub(crate) schema: SchemaRef,
+}
+
 #[derive(Clone)]
 pub enum LogicalPlan {
     Scan(Scan),
+    Prepared(Prepared),
     Projection {
         input: Box<LogicalPlan>,
         projection: Projection,
@@ -177,6 +191,128 @@ impl LogicalPlan {
         Ok(Self::Aggregate {
             input: Box::new(self),
             aggregate: Aggregate::new(AggregateSpec::grouped_by(group_by, expressions)?),
+        })
+    }
+
+    /// Whether the query joins tables or uses subqueries, so its rows are
+    /// prepared before it runs and its columns are not one table's (ADR 0009).
+    pub fn is_prepared(&self) -> bool {
+        self.prepared().is_some()
+    }
+
+    /// The prepared leaf, when the plan has one.
+    pub(crate) fn prepared(&self) -> Option<&Prepared> {
+        match self {
+            Self::Prepared(prepared) => Some(prepared),
+            Self::Scan(_) => None,
+            Self::Projection { input, .. }
+            | Self::Filter { input, .. }
+            | Self::Limit { input, .. }
+            | Self::Sort { input, .. }
+            | Self::Aggregate { input, .. } => input.prepared(),
+        }
+    }
+
+    fn shapes_output(&self) -> bool {
+        match self {
+            Self::Projection { .. } | Self::Aggregate { .. } => true,
+            Self::Scan(_) | Self::Prepared(_) => false,
+            Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
+                input.shapes_output()
+            }
+        }
+    }
+
+    /// The plan to run once the prepared rows are ready: the prepared leaf
+    /// becomes a scan of `relation`, and column indexes are mapped to its columns.
+    pub(crate) fn bind(&self, relation: &Relation) -> Result<Self> {
+        self.bind_inner(relation, !self.shapes_output())
+    }
+
+    fn bind_inner(&self, relation: &Relation, reshape: bool) -> Result<Self> {
+        let map = |column: usize| {
+            relation
+                .columns
+                .get(column)
+                .copied()
+                .ok_or_else(|| anyhow!("prepared column {column} out of range"))
+        };
+        Ok(match self {
+            Self::Prepared(_) => {
+                let mut plan = Self::scan(Arc::clone(&relation.source));
+                if let Some(filter) = &relation.filter {
+                    plan = plan.filter(Filter::new(filter.clone()));
+                }
+                if reshape {
+                    plan = plan.project(relation.columns.clone());
+                }
+                plan
+            }
+            Self::Scan(_) => bail!("a prepared query also reads a table directly"),
+            Self::Projection { input, projection } => Self::Projection {
+                input: Box::new(input.bind_inner(relation, reshape)?),
+                projection: Projection::new(
+                    projection
+                        .columns
+                        .iter()
+                        .map(|column| map(*column))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            },
+            Self::Filter { input, filter } => Self::Filter {
+                input: Box::new(input.bind_inner(relation, reshape)?),
+                filter: filter.clone(),
+            },
+            Self::Limit { input, limit } => Self::Limit {
+                input: Box::new(input.bind_inner(relation, reshape)?),
+                limit: *limit,
+            },
+            Self::Sort { input, sort } => Self::Sort {
+                input: Box::new(input.bind_inner(relation, reshape)?),
+                sort: Sort::by(
+                    sort.keys
+                        .iter()
+                        .map(|key| Ok(SortSpec::new(map(key.column)?, key.direction, key.nulls)))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            },
+            Self::Aggregate { input, aggregate } => {
+                let spec = aggregate.spec();
+                let expressions = spec
+                    .expressions()
+                    .iter()
+                    .map(|expression| {
+                        Ok(match (expression.function(), expression.column()) {
+                            (AggregateFunction::Count, None) => AggregateExpr::count_all(),
+                            (AggregateFunction::Count, Some(column)) => {
+                                AggregateExpr::count(map(column)?)
+                            }
+                            (AggregateFunction::Sum, Some(column)) => {
+                                AggregateExpr::sum(map(column)?)
+                            }
+                            (AggregateFunction::Avg, Some(column)) => {
+                                AggregateExpr::avg(map(column)?)
+                            }
+                            (AggregateFunction::Min, Some(column)) => {
+                                AggregateExpr::min(map(column)?)
+                            }
+                            (AggregateFunction::Max, Some(column)) => {
+                                AggregateExpr::max(map(column)?)
+                            }
+                            (_, None) => *expression,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let group_by = spec
+                    .group_by()
+                    .iter()
+                    .map(|column| map(*column))
+                    .collect::<Result<Vec<_>>>()?;
+                Self::Aggregate {
+                    input: Box::new(input.bind_inner(relation, reshape)?),
+                    aggregate: Aggregate::new(AggregateSpec::grouped_by(group_by, expressions)?),
+                }
+            }
         })
     }
 

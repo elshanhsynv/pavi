@@ -292,6 +292,11 @@ impl PaviApp {
         let kind = filtered.kind;
         let aggregate = filtered.aggregate;
         let scanned = self.scan_fraction();
+        // Joins and subqueries are prepared before the query runs (ADR 0009).
+        let preparing = filtered
+            .execution
+            .as_ref()
+            .is_some_and(|execution| execution.preparing_progress().is_some());
         let display_columns = filtered.display_columns.clone();
         if rows == 0 {
             widgets::placeholder(ui, |ui| {
@@ -303,6 +308,11 @@ impl PaviApp {
                     ui.add(egui::Spinner::new().color(theme::ACCENT));
                     ui.label(
                         RichText::new(match scanned {
+                            Some(fraction) if preparing => format!(
+                                "{} query running… joining tables, {} done",
+                                kind.label(),
+                                super::status::percent(fraction)
+                            ),
                             Some(fraction) => format!(
                                 "{} query running… {} of the file scanned",
                                 kind.label(),

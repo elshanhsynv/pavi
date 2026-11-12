@@ -304,9 +304,10 @@ pub struct ParquetSource {
     /// The temporary Parquet copy of a CSV, JSON or Arrow file (ADR 0007),
     /// deleted with the source.
     converted: Option<ConvertedFile>,
-    /// A downloaded copy of a remote Parquet file whose server doesn't answer
-    /// range requests (ADR 0008), deleted with the source.
-    downloaded: Option<TempFolder>,
+    /// A temporary file this source reads, deleted with it: a remote Parquet
+    /// file downloaded because its server doesn't answer range requests
+    /// (ADR 0008), or a table prepared for a join or subquery (ADR 0009).
+    temporary: Option<TempFolder>,
 }
 
 /// Reads one file's footer.
@@ -414,6 +415,25 @@ impl ParquetSource {
         Ok(source)
     }
 
+    /// Opens a Parquet file written in `folder`, which is deleted with the source.
+    /// `name` is what the source is called in messages.
+    pub(crate) fn open_temporary(file: PathBuf, folder: TempFolder, name: &str) -> Result<Self> {
+        let file_info = FileInfo::from(
+            std::fs::metadata(&file).with_context(|| format!("open {}", file.display()))?,
+        );
+        let location = Location::Local(file);
+        let path = PathBuf::from(name);
+        let (bytes, arrow_metadata) = open_file(&location, &path)?;
+        let mut source = Self::from_files(
+            path,
+            file_info,
+            vec![(location, bytes, arrow_metadata, Vec::new())],
+            Vec::new(),
+        )?;
+        source.temporary = Some(folder);
+        Ok(source)
+    }
+
     /// Opens an `https`, `http`, `s3`, `gs` or `az` URL (ADR 0008). A Parquet
     /// object is read with range requests; anything else, or a Parquet object
     /// on a server without range requests, is downloaded first.
@@ -466,7 +486,7 @@ impl ParquetSource {
             vec![(location, bytes, arrow_metadata, Vec::new())],
             Vec::new(),
         )?;
-        source.downloaded = Some(folder);
+        source.temporary = Some(folder);
         Ok(source)
     }
 
@@ -640,7 +660,7 @@ impl ParquetSource {
             checked_dictionaries: Mutex::new(HashSet::new()),
             format: FileFormat::Parquet,
             converted: None,
-            downloaded: None,
+            temporary: None,
         })
     }
 
@@ -676,7 +696,7 @@ impl ParquetSource {
     /// Whether a remote file was downloaded rather than read with range requests.
     #[cfg(test)]
     pub(crate) fn is_downloaded(&self) -> bool {
-        self.downloaded.is_some()
+        self.temporary.is_some()
     }
 
     /// Where the temporary Parquet copy of a converted file is.
@@ -1163,79 +1183,16 @@ impl ParquetSource {
     }
 
     pub fn validate_aggregate(&self, aggregate: &AggregateSpec) -> Result<()> {
-        let schema = &self.dataset_metadata.schema;
-        for &group in aggregate.group_by() {
-            let field = schema
-                .fields()
-                .get(group)
-                .ok_or_else(|| anyhow!("group column {group} out of range"))?;
-            if !is_comparable(field.data_type()) {
-                bail!(
-                    "GROUP BY is not supported for {:?} columns",
-                    field.data_type()
-                );
-            }
-        }
-        for expression in aggregate.expressions() {
-            let field = expression
-                .column()
-                .map(|column| {
-                    schema
-                        .fields()
-                        .get(column)
-                        .ok_or_else(|| anyhow!("aggregate column {column} out of range"))
-                })
-                .transpose()?;
-            match (expression.function(), field) {
-                (AggregateFunction::Count, _) => {}
-                (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
-                    if is_summable(field.data_type()) => {}
-                (AggregateFunction::Min | AggregateFunction::Max, Some(field))
-                    if is_comparable(field.data_type()) => {}
-                (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
-                    "{:?} is not supported for {:?} columns",
-                    expression.function(),
-                    field.data_type()
-                ),
-                (AggregateFunction::Min | AggregateFunction::Max, Some(field)) => bail!(
-                    "{:?} is not supported for {:?} columns",
-                    expression.function(),
-                    field.data_type()
-                ),
-                (_, None) => bail!("only COUNT may use *"),
-            }
-        }
-        Ok(())
+        check_aggregate(&self.dataset_metadata.schema, aggregate)
     }
 
     /// Returns the schema produced by a validated aggregate without scanning data.
     pub fn aggregate_schema(&self, aggregate: &AggregateSpec) -> Result<Arc<Schema>> {
-        self.validate_aggregate(aggregate)?;
-        Ok(GroupCollector::new(
-            aggregate,
-            &self.dataset_metadata.schema,
-            GroupBudget::default(),
-        )?
-        .output_schema())
+        aggregate_output_schema(&self.dataset_metadata.schema, aggregate)
     }
 
     pub fn validate_sort(&self, sort: &[SortSpec]) -> Result<()> {
-        validate_sort_keys(sort)?;
-        for key in sort {
-            let field = self
-                .dataset_metadata
-                .schema
-                .fields()
-                .get(key.column)
-                .ok_or_else(|| anyhow!("sort column {} out of range", key.column))?;
-            if !is_comparable(field.data_type()) {
-                bail!(
-                    "sorting is not supported for {:?} columns",
-                    field.data_type()
-                );
-            }
-        }
-        Ok(())
+        check_sort(&self.dataset_metadata.schema, sort)
     }
 
     /// The next run of row groups a scan reads with one reader, searching from
@@ -1678,7 +1635,7 @@ fn project_batch(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum Scalar {
+pub(crate) enum Scalar {
     Null,
     Bool(bool),
     I64(i64),
@@ -2166,7 +2123,7 @@ fn aggregate_name(expression: AggregateExpr, input: &Option<String>) -> String {
     }
 }
 
-fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scalar> {
+pub(crate) fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scalar> {
     if array.is_null(row) {
         return Ok(Scalar::Null);
     }
@@ -2558,6 +2515,77 @@ fn decimal_divisor(data_type: &DataType) -> f64 {
         | DataType::Decimal128(_, scale) => 10_f64.powi((*scale).into()),
         _ => 1.0,
     }
+}
+
+/// Checks an aggregate against a schema: group columns must be comparable, SUM
+/// and AVG need summable columns, MIN and MAX comparable ones.
+pub fn check_aggregate(schema: &Schema, aggregate: &AggregateSpec) -> Result<()> {
+    for &group in aggregate.group_by() {
+        let field = schema
+            .fields()
+            .get(group)
+            .ok_or_else(|| anyhow!("group column {group} out of range"))?;
+        if !is_comparable(field.data_type()) {
+            bail!(
+                "GROUP BY is not supported for {:?} columns",
+                field.data_type()
+            );
+        }
+    }
+    for expression in aggregate.expressions() {
+        let field = expression
+            .column()
+            .map(|column| {
+                schema
+                    .fields()
+                    .get(column)
+                    .ok_or_else(|| anyhow!("aggregate column {column} out of range"))
+            })
+            .transpose()?;
+        match (expression.function(), field) {
+            (AggregateFunction::Count, _) => {}
+            (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
+                if is_summable(field.data_type()) => {}
+            (AggregateFunction::Min | AggregateFunction::Max, Some(field))
+                if is_comparable(field.data_type()) => {}
+            (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
+                "{:?} is not supported for {:?} columns",
+                expression.function(),
+                field.data_type()
+            ),
+            (AggregateFunction::Min | AggregateFunction::Max, Some(field)) => bail!(
+                "{:?} is not supported for {:?} columns",
+                expression.function(),
+                field.data_type()
+            ),
+            (_, None) => bail!("only COUNT may use *"),
+        }
+    }
+    Ok(())
+}
+
+/// The schema an aggregate produces over `schema`, after checking it.
+pub fn aggregate_output_schema(schema: &Schema, aggregate: &AggregateSpec) -> Result<Arc<Schema>> {
+    check_aggregate(schema, aggregate)?;
+    Ok(GroupCollector::new(aggregate, schema, GroupBudget::default())?.output_schema())
+}
+
+/// Checks sort keys against a schema: every key column must be comparable.
+pub fn check_sort(schema: &Schema, sort: &[SortSpec]) -> Result<()> {
+    validate_sort_keys(sort)?;
+    for key in sort {
+        let field = schema
+            .fields()
+            .get(key.column)
+            .ok_or_else(|| anyhow!("sort column {} out of range", key.column))?;
+        if !is_comparable(field.data_type()) {
+            bail!(
+                "sorting is not supported for {:?} columns",
+                field.data_type()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn projected_position(projection: &Projection, column: usize, purpose: &str) -> Result<usize> {

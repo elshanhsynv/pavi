@@ -12,7 +12,7 @@ use pavi_runtime::{
     SubmitError, TaskId,
 };
 
-use crate::{LogicalPlan, PhysicalPlan, Planner};
+use crate::{LogicalPlan, PhysicalPlan, Planner, prep::PrepTask};
 
 pub struct QueryEngine {
     runtime: RuntimeHandle,
@@ -20,7 +20,27 @@ pub struct QueryEngine {
     group_budget: GroupBudget,
 }
 
+/// A running query. A query that joins tables or uses subqueries first
+/// prepares its rows on another thread (ADR 0009), then runs like any other.
 pub struct QueryExecution {
+    generation_id: GenerationId,
+    stage: Stage,
+    cancelled: bool,
+}
+
+enum Stage {
+    Preparing {
+        task: PrepTask,
+        /// The query to run on the prepared rows.
+        template: LogicalPlan,
+        runtime: RuntimeHandle,
+        sort_budget: SortBudget,
+        group_budget: GroupBudget,
+    },
+    Running(Box<Running>),
+}
+
+struct Running {
     runtime: RuntimeHandle,
     sort_budget: SortBudget,
     group_budget: GroupBudget,
@@ -102,11 +122,153 @@ impl QueryEngine {
         logical: &LogicalPlan,
         generation_id: GenerationId,
     ) -> Result<QueryExecution> {
+        if let Some(prepared) = logical.prepared() {
+            Planner::validate(logical)?;
+            let task = PrepTask::start(Arc::clone(&prepared.prep), self.runtime.clone())?;
+            return Ok(QueryExecution {
+                generation_id,
+                stage: Stage::Preparing {
+                    task,
+                    template: logical.clone(),
+                    runtime: self.runtime.clone(),
+                    sort_budget: self.sort_budget,
+                    group_budget: self.group_budget,
+                },
+                cancelled: false,
+            });
+        }
+        Ok(QueryExecution {
+            generation_id,
+            stage: Stage::Running(Box::new(Running::start(
+                logical,
+                self.runtime.clone(),
+                self.sort_budget,
+                self.group_budget,
+                generation_id,
+            )?)),
+            cancelled: false,
+        })
+    }
+
+    pub fn output_schema(&self, logical: &LogicalPlan) -> Result<SchemaRef> {
+        Planner::validate(logical)
+    }
+}
+
+impl QueryExecution {
+    pub fn generation_id(&self) -> GenerationId {
+        self.generation_id
+    }
+
+    /// Source rows the scan in flight has passed, or `None` when no filter, sort
+    /// or aggregate scan is running. It is a position in the file: divide by the
+    /// file's row count for a fraction.
+    pub fn scanned_rows(&self) -> Option<u64> {
+        match &self.stage {
+            Stage::Running(running) => running.scanned_rows(),
+            Stage::Preparing { .. } => None,
+        }
+    }
+
+    /// While joined or subquery rows are being prepared, the share done (0 to 1).
+    pub fn preparing_progress(&self) -> Option<f32> {
+        match &self.stage {
+            Stage::Preparing { task, .. } => Some(task.progress()),
+            Stage::Running(_) => None,
+        }
+    }
+
+    pub fn cancellation_token(&self) -> Option<CancellationToken> {
+        match &self.stage {
+            Stage::Running(running) => running.cancellation_token(),
+            Stage::Preparing { .. } => None,
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+        match &mut self.stage {
+            Stage::Running(running) => running.cancel(),
+            Stage::Preparing { task, .. } => task.cancel(),
+        }
+    }
+
+    pub fn next_batch(&mut self) -> Result<Option<QueryBatch>> {
+        loop {
+            if self.cancelled {
+                bail!("query execution was cancelled");
+            }
+            match &mut self.stage {
+                Stage::Running(running) => return running.next_batch(),
+                Stage::Preparing { task, .. } => {
+                    let relation = task.recv()?;
+                    self.start(relation)?;
+                }
+            }
+        }
+    }
+
+    /// Polls for one next batch without waiting for a runtime response.
+    pub fn poll_next_batch(&mut self) -> Result<QueryPoll> {
+        loop {
+            if self.cancelled {
+                bail!("query execution was cancelled");
+            }
+            match &mut self.stage {
+                Stage::Running(running) => return running.poll_next_batch(),
+                Stage::Preparing { task, .. } => match task.try_recv()? {
+                    Some(relation) => self.start(relation)?,
+                    None => return Ok(QueryPoll::Pending),
+                },
+            }
+        }
+    }
+
+    pub fn scheduled_reads(&self) -> usize {
+        match &self.stage {
+            Stage::Running(running) => running.scheduled_reads(),
+            Stage::Preparing { .. } => 0,
+        }
+    }
+
+    /// Runs the query on the rows its preparation produced.
+    fn start(&mut self, relation: crate::prep::Relation) -> Result<()> {
+        let Stage::Preparing {
+            template,
+            runtime,
+            sort_budget,
+            group_budget,
+            ..
+        } = &self.stage
+        else {
+            return Ok(());
+        };
+        let plan = template.bind(&relation)?;
+        let running = Running::start(
+            &plan,
+            runtime.clone(),
+            *sort_budget,
+            *group_budget,
+            self.generation_id,
+        )?;
+        self.stage = Stage::Running(Box::new(running));
+        Ok(())
+    }
+}
+
+impl Running {
+    fn start(
+        logical: &LogicalPlan,
+        runtime: RuntimeHandle,
+        sort_budget: SortBudget,
+        group_budget: GroupBudget,
+        generation_id: GenerationId,
+    ) -> Result<Self> {
         let plan = Planner::plan(logical)?;
-        let mut execution = QueryExecution {
-            runtime: self.runtime.clone(),
-            sort_budget: self.sort_budget,
-            group_budget: self.group_budget,
+        let mut execution = Running {
+            runtime,
+            sort_budget,
+            group_budget,
             remaining: plan.limit,
             plan,
             generation_id,
@@ -128,16 +290,6 @@ impl QueryEngine {
             return Err(error);
         }
         Ok(execution)
-    }
-
-    pub fn output_schema(&self, logical: &LogicalPlan) -> Result<SchemaRef> {
-        Planner::plan(logical)?.output_schema()
-    }
-}
-
-impl QueryExecution {
-    pub fn generation_id(&self) -> GenerationId {
-        self.generation_id
     }
 
     /// Source rows the scan in flight has passed, or `None` when no filter, sort
@@ -922,9 +1074,12 @@ mod tests {
         let _ = execution.next_batch().unwrap().unwrap();
 
         assert_eq!(execution.scheduled_reads(), 1);
-        assert!(execution.pending.is_none());
+        let Stage::Running(running) = &execution.stage else {
+            panic!("a plain scan runs at once");
+        };
+        assert!(running.pending.is_none());
         assert!(
-            execution
+            running
                 .buffered
                 .iter()
                 .map(|(_, batch)| batch.num_rows())

@@ -300,6 +300,15 @@ impl PaviApp {
             let done = task.progress();
             return (done > 0.0).then_some(done);
         }
+        // Joins and subqueries being prepared (ADR 0009).
+        if let Some(done) = self
+            .filtered
+            .as_ref()
+            .and_then(|filtered| filtered.execution.as_ref())
+            .and_then(pavi_query::QueryExecution::preparing_progress)
+        {
+            return Some(done);
+        }
         let scanned = self.filtered.as_ref()?.execution.as_ref()?.scanned_rows()?;
         let total = self.dataset.as_ref()?.source.row_count();
         (total > 0).then(|| (scanned as f64 / total as f64).min(1.0) as f32)
@@ -910,7 +919,11 @@ impl PaviApp {
         let dataset = self.dataset.as_ref().ok_or("Open a file first")?;
         let (source, batch_column) = match &self.filtered {
             Some(filtered) if filtered.aggregate => {
-                return Err("Aggregated results cannot be filtered by value".to_owned());
+                return Err(
+                    "Only rows with this file's own columns can be filtered by value; \
+                     this result was aggregated or joined"
+                        .to_owned(),
+                );
             }
             Some(filtered) => *filtered
                 .display_columns
@@ -1102,23 +1115,26 @@ impl PaviApp {
             self.sql_error = Some("Enter a SELECT query before running it".to_string());
             return;
         }
-        let Some(dataset) = &self.dataset else {
+        let Some((tables, _)) = self.sql_tables() else {
             self.sql_error = Some("Open a dataset before running SQL".to_string());
             self.record_sql_failure(&sql);
             return;
         };
-        let source = Arc::clone(&dataset.source);
-        let plan =
-            match SqlAst::parse(&sql).and_then(|ast| ast.to_logical_plan(Arc::clone(&source))) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    self.sql_error = Some(format!("SQL error: {error:#}"));
-                    self.record_sql_failure(&sql);
-                    return;
-                }
-            };
-        let (projected_columns, sort, aggregate) = match Planner::plan(&plan) {
-            Ok(plan) => {
+        let plan = match SqlAst::parse(&sql).and_then(|ast| ast.to_logical_plan_with(&tables)) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.sql_error = Some(format!("SQL error: {error:#}"));
+                self.record_sql_failure(&sql);
+                return;
+            }
+        };
+        // A join or subquery's columns are its own, not this tab's: they are
+        // shown as the result names them, like an aggregate's (ADR 0009).
+        let planned = if plan.is_prepared() {
+            Planner::validate(&plan)
+                .map(|schema| ((0..schema.fields().len()).collect(), Vec::new(), true))
+        } else {
+            Planner::plan(&plan).map(|plan| {
                 let aggregate = plan.aggregate();
                 (
                     if let Some(aggregate) = aggregate {
@@ -1129,7 +1145,10 @@ impl PaviApp {
                     plan.sort().to_vec(),
                     aggregate.is_some(),
                 )
-            }
+            })
+        };
+        let (projected_columns, sort, aggregate): (Vec<usize>, _, _) = match planned {
+            Ok(planned) => planned,
             Err(error) => {
                 self.sql_error = Some(format!("SQL error: {error:#}"));
                 self.record_sql_failure(&sql);
@@ -1483,10 +1502,10 @@ impl PaviApp {
                 return;
             }
         };
-        let Some(dataset) = &self.dataset else {
+        if self.dataset.is_none() {
             self.chart.error = Some("Open a dataset before running a chart".to_string());
             return;
-        };
+        }
         self.chart.cancel();
         self.chart.model = None;
         self.chart.error = None;
@@ -1516,9 +1535,11 @@ impl PaviApp {
             return;
         }
 
-        let sql = self.chart.sql_input.trim();
-        let source = Arc::clone(&dataset.source);
-        let plan = match SqlAst::parse(sql).and_then(|ast| ast.to_logical_plan(source)) {
+        let sql = self.chart.sql_input.trim().to_owned();
+        let Some((tables, _)) = self.sql_tables() else {
+            return;
+        };
+        let plan = match SqlAst::parse(&sql).and_then(|ast| ast.to_logical_plan_with(&tables)) {
             Ok(plan) => plan,
             Err(error) => {
                 self.chart.error = Some(format!("Chart SQL: {error:#}"));

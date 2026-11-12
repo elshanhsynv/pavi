@@ -357,6 +357,100 @@ impl PaviApp {
     }
 }
 
+/// A SQL table name for a file or folder: its name without extensions, with
+/// characters other than letters, digits and `_` turned into `_`, not starting
+/// with a digit, and not one of `taken` (ignoring case).
+pub(crate) fn table_name(path: &Path, taken: &[String]) -> String {
+    let shown = parquet_reader::display_path(path);
+    let stem = shown
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem.split('.').next().unwrap_or_default();
+    let mut name = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert_str(0, "t_");
+    }
+    let free = |candidate: &str| {
+        !candidate.eq_ignore_ascii_case("dataset")
+            && !taken
+                .iter()
+                .any(|taken| taken.eq_ignore_ascii_case(candidate))
+    };
+    if free(&name) {
+        return name;
+    }
+    (2..)
+        .map(|suffix| format!("{name}_{suffix}"))
+        .find(|candidate| free(candidate))
+        .unwrap_or(name)
+}
+
+impl PaviApp {
+    /// The open tabs' datasets, in tab order, with the open one marked.
+    fn tab_datasets(&self) -> Vec<(&Dataset, bool)> {
+        (0..self.tab_count())
+            .filter_map(|index| {
+                if index == self.tabs.active {
+                    self.dataset.as_ref().map(|dataset| (dataset, true))
+                } else {
+                    self.tabs
+                        .parked
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .and_then(|tab| tab.dataset.as_ref())
+                        .map(|dataset| (dataset, false))
+                }
+            })
+            .collect()
+    }
+
+    /// The tables SQL can name (ADR 0009): `dataset` for the open tab, and every
+    /// open tab by a name from its file. `None` without an open dataset. The
+    /// names are returned too, in tab order, for the editor.
+    pub(super) fn sql_tables(&self) -> Option<(pavi_query::Tables, Vec<String>)> {
+        let dataset = self.dataset.as_ref()?;
+        let mut tables = pavi_query::Tables::new(Arc::clone(&dataset.source));
+        let mut names = Vec::new();
+        for (tab, _) in self.tab_datasets() {
+            let name = table_name(&tab.path, &names);
+            tables = tables.with(name.clone(), Arc::clone(&tab.source));
+            names.push(name);
+        }
+        Some((tables, names))
+    }
+
+    /// Column names for SQL completions: the open tab's, then other tabs' that
+    /// are not already listed.
+    pub(super) fn sql_columns(&self) -> Vec<String> {
+        let mut columns = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.column_names.clone())
+            .unwrap_or_default();
+        for (tab, open) in self.tab_datasets() {
+            if open {
+                continue;
+            }
+            for column in &tab.column_names {
+                if !columns.contains(column) {
+                    columns.push(column.clone());
+                }
+            }
+        }
+        columns
+    }
+}
+
 fn theme_number(value: u64) -> String {
     ui::theme::number(value)
 }

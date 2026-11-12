@@ -35,6 +35,10 @@ Opening a new file cancels all of the above (`app.rs:643-660`). If the user acts
 - Atomics: task ID counter, shutdown flag, cancellation flags.
 - No `RwLock`, no locks touched by the UI thread except via `ParquetSource::cache_stats` (Inspector). No lock is held across rendering.
 
+## Query preparation
+
+A query that joins tables or uses subqueries (ADR 0009) is prepared on its own thread, `pavi-query-prep`, like export and profiling. It drives subqueries through `QueryEngine` (whose reads run on the worker pool) and reads join inputs directly with `parquet_reader`. Because it is not a pool worker, a subquery waiting on the pool can't deadlock it. It checks a cancellation flag between batches and stores its progress in an atomic; `QueryExecution` polls its one-slot result channel each frame.
+
 ## Network reads
 
 Remote reads (ADR 0008) are blocking HTTP requests made on the worker that runs the read, through one shared `ureq` agent (connection pool). The range cache of a `RemoteObject` is behind a `Mutex` held only to look up or insert a range, never during a request. Cancellation is checked between batches as for local files; a request already sent runs until it answers or times out.

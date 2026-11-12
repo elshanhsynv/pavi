@@ -876,7 +876,11 @@ fn cell_menu_filters_to_and_excludes_the_selected_value() {
     assert!(app.grid.select_filtered(0, 0, 0));
     app.cell_action = Some(CellAction::FilterTo);
     app.apply_cell_action(&ctx);
-    assert!(app.status.contains("Aggregated"), "{}", app.status);
+    assert!(
+        app.status.contains("aggregated or joined"),
+        "{}",
+        app.status
+    );
     assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sql);
 
     // Nothing selected: nothing to filter by.
@@ -2025,4 +2029,91 @@ fn keeps_a_url_as_typed_and_reports_when_it_cannot_be_read() {
     assert!(error.contains("/dir/data.parquet"), "{error}");
     assert!(!error.contains("secret"), "{error}");
     assert!(app.session.recent_files.is_empty());
+}
+
+#[test]
+fn names_open_tabs_as_sql_tables_and_joins_them() {
+    use std::path::Path;
+
+    use crate::app::tabs::table_name;
+
+    assert_eq!(
+        table_name(Path::new("C:/data/flights.parquet"), &[]),
+        "flights"
+    );
+    assert_eq!(
+        table_name(Path::new("s3://b/2023-01 trips.snappy.parquet?sig=1"), &[]),
+        "t_2023_01_trips"
+    );
+    assert_eq!(
+        table_name(Path::new("/x/flights.csv"), &["flights".to_string()]),
+        "flights_2"
+    );
+    assert_eq!(
+        table_name(Path::new("/x/dataset.parquet"), &[]),
+        "dataset_2"
+    );
+
+    let directory = TempDir::new().unwrap();
+    let write = |name: &str, batch: arrow_array::RecordBatch| {
+        let path = directory.path().join(name);
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    };
+    let orders = write(
+        "orders.parquet",
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+            ),
+            ("customer", Arc::new(Int32Array::from(vec![10, 20, 10]))),
+        ])
+        .unwrap(),
+    );
+    let customers = write(
+        "customers.parquet",
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![10, 20])) as arrow_array::ArrayRef,
+            ),
+            ("name", Arc::new(StringArray::from(vec!["Ann", "Bo"]))),
+        ])
+        .unwrap(),
+    );
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.open_path(customers);
+    poll_until_opened(&mut app);
+    app.open_path(orders);
+    poll_until_opened(&mut app);
+
+    let (_, names) = app.sql_tables().unwrap();
+    assert_eq!(names, ["customers", "orders"]);
+    assert!(app.sql_columns().contains(&"name".to_string()));
+
+    app.sql_input = "SELECT dataset.id, c.name FROM dataset \
+                     JOIN customers c ON dataset.customer = c.id ORDER BY dataset.id"
+        .to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert_eq!(filtered_ids(&app), vec!["1", "2", "3"]);
+    let names = (0..app.grid.rows)
+        .map(|row| app.filtered_cell_text(row, 1).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["Ann", "Bo", "Ann"]);
+
+    app.sql_input = "SELECT id FROM dataset WHERE customer IN \
+                     (SELECT id FROM customers WHERE name = 'Bo')"
+        .to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert_eq!(filtered_ids(&app), vec!["2"]);
 }

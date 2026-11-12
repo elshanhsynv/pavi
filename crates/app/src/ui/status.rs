@@ -78,7 +78,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                 }
                 if let Some(progress) = status.progress {
                     ui.label(small(percent(progress)).color(theme::TEXT))
-                        .on_hover_text("Share of the file scanned so far");
+                        .on_hover_text("Share of the file scanned, or of the joins done, so far");
                 }
                 let right_width = if status.dataset.is_some() { 560.0 } else { 0.0 };
                 ui.allocate_ui_with_layout(

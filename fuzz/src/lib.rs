@@ -289,4 +289,30 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT id FROM dataset ORDER BY amount DESC LIMIT 5",
     "SELECT id, name FROM dataset ORDER BY active DESC, day, id DESC",
     "SELECT active, category, COUNT(*), MAX(score) FROM dataset GROUP BY active, category",
+    "SELECT a.id, b.name FROM dataset a JOIN dataset b ON a.id = b.id WHERE a.score > 1",
+    "SELECT a.category, COUNT(*) FROM dataset a LEFT JOIN dataset b ON a.id = b.small GROUP BY a.category",
+    "SELECT * FROM dataset a JOIN dataset b ON a.category = b.category AND a.active = b.active LIMIT 9",
+    "SELECT id FROM dataset WHERE id IN (SELECT small FROM dataset WHERE active = true)",
+    "SELECT id FROM dataset WHERE name NOT IN (SELECT name FROM dataset WHERE id < 3)",
+    "SELECT id FROM dataset WHERE score > (SELECT AVG(score) FROM dataset)",
+    "SELECT name FROM (SELECT id, name FROM dataset WHERE id < 10) t ORDER BY id DESC",
 ];
+
+/// One runtime shared by fuzz inputs that need the query engine. It is kept in a
+/// static (not leaked), so the leak checker sees it as still in use at exit.
+pub fn runtime() -> pavi_runtime::RuntimeHandle {
+    static RUNTIME: OnceLock<std::sync::Mutex<pavi_runtime::Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            std::sync::Mutex::new(
+                pavi_runtime::Runtime::new(pavi_runtime::RuntimeConfig {
+                    worker_count: 2,
+                    queue_capacity: 32,
+                })
+                .expect("start the fuzz runtime"),
+            )
+        })
+        .lock()
+        .expect("fuzz runtime lock")
+        .handle()
+}

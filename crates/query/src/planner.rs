@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use arrow_schema::{Schema, SchemaRef};
-use parquet_reader::{AggregateSpec, FilterExpr, ParquetSource, Projection, SortSpec};
+use parquet_reader::{
+    AggregateSpec, FilterExpr, ParquetSource, Projection, SortSpec, aggregate_output_schema,
+    check_aggregate, check_sort,
+};
 
-use crate::LogicalPlan;
+use crate::{LogicalPlan, logical::Prepared};
 
 pub struct PhysicalPlan {
     pub(crate) source: Arc<ParquetSource>,
@@ -62,9 +65,59 @@ impl PhysicalPlan {
 }
 
 impl Planner {
+    /// Checks a plan against its input's schema without reading anything, and
+    /// returns the schema of its output. Works for plans whose rows still need
+    /// preparing (joins, subqueries).
+    pub fn validate(logical: &LogicalPlan) -> Result<SchemaRef> {
+        let mut state = PlanState::default();
+        collect(logical, &mut state)?;
+        let schema = match (&state.source, &state.prepared) {
+            (Some(source), None) => source.schema(),
+            (None, Some(prepared)) => Arc::clone(&prepared.schema),
+            _ => bail!("query plan must read exactly one table"),
+        };
+        let column_count = schema.fields().len();
+        let projection = match &state.columns {
+            Some(columns) => Some(
+                Projection::columns(columns.clone(), column_count)
+                    .context("validate query projection")?,
+            ),
+            None => None,
+        };
+        if let Some(filter) = &state.filter {
+            filter
+                .validate_schema(&schema)
+                .context("validate query filter")?;
+        }
+        if let Some(sort) = &state.sort {
+            check_sort(&schema, sort).context("validate query sort")?;
+        }
+        if let Some(aggregate) = &state.aggregate {
+            if projection.is_some() {
+                bail!("projection cannot be combined with aggregate output");
+            }
+            if state.sort.is_some() {
+                bail!("ORDER BY aggregate results is not supported");
+            }
+            check_aggregate(&schema, aggregate).context("validate query aggregate")?;
+            return aggregate_output_schema(&schema, aggregate);
+        }
+        let projection = projection.unwrap_or_else(|| Projection::all(column_count));
+        Ok(Arc::new(Schema::new(
+            projection
+                .as_slice()
+                .iter()
+                .map(|column| schema.field(*column).clone())
+                .collect::<Vec<_>>(),
+        )))
+    }
+
     pub fn plan(logical: &LogicalPlan) -> Result<PhysicalPlan> {
         let mut state = PlanState::default();
         collect(logical, &mut state)?;
+        if state.prepared.is_some() {
+            bail!("this query's joined or subquery rows must be prepared before it is planned");
+        }
         let source = state.source.context("query plan has no scan")?;
         let has_projection = state.columns.is_some();
         let projection = match state.columns {
@@ -105,6 +158,7 @@ impl Planner {
 #[derive(Default)]
 struct PlanState {
     source: Option<Arc<ParquetSource>>,
+    prepared: Option<Prepared>,
     columns: Option<Vec<usize>>,
     filter: Option<FilterExpr>,
     limit: Option<usize>,
@@ -115,7 +169,13 @@ struct PlanState {
 fn collect(plan: &LogicalPlan, state: &mut PlanState) -> Result<()> {
     match plan {
         LogicalPlan::Scan(scan) => {
-            if state.source.replace(Arc::clone(&scan.source)).is_some() {
+            if state.prepared.is_some() || state.source.replace(Arc::clone(&scan.source)).is_some()
+            {
+                bail!("query plan contains more than one scan");
+            }
+        }
+        LogicalPlan::Prepared(prepared) => {
+            if state.source.is_some() || state.prepared.replace(prepared.clone()).is_some() {
                 bail!("query plan contains more than one scan");
             }
         }
