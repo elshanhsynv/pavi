@@ -13,8 +13,10 @@ Each budget is a named constant. Change it in one place and update this table.
 | UI loaded pages | 8 pages | `pavi::pages::MAX_LOADED_PAGES` |
 | Page size | 4,096 rows | `parquet_reader::page::PAGE_ROWS` |
 | Filter/SQL/sort result window | 8 batches (~32k rows) | `pavi::results::MAX_FILTERED_BATCHES` |
-| Sort input (no LIMIT) | 100,000 rows / 128 MB | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
-| Rows a GUI sort returns | first 100,000 in sort order | `pavi::app::SORT_ROW_CAP` (= `SortBudget::DEFAULT_MAX_ROWS`) |
+| Sort rows in memory (larger sorts spill, ADR 0005) | 100,000 rows / 128 MB | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
+| Sort spill files | 32 GiB per sort | `spill::MAX_SPILL_BYTES` |
+| Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
+| Sort keys / GROUP BY columns | 8 / 8 | `sort::MAX_SORT_KEYS`, `aggregate::MAX_GROUP_COLUMNS` |
 | GROUP BY | 10,000 groups / 8 MB | `GroupBudget::DEFAULT_MAX_GROUPS`, `DEFAULT_MAX_BYTES` |
 | Profile distinct values | 4,096 values / 1 MB, 128 bytes each | `profile::MAX_DISTINCT_*` |
 | Chart input | 16,384 rows | `chart::MAX_INPUT_ROWS` |

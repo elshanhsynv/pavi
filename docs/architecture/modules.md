@@ -55,7 +55,8 @@ crates/parquet/src/            (parquet_reader)
 ├── cache.rs        PageCache (LRU in a VecDeque), PageCacheLimits (8 pages / 128 MB), stats
 ├── projection.rs   Projection (ordered, de-duplicated top-level column indexes)
 ├── filter.rs       FilterExpr (AND/OR tree), Comparison, FilterOp: text parser, schema validation, batch evaluation, stats pruning, Display
-├── sort.rs         SortSpec, SortDirection, NullOrder, SortBudget (100k rows / 128 MB)
+├── sort.rs         SortSpec, SortDirection, NullOrder, SortBudget (100k rows / 128 MB), MAX_SORT_KEYS
+├── spill.rs        external sort: SortKeys, RunWriter (sorted runs in temp Parquet files), SortMerge (ADR 0005)
 ├── types.rs        which Arrow types each operation accepts (is_comparable, is_numeric, is_string, …)
 ├── aggregate.rs    AggregateFunction/Expr/Spec, GroupBudget (10k groups / 8 MB)
 └── value.rs        shared value → text: format_cell* (bounded display), scalar_text (full, for CSV/profiling)
@@ -153,7 +154,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 | `DatasetMetadata`, `RowGroupInfo`, `ColumnInfo`, `ColumnStatistics` | Schema, cumulative row ranges per row group, stringified min/max/null/distinct per (column, row group) | `crates/parquet/src/metadata.rs` |
 | `Projection` | Ordered unique top-level column indexes; `parquet_columns()` gives sorted order for the reader | `projection.rs` |
 | `FilterExpr` | A tree of `Comparison`s joined by `And` / `Or`. A `Comparison` is `col OP value` with `== != > >= < <= contains LIKE NOT LIKE IS NULL IS NOT NULL`; a null cell passes only `IS NULL`. `IN` / `BETWEEN` are parsed into comparisons. The value is parsed for the column's type (`ordered_value`): integers exactly (as `i128`), floats as `f64` (rounded to the nearest `f32` for `Float32` columns, so a filter on the displayed value matches the cell), decimals as unscaled integers in the column's scale (`decimal_value`), times as `HH:MM:SS[.fff]` in the column's unit, dates as `YYYY-MM-DD`, timestamps as `YYYY-MM-DD[THH:MM:SS][offset]` (read in the column's time zone when no offset is given). Row-group pruning reads statistics in the same units | `filter.rs:28-157` |
-| `SortSpec`/`SortBudget`, `AggregateSpec`/`GroupBudget` | Single sort key; ≤1 group-by column with COUNT/SUM/AVG/MIN/MAX | `sort.rs`, `aggregate.rs` |
+| `SortSpec`/`SortBudget`, `AggregateSpec`/`GroupBudget` | Up to 8 sort keys (a `&[SortSpec]`, most significant first); up to 8 GROUP BY columns with COUNT/SUM/AVG/MIN/MAX | `sort.rs`, `aggregate.rs` |
 | `SqlAst` → `LogicalPlan` → `Planner` → `PhysicalPlan` | Parse → tree → validated flat struct `{projection, filter, limit, sort, aggregate}` (operator order is ignored) | `crates/query/src/{sql,logical,planner}.rs` |
 | `format_cell_with_limit` / `scalar_text` | Arrow value → text. Display is truncated (nested ≤8 deep/≤16 items); `scalar_text` is full-length for scalars | `value.rs` |
 | `value_tree` / `decimal_f64` | A nested cell as a bounded tree for the Inspector; a decimal as a float for charts and profile means | `value.rs` |
@@ -168,7 +169,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 | `read_page` | `read_window` for page `i` through the `Mutex<PageCache>` | `source.rs:223-242` |
 | `read_filtered_from` | From source row `start_row` (stats-pruned row groups; the first group is entered with a `RowSelection` skip), filter each batch, return ≤n matches plus `next_row`, the row after the last match taken (`FilteredWindow`). Paging with `next_row` reads each row once | `source.rs` (`scan_filtered`) |
 | `read_filtered_window` | Offset-based variant (skip the first N matches, scanning from row 0); used by the CLI | `source.rs` |
-| `read_sorted` | Rows that pass the filter are buffered with a sequence-number column (stable tie-breaker). Without a limit they must fit the budget; with `limit` ≤ budget rows the buffer is cut back to the best `limit` rows every ~32k rows (top-N). Then `lexsort_to_indices`, `take`, split into 4,096-row batches | `source.rs` |
+| `read_sorted` | Rows that pass the filter are buffered (kept columns + a sequence-number column, the stable tie-breaker). With `limit` ≤ budget rows the buffer is cut back to the best `limit` rows every ~32k rows (top-N). Otherwise a buffer past the budget is sorted and written as a run; the result is `SortOutput::InMemory(batches)` or `SortOutput::Spilled(SortMerge)` | `source.rs`, `spill.rs` |
 | `read_aggregated` | Streaming row-by-row accumulation into `GroupCollector` (hash map of `Scalar` keys) | `source.rs:451-526`, `965-1177` |
 | Export writers | `CsvWriter` (hand-rolled) and `parquet::arrow::ArrowWriter` to `<name>.pavi-<gen>.tmp`, then `fs::rename` | `crates/app/src/export.rs` |
 

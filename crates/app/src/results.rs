@@ -38,10 +38,8 @@ impl QueryKind {
 pub(crate) struct FilteredGrid {
     pub(crate) kind: QueryKind,
     pub(crate) plan: LogicalPlan,
-    pub(crate) sort: Option<SortSpec>,
-    /// The sort had no LIMIT, so PAVI added one: the result is the first
-    /// `SORT_ROW_CAP` rows in sort order, not every row.
-    pub(crate) sort_capped: bool,
+    /// Sort keys, most significant first; empty when the result is not sorted.
+    pub(crate) sort: Vec<SortSpec>,
     /// The filter-box filter this result shows, kept so a cell menu can add to it.
     pub(crate) filter: Option<parquet_reader::FilterExpr>,
     pub(crate) aggregate: bool,
@@ -60,7 +58,7 @@ impl FilteredGrid {
     pub(crate) fn new(
         kind: QueryKind,
         plan: LogicalPlan,
-        sort: Option<SortSpec>,
+        sort: Vec<SortSpec>,
         aggregate: bool,
         projected_columns: Vec<usize>,
         execution: QueryExecution,
@@ -69,7 +67,6 @@ impl FilteredGrid {
             kind,
             plan,
             sort,
-            sort_capped: false,
             filter: None,
             aggregate,
             projected_columns,

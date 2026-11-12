@@ -11,7 +11,8 @@ pub struct PhysicalPlan {
     pub(crate) projection: Projection,
     pub(crate) filter: Option<FilterExpr>,
     pub(crate) limit: Option<usize>,
-    pub(crate) sort: Option<SortSpec>,
+    /// Sort keys, most significant first; empty when there is no sort.
+    pub(crate) sort: Vec<SortSpec>,
     pub(crate) aggregate: Option<AggregateSpec>,
 }
 
@@ -50,8 +51,9 @@ impl PhysicalPlan {
         self.limit
     }
 
-    pub fn sort(&self) -> Option<SortSpec> {
-        self.sort
+    /// Sort keys, most significant first; empty when there is no sort.
+    pub fn sort(&self) -> &[SortSpec] {
+        &self.sort
     }
 
     pub fn aggregate(&self) -> Option<&AggregateSpec> {
@@ -75,7 +77,7 @@ impl Planner {
                 .validate_filter(filter)
                 .context("validate query filter")?;
         }
-        if let Some(sort) = state.sort {
+        if let Some(sort) = &state.sort {
             source.validate_sort(sort).context("validate query sort")?;
         }
         if let Some(aggregate) = &state.aggregate {
@@ -94,7 +96,7 @@ impl Planner {
             projection,
             filter: state.filter,
             limit: state.limit,
-            sort: state.sort,
+            sort: state.sort.unwrap_or_default(),
             aggregate: state.aggregate,
         })
     }
@@ -106,7 +108,7 @@ struct PlanState {
     columns: Option<Vec<usize>>,
     filter: Option<FilterExpr>,
     limit: Option<usize>,
-    sort: Option<SortSpec>,
+    sort: Option<Vec<SortSpec>>,
     aggregate: Option<AggregateSpec>,
 }
 
@@ -137,7 +139,7 @@ fn collect(plan: &LogicalPlan, state: &mut PlanState) -> Result<()> {
         }
         LogicalPlan::Sort { input, sort } => {
             collect(input, state)?;
-            if state.sort.replace(sort.spec()).is_some() {
+            if state.sort.replace(sort.keys().to_vec()).is_some() {
                 bail!("query plan contains more than one sort");
             }
         }

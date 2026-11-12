@@ -291,7 +291,6 @@ impl PaviApp {
         let error = filtered.error.clone();
         let kind = filtered.kind;
         let aggregate = filtered.aggregate;
-        let sort_capped = filtered.sort_capped;
         let scanned = self.scan_fraction();
         let display_columns = filtered.display_columns.clone();
         if rows == 0 {
@@ -372,19 +371,10 @@ impl PaviApp {
                 }
                 ui.label(
                     RichText::new(format!(
-                        "{} result · rows {}–{} loaded{}",
+                        "{} result · rows {}–{} loaded",
                         kind.label(),
                         theme::number(first_result + 1),
                         theme::number(first_result + rows),
-                        if sort_capped {
-                            format!(
-                                " · limited to the first {} rows in sort order; \
-                                 filter to narrow",
-                                theme::number(SORT_ROW_CAP as u64)
-                            )
-                        } else {
-                            String::new()
-                        }
                     ))
                     .font(theme::small())
                     .color(theme::MUTED),
@@ -661,12 +651,13 @@ impl PaviApp {
             self.request_page(page);
         }
     }
-    fn sort_direction(&self, column: usize) -> Option<SortDirection> {
-        self.filtered
-            .as_ref()
-            .and_then(|filtered| filtered.sort)
-            .filter(|sort| sort.column == column)
-            .map(|sort| sort.direction)
+    /// Where `column` is among the sort keys (0 = most significant), and its direction.
+    fn sort_direction(&self, column: usize) -> Option<(usize, SortDirection)> {
+        self.sort_keys()
+            .iter()
+            .enumerate()
+            .find(|(_, key)| key.column == column)
+            .map(|(index, key)| (index, key.direction))
     }
 
     /// Draws one header row and returns where its cells went.
@@ -723,7 +714,8 @@ impl PaviApp {
             theme::TEXT,
         );
         let mut used = name.right();
-        if let Some(direction) = header.source.and_then(|source| self.sort_direction(source))
+        if let Some((order, direction)) =
+            header.source.and_then(|source| self.sort_direction(source))
             && used + 18.0 < rect.right()
         {
             widgets::icon(
@@ -736,6 +728,17 @@ impl PaviApp {
                 theme::ACCENT,
             );
             used += 18.0;
+            // With several keys, a small number says which one this is.
+            if self.sort_keys().len() > 1 && used + 10.0 < rect.right() {
+                let number = ui.painter().text(
+                    egui::pos2(used - 2.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    (order + 1).to_string(),
+                    theme::small(),
+                    theme::ACCENT,
+                );
+                used = number.right() + 2.0;
+            }
         }
         if self.show_column_types {
             // The name wins: the type label is cut on the left when space is short.
@@ -772,6 +775,18 @@ impl PaviApp {
                 ] {
                     if widgets::menu_item(ui, label, "").clicked() {
                         chosen = Some(HeaderAction::Sort(source, direction));
+                    }
+                }
+                // Once something is sorted, this column can break its ties.
+                let keys = self.sort_keys();
+                if !keys.is_empty() && !(keys.len() == 1 && keys[0].column == source) {
+                    for (label, direction) in [
+                        ("Then by ascending", SortDirection::Ascending),
+                        ("Then by descending", SortDirection::Descending),
+                    ] {
+                        if widgets::menu_item(ui, label, "").clicked() {
+                            chosen = Some(HeaderAction::ThenSort(source, direction));
+                        }
                     }
                 }
                 ui.separator();

@@ -10,7 +10,8 @@ use std::{
 use eframe::egui::{self, Align, Layout, RichText};
 use egui_extras::{Column, TableBuilder};
 use parquet_reader::{
-    Comparison, FilterExpr, FilterOp, NullOrder, ParquetSource, Projection, SortDirection,
+    Comparison, FilterExpr, FilterOp, MAX_SORT_KEYS, NullOrder, ParquetSource, Projection,
+    SortDirection, SortSpec,
     types::is_comparable,
     value::{format_cell_with_limit, scalar_text},
 };
@@ -37,9 +38,6 @@ const INITIAL_COLUMN_WIDTH: f32 = 110.0;
 const CELL_LIMIT: usize = 256;
 /// Longest cell value "Filter to this value" accepts; longer ones are refused.
 const MAX_FILTER_VALUE_BYTES: usize = 1024;
-/// Rows a sort without a LIMIT returns: the first ones in sort order. Kept at the
-/// reader's sort budget, so the scan keeps only these rows and works on any file size.
-const SORT_ROW_CAP: usize = pavi_query::SortBudget::DEFAULT_MAX_ROWS;
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 
 fn ui_row_count(rows: u64) -> usize {
@@ -122,6 +120,8 @@ enum HeaderAction {
     Profile(usize),
     /// Copy the column name.
     CopyName(String),
+    /// Add a source column as the next sort key.
+    ThenSort(usize, SortDirection),
     /// Pin this many shown columns to the left (0 unpins).
     Pin(usize),
 }
@@ -664,6 +664,7 @@ impl PaviApp {
         match self.header_action.take() {
             Some(HeaderAction::Select(column)) => self.select_column(column),
             Some(HeaderAction::Sort(source, direction)) => self.sort_column(source, direction),
+            Some(HeaderAction::ThenSort(source, direction)) => self.add_sort_key(source, direction),
             Some(HeaderAction::Hide(source)) => {
                 self.column_layout.set_hidden(source, true);
                 self.apply_column_layout_change();
@@ -961,7 +962,7 @@ impl PaviApp {
             .filter(Filter::new(filter.clone()))
             .project(projected_columns.clone());
         let sort = match Planner::plan(&plan) {
-            Ok(plan) => plan.sort(),
+            Ok(plan) => plan.sort().to_vec(),
             Err(error) => {
                 self.filter_error = Some(format!("Invalid filter: {error:#}"));
                 return;
@@ -1051,13 +1052,11 @@ impl PaviApp {
                 let aggregate = plan.aggregate();
                 (
                     if let Some(aggregate) = aggregate {
-                        (0..aggregate.expressions().len()
-                            + usize::from(aggregate.group_by().is_some()))
-                            .collect()
+                        (0..aggregate.expressions().len() + aggregate.group_by().len()).collect()
                     } else {
                         plan.projected_columns().to_vec()
                     },
-                    plan.sort(),
+                    plan.sort().to_vec(),
                     aggregate.is_some(),
                 )
             }
@@ -1133,10 +1132,18 @@ impl PaviApp {
     }
 
     /// Sorts by `column`: ascending, or descending when it is already sorted ascending.
+    /// The sort keys of the result on screen; empty when it is not sorted.
+    fn sort_keys(&self) -> &[SortSpec] {
+        self.filtered
+            .as_ref()
+            .map_or(&[], |filtered| filtered.sort.as_slice())
+    }
+
+    /// Sorts by `column` alone: ascending, or descending when it is already the
+    /// only key, ascending.
     fn toggle_sort(&mut self, column: usize) {
-        let previous = self.filtered.as_ref().and_then(|filtered| filtered.sort);
-        let direction = match previous {
-            Some(sort) if sort.column == column && sort.direction == SortDirection::Ascending => {
+        let direction = match self.sort_keys() {
+            [key] if key.column == column && key.direction == SortDirection::Ascending => {
                 SortDirection::Descending
             }
             _ => SortDirection::Ascending,
@@ -1144,18 +1151,36 @@ impl PaviApp {
         self.sort_column(column, direction);
     }
 
+    /// Sorts by `column` alone.
     fn sort_column(&mut self, column: usize, direction: SortDirection) {
+        self.apply_sort(vec![SortSpec::new(column, direction, NullOrder::Last)]);
+    }
+
+    /// Keeps the current sort and adds `column` as its least significant key (or
+    /// changes its direction, if it is already a key).
+    fn add_sort_key(&mut self, column: usize, direction: SortDirection) {
+        let mut keys = self.sort_keys().to_vec();
+        match keys.iter_mut().find(|key| key.column == column) {
+            Some(key) => key.direction = direction,
+            None => keys.push(SortSpec::new(column, direction, NullOrder::Last)),
+        }
+        if keys.len() > MAX_SORT_KEYS {
+            self.status = format!("A sort can have at most {MAX_SORT_KEYS} columns");
+            return;
+        }
+        self.apply_sort(keys);
+    }
+
+    /// Sorts the result on screen (or the file) by `keys`. The whole result is
+    /// sorted; one too large for memory spills to disk (ADR 0005).
+    fn apply_sort(&mut self, keys: Vec<SortSpec>) {
         let Some(dataset) = &self.dataset else {
             self.status = "Open a dataset before sorting".to_string();
             return;
         };
         let source = Arc::clone(&dataset.source);
         let column_count = source.column_count();
-        let column_name = dataset.column_names.get(column).cloned();
-        let Some(column_name) = column_name else {
-            self.status = format!("Sort column {column} is out of range");
-            return;
-        };
+        let description = self.describe_sort(&keys);
         let (plan, kind) = if let Some(filtered) = &self.filtered {
             (filtered.plan.clone(), filtered.kind)
         } else {
@@ -1164,25 +1189,17 @@ impl PaviApp {
                 QueryKind::Sort,
             )
         };
-        let mut plan = plan.replace_sort(column, direction, NullOrder::Last);
-        let mut capped = self
-            .filtered
-            .as_ref()
-            .is_some_and(|filtered| filtered.sort_capped);
+        let plan = plan.replace_sort(keys);
         // Sorting a filtered result keeps its filter, so a cell menu can still add to it.
         let active_filter = self
             .filtered
             .as_ref()
             .and_then(|filtered| filtered.filter.clone());
         let (projected_columns, sort) = match Planner::plan(&plan) {
-            Ok(planned) => {
-                if planned.limit().is_none() {
-                    // Without a LIMIT every row would have to fit in the sort budget.
-                    plan = plan.limit(SORT_ROW_CAP);
-                    capped = true;
-                }
-                (planned.projected_columns().to_vec(), planned.sort())
-            }
+            Ok(planned) => (
+                planned.projected_columns().to_vec(),
+                planned.sort().to_vec(),
+            ),
             Err(error) => {
                 self.status = format!("Sort error: {error:#}");
                 return;
@@ -1205,39 +1222,46 @@ impl PaviApp {
             Ok(execution) => {
                 let mut filtered =
                     FilteredGrid::new(kind, plan, sort, false, projected_columns, execution);
-                filtered.sort_capped = capped;
                 filtered.filter = active_filter;
                 self.filtered = Some(filtered);
                 self.refresh_grid_columns();
-                let arrow = match direction {
-                    SortDirection::Ascending => "↑",
-                    SortDirection::Descending => "↓",
-                };
-                self.status = if capped {
-                    format!(
-                        "Sorting {column_name} {arrow} (nulls last, first {} rows)",
-                        ui::theme::number(SORT_ROW_CAP as u64)
-                    )
-                } else {
-                    format!("Sorting {column_name} {arrow} (nulls last)")
-                };
+                self.status = format!("Sorting by {description} (nulls last)");
             }
             Err(error) => self.status = format!("Start sort: {error:#}"),
         }
     }
 
+    /// Sort keys as text: "DEP_DELAY ↓, FL_DATE ↑".
+    fn describe_sort(&self, keys: &[SortSpec]) -> String {
+        let names = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.column_names.as_slice())
+            .unwrap_or_default();
+        keys.iter()
+            .map(|key| {
+                let name = names.get(key.column).map_or("?", String::as_str);
+                let arrow = match key.direction {
+                    SortDirection::Ascending => "↑",
+                    SortDirection::Descending => "↓",
+                };
+                format!("{name} {arrow}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     fn sort_heading(&self, column: usize, name: &str) -> String {
-        let Some(sort) = self.filtered.as_ref().and_then(|filtered| filtered.sort) else {
-            return name.to_string();
-        };
-        if sort.column != column {
-            return name.to_string();
+        match self.sort_keys().iter().find(|key| key.column == column) {
+            Some(key) => format!(
+                "{name} {}",
+                match key.direction {
+                    SortDirection::Ascending => "↑",
+                    SortDirection::Descending => "↓",
+                }
+            ),
+            None => name.to_string(),
         }
-        let arrow = match sort.direction {
-            SortDirection::Ascending => " ↑",
-            SortDirection::Descending => " ↓",
-        };
-        format!("{name}{arrow}")
     }
 
     fn poll_filtered(&mut self) {
@@ -1271,19 +1295,10 @@ impl PaviApp {
                 Ok(QueryPoll::Batch(batch)) if batch.generation_id == self.grid.generation => {
                     if filtered.rows == 0 {
                         // The scan-time message ("Sorting …") is no longer true.
-                        status = Some(if filtered.sort_capped {
-                            format!(
-                                "{} result ready (first {} rows in sort order); \
-                                 more rows load as you scroll",
-                                filtered.kind.label(),
-                                ui::theme::number(SORT_ROW_CAP as u64)
-                            )
-                        } else {
-                            format!(
-                                "{} result ready; more rows load as you scroll",
-                                filtered.kind.label()
-                            )
-                        });
+                        status = Some(format!(
+                            "{} result ready; more rows load as you scroll",
+                            filtered.kind.label()
+                        ));
                     }
                     filtered.push(batch.batch);
                     if self

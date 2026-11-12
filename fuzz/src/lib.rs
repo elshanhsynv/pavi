@@ -252,4 +252,6 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT SUM(amount), AVG(amount), MIN(at), MAX(at) FROM dataset WHERE at > '00:30:00'",
     "SELECT at, COUNT(*) FROM dataset GROUP BY at",
     "SELECT id FROM dataset ORDER BY amount DESC LIMIT 5",
+    "SELECT id, name FROM dataset ORDER BY active DESC, day, id DESC",
+    "SELECT active, category, COUNT(*), MAX(score) FROM dataset GROUP BY active, category",
 ];

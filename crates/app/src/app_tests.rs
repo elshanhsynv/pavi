@@ -676,8 +676,8 @@ fn runs_sql_through_the_existing_bounded_result_grid() {
     poll_until_idle(&mut app);
     assert_eq!(filtered_ids(&app), vec!["7", "6"]);
     assert_eq!(
-        app.filtered.as_ref().and_then(|filtered| filtered.sort),
-        Some(SortSpec::new(0, SortDirection::Descending, NullOrder::Last))
+        app.sort_keys(),
+        [SortSpec::new(0, SortDirection::Descending, NullOrder::Last)]
     );
 
     app.sql_input = "SELECT COUNT(*), SUM(id) FROM dataset".to_string();
@@ -1316,26 +1316,57 @@ fn header_actions_sort_select_and_hide_columns() {
 }
 
 #[test]
-fn sort_without_a_limit_returns_the_first_rows_instead_of_a_budget_error() {
-    let rows = SORT_ROW_CAP + 500;
+fn sorts_the_whole_file_and_by_several_columns() {
+    // More rows than the in-memory sort budget: the sort spills to disk.
+    let rows = pavi_query::SortBudget::DEFAULT_MAX_ROWS + 500;
     let (_directory, source, path) = source(rows);
     let mut app = make_app(source, path);
 
     app.sort_column(0, SortDirection::Descending);
+    assert_eq!(app.status, "Sorting by id ↓ (nulls last)");
     poll_until_idle(&mut app);
     let filtered = app.filtered.as_ref().unwrap();
     assert!(filtered.error.is_none(), "{:?}", filtered.error);
-    assert!(filtered.sort_capped);
     assert_eq!(filtered_ids(&app)[0], (rows - 1).to_string());
-    assert!(app.status.contains("first 100,000 rows"));
+    // Rows past the old 100,000-row cap are reachable: read on to the end.
+    for _ in 0..40 {
+        app.request_more_filtered();
+        poll_until_idle(&mut app);
+    }
+    let filtered = app.filtered.as_ref().unwrap();
+    assert!(filtered.finished);
+    assert_eq!(filtered.received_rows(), rows as u64);
+    assert_eq!(filtered_ids(&app).last().map(String::as_str), Some("0"));
 
-    // A SQL LIMIT is the user's own cap and is left alone.
-    app.sql_input = "SELECT id FROM dataset ORDER BY id LIMIT 5".into();
-    app.run_sql();
+    // "Then by" keeps the first key and adds a second one.
+    let (_small, small, small_path) = self::source(8);
+    let mut app = make_app(small, small_path);
+    app.sort_column(1, SortDirection::Ascending);
     poll_until_idle(&mut app);
+    app.header_action = Some(HeaderAction::ThenSort(0, SortDirection::Descending));
+    app.apply_header_action(&egui::Context::default());
+    assert_eq!(app.status, "Sorting by name ↑, id ↓ (nulls last)");
+    poll_until_idle(&mut app);
+    assert_eq!(app.sort_keys().len(), 2);
+    assert_eq!(filtered_ids(&app), ["6", "4", "2", "0", "7", "5", "3", "1"]);
+    // Clicking a header again sorts by that column alone.
     app.toggle_sort(0);
     poll_until_idle(&mut app);
-    assert!(!app.filtered.as_ref().unwrap().sort_capped);
+    assert_eq!(app.sort_keys().len(), 1);
+    assert_eq!(filtered_ids(&app), ["0", "1", "2", "3", "4", "5", "6", "7"]);
+
+    // SQL takes several ORDER BY and GROUP BY columns.
+    app.sql_input = "SELECT id, name FROM dataset ORDER BY name DESC, id LIMIT 3".into();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert_eq!(filtered_ids(&app), ["1", "3", "5"]);
+    app.sql_input = "SELECT name, id, COUNT(*) FROM dataset GROUP BY name, id".into();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert_eq!(app.grid.columns, 3);
+    assert_eq!(app.grid.rows, 8);
 }
 
 #[test]

@@ -114,38 +114,49 @@ sequenceDiagram
     Q->>RT: submit_filtered_from(start_row=next_row, 4096)
 ```
 
-## 4.4 Sort (Sort menu, header right-click)
+## 4.4 Sort (Sort menu, header right-click, SQL ORDER BY)
 
-1. The Sort menu in the top bar calls `toggle_sort(source_column)` (Asc → Desc → Asc). A right-click on a grid header offers "Sort ascending" / "Sort descending": `render_headers` stores a `HeaderAction`, and `apply_header_action` runs it after the table is drawn. Both end in `sort_column(column, direction)`. A plain header click only selects the column (`HeaderAction::Select`); it never starts a scan. If a filter/SQL result is active, its plan is reused; otherwise `scan().project(all)`. Nulls are always last.
-2. If the plan has no `LIMIT`, `sort_column` adds `LIMIT SORT_ROW_CAP` (100,000, the sort budget's row cap) and marks the result `sort_capped`; the status bar and the result strip say that only the first 100,000 rows in sort order are shown. A SQL `LIMIT` is left as written.
-3. `execute` submits **one** `ReadOperation::Sorted` with a `SortedRead { sort, budget, limit }` (`execution.rs`).
-4. Worker `read_sorted`: with `LIMIT n` (n ≤ 100,000) only the best n rows are kept while scanning, so any file size works. That is the path every GUI sort takes. Without a limit (or with a larger SQL `LIMIT`) it buffers the rows that pass the filter, and more than 100,000 of them (or the byte estimate) is an error. It sorts with a stable tie-breaker, `take`s output columns and splits into 4,096-row batches.
-5. While the scan runs, `QueryExecution::scanned_rows()` returns the position the worker last reported (`None` for page and window reads). `PaviApp::scan_fraction` divides it by the file's row count; the status bar and the grid's "query running…" placeholder show it as a percentage. The same applies to filter and SQL scans. The percentage is the share of the file read, so the final in-memory sort is not counted.
-6. All sorted batches are moved into `QueryExecution.buffered` at once; the UI then drains them into its 8-batch window like a filter.
+1. The Sort menu in the top bar calls `toggle_sort(source_column)` (Asc → Desc → Asc, by that column alone). A right-click on a grid header offers "Sort ascending" / "Sort descending" (`HeaderAction::Sort`, by that column alone) and, once something is sorted, "Then by ascending" / "Then by descending" (`HeaderAction::ThenSort`, adds the column as the next key or changes its direction). All end in `apply_sort(keys)`, which replaces the plan's sort (`LogicalPlan::replace_sort`) and keeps any filter. A plain header click only selects the column. SQL `ORDER BY a DESC, b` builds the same `Vec<SortSpec>`. At most `MAX_SORT_KEYS` (8) keys; nulls are last unless SQL says `NULLS FIRST`.
+2. `execute` submits **one** `ReadOperation::Sorted` with a `SortedRead { sort: Vec<SortSpec>, budget, limit }` (`execution.rs`).
+3. Worker `read_sorted` keeps, per row, the output columns, the sort keys and a sequence number (the last key, so equal keys keep file order):
+   - `LIMIT n` with n ≤ the budget (100,000 rows): only the best n rows are kept while scanning (top-N). Never touches disk.
+   - Otherwise, while the rows fit the budget (100,000 rows / 128 MB): sorted in memory → `SortOutput::InMemory` → `PageOutcome::Batches`.
+   - Past the budget (ADR 0005): each full buffer is sorted and written as an uncompressed Parquet *run* in `<temp>/pavi-sort-<pid>-<n>/` (`spill::RunWriter`); more than 16 runs are merged 16 at a time into longer runs; the rest become a `SortMerge` → `PageOutcome::SortSpilled(Arc<Mutex<SortMerge>>)`. Total spill size is capped at `MAX_SPILL_BYTES` (32 GiB).
+4. For a spilled sort, `QueryExecution` keeps the merge and, each time the grid or an export wants more rows, submits `ReadOperation::SortMerge { merge, rows }`, which returns `PageOutcome::Merged { batches, finished }` (≈4,096 rows). A merge round concatenates one buffered batch per run, sorts it, and hands out everything up to the smallest "last buffered row" of any run; nothing unread can sort before that. A `LIMIT` past the budget is applied by the merge.
+5. While the scan runs, `QueryExecution::scanned_rows()` returns the position the worker last reported; the status bar and the grid's "query running…" placeholder show it as a percentage. Writing runs is part of the scan; the intermediate merges and the final merge are not counted.
+6. Results flow into the 8-batch window like a filter's. When the merge has handed out its last row, or the result is replaced or cancelled, the `SortMerge` is dropped and its folder deleted. Spill folders older than a day (from a crash) are removed by the next sort that spills.
 
-**Memory:** up to 100k filtered rows / 128 MB of decoded input plus the sorted copy on the worker (top-N: about n + 32k rows); the sorted result sits in `QueryExecution.buffered` until consumed.
-**Errors:** budget error text ("sort input exceeds the in-memory sort budget… filter the data or add a LIMIT…") ends up in the status bar / grid error. GUI sorts can still hit the 128 MB byte budget on very wide rows.
+**Memory:** at most the sort budget (100k rows / 128 MB of kept columns, plus the sorted copy) while scanning; a merge holds one 4,096-row batch per run (≤ 16 runs) plus one merged round.
+**Disk:** a spilled sort writes about its kept columns, uncompressed, once per pass (one pass up to 16 × 100k rows, one more per ×16).
+**Errors:** "this sort needs more than 32 GB of temporary disk space; filter the data or add a LIMIT"; I/O errors creating or reading spill files; a top-N whose kept rows alone exceed 128 MB. All end up in the status bar / grid error.
 "Back to file order" in the Sort menu = `clear_filter`.
 
 ```mermaid
 sequenceDiagram
-    participant H as Sort menu / header menu
+    participant H as Sort menu / header menu / SQL
     participant UI as PaviApp
     participant Q as QueryExecution
     participant W as Worker
-    H->>UI: sort_column(col, dir)
-    UI->>UI: plan.replace_sort(col, dir, NullsLast), add LIMIT 100k if none
+    H->>UI: apply_sort(keys)
+    UI->>UI: plan.replace_sort(keys)
     UI->>Q: execute(plan)
     Q->>W: ReadOperation::Sorted (one task)
-    W->>W: scan + filter; LIMIT n: keep best n rows, else > 100k rows → error
-    W->>W: lexsort (value, sequence), take, slice 4096
-    W-->>Q: PageOutcome::Batches(all)
+    alt fits the budget (or LIMIT ≤ budget)
+        W-->>Q: PageOutcome::Batches(all)
+    else spills
+        W->>W: sorted runs → temp files, merge passes of 16
+        W-->>Q: PageOutcome::SortSpilled(merge)
+        loop as the grid scrolls / export reads
+            Q->>W: ReadOperation::SortMerge (≈4,096 rows)
+            W-->>Q: PageOutcome::Merged
+        end
+    end
     Q-->>UI: batches one per poll → 8-batch window
 ```
 
 ## 4.5 SQL (SQL workspace) and aggregates
 
-1. `run_sql` (`app.rs:1029-1111`): `SqlAst::parse` (`sql.rs:61-95`) enforces the subset (one statement, `SELECT`, `FROM dataset` only, a `WHERE` of comparisons, `IN`, `BETWEEN`, `LIKE` and `IS NULL` joined by `AND` / `OR`; a general `NOT`, `ESCAPE`, `ILIKE` and subqueries are rejected, one `ORDER BY` column, `LIMIT`, optional single `GROUP BY` + aggregates). Column names are resolved case-insensitively (`sql.rs:486-506`). → `to_logical_plan` → `Planner::plan`.
+1. `run_sql` (`app.rs:1029-1111`): `SqlAst::parse` (`sql.rs:61-95`) enforces the subset (one statement, `SELECT`, `FROM dataset` only, up to 8 `ORDER BY` keys and 8 `GROUP BY` columns (SELECT lists the GROUP BY columns first, in order), a `WHERE` of comparisons, `IN`, `BETWEEN`, `LIKE` and `IS NULL` joined by `AND` / `OR`; a general `NOT`, `ESCAPE`, `ILIKE` and subqueries are rejected, `LIMIT`, aggregates). Column names are resolved case-insensitively (`sql.rs:486-506`). → `to_logical_plan` → `Planner::plan`.
 2. Execution picks one strategy in `schedule_next` (`execution.rs:319-433`), by precedence: **aggregate** (one `Aggregated` task) → **sort** (one `Sorted` task) → **filter** (repeated filtered reads, each resuming at the previous cursor) → **plain scan** (`Page` tasks, or a final `Window` for the LIMIT remainder).
 3. Aggregates (`read_aggregated`, `source.rs:451-526`) stream all row groups, converting every value to a `Scalar` and updating accumulators per row; `COUNT(*)` with no filter uses the metadata row count (fast path, `source.rs:481-485`).
 4. Results flow into the same `FilteredGrid`. History is recorded with duration/row count on finish/failure (`app.rs:628-641`) and the session is saved.

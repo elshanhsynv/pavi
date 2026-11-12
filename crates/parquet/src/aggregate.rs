@@ -69,29 +69,43 @@ impl AggregateExpr {
     }
 }
 
-/// Aggregates and an optional single grouping column.
+/// Most columns one GROUP BY may name.
+pub const MAX_GROUP_COLUMNS: usize = 8;
+
+/// Aggregates and the columns they are grouped by (none for one overall group).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateSpec {
     expressions: Vec<AggregateExpr>,
-    group_by: Option<usize>,
+    group_by: Vec<usize>,
 }
 
 impl AggregateSpec {
     pub fn new(expressions: impl Into<Vec<AggregateExpr>>) -> Result<Self> {
-        Self::with_group_by(expressions, None)
+        Self::grouped_by(Vec::new(), expressions)
     }
 
     pub fn grouped(group_by: usize, expressions: impl Into<Vec<AggregateExpr>>) -> Result<Self> {
-        Self::with_group_by(expressions, Some(group_by))
+        Self::grouped_by(vec![group_by], expressions)
     }
 
-    fn with_group_by(
+    /// Groups by every column in `group_by`, in that order.
+    pub fn grouped_by(
+        group_by: impl Into<Vec<usize>>,
         expressions: impl Into<Vec<AggregateExpr>>,
-        group_by: Option<usize>,
     ) -> Result<Self> {
         let expressions = expressions.into();
+        let group_by = group_by.into();
         if expressions.is_empty() {
             bail!("aggregate needs at least one expression");
+        }
+        if group_by.len() > MAX_GROUP_COLUMNS {
+            bail!(
+                "GROUP BY names {} columns; the limit is {MAX_GROUP_COLUMNS}",
+                group_by.len()
+            );
+        }
+        if (1..group_by.len()).any(|index| group_by[..index].contains(&group_by[index])) {
+            bail!("GROUP BY names the same column twice");
         }
         Ok(Self {
             expressions,
@@ -103,8 +117,9 @@ impl AggregateSpec {
         &self.expressions
     }
 
-    pub fn group_by(&self) -> Option<usize> {
-        self.group_by
+    /// The grouping columns, in order; empty for one overall group.
+    pub fn group_by(&self) -> &[usize] {
+        &self.group_by
     }
 }
 

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use parquet_reader::{FilterExpr, FilterOp, NullOrder, ParquetSource, SortDirection};
+use parquet_reader::{
+    FilterExpr, FilterOp, MAX_SORT_KEYS, NullOrder, ParquetSource, SortDirection, SortSpec,
+    aggregate::MAX_GROUP_COLUMNS,
+};
 use sqlparser::{
     ast::{
         BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
@@ -19,7 +22,8 @@ use crate::{AggregateExpr, AggregateFunction, Filter, LogicalPlan, Planner};
 pub struct SqlAst {
     projection: SqlProjection,
     predicate: Option<SqlPredicate>,
-    sort: Option<SqlSort>,
+    /// ORDER BY keys, most significant first.
+    sort: Vec<SqlSort>,
     limit: Option<usize>,
 }
 
@@ -32,7 +36,8 @@ pub enum SqlProjection {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlAggregate {
-    pub group_by: Option<String>,
+    /// GROUP BY columns, in order; empty for one overall group.
+    pub group_by: Vec<String>,
     pub expressions: Vec<SqlAggregateExpr>,
 }
 
@@ -146,8 +151,9 @@ impl SqlAst {
         self.limit
     }
 
-    pub fn sort(&self) -> Option<&SqlSort> {
-        self.sort.as_ref()
+    /// ORDER BY keys, most significant first.
+    pub fn sort(&self) -> &[SqlSort] {
+        &self.sort
     }
 
     /// Resolves names against a single PAVI data source and produces the existing logical plan.
@@ -188,9 +194,9 @@ impl SqlAst {
                     .collect::<Result<Vec<_>>>()?;
                 let group_by = aggregate
                     .group_by
-                    .as_deref()
+                    .iter()
                     .map(|column| resolve_column(&source, column))
-                    .transpose()?;
+                    .collect::<Result<Vec<_>>>()?;
                 (None, Some((group_by, expressions)))
             }
         };
@@ -201,15 +207,15 @@ impl SqlAst {
             .transpose()?;
         let sort = self
             .sort
-            .as_ref()
-            .map(|sort| -> Result<(usize, SortDirection, NullOrder)> {
-                Ok((
+            .iter()
+            .map(|sort| {
+                Ok(SortSpec::new(
                     resolve_column(&source, &sort.column)?,
                     sort.direction,
                     sort.nulls,
                 ))
             })
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
 
         let mut plan = LogicalPlan::scan(source);
         if let Some(filter) = filter {
@@ -219,17 +225,17 @@ impl SqlAst {
             plan = plan.project(projection);
         }
         if let Some((group_by, expressions)) = aggregate {
-            plan = if let Some(group_by) = group_by {
-                plan.aggregate_grouped(group_by, expressions)?
-            } else {
+            plan = if group_by.is_empty() {
                 plan.aggregate(expressions)?
+            } else {
+                plan.aggregate_grouped(group_by, expressions)?
             };
         }
-        if let Some((column, direction, nulls)) = sort {
+        if !sort.is_empty() {
             if matches!(self.projection, SqlProjection::Aggregates(_)) {
                 bail!("ORDER BY aggregate results is not supported");
             }
-            plan = plan.sort(column, direction, nulls);
+            plan = plan.sort_by(sort);
         }
         if let Some(limit) = self.limit {
             plan = plan.limit(limit);
@@ -239,9 +245,9 @@ impl SqlAst {
     }
 }
 
-fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Option<SqlSort>> {
+fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<SqlSort>> {
     let Some(order_by) = order_by else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     if order_by.interpolate.is_some() {
         bail!("ORDER BY INTERPOLATE is not supported");
@@ -249,25 +255,50 @@ fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Option<SqlSort>> {
     let OrderByKind::Expressions(expressions) = &order_by.kind else {
         bail!("ORDER BY ALL is not supported");
     };
-    let [expression] = expressions.as_slice() else {
-        bail!("ORDER BY supports exactly one column");
-    };
-    if expression.with_fill.is_some() {
-        bail!("ORDER BY WITH FILL is not supported");
+    if expressions.len() > MAX_SORT_KEYS {
+        bail!(
+            "ORDER BY names {} columns; the limit is {MAX_SORT_KEYS}",
+            expressions.len()
+        );
     }
-    Ok(Some(SqlSort {
-        column: parse_column(&expression.expr)?,
-        direction: if expression.options.asc == Some(false) {
-            SortDirection::Descending
-        } else {
-            SortDirection::Ascending
-        },
-        nulls: if expression.options.nulls_first == Some(true) {
-            NullOrder::First
-        } else {
-            NullOrder::Last
-        },
-    }))
+    let sort = expressions
+        .iter()
+        .map(|expression| {
+            if expression.with_fill.is_some() {
+                bail!("ORDER BY WITH FILL is not supported");
+            }
+            Ok(SqlSort {
+                column: parse_column(&expression.expr)?,
+                direction: if expression.options.asc == Some(false) {
+                    SortDirection::Descending
+                } else {
+                    SortDirection::Ascending
+                },
+                nulls: if expression.options.nulls_first == Some(true) {
+                    NullOrder::First
+                } else {
+                    NullOrder::Last
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    reject_repeats(sort.iter().map(|key| key.column.as_str()), "ORDER BY")?;
+    Ok(sort)
+}
+
+/// Fails when a column name appears twice (names compare case-insensitively).
+fn reject_repeats<'a>(names: impl Iterator<Item = &'a str>, clause: &str) -> Result<()> {
+    let mut seen: Vec<&str> = Vec::new();
+    for name in names {
+        if seen
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+        {
+            bail!("{clause} names the column {name} twice");
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 fn reject_select_clauses(select: &sqlparser::ast::Select) -> Result<()> {
@@ -336,22 +367,23 @@ fn parse_projection(items: &[SelectItem], group_by: &GroupByExpr) -> Result<SqlP
         }
     }
     if aggregates.is_empty() {
-        if group_by.is_some() {
+        if !group_by.is_empty() {
             bail!("GROUP BY requires at least one aggregate");
         }
         return Ok(SqlProjection::Columns(columns));
     }
-    let Some(group_by) = group_by.or_else(|| columns.is_empty().then_some(String::new())) else {
+    if group_by.is_empty() && !columns.is_empty() {
         bail!("aggregate SELECT cannot include ordinary columns without GROUP BY");
-    };
-    let group_by = (!group_by.is_empty()).then_some(group_by);
-    let group_matches = match (columns.first(), group_by.as_deref()) {
-        (None, None) => true,
-        (Some(column), Some(group)) => column.eq_ignore_ascii_case(group),
-        _ => false,
-    };
-    if columns.len() != usize::from(group_by.is_some()) || !group_matches {
-        bail!("SELECT may include only the GROUP BY column and aggregate expressions");
+    }
+    // The result has the GROUP BY columns first, in GROUP BY order, so SELECT must
+    // list them the same way.
+    let same = columns.len() == group_by.len()
+        && columns
+            .iter()
+            .zip(&group_by)
+            .all(|(column, group)| column.eq_ignore_ascii_case(group));
+    if !same {
+        bail!("SELECT must list the GROUP BY columns first, in the same order, then aggregates");
     }
     Ok(SqlProjection::Aggregates(SqlAggregate {
         group_by,
@@ -359,20 +391,23 @@ fn parse_projection(items: &[SelectItem], group_by: &GroupByExpr) -> Result<SqlP
     }))
 }
 
-fn parse_group_by(group_by: &GroupByExpr) -> Result<Option<String>> {
+fn parse_group_by(group_by: &GroupByExpr) -> Result<Vec<String>> {
     match group_by {
-        GroupByExpr::Expressions(expressions, modifiers)
-            if expressions.is_empty() && modifiers.is_empty() =>
-        {
-            Ok(None)
+        GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
+            if expressions.len() > MAX_GROUP_COLUMNS {
+                bail!(
+                    "GROUP BY names {} columns; the limit is {MAX_GROUP_COLUMNS}",
+                    expressions.len()
+                );
+            }
+            let columns = expressions
+                .iter()
+                .map(parse_column)
+                .collect::<Result<Vec<_>>>()?;
+            reject_repeats(columns.iter().map(String::as_str), "GROUP BY")?;
+            Ok(columns)
         }
-        GroupByExpr::Expressions(expressions, modifiers)
-            if modifiers.is_empty() && expressions.len() == 1 =>
-        {
-            let expression = &expressions[0];
-            Ok(Some(parse_column(expression)?))
-        }
-        _ => bail!("GROUP BY supports exactly one column"),
+        _ => bail!("GROUP BY supports plain column names only (no ROLLUP, CUBE or ALL)"),
     }
 }
 
@@ -819,11 +854,11 @@ mod tests {
         let ast = SqlAst::parse(sql).unwrap();
         assert_eq!(
             ast.sort(),
-            Some(&SqlSort {
+            [SqlSort {
                 column: "id".to_string(),
                 direction: SortDirection::Descending,
                 nulls: NullOrder::Last,
-            })
+            }]
         );
         let batches = execute(sql, order_source);
         let ids = batches[0]
@@ -914,7 +949,10 @@ mod tests {
         let grouped_sql = "SELECT name, COUNT(*), AVG(id) FROM dataset GROUP BY name";
         let grouped = execute(grouped_sql, Arc::clone(&source));
         let direct = LogicalPlan::scan(source)
-            .aggregate_grouped(1, vec![AggregateExpr::count_all(), AggregateExpr::avg(0)])
+            .aggregate_grouped(
+                vec![1],
+                vec![AggregateExpr::count_all(), AggregateExpr::avg(0)],
+            )
             .unwrap();
         let runtime = runtime();
         let direct_batch = QueryEngine::new(&runtime)
@@ -980,7 +1018,8 @@ mod tests {
             "SELECT id FROM dataset WHERE name ILIKE 'a%'",
             "SELECT id FROM dataset WHERE id + 1 = 2",
             "SELECT id FROM dataset WHERE id BETWEEN name AND 3",
-            "SELECT id FROM dataset ORDER BY id, enabled",
+            "SELECT id FROM dataset ORDER BY id, id",
+            "SELECT id, COUNT(*) FROM dataset GROUP BY enabled",
             "SELECT id FROM dataset LIMIT 1 OFFSET 1",
         ] {
             assert!(SqlAst::parse(sql).is_err(), "{sql}");

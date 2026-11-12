@@ -16,8 +16,11 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - The Inspector has a Row section listing every shown column of the selected row; click a line to select that cell.
 - Decimal and time-of-day columns can be filtered (`price > 12.50`, `at < 08:30:00`), sorted, grouped, profiled and charted, and used in MIN/MAX. Decimals also work with SUM and AVG.
 - A list, struct or map cell opens as a tree in the Inspector.
+- Sort by several columns: right-click a header and choose "Then by", or write `ORDER BY a DESC, b` in SQL.
+- SQL `GROUP BY` takes several columns, e.g. `SELECT carrier, origin, COUNT(*) FROM dataset GROUP BY carrier, origin`.
 
 ### Changed
+- Sorting sorts the whole file instead of showing only the first 100,000 rows. A sort too large for memory writes temporary files (up to 32 GB) and may take a while.
 - Copying cells copies their full values instead of the first 256 characters, quotes values that contain a tab, line break or quote, and allows up to 16 MB instead of 64 KB.
 - In the filter box, quote a value that contains `AND`, `OR`, a comma or brackets, e.g. `title == "war and peace"`. Unquoted, `and` / `or` now join two tests.
 

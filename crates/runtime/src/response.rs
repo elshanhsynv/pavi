@@ -1,7 +1,7 @@
 use anyhow::Error;
 use arrow_array::RecordBatch;
-use parquet_reader::{DataPage, FilteredWindow, ParquetSource};
-use std::sync::Arc;
+use parquet_reader::{DataPage, FilteredWindow, ParquetSource, SortMerge};
+use std::sync::{Arc, Mutex};
 
 use crate::{GenerationId, TaskId};
 
@@ -13,6 +13,14 @@ pub enum PageOutcome {
     Batches(Vec<RecordBatch>),
     /// Filtered rows plus the source row to resume scanning from.
     Filtered(FilteredWindow),
+    /// A sort too large for memory spilled to disk; read its rows with
+    /// `RuntimeHandle::submit_sort_merge`.
+    SortSpilled(Arc<Mutex<SortMerge>>),
+    /// Rows from a spilled sort, and whether it has handed out every row.
+    Merged {
+        batches: Vec<RecordBatch>,
+        finished: bool,
+    },
     Cancelled,
     ReadFailed(Error),
 }

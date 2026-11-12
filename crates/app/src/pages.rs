@@ -98,6 +98,10 @@ impl SourcePages {
                         grid.requested.remove(&page_index);
                         status = Some(format!("load page {page_index}: {error:#}"));
                     }
+                    PageOutcome::SortSpilled(_) | PageOutcome::Merged { .. } => {
+                        grid.requested.remove(&page_index);
+                        status = Some(format!("load page {page_index}: unexpected sort result"));
+                    }
                     PageOutcome::Batch(_)
                     | PageOutcome::Batches(_)
                     | PageOutcome::Filtered(_)
