@@ -6,7 +6,9 @@ use std::{env, path::Path, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
-use parquet_reader::{DataPage, PAGE_ROWS, PageCacheLimits, ParquetSource, Projection};
+use parquet_reader::{
+    DataPage, NullOrder, PAGE_ROWS, PageCacheLimits, ParquetSource, Projection, SortDirection,
+};
 use pavi_query::{LogicalPlan, QueryEngine};
 use pavi_runtime::{GenerationId, OpenOutcome, PageOutcome, Runtime, RuntimeConfig};
 
@@ -121,6 +123,24 @@ fn main() -> Result<()> {
     println!("query_scheduled_reads,{}", execution.scheduled_reads());
     print_cache("query_cache", &source)?;
 
+    // A whole-file sort by the first column. Past the in-memory sort budget it
+    // spills to disk (ADR 0005), so this also times the run files and the merge.
+    let started = Instant::now();
+    let mut execution = QueryEngine::new(&runtime).execute(
+        &LogicalPlan::scan(Arc::clone(&source)).sort(0, SortDirection::Descending, NullOrder::Last),
+        GenerationId(2),
+    )?;
+    let first = execution
+        .next_batch()?
+        .context("sort unexpectedly returned no rows")?;
+    println!("sort_first_batch_ms,{}", millis(started.elapsed()));
+    let mut rows = first.batch.num_rows() as u64;
+    while let Some(batch) = execution.next_batch()? {
+        rows += batch.batch.num_rows() as u64;
+    }
+    println!("sort_all_ms,{}", millis(started.elapsed()));
+    println!("sort_all_rows,{rows}");
+
     runtime.shutdown();
     Ok(())
 }
@@ -155,6 +175,9 @@ fn read_page(
         PageOutcome::Batch(_) => bail!("page {page} unexpectedly returned a record batch"),
         PageOutcome::Batches(_) => bail!("page {page} unexpectedly returned record batches"),
         PageOutcome::Filtered(_) => bail!("page {page} unexpectedly returned a filtered window"),
+        PageOutcome::SortSpilled(_) | PageOutcome::Merged { .. } => {
+            bail!("page {page} unexpectedly returned sorted rows")
+        }
     }
 }
 

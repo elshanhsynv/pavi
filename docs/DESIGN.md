@@ -100,9 +100,9 @@ Reuse these before writing a new control. A new shared control goes in `widgets.
 - Keyboard: Ctrl+O open, Ctrl+R reload, Ctrl+F focus the filter box, Ctrl+Shift+F find in loaded rows (Enter / F3 next, Shift+Enter / Shift+F3 previous, Esc closes), Ctrl+G focus "Go to row", Ctrl+I toggle the Inspector, Ctrl+1 / Ctrl+2 Grid / SQL, Ctrl+C copy selection, Ctrl+Enter run SQL, arrow keys, Page Up/Down, Home and End (+Shift) move/extend the cell selection.
 - Dropping a file on the window opens it.
 - A header click selects the column: it is underlined in `ACCENT` and the Inspector's Column section describes it. It never starts a scan.
-- A header right-click opens a menu: Sort ascending / descending, Profile column, Fit width, Hide column, Copy name.
+- A header right-click opens a menu: Sort ascending / descending (by this column alone), Then by ascending / descending (once something is sorted: this column breaks its ties), Profile column, Fit width, Hide column, Pin columns, Copy name. With several sort keys each sorted header shows its arrow and its position (1, 2, …).
 - A cell right-click selects the cell and opens a menu: Filter to this value, Exclude this value, Copy cell, Copy row. While a filter is applied it also offers "Add to filter: this value" and "Add to filter: not this value", which narrow that filter. A null cell filters to or away from nulls. When the cell cannot be filtered by (an unsupported type, an aggregate result) the filter rows are disabled and a caption says why.
-- Sorting is always an explicit choice (the Sort menu or the header menu), because it scans the whole file. A sort without a SQL `LIMIT` returns the first 100,000 rows in sort order and says so in the result strip; "Back to file order" in the Sort menu clears it.
+- Sorting is always an explicit choice (the Sort menu or the header menu), because it scans the whole file. It sorts every row; a large sort shows its scan progress and may take a while, because it writes temporary files. "Back to file order" in the Sort menu clears it.
 - Every long action can be cancelled or replaced by starting a new one.
 
 ## Known design debt

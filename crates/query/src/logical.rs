@@ -25,9 +25,10 @@ pub struct Limit {
     pub(crate) rows: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Sort {
-    pub(crate) spec: SortSpec,
+    /// Keys, most significant first.
+    pub(crate) keys: Vec<SortSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,13 +101,16 @@ impl Limit {
 
 impl Sort {
     pub fn new(column: usize, direction: SortDirection, nulls: NullOrder) -> Self {
-        Self {
-            spec: SortSpec::new(column, direction, nulls),
-        }
+        Self::by(vec![SortSpec::new(column, direction, nulls)])
     }
 
-    pub fn spec(&self) -> SortSpec {
-        self.spec
+    /// A sort by several keys, most significant first.
+    pub fn by(keys: Vec<SortSpec>) -> Self {
+        Self { keys }
+    }
+
+    pub fn keys(&self) -> &[SortSpec] {
+        &self.keys
     }
 }
 
@@ -147,9 +151,14 @@ impl LogicalPlan {
     }
 
     pub fn sort(self, column: usize, direction: SortDirection, nulls: NullOrder) -> Self {
+        self.sort_by(vec![SortSpec::new(column, direction, nulls)])
+    }
+
+    /// Sorts by several keys, most significant first.
+    pub fn sort_by(self, keys: Vec<SortSpec>) -> Self {
         Self::Sort {
             input: Box::new(self),
-            sort: Sort::new(column, direction, nulls),
+            sort: Sort::by(keys),
         }
     }
 
@@ -162,27 +171,26 @@ impl LogicalPlan {
 
     pub fn aggregate_grouped(
         self,
-        group_by: usize,
+        group_by: impl Into<Vec<usize>>,
         expressions: impl Into<Vec<AggregateExpr>>,
     ) -> Result<Self> {
         Ok(Self::Aggregate {
             input: Box::new(self),
-            aggregate: Aggregate::new(AggregateSpec::grouped(group_by, expressions)?),
+            aggregate: Aggregate::new(AggregateSpec::grouped_by(group_by, expressions)?),
         })
     }
 
-    /// Replaces the one supported sort while keeping `Limit` outside it.
-    pub fn replace_sort(self, column: usize, direction: SortDirection, nulls: NullOrder) -> Self {
-        let sort = Sort::new(column, direction, nulls);
+    /// Replaces the plan's sort (if any) with `keys`, keeping `Limit` outside it.
+    pub fn replace_sort(self, keys: Vec<SortSpec>) -> Self {
         match self {
             Self::Limit { input, limit } => Self::Limit {
-                input: Box::new(input.replace_sort(column, direction, nulls)),
+                input: Box::new(input.replace_sort(keys)),
                 limit,
             },
-            Self::Sort { input, .. } => input.replace_sort(column, direction, nulls),
+            Self::Sort { input, .. } => input.replace_sort(keys),
             plan => Self::Sort {
                 input: Box::new(plan),
-                sort,
+                sort: Sort::by(keys),
             },
         }
     }

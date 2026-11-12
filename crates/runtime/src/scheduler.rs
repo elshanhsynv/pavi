@@ -13,7 +13,7 @@ use std::{
 
 use parquet_reader::{
     AggregateSpec, Cancelled, FilterExpr, GroupBudget, ParquetSource, Projection, SortBudget,
-    SortSpec,
+    SortMerge, SortOutput, SortSpec,
 };
 
 use crate::{
@@ -40,9 +40,10 @@ impl Default for RuntimeConfig {
 
 /// What a sorted read orders by, its memory budget, and an optional row limit
 /// (`ORDER BY … LIMIT n`), which lets inputs larger than the budget be sorted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SortedRead {
-    pub sort: SortSpec,
+    /// Sort keys, most significant first.
+    pub sort: Vec<SortSpec>,
     pub budget: SortBudget,
     pub limit: Option<usize>,
 }
@@ -100,9 +101,13 @@ enum ReadOperation {
     },
     Sorted {
         filter: Option<FilterExpr>,
-        sort: SortSpec,
+        sort: Vec<SortSpec>,
         budget: SortBudget,
         limit: Option<usize>,
+    },
+    SortMerge {
+        merge: Arc<Mutex<SortMerge>>,
+        rows: usize,
     },
     Aggregated {
         filter: Option<FilterExpr>,
@@ -359,6 +364,25 @@ impl RuntimeHandle {
         )
     }
 
+    /// Reads up to about `rows` more rows from a spilled sort; the outcome is
+    /// [`PageOutcome::Merged`].
+    pub fn submit_sort_merge(
+        &self,
+        source: Arc<ParquetSource>,
+        merge: Arc<Mutex<SortMerge>>,
+        rows: usize,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::SortMerge { merge, rows },
+            None,
+        )
+    }
+
     pub fn submit_aggregated(
         &self,
         source: Arc<ParquetSource>,
@@ -583,8 +607,27 @@ fn read_source(
             budget,
             limit,
         } => source
-            .read_sorted(filter.as_ref(), projection, sort, budget, limit, checkpoint)
-            .map(PageOutcome::Batches),
+            .read_sorted(
+                filter.as_ref(),
+                projection,
+                &sort,
+                budget,
+                limit,
+                checkpoint,
+            )
+            .map(|output| match output {
+                SortOutput::InMemory(batches) => PageOutcome::Batches(batches),
+                SortOutput::Spilled(merge) => PageOutcome::SortSpilled(Arc::new(Mutex::new(merge))),
+            }),
+        ReadOperation::SortMerge { merge, rows } => {
+            let mut merge = merge
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sort merge lock poisoned"))?;
+            // The merge reports no position in the file; it only checks for stop.
+            merge
+                .next_rows(rows, &|| checkpoint(0))
+                .map(|(batches, finished)| PageOutcome::Merged { batches, finished })
+        }
         ReadOperation::Aggregated {
             filter,
             aggregate,

@@ -1,9 +1,12 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use parquet_reader::{DataPage, FilteredWindow, GroupBudget, PAGE_ROWS, SortBudget};
+use parquet_reader::{DataPage, FilteredWindow, GroupBudget, PAGE_ROWS, SortBudget, SortMerge};
 use pavi_runtime::{
     CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SortedRead,
     SubmitError, TaskId,
@@ -34,6 +37,8 @@ pub struct QueryExecution {
     cancelled: bool,
     scheduled_reads: usize,
     sort_submitted: bool,
+    /// A sort that spilled to disk; its rows are read a page at a time.
+    sort_merge: Option<Arc<Mutex<SortMerge>>>,
     aggregate_submitted: bool,
 }
 
@@ -56,6 +61,7 @@ enum InFlight {
     Window,
     Filtered,
     Sorted,
+    SortMerge,
     Aggregate,
 }
 
@@ -113,6 +119,7 @@ impl QueryEngine {
             cancelled: false,
             scheduled_reads: 0,
             sort_submitted: false,
+            sort_merge: None,
             aggregate_submitted: false,
         };
         if let Err(error) = execution.schedule_next()
@@ -141,7 +148,7 @@ impl QueryExecution {
         match self.in_flight.as_ref()? {
             InFlight::Filtered => Some(task.progress().scanned_rows().max(self.next_filter_row)),
             InFlight::Sorted | InFlight::Aggregate => Some(task.progress().scanned_rows()),
-            InFlight::Page | InFlight::Window => None,
+            InFlight::Page | InFlight::Window | InFlight::SortMerge => None,
         }
     }
 
@@ -190,6 +197,10 @@ impl QueryExecution {
                 }
                 PageOutcome::Batches(batches) => {
                     self.buffer_batches(batches, in_flight, response.task_id)?
+                }
+                PageOutcome::SortSpilled(merge) => self.start_merge(merge, in_flight)?,
+                PageOutcome::Merged { batches, finished } => {
+                    self.buffer_merged(batches, finished, in_flight, response.task_id)?
                 }
                 PageOutcome::Filtered(window) => {
                     self.buffer_filtered(window, in_flight, response.task_id)?
@@ -254,6 +265,10 @@ impl QueryExecution {
                 PageOutcome::Batches(batches) => {
                     self.buffer_batches(batches, in_flight, response.task_id)?
                 }
+                PageOutcome::SortSpilled(merge) => self.start_merge(merge, in_flight)?,
+                PageOutcome::Merged { batches, finished } => {
+                    self.buffer_merged(batches, finished, in_flight, response.task_id)?
+                }
                 PageOutcome::Filtered(window) => {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
@@ -289,7 +304,9 @@ impl QueryExecution {
             InFlight::Filtered => bail!("runtime returned a plain batch for a filtered query read"),
             InFlight::Aggregate => self.finished = true,
             InFlight::Page => bail!("runtime returned a batch for a page query read"),
-            InFlight::Sorted => bail!("runtime returned one batch for a sorted query read"),
+            InFlight::Sorted | InFlight::SortMerge => {
+                bail!("runtime returned one batch for a sorted query read")
+            }
         }
         if batch.num_rows() > 0 {
             self.buffered.push_back((task_id, batch));
@@ -315,6 +332,38 @@ impl QueryExecution {
         }
         if window.batch.num_rows() > 0 {
             self.buffered.push_back((task_id, window.batch));
+        }
+        Ok(())
+    }
+
+    fn start_merge(&mut self, merge: Arc<Mutex<SortMerge>>, in_flight: InFlight) -> Result<()> {
+        if !matches!(in_flight, InFlight::Sorted) {
+            bail!("runtime returned a spilled sort for a non-sort query read");
+        }
+        self.sort_merge = Some(merge);
+        Ok(())
+    }
+
+    fn buffer_merged(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        finished: bool,
+        in_flight: InFlight,
+        task_id: TaskId,
+    ) -> Result<()> {
+        if !matches!(in_flight, InFlight::SortMerge) {
+            bail!("runtime returned merged rows for a non-merge query read");
+        }
+        self.buffered.extend(
+            batches
+                .into_iter()
+                .filter(|batch| batch.num_rows() > 0)
+                .map(|batch| (task_id, batch)),
+        );
+        if finished {
+            self.finished = true;
+            // Dropping the merge deletes its spill files.
+            self.sort_merge = None;
         }
         Ok(())
     }
@@ -384,25 +433,39 @@ impl QueryExecution {
                 InFlight::Aggregate,
                 false,
             )
-        } else if let Some(sort) = self.plan.sort {
+        } else if !self.plan.sort.is_empty() {
             if self.sort_submitted {
-                return Ok(());
+                // A spilled sort hands out its rows a page at a time.
+                let Some(merge) = &self.sort_merge else {
+                    return Ok(());
+                };
+                (
+                    self.runtime.submit_sort_merge(
+                        source,
+                        Arc::clone(merge),
+                        row_count,
+                        self.generation_id,
+                    ),
+                    InFlight::SortMerge,
+                    false,
+                )
+            } else {
+                (
+                    self.runtime.submit_sorted(
+                        source,
+                        self.plan.filter.clone(),
+                        projection,
+                        SortedRead {
+                            sort: self.plan.sort.clone(),
+                            budget: self.sort_budget,
+                            limit: self.plan.limit,
+                        },
+                        self.generation_id,
+                    ),
+                    InFlight::Sorted,
+                    false,
+                )
             }
-            (
-                self.runtime.submit_sorted(
-                    source,
-                    self.plan.filter.clone(),
-                    projection,
-                    SortedRead {
-                        sort,
-                        budget: self.sort_budget,
-                        limit: self.plan.limit,
-                    },
-                    self.generation_id,
-                ),
-                InFlight::Sorted,
-                false,
-            )
         } else if let Some(filter) = &self.plan.filter {
             (
                 self.runtime.submit_filtered_from(
@@ -1009,7 +1072,7 @@ mod tests {
         let runtime = runtime();
         let logical = LogicalPlan::scan(Arc::clone(&source))
             .aggregate_grouped(
-                0,
+                vec![0],
                 vec![
                     AggregateExpr::count_all(),
                     AggregateExpr::count(1),
@@ -1307,21 +1370,46 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sort_inputs_over_the_configured_budget_without_temp_files() {
+    fn spills_sorts_over_the_budget_and_reads_them_a_page_at_a_time() {
         let (directory, source, _) = source();
+        let rows = source.row_count();
         let runtime = runtime();
-        let mut execution = QueryEngine::with_sort_budget(
+        let engine = QueryEngine::with_sort_budget(
             &runtime,
-            SortBudget::new(10, SortBudget::DEFAULT_MAX_BYTES).unwrap(),
-        )
-        .execute(
-            &LogicalPlan::scan(source).sort(0, SortDirection::Ascending, NullOrder::Last),
-            GenerationId(13),
-        )
-        .unwrap();
-        let error = execution.next_batch().unwrap_err();
-        assert!(format!("{error:#}").contains("external sorting is unavailable"));
+            SortBudget::new(1_000, SortBudget::DEFAULT_MAX_BYTES).unwrap(),
+        );
+        // `enabled` descending (true first), then id descending.
+        let plan = LogicalPlan::scan(Arc::clone(&source)).sort_by(vec![
+            parquet_reader::SortSpec::new(2, SortDirection::Descending, NullOrder::Last),
+            parquet_reader::SortSpec::new(0, SortDirection::Descending, NullOrder::Last),
+        ]);
+        let mut execution = engine.execute(&plan, GenerationId(13)).unwrap();
+        let mut seen = Vec::new();
+        while let Some(batch) = execution.next_batch().unwrap() {
+            assert!(batch.batch.num_rows() <= PAGE_ROWS as usize);
+            seen.extend(ids(&batch.batch));
+        }
+        assert_eq!(seen.len() as u64, rows, "every row comes back");
+        // `enabled` true first, then false; within each, id descending.
+        let mut expected = (0..rows as i32).collect::<Vec<_>>();
+        expected.sort_by_key(|id| (std::cmp::Reverse(id % 2 == 0), std::cmp::Reverse(*id)));
+        assert_eq!(seen, expected);
+        assert!(
+            execution.scheduled_reads() > 2,
+            "the merge was read in steps"
+        );
+        // Spill files live in the system temp folder, never next to the data file.
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+
+        // A LIMIT past the budget spills too, and stops where it should.
+        let mut execution = engine
+            .execute(&plan.clone().limit(1_500), GenerationId(14))
+            .unwrap();
+        let mut count = 0;
+        while let Some(batch) = execution.next_batch().unwrap() {
+            count += batch.batch.num_rows();
+        }
+        assert_eq!(count, 1_500);
     }
 
     #[test]

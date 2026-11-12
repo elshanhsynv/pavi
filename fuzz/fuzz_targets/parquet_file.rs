@@ -44,7 +44,7 @@ fn check(data: &[u8]) {
     let never = |_: u64| false;
     let sort = SortSpec::new(0, SortDirection::Descending, NullOrder::Last);
     let sort_budget = SortBudget::new(10_000, 16 * 1024 * 1024).expect("budget");
-    let _ = source.read_sorted(None, &projection, sort, sort_budget, Some(10), &never);
+    let _ = source.read_sorted(None, &projection, &[sort], sort_budget, Some(10), &never);
     let group_budget = GroupBudget::new(1_000, 1024 * 1024).expect("budget");
     if let Ok(spec) = AggregateSpec::grouped(0, [AggregateExpr::count_all(), AggregateExpr::max(0)])
     {

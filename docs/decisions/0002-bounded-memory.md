@@ -1,6 +1,6 @@
 # 0002. Every buffer is bounded
 
-- Status: accepted
+- Status: accepted; the sort input cap is amended by [0005](0005-external-sort.md)
 - Date: 2026-11-08 (recorded after the fact)
 
 ## Context

@@ -292,15 +292,8 @@ impl PaviApp {
             .as_ref()
             .map(|dataset| dataset.column_names.clone())
             .unwrap_or_default();
-        let sorted = self
-            .filtered
-            .as_ref()
-            .and_then(|filtered| filtered.sort)
-            .and_then(|sort| {
-                names
-                    .get(sort.column)
-                    .map(|name| self.sort_heading(sort.column, name))
-            });
+        let keys = self.sort_keys();
+        let sorted = (!keys.is_empty()).then(|| self.describe_sort(keys));
         let hint = sorted
             .as_ref()
             .map_or_else(|| "Sort".to_owned(), |sorted| format!("Sorted by {sorted}"));

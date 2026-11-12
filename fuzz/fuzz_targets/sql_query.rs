@@ -3,7 +3,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use parquet_reader::{GroupBudget, Projection, SortBudget};
+use parquet_reader::{GroupBudget, Projection, SortBudget, SortOutput};
 use pavi_query::{Planner, SqlAst};
 
 fuzz_target!(
@@ -37,16 +37,25 @@ fn check(data: &[u8]) {
         source
             .read_aggregated(plan.filter(), aggregate, budget, &never)
             .map(|batch| vec![batch])
-    } else if let Some(sort) = plan.sort() {
-        let budget = SortBudget::new(10_000, 16 * 1024 * 1024).expect("budget");
-        source.read_sorted(
-            plan.filter(),
-            &projection,
-            sort,
-            budget,
-            plan.limit(),
-            &never,
-        )
+    } else if !plan.sort().is_empty() {
+        // A small budget, so larger fixtures also exercise the spill and merge.
+        let budget = SortBudget::new(16, 16 * 1024 * 1024).expect("budget");
+        source
+            .read_sorted(
+                plan.filter(),
+                &projection,
+                plan.sort(),
+                budget,
+                plan.limit(),
+                &never,
+            )
+            .and_then(|output| match output {
+                SortOutput::InMemory(batches) => Ok(batches),
+                SortOutput::Spilled(mut merge) => {
+                    let (batches, _) = merge.next_rows(64, &|| false)?;
+                    Ok(batches)
+                }
+            })
     } else if let Some(filter) = plan.filter() {
         source
             .read_filtered_from(filter, 0, 64, &projection, &never)

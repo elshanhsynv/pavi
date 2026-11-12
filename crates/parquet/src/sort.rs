@@ -22,6 +22,30 @@ pub struct SortSpec {
     pub nulls: NullOrder,
 }
 
+/// Most keys one sort may have.
+pub const MAX_SORT_KEYS: usize = 8;
+
+/// Checks a list of sort keys: at least one, at most [`MAX_SORT_KEYS`], no column twice.
+pub fn validate_sort_keys(keys: &[SortSpec]) -> Result<()> {
+    if keys.is_empty() {
+        bail!("a sort needs at least one column");
+    }
+    if keys.len() > MAX_SORT_KEYS {
+        bail!(
+            "ORDER BY names {} columns; the limit is {MAX_SORT_KEYS}",
+            keys.len()
+        );
+    }
+    if (1..keys.len()).any(|index| {
+        keys[..index]
+            .iter()
+            .any(|key| key.column == keys[index].column)
+    }) {
+        bail!("a sort names the same column twice");
+    }
+    Ok(())
+}
+
 /// Bound on the source rows and estimated Arrow workspace retained for one sort.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SortBudget {
