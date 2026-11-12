@@ -8,7 +8,8 @@ Pavi is a native desktop explorer for **Parquet** files with a bounded Arrow-bas
 * Virtualized scrolling to any row of very large files (a moving 500,000-row window with a whole-file scrollbar), projected page caching, column resizing, and cell selection
 * Filters, SQL (`SELECT` / `WHERE` / `ORDER BY` / aggregates), and deterministic single-column sorting over booleans, numbers, text, dates, and timestamps (e.g. `FL_DATE >= 2006-02-15`); filters combine tests with `AND` / `OR` and support `IN`, `BETWEEN`, `LIKE` and `IS NULL` (e.g. `DEP_DELAY > 60 AND DISTANCE BETWEEN 500 AND 1000`); filtered results stream from a resume cursor, and `ORDER BY … LIMIT n` keeps only the top rows so it works on files of any size
 * Bounded charts, Inspector metadata/statistics, query history, recent files, and restored session preferences
-* Streaming CSV and Parquet export for the current source/query/filter result, plus cached selected-row export and clipboard copy
+* Find in the loaded rows, pinned columns, a whole-row view in the Inspector, and clipboard copy of full values (tab-separated, up to 16 MB)
+* Streaming CSV and Parquet export for the current source/query/filter result, plus cached selected-row export
 
 ## Tech Stack
 

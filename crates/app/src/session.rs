@@ -22,6 +22,8 @@ pub struct GridLayoutPreference {
     pub order: Vec<String>,
     pub hidden: Vec<String>,
     pub widths: BTreeMap<String, u16>,
+    /// Shown columns pinned to the left.
+    pub pinned: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
@@ -377,8 +379,15 @@ mod tests {
             order: vec!["name".to_string(), "id".to_string()],
             hidden: vec!["id".to_string()],
             widths: BTreeMap::from([("name".to_string(), 240)]),
+            pinned: 1,
         });
         assert_eq!(state.grid_layout("id|name").unwrap().order[0], "name");
+        assert_eq!(state.grid_layout("id|name").unwrap().pinned, 1);
+        // Layouts saved before pinning existed load with nothing pinned.
+        let old: GridLayoutPreference =
+            serde_json::from_str(r#"{"schema_key":"a","order":[],"hidden":[],"widths":{}}"#)
+                .unwrap();
+        assert_eq!(old.pinned, 0);
         for index in 0..=MAX_GRID_LAYOUTS {
             state.save_grid_layout(GridLayoutPreference {
                 schema_key: format!("schema-{index}"),

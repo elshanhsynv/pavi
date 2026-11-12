@@ -11,9 +11,16 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Filters can combine tests with `AND`, `OR` and brackets, in the filter box and in SQL `WHERE`.
 - New filter tests: `IN (…)`, `BETWEEN … AND …`, `LIKE` with `%` and `_`, `IS NULL`, and their `NOT` forms. The filter box also accepts `=` and `<>`.
 - Cell menu: "Add to filter" narrows the filter already applied instead of replacing it, and a null cell can be filtered to or away from nulls.
+- Find in the loaded rows (Ctrl+Shift+F): Enter or F3 moves to the next match, Shift+Enter or Shift+F3 to the previous one.
+- Pin columns: right-click a header and choose "Pin columns up to here". Pinned columns and the row numbers stay in place when the grid scrolls sideways. The pin is saved with the column layout.
+- The Inspector has a Row section listing every shown column of the selected row; click a line to select that cell.
 
 ### Changed
+- Copying cells copies their full values instead of the first 256 characters, quotes values that contain a tab, line break or quote, and allows up to 16 MB instead of 64 KB.
 - In the filter box, quote a value that contains `AND`, `OR`, a comma or brackets, e.g. `title == "war and peace"`. Unquoted, `and` / `or` now join two tests.
+
+### Fixed
+- The window can be resized by dragging its edges and corners.
 
 ## [0.2.0] - 2026-11-10
 

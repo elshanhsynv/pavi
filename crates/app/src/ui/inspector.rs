@@ -9,6 +9,12 @@ use arrow_schema::DataType;
 /// Width the Inspector opens at; the user can drag it within `INSPECTOR_WIDTHS`.
 const INSPECTOR_WIDTH: f32 = 280.0;
 const INSPECTOR_WIDTHS: std::ops::RangeInclusive<f32> = 240.0..=460.0;
+/// Height of one line of the Row section.
+const FIELD_HEIGHT: f32 = 20.0;
+/// Most height the Row section takes before it scrolls.
+const ROW_SECTION_HEIGHT: f32 = 240.0;
+/// Narrowest the column-name part of a Row line gets.
+const FIELD_NAME_MIN_WIDTH: f32 = 90.0;
 
 impl PaviApp {
     pub(in crate::app) fn show_inspector_panel(&mut self, ctx: &egui::Context) {
@@ -32,6 +38,8 @@ impl PaviApp {
     fn show_metadata(&mut self, ui: &mut egui::Ui) {
         let selected_column = self.selected_source_column();
         let selected_cell = self.selected_cell_details();
+        let row_view = self.selected_row_view();
+        let mut select_field = None;
         let mut start_profile = None;
         let mut cancel_profile = false;
         let Some(dataset) = &self.dataset else {
@@ -76,6 +84,35 @@ impl PaviApp {
             {
                 ui.add(egui::Label::new(extra).wrap());
             }
+        });
+
+        let row_note = row_view
+            .as_ref()
+            .map(|view| format!("{} columns", view.fields.len()))
+            .unwrap_or_default();
+        widgets::section(ui, "Row", &row_note, true, |ui| {
+            let Some(view) = &row_view else {
+                ui.label(
+                    RichText::new("Click a cell to see its whole row, one column per line.")
+                        .color(theme::MUTED),
+                );
+                return;
+            };
+            let selected = self.grid.selection.map(|(_, column)| column);
+            egui::ScrollArea::vertical()
+                .id_salt("inspector_row")
+                .max_height(ROW_SECTION_HEIGHT)
+                .auto_shrink([false, true])
+                .show_rows(ui, FIELD_HEIGHT, view.fields.len(), |ui, range| {
+                    for column in range {
+                        let (name, batch_column) = &view.fields[column];
+                        let value = view.batch.column(*batch_column);
+                        let text = format_cell_with_limit(value.as_ref(), view.offset, CELL_LIMIT);
+                        if field_row(ui, name, &text, selected == Some(column)).clicked() {
+                            select_field = Some((view.row, column));
+                        }
+                    }
+                });
         });
 
         widgets::section(ui, "Column", "", true, |ui| {
@@ -286,12 +323,59 @@ impl PaviApp {
             }
         });
 
+        if let Some((row, column)) = select_field {
+            self.grid.select(row, column);
+            self.reveal_column(column);
+        }
         if cancel_profile {
             self.cancel_profile();
         }
         if let Some(column) = start_profile {
             self.run_profile(column);
         }
+    }
+}
+
+/// One "column  value" line of the Row section; click it to select that cell.
+fn field_row(ui: &mut egui::Ui, name: &str, value: &str, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), FIELD_HEIGHT),
+        egui::Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, name)
+    });
+    if selected {
+        ui.painter()
+            .rect_filled(rect, theme::RADIUS, theme::SELECTED);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, theme::RADIUS, theme::HOVER);
+    }
+    let split = rect.left() + (rect.width() * 0.42).max(FIELD_NAME_MIN_WIDTH);
+    let pad = Spacing::Sm.px();
+    ui.painter_at(rect.with_max_x(split - pad)).text(
+        egui::pos2(rect.left() + pad, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        theme::body(),
+        theme::MUTED,
+    );
+    let color = if value == "null" {
+        theme::DISABLED
+    } else {
+        theme::TEXT
+    };
+    let drawn = ui.painter_at(rect.with_min_x(split)).text(
+        egui::pos2(split, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        value,
+        theme::body(),
+        color,
+    );
+    if drawn.right() > rect.right() || name.len() > 24 {
+        response.on_hover_text(format!("{name}\n{value}"))
+    } else {
+        response
     }
 }
 

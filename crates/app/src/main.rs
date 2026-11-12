@@ -5,6 +5,7 @@
 mod app;
 mod chart;
 mod export;
+mod find;
 mod inspector;
 mod pages;
 mod profile;

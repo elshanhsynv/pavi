@@ -58,6 +58,8 @@ pub const BAR_HEIGHT: f32 = 40.0;
 pub const STATUS_HEIGHT: f32 = 26.0;
 /// Buttons, inputs and menu rows.
 pub const CONTROL_HEIGHT: f32 = 26.0;
+/// Width of the strips along the window edges that resize the window.
+pub const RESIZE_BORDER: f32 = 5.0;
 /// Corner radius of controls and popups.
 pub const RADIUS: u8 = 4;
 

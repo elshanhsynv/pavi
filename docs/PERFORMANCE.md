@@ -18,7 +18,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | GROUP BY | 10,000 groups / 8 MB | `GroupBudget::DEFAULT_MAX_GROUPS`, `DEFAULT_MAX_BYTES` |
 | Profile distinct values | 4,096 values / 1 MB, 128 bytes each | `profile::MAX_DISTINCT_*` |
 | Chart input | 16,384 rows | `chart::MAX_INPUT_ROWS` |
-| Clipboard copy | 64 KB | `MAX_CLIPBOARD_BYTES` |
+| Clipboard copy | 16 MB of text; values are formatted only up to the space left | `MAX_CLIPBOARD_BYTES` |
+| Find, one step on the UI thread | 500,000 cells (only rows already loaded) | `find::MAX_FIND_CELLS` |
 | Cell value used as a filter | 1,024 bytes | `MAX_FILTER_VALUE_BYTES` |
 | Comparisons in one filter | 64 (each `IN` value counts), 16 levels deep | `filter::MAX_FILTER_TERMS`, `MAX_FILTER_DEPTH` |
 | `LIKE` pattern | 256 characters | `filter::MAX_LIKE_PATTERN_CHARS` |
