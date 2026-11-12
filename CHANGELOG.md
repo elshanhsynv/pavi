@@ -44,6 +44,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ### Fixed
 - The window can be resized by dragging its edges and corners.
 - Files with a list, struct or map column now show row-group statistics for their other columns, and filters on those columns skip row groups again.
+- CLI: piping the output into a command that stops reading early (`cli file.parquet | head`) no longer crashes.
+- CLI: an invalid `--filter` is reported before anything is printed.
+- CLI: the preview table stays aligned with long column names, Chinese/Japanese/Korean text and emoji, and values with line breaks or tabs (shown as `\n` and `\t`). Numbers are right-aligned, and "1 rows" now reads "1 row".
 
 ## [0.2.0] - 2026-11-10
 

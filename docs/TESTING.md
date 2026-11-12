@@ -18,7 +18,7 @@ Tests are inline `#[cfg(test)] mod tests` blocks next to the code they test. The
 | `pavi_runtime` | Queueing, back-pressure, cancellation, shutdown |
 | `pavi_query` | SQL subset parsing and rejections, plan validation, execution order |
 | `pavi` (app) | `app_tests.rs` drives `PaviApp` without a window: open → poll → act → assert on state. Also unit tests in `state.rs`, `chart.rs`, `export.rs`, `profile.rs`, `session.rs` |
-| `cli` | Argument validation |
+| `cli` | Argument validation, `run()` against a temporary Parquet file written into a `Vec<u8>` (nothing printed before an error, broken pipes), table layout (`output.rs`) |
 
 ## Fixtures
 
