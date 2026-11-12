@@ -11,6 +11,7 @@ mod pages;
 mod profile;
 mod results;
 mod session;
+mod sql_editor;
 mod state;
 
 use eframe::egui;

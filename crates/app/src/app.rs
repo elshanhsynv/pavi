@@ -85,6 +85,10 @@ pub(crate) struct PaviApp {
     filter_error: Option<String>,
     sql_input: String,
     sql_error: Option<String>,
+    /// Completions open under the SQL editor's cursor.
+    sql_completion: Option<SqlCompletion>,
+    /// Name typed in the "Saved" menu for the query being saved.
+    saved_query_name: String,
     chart: ChartState,
     profile: ProfileState,
     session_store: SessionStore,
@@ -124,6 +128,16 @@ enum HeaderAction {
     ThenSort(usize, SortDirection),
     /// Pin this many shown columns to the left (0 unpins).
     Pin(usize),
+}
+
+/// Completions for the word being typed in the SQL editor.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SqlCompletion {
+    /// Where the word starts and where the cursor is, in characters.
+    pub(crate) start: usize,
+    pub(crate) cursor: usize,
+    pub(crate) items: Vec<crate::sql_editor::Suggestion>,
+    pub(crate) selected: usize,
 }
 
 /// The find bar: text to look for in the loaded rows.
@@ -211,6 +225,8 @@ impl PaviApp {
             filter_error: None,
             sql_input: session.sql_input.clone(),
             sql_error: None,
+            sql_completion: None,
+            saved_query_name: String::new(),
             chart: ChartState {
                 visible: chart_visible,
                 ..ChartState::default()

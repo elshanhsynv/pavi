@@ -14,6 +14,18 @@ pub const MAX_QUERY_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_BYTES: usize = 256 * 1024;
 pub const MAX_GRID_LAYOUTS: usize = 8;
 pub const MAX_LAYOUT_COLUMNS: usize = 2_048;
+/// Saved queries kept in the session file.
+pub const MAX_SAVED_QUERIES: usize = 100;
+/// Characters of a saved query's name.
+pub const MAX_SAVED_NAME_CHARS: usize = 80;
+
+/// A SQL query the user saved under a name.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct SavedQuery {
+    pub name: String,
+    pub sql: String,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -51,6 +63,8 @@ pub struct SessionState {
     pub last_opened_file: Option<PathBuf>,
     pub sql_input: String,
     pub query_history: Vec<QueryHistoryEntry>,
+    /// Sorted by name, ignoring case.
+    pub saved_queries: Vec<SavedQuery>,
     pub preferences: Preferences,
 }
 
@@ -62,6 +76,7 @@ impl Default for SessionState {
             last_opened_file: None,
             sql_input: String::new(),
             query_history: Vec::new(),
+            saved_queries: Vec::new(),
             preferences: Preferences {
                 inspector_visible: true,
                 ..Preferences::default()
@@ -121,6 +136,57 @@ impl SessionState {
         self.trim_history();
     }
 
+    /// Saves `sql` as `name`, replacing a saved query of the same name (ignoring
+    /// case). Returns the name it was saved under, or why it was not saved.
+    pub fn save_query(&mut self, name: &str, sql: &str) -> Result<String, String> {
+        let name = name
+            .trim()
+            .chars()
+            .take(MAX_SAVED_NAME_CHARS)
+            .collect::<String>();
+        if name.is_empty() {
+            return Err("Give the query a name first".to_owned());
+        }
+        if sql.trim().is_empty() {
+            return Err("There is no query to save".to_owned());
+        }
+        if sql.len() > MAX_QUERY_BYTES {
+            return Err(format!(
+                "Queries longer than {} KB cannot be saved",
+                MAX_QUERY_BYTES / 1024
+            ));
+        }
+        let existing = self
+            .saved_queries
+            .iter()
+            .position(|saved| saved.name.eq_ignore_ascii_case(&name));
+        match existing {
+            Some(index) => self.saved_queries[index].sql = sql.to_owned(),
+            None if self.saved_queries.len() >= MAX_SAVED_QUERIES => {
+                return Err(format!(
+                    "At most {MAX_SAVED_QUERIES} queries can be saved; delete one first"
+                ));
+            }
+            None => self.saved_queries.push(SavedQuery {
+                name: name.clone(),
+                sql: sql.to_owned(),
+            }),
+        }
+        self.sort_saved_queries();
+        Ok(name)
+    }
+
+    pub fn remove_saved_query(&mut self, index: usize) {
+        if index < self.saved_queries.len() {
+            self.saved_queries.remove(index);
+        }
+    }
+
+    fn sort_saved_queries(&mut self) {
+        self.saved_queries
+            .sort_by_key(|saved| saved.name.to_lowercase());
+    }
+
     pub fn clear_history(&mut self) {
         self.query_history.clear();
     }
@@ -165,6 +231,16 @@ impl SessionState {
             entry.sql = bounded_text(&entry.sql, MAX_QUERY_BYTES);
         }
         self.trim_history();
+        self.saved_queries.retain(|saved| {
+            !saved.name.trim().is_empty()
+                && !saved.sql.trim().is_empty()
+                && saved.sql.len() <= MAX_QUERY_BYTES
+        });
+        for saved in &mut self.saved_queries {
+            saved.name = saved.name.chars().take(MAX_SAVED_NAME_CHARS).collect();
+        }
+        self.saved_queries.truncate(MAX_SAVED_QUERIES);
+        self.sort_saved_queries();
         self.preferences.grid_layouts.retain(|layout| {
             !layout.schema_key.is_empty() && layout.order.len() <= MAX_LAYOUT_COLUMNS
         });
@@ -369,6 +445,73 @@ mod tests {
         assert!(!saved.contains("task_id"));
         assert!(!saved.contains("generation"));
         assert!(!saved.contains("RecordBatch"));
+    }
+
+    #[test]
+    fn saves_named_queries_sorted_bounded_and_replaced_by_name() {
+        let mut state = SessionState::default();
+        assert_eq!(
+            state.save_query("  b busy  ", "SELECT 1"),
+            Ok("b busy".to_string())
+        );
+        assert_eq!(
+            state.save_query("Alpha", "SELECT 2"),
+            Ok("Alpha".to_string())
+        );
+        // The same name (ignoring case) replaces the query.
+        assert_eq!(
+            state.save_query("B BUSY", "SELECT 3"),
+            Ok("B BUSY".to_string())
+        );
+        assert_eq!(
+            state
+                .saved_queries
+                .iter()
+                .map(|saved| (saved.name.as_str(), saved.sql.as_str()))
+                .collect::<Vec<_>>(),
+            [("Alpha", "SELECT 2"), ("b busy", "SELECT 3")]
+        );
+        assert!(state.save_query(" ", "SELECT 1").is_err());
+        assert!(state.save_query("x", "  ").is_err());
+        assert!(
+            state
+                .save_query("x", &"x".repeat(MAX_QUERY_BYTES + 1))
+                .is_err()
+        );
+        let long = "n".repeat(MAX_SAVED_NAME_CHARS + 10);
+        assert_eq!(
+            state.save_query(&long, "SELECT 1").unwrap().chars().count(),
+            MAX_SAVED_NAME_CHARS
+        );
+        for index in state.saved_queries.len()..MAX_SAVED_QUERIES {
+            state
+                .save_query(&format!("q{index:03}"), "SELECT 1")
+                .unwrap();
+        }
+        assert!(state.save_query("one too many", "SELECT 1").is_err());
+        state.remove_saved_query(0);
+        assert_eq!(state.saved_queries.len(), MAX_SAVED_QUERIES - 1);
+
+        // Bad entries in a session file are dropped when it loads.
+        let mut loaded = SessionState {
+            saved_queries: vec![
+                SavedQuery {
+                    name: "z".into(),
+                    sql: "SELECT 1".into(),
+                },
+                SavedQuery {
+                    name: String::new(),
+                    sql: "SELECT 2".into(),
+                },
+                SavedQuery {
+                    name: "a".into(),
+                    sql: String::new(),
+                },
+            ],
+            ..SessionState::default()
+        };
+        loaded.normalize();
+        assert_eq!(loaded.saved_queries.len(), 1);
     }
 
     #[test]

@@ -46,6 +46,18 @@ pub const TYPE_TEMPORAL: Color32 = Color32::from_rgb(198, 164, 224);
 /// Boolean columns.
 pub const TYPE_BOOL: Color32 = Color32::from_rgb(150, 204, 150);
 
+// SQL editor highlighting.
+/// SQL keywords (SELECT, WHERE, …).
+pub const SQL_KEYWORD: Color32 = ACCENT;
+/// Aggregate functions (COUNT, SUM, …).
+pub const SQL_FUNCTION: Color32 = TYPE_TEMPORAL;
+/// Quoted text.
+pub const SQL_STRING: Color32 = TYPE_BOOL;
+/// Numbers.
+pub const SQL_NUMBER: Color32 = TYPE_NUMBER;
+/// Comments, and names that are not columns of the file (often a typo).
+pub const SQL_MUTED: Color32 = MUTED;
+
 /// Line and scatter chart marks.
 pub const CHART_POINT: Color32 = TYPE_NUMBER;
 /// Bar chart and histogram marks.
