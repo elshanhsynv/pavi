@@ -8,7 +8,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MIN_COLUMN_WIDTH: usize = 4;
 const MAX_COLUMN_WIDTH: usize = 32;
 
-pub fn print_batch(batch: &RecordBatch, out: &mut impl Write) -> io::Result<()> {
+/// Prints `batch` as a table; the `#` column counts from `first_number`.
+pub fn print_batch(batch: &RecordBatch, first_number: u64, out: &mut impl Write) -> io::Result<()> {
     let rows = batch.num_rows();
     let columns = batch.num_columns();
 
@@ -49,7 +50,8 @@ pub fn print_batch(batch: &RecordBatch, out: &mut impl Write) -> io::Result<()> 
 
     // First column is the row number.
     let mut widths = Vec::with_capacity(columns + 1);
-    widths.push(rows.to_string().len().max(3));
+    let last_number = first_number.saturating_add(rows.saturating_sub(1) as u64);
+    widths.push(last_number.to_string().len().max(3));
 
     for (column, header) in headers.iter().enumerate() {
         let value_width = cells
@@ -78,8 +80,8 @@ pub fn print_batch(batch: &RecordBatch, out: &mut impl Write) -> io::Result<()> 
 
     write_rule(out, &widths, ['├', '┼', '┤'])?;
 
-    for (row_index, row) in cells.iter().enumerate() {
-        write!(out, "│ {:>width$} │", row_index + 1, width = widths[0])?;
+    for (number, row) in (first_number..).zip(&cells) {
+        write!(out, "│ {:>width$} │", number, width = widths[0])?;
 
         for ((value, &width), &right) in row.iter().zip(&widths[1..]).zip(&right_aligned) {
             write!(out, " ")?;
@@ -171,7 +173,7 @@ mod tests {
 
     fn render(batch: &RecordBatch) -> String {
         let mut out = Vec::new();
-        print_batch(batch, &mut out).unwrap();
+        print_batch(batch, 1, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 

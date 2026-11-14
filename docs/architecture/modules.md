@@ -38,7 +38,7 @@ PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), eac
 | `pavi_runtime` → lib | library | Fixed worker pool; typed tasks (`OpenTask`, `PageTask`) with one bounded response channel each; cooperative cancellation; generation IDs | parquet_reader |
 | `pavi_query` → lib | library | SQL subset parser, `LogicalPlan` builder, `Planner` (flattens to `PhysicalPlan`), `QueryExecution` (incremental, blocking or polling) | parquet_reader, pavi_runtime, sqlparser |
 | `pavi` → bin `pavi` | GUI | eframe app, all UI, export, profiling, charts, session persistence | all three libs + eframe, egui_extras, rfd, serde(_json), chrono, parquet (writer) |
-| `cli` → bin `cli` | CLI | metadata + preview printer | **parquet_reader only** + clap |
+| `cli` → bin `cli` | CLI | metadata + preview printer, row streaming, row count | **parquet_reader only** + clap |
 | `pavi_bench` → bin `pavi-bench` | tool | prints CSV-like timing/cache metrics for open, page reads, a scan query | all three libs |
 
 Direction is strictly downward: `app → query → runtime → parquet_reader`. No cycles. No library depends on the GUI.
@@ -87,7 +87,7 @@ crates/app/src/                (pavi)
 ├── app_tests.rs    57 tests driving PaviApp without a window
 ├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
-├── export.rs       ExportState, ExportTask (own thread), CSV and JSON Lines writers, Parquet ArrowWriter, Arrow IPC FileWriter, temp-file + rename
+├── export.rs       ExportState, ExportTask (own thread), progress, temp-file + rename; the writers are parquet_reader::export::BatchWriter
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
 ├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
@@ -108,8 +108,8 @@ crates/app/src/                (pavi)
 
 ### Sharing between GUI and CLI
 
-- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `FilterExpr::parse`, `Projection`, and the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling).
-- **GUI-only:** the runtime, the query engine/SQL, sort, aggregates, page cache use (`read_page`), export, profiling, charts.
+- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `read_filtered_from`, `FilterExpr::parse`, `Projection`, the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling), and the `export` module (`ExportFormat`, `BatchWriter`: CSV, JSON Lines, Parquet and Arrow IPC written batch by batch to any `Write`).
+- **GUI-only:** the runtime, the query engine/SQL, sort, aggregates, page cache use (`read_page`), the export task (thread, progress, temp file + rename), profiling, charts.
 - **Duplicated logic:** CLI has its own table printer and truncation (`crates/cli/src/output.rs`). Value → text conversion lives in one place, `value.rs`: display, CSV export, profiling and row-group statistics all use it. Aggregation keeps its own typed `Scalar` values (`source.rs::scalar_at`), which are turned back into Arrow arrays and displayed through `value.rs`. Type support is defined once in `types.rs` and used by sort, aggregates, filters and profiling; CSV export uses `value::is_scalar_type`. Charts keep their own checks.
 
 ### Cargo features
@@ -128,7 +128,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | `main()` (GUI) | Takes optional path from `argv[1]`; window 1448×900 (min 900×600), **`with_decorations(false)`** (custom title bar), centered; `run_native("PAVI", …)` | `crates/app/src/main.rs:12-27` |
 | `PaviApp::new` / `new_with_store` | Starts `Runtime` (worker count = CPU count, queue 32), loads session, reopens `argv[1]` or last file | `app.rs:335-396` |
 | `eframe::App for PaviApp` | `update()` = poll everything then draw; `save()` = `persist_session()` but **never called** (eframe `persistence` feature off) | `app.rs:1775-1831` |
-| `main()` / `run()` (CLI) | `Args::parse` → open → check columns and filter → print summary → preview | `crates/cli/src/main.rs` |
+| `main()` / `run()` (CLI) | `Args::parse` → open → check columns and filter → count, stream rows (`stream_rows`) or print summary and preview | `crates/cli/src/main.rs` |
 
 ### UI layer
 
@@ -183,7 +183,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 | `read_filtered_window` | Offset-based variant (skip the first N matches, scanning from row 0); used by the CLI | `source.rs` |
 | `read_sorted` | Rows that pass the filter are buffered (kept columns + a sequence-number column, the stable tie-breaker). With `limit` ≤ budget rows the buffer is cut back to the best `limit` rows every ~32k rows (top-N). Otherwise a buffer past the budget is sorted and written as a run; the result is `SortOutput::InMemory(batches)` or `SortOutput::Spilled(SortMerge)` | `source.rs`, `spill.rs` |
 | `read_aggregated` | Streaming row-by-row accumulation into `GroupCollector` (hash map of `Scalar` keys) | `source.rs:451-526`, `965-1177` |
-| Export writers | `CsvWriter` (hand-rolled) and `parquet::arrow::ArrowWriter` to `<name>.pavi-<gen>.tmp`, then `fs::rename` | `crates/app/src/export.rs` |
+| Export writers | `BatchWriter`: `CsvWriter` and `JsonWriter` (hand-rolled), `parquet::arrow::ArrowWriter`, `arrow_ipc::writer::FileWriter`, to any `Write`. The app writes to `<name>.pavi-<gen>.tmp`, then `fs::rename`; the CLI writes to stdout | `crates/parquet/src/export.rs`, `crates/app/src/export.rs` |
 
 Caching: two independent LRU layers of 8 pages each — `PageCache` inside `ParquetSource` (keyed by page index **and** projection, 128 MB cap) and `PaviApp.pages` (8 pages, no byte cap).
 
@@ -194,8 +194,12 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 | Arg | Meaning |
 |---|---|
 | `FILE` (positional, required) | Anything `ParquetSource::open` opens: a Parquet file, a folder, a CSV/JSON/Arrow file or a remote URL |
-| `--head N` (default 10) | Preview rows; rejected if >1000 (`validate_head`, `MAX_HEAD_ROWS`) |
-| `--columns 0,3,5` | **Column indexes only** (names not accepted) |
-| `--filter "col OP value"` | Same `FilterExpr` grammar as the GUI filter box |
+| `--format F` (default `table`) | `table`, or `csv`, `jsonl` (alias `json`), `parquet`, `arrow`: rows only, streamed with `parquet_reader::export::BatchWriter` |
+| `--head N` | Rows to output. Table: default 10, rejected if >1000 (`validate_head`, `MAX_HEAD_ROWS`). Other formats: default every row |
+| `--offset N` (default 0) | Skip N rows, or N matching rows with `--filter`. The table's `#` counts from N + 1 |
+| `--columns a,b` | Column names or 0-based indexes; a name is tried first, so a column called `7` is found by name |
+| `--filter "…"` | Same `FilterExpr` grammar as the GUI filter box |
+| `--count` | Print only the row count (footer), or the matching rows (a scan of the filter's columns). Excludes `--head`, `--offset`, `--columns`, `--format`, `--quiet` |
+| `-q`, `--quiet` | Table without the summary |
 
-Output goes to stdout: for a folder, its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges, then a box-drawn table with headers and cells cut to 4–32 terminal columns (numbers right-aligned, control characters escaped). Arguments are all checked before the first line is written. Exit codes: `0` success, also when the reader of stdout closes early (broken pipe); `1` for any `anyhow` error (printed as `Error: …` with Debug formatting on stderr, the same text Rust prints for an error returned from `main`); `2` for clap usage errors.
+Table output goes to stdout: unless `--quiet`, for a folder its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges; then a box-drawn table with headers and cells cut to 4–32 terminal columns (numbers right-aligned, control characters escaped). Arguments are all checked before the first line is written. Exit codes: `0` success, also when the reader of stdout closes early (broken pipe); `1` for any `anyhow` error (printed as `Error: …` with Debug formatting on stderr, the same text Rust prints for an error returned from `main`); `2` for clap usage errors.

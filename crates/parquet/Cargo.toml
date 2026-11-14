@@ -17,6 +17,8 @@ bytes.workspace = true
 arrow-ord.workspace = true
 parquet.workspace = true
 ring.workspace = true
+# JSON Lines export (moved from the app, which already used it).
+serde_json.workspace = true
 rustls-native-certs.workspace = true
 ureq.workspace = true
 

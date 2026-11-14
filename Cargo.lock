@@ -2991,6 +2991,7 @@ dependencies = [
  "parquet",
  "ring",
  "rustls-native-certs",
+ "serde_json",
  "tempfile",
  "ureq",
 ]
