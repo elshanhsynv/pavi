@@ -1011,6 +1011,8 @@ dependencies = [
  "clap",
  "parquet",
  "parquet_reader",
+ "pavi_query",
+ "pavi_runtime",
  "tempfile",
  "unicode-width",
 ]

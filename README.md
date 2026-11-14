@@ -48,6 +48,9 @@ cli flights.parquet --schema --format csv
 cli flights.parquet --stats --columns DEP_DELAY      # min/max per row group, no scan
 cli flights.csv -o flights.parquet                   # convert; the file appears when complete
 curl -s https://example.com/data.parquet | cli - --count
+cli flights.parquet --sql "SELECT ORIGIN, COUNT(*), AVG(DEP_DELAY) FROM flights GROUP BY ORIGIN"
+cli flights.parquet --table airports.csv --format csv \
+    --sql "SELECT f.FL_DATE, a.name FROM flights AS f JOIN airports AS a ON f.ORIGIN = a.code"
 ```
 
 `--format` is `table`, `csv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `cli --help` lists every option and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).

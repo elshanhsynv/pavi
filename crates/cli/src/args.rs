@@ -82,6 +82,24 @@ pub struct Args {
     /// rows; --head limits them
     #[arg(long, conflicts_with_all = ["count", "sort", "filter", "offset", "quiet"])]
     pub stats: bool,
+
+    /// Run a SQL query and output its rows, e.g. "SELECT ORIGIN, COUNT(*)
+    /// FROM dataset GROUP BY ORIGIN". FILE is the table `dataset` (and also
+    /// its file name, e.g. `flights`); --table adds more. The same subset as
+    /// the app's SQL editor: WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX with
+    /// GROUP BY, INNER/LEFT joins and subqueries. --head and --offset cut the
+    /// result
+    #[arg(
+        long,
+        value_name = "QUERY",
+        conflicts_with_all = ["filter", "sort", "columns", "count", "schema", "stats", "quiet"]
+    )]
+    pub sql: Option<String>,
+
+    /// Another file for --sql, as NAME=PATH or just PATH (then named after
+    /// the file, e.g. airports.csv → airports). Repeat for more tables
+    #[arg(long = "table", value_name = "[NAME=]PATH", requires = "sql")]
+    pub tables: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

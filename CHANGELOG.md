@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- CLI: `--sql "SELECT …"` runs the app's SQL (WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX with GROUP BY, joins and subqueries) and outputs the result in any format or to a file. The file is the table `dataset`, or its own name (`flights`); `--table [NAME=]PATH` adds other files to join, named as the app names its tabs.
 - CLI: `--format csv`, `jsonl`, `parquet` or `arrow` writes the rows, and only the rows, to standard output, so the CLI works in pipelines. These formats stream every row unless `--head` is given; the table stays at most 1,000 rows.
 - CLI: `--columns` takes column names as well as numbers, `--offset N` skips rows (or matching rows with `--filter`), `--count` prints only the number of (matching) rows, and `--quiet` leaves out the summary above the table.
 - CLI: `--help` describes every option and the exit codes, and `--version` prints the version.

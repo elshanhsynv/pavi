@@ -25,7 +25,7 @@ crates/parquet  (parquet_reader)  all Parquet/Arrow I/O, filter, sort, aggregate
 crates/runtime  (pavi_runtime)    fixed worker pool, bounded channels, cancellation, generation IDs
 crates/query    (pavi_query)      SQL subset → LogicalPlan → PhysicalPlan → incremental execution
 crates/app      (pavi)            GUI: app.rs (PaviApp), ui/*.rs (impl PaviApp blocks), export, charts, session
-crates/cli      (cli)             synchronous preview tool; uses only parquet_reader
+crates/cli      (cli)             command line: preview, stream, convert; parquet_reader, plus query + runtime for --sql (ADR 0011)
 crates/bench    (pavi_bench)      timing and cache metrics
 ```
 

@@ -13,6 +13,9 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 clap.workspace = true
 parquet_reader = { path = "../parquet" }
+# `--sql` runs on the app's query engine and worker pool (ADR 0011).
+pavi_query = { path = "../query" }
+pavi_runtime = { path = "../runtime" }
 # Terminal column widths for the preview table (CJK and most emoji take two
 # columns). Already in the tree through egui's dependencies.
 unicode-width = "0.1"
