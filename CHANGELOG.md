@@ -7,26 +7,31 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-14
+
+This release turns the command-line tool into a full companion to the app: it streams, converts, sorts, queries and profiles files in scripts and pipelines. **The program is renamed from `cli` to `pavi-cli`**; scripts that call it need the new name. Run `pavi-cli --help` for every option.
+
 ### Added
+- CLI: `--format csv`, `jsonl`, `parquet` or `arrow` writes the rows, and only the rows, to standard output, so the CLI works in pipelines. These formats stream every row unless `--head` is given; the table stays at most 1,000 rows.
+- CLI: `-o`/`--output PATH` writes to a file instead of standard output, in the format its extension names (`.csv`, `.jsonl`, `.json`, `.parquet`, `.arrow`, `.feather`) unless `--format` is given. The file appears only once it is complete, so converting is `pavi-cli in.csv -o out.parquet`. The CLI refuses to overwrite the file it is reading.
+- CLI: `-` reads standard input (Parquet, Arrow, JSON or CSV, told apart by their first bytes), e.g. `curl … | pavi-cli - --count`.
+- CLI: `--sql "SELECT …"` runs the app's SQL (WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX with GROUP BY, joins and subqueries) and outputs the result in any format or to a file. The file is the table `dataset`, or its own name (`flights`); `--table [NAME=]PATH` adds other files to join, named as the app names its tabs.
+- CLI: `--sort "DEP_DELAY:desc,FL_DATE"` sorts by up to 8 columns, with `--filter`, `--offset`, `--head` and every format. Sorts larger than memory spill to temporary files, as in the app.
+- CLI: `--profile` profiles every column (or `--columns`, up to 256) in one scan, as the app's Profile window does: rows, nulls, distinct values, min, max, mean and the most frequent value, in any format. With `--filter`, only matching rows are profiled.
+- CLI: `--schema` prints each column's index, name, type and nullability, and `--stats` prints the row-group statistics (rows, nulls, min, max, distinct count) from the file footer without reading any data. Both work with `--columns` and every `--format`.
+- CLI: `--columns` takes column names as well as numbers, `--offset N` skips rows (or matching rows with `--filter`), `--count` prints only the number of (matching) rows, and `--quiet` leaves out the summary above the table.
 - CLI: a progress line on the terminal ("Counting: 13,064,960 of 1,000,000,000 rows (1%)") while opening, scanning, sorting, counting or profiling takes more than a second. It goes to standard error, is erased when the output appears, and never shows in pipes or logs; `--no-progress` turns it off.
 - CLI: `--ascii` draws tables with `+ - |` for consoles and code pages that can't show box-drawing characters.
-- CLI: `--profile` profiles every column (or `--columns`, up to 256) in one scan, as the app's Profile window does: rows, nulls, distinct values, min, max, mean and the most frequent value, in any format. With `--filter`, only matching rows are profiled.
-- CLI: `--sql "SELECT …"` runs the app's SQL (WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX with GROUP BY, joins and subqueries) and outputs the result in any format or to a file. The file is the table `dataset`, or its own name (`flights`); `--table [NAME=]PATH` adds other files to join, named as the app names its tabs.
-- CLI: `--format csv`, `jsonl`, `parquet` or `arrow` writes the rows, and only the rows, to standard output, so the CLI works in pipelines. These formats stream every row unless `--head` is given; the table stays at most 1,000 rows.
-- CLI: `--columns` takes column names as well as numbers, `--offset N` skips rows (or matching rows with `--filter`), `--count` prints only the number of (matching) rows, and `--quiet` leaves out the summary above the table.
 - CLI: `--help` describes every option and the exit codes, and `--version` prints the version.
-- CLI: `--sort "DEP_DELAY:desc,FL_DATE"` sorts by up to 8 columns, with `--filter`, `--offset`, `--head` and every format. Sorts larger than memory spill to temporary files, as in the app.
-- CLI: `--schema` prints each column's index, name, type and nullability, and `--stats` prints the row-group statistics (rows, nulls, min, max, distinct count) from the file footer without reading any data. Both work with `--columns` and every `--format`.
-- CLI: `-o`/`--output PATH` writes to a file instead of standard output, in the format its extension names (`.csv`, `.jsonl`, `.json`, `.parquet`, `.arrow`, `.feather`) unless `--format` is given. The file appears only once it is complete, so converting is `cli in.csv -o out.parquet`. The CLI refuses to overwrite the file it is reading.
-- CLI: `-` reads standard input (Parquet, Arrow, JSON or CSV, told apart by their first bytes), e.g. `curl … | cli - --count`.
 
 ### Changed
 - The command-line program is now `pavi-cli` (`pavi-cli.exe` in the release zip) instead of `cli`.
+- A number in a filter is a column's name first: `2023 > 5` now means the column named `2023` if there is one, and the column at position 2023 only if there isn't (see Fixed).
 - The table's `#` column counts from `--offset`, so it shows row numbers in the file (or match numbers with `--filter`).
 - The CLI summary shows column types as `Int64` or `Timestamp(µs, "UTC")` instead of Rust's debug form.
 
 ### Fixed
-- Filters and SQL `WHERE` on a column whose name is a number (such as `2023`) use that column. A bare number in a filter was always read as a column position, so such a column couldn't be filtered and SQL could read the wrong column. A number now means a position only when no column has that name.
+- Filters and SQL `WHERE` on a column whose name is a number (such as `2023`) use that column. A bare number in a filter was always read as a column position, so such a column couldn't be filtered and SQL could read the wrong column.
 
 ## [0.3.0] - 2026-11-12
 
@@ -124,7 +129,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/elshanhsynv/pavi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/elshanhsynv/pavi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.2.0
 [0.1.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.1.0

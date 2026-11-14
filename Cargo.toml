@@ -12,7 +12,7 @@ members = [
 
 [workspace.package]
 # One version for the whole app; release tags are v<version> (docs/RELEASING.md).
-version = "0.3.0"
+version = "0.4.0"
 
 [workspace.dependencies]
 anyhow = "1"
