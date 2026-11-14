@@ -8,6 +8,7 @@ mod footer;
 pub mod join;
 pub mod metadata;
 pub mod page;
+pub mod profile;
 pub mod projection;
 pub mod remote;
 pub mod sort;

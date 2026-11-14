@@ -18,8 +18,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
 | Sort keys / GROUP BY columns | 8 / 8 | `sort::MAX_SORT_KEYS`, `aggregate::MAX_GROUP_COLUMNS` |
 | GROUP BY | 10,000 groups / 8 MB | `GroupBudget::DEFAULT_MAX_GROUPS`, `DEFAULT_MAX_BYTES` |
-| Profile distinct values | 4,096 values / 1 MB, 128 bytes each | `profile::MAX_DISTINCT_*` |
-| Whole-file profile | 256 columns; per column 1,000 distinct values / 64 KB, then the count reads "more than" | `profile::MAX_FILE_PROFILE_COLUMNS`, `FILE_PROFILE_DISTINCT_VALUES`, `FILE_PROFILE_DISTINCT_BYTES` |
+| Profile distinct values | 4,096 values / 1 MB, 128 bytes each | `parquet_reader::profile::MAX_DISTINCT_*` |
+| Whole-file profile (app's Profile window and CLI `--profile`) | 256 columns; per column 1,000 distinct values / 64 KB, then the count reads "more than"; the CLI also holds one 4,096-row batch of the profiled columns | `parquet_reader::profile::MAX_FILE_PROFILE_COLUMNS`, `FILE_PROFILE_DISTINCT_VALUES`, `FILE_PROFILE_DISTINCT_BYTES` |
 | Chart input | 16,384 rows | `chart::MAX_INPUT_ROWS` |
 | Chart series | 6 Y columns | `chart::MAX_SERIES` |
 | Clipboard copy | 16 MB of text; values are formatted only up to the space left | `MAX_CLIPBOARD_BYTES` |

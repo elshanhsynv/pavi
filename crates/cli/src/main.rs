@@ -127,6 +127,11 @@ fn run(
         let limit = table_rows.map_or(args.head, |rows| Some(rows as u64));
         return write_facts(&batch, "Statistics", limit, format, out);
     }
+    if args.profile {
+        let profiles = profile_columns(&parquet, &projection, filter.as_ref(), batch_rows)?;
+        let batch = inspect::profile_batch(&profiles)?;
+        return write_facts(&batch, "Profile", None, format, out);
+    }
 
     let output = RowOutput {
         format,
@@ -216,7 +221,43 @@ impl RowOutput {
     }
 }
 
-/// Writes a `--schema` or `--stats` batch, cut to `limit` rows.
+/// Profiles `projection`'s columns in one scan of the rows `filter` keeps,
+/// with the accumulators the app's Profile window uses. Memory stays at one
+/// batch plus each column's bounded distinct values.
+fn profile_columns(
+    parquet: &ParquetSource,
+    projection: &Projection,
+    filter: Option<&FilterExpr>,
+    batch_rows: u64,
+) -> anyhow::Result<Vec<parquet_reader::profile::ColumnStats>> {
+    let columns = projection.as_slice();
+    if columns.len() > parquet_reader::profile::MAX_FILE_PROFILE_COLUMNS {
+        bail!(
+            "--profile covers at most {} columns and this has {}; choose some with --columns",
+            parquet_reader::profile::MAX_FILE_PROFILE_COLUMNS,
+            columns.len()
+        );
+    }
+    let mut profiler = parquet_reader::profile::FileProfiler::new(parquet, columns)?;
+    if !profiler.read_columns().is_empty() {
+        let read = Projection::columns(profiler.read_columns().to_vec(), parquet.column_count())?;
+        let schema = parquet.read_window(0, 0, &read)?.schema();
+        Rows {
+            parquet,
+            filter,
+            sort: None,
+            projection: &read,
+            schema: &schema,
+            offset: 0,
+            batch_rows,
+            sort_budget: SortBudget::default(),
+        }
+        .for_each(u64::MAX, &mut |batch| profiler.push_batch(&batch))?;
+    }
+    Ok(profiler.finish())
+}
+
+/// Writes a `--schema`, `--stats` or `--profile` batch, cut to `limit` rows.
 fn write_facts(
     batch: &RecordBatch,
     title: &str,
@@ -1211,5 +1252,128 @@ mod tests {
             ),
             "b\ny\n"
         );
+    }
+
+    const PROFILE_HEADER: &str =
+        "column,type,rows,nulls,distinct,distinct_capped,min,max,mean,top_value,top_count\n";
+
+    #[test]
+    fn profiles_every_column_or_the_chosen_ones_in_any_format() {
+        let (_folder, path) = fixture();
+        assert_eq!(
+            output(&[&path, "--profile", "--format", "csv"]),
+            format!(
+                "{PROFILE_HEADER}id,Int64,5,0,5,false,1,5,3,1,1\n\
+                 name,Utf8,5,0,5,false,a,e,,a,1\n\
+                 7,Utf8,5,4,1,false,x,x,,x,1\n"
+            )
+        );
+        // Only matching rows, and only --columns.
+        assert_eq!(
+            output(&[
+                &path,
+                "--profile",
+                "--format",
+                "csv",
+                "--columns",
+                "id",
+                "--filter",
+                "id >= 4",
+            ]),
+            format!("{PROFILE_HEADER}id,Int64,2,0,2,false,4,5,4.5,4,1\n")
+        );
+        let table = output(&[&path, "--profile"]);
+        assert!(
+            table.starts_with("\nProfile: 3 rows × 11 columns"),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn profiles_wide_value_ranges_and_nested_columns_within_their_limits() {
+        use arrow_array::{ListArray, types::Int32Type};
+
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("wide.parquet");
+        let rows = parquet_reader::profile::FILE_PROFILE_DISTINCT_VALUES as i64 + 100;
+        let tags = ListArray::from_iter_primitive::<Int32Type, _, _>(
+            (0..rows).map(|row| (row % 2 == 0).then(|| vec![Some(1)])),
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "n",
+                Arc::new(Int64Array::from_iter_values(0..rows)) as arrow_array::ArrayRef,
+            ),
+            ("tags", Arc::new(tags)),
+        ])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let csv = output(&[&path, "--profile", "--format", "csv"]);
+        let lines = csv.lines().collect::<Vec<_>>();
+        // Distinct values stop at the cap; min, max and mean still cover every
+        // row; the most frequent value is left out as it would be a guess.
+        assert_eq!(
+            lines[1],
+            format!("n,Int64,{rows},0,1000,true,0,{},549.5,,", rows - 1)
+        );
+        // A list column: its type and what the footer says, nothing measured.
+        let footer_nulls = ParquetSource::open(&path).unwrap().metadata().columns()[1]
+            .row_group_statistics
+            .iter()
+            .map(|stats| stats.as_ref().and_then(|stats| stats.null_count))
+            .sum::<Option<u64>>()
+            .map_or(String::new(), |nulls| nulls.to_string());
+        assert_eq!(
+            lines[2],
+            format!("tags,List(Int32),{rows},{footer_nulls},0,false,,,,,"),
+            "{csv}"
+        );
+    }
+
+    #[test]
+    fn refuses_profiles_wider_than_the_limit_before_printing() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("many.parquet");
+        let columns = parquet_reader::profile::MAX_FILE_PROFILE_COLUMNS + 1;
+        let batch = RecordBatch::try_from_iter((0..columns).map(|column| {
+            (
+                format!("c{column}"),
+                Arc::new(Int64Array::from(vec![1])) as arrow_array::ArrayRef,
+            )
+        }))
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let mut out = Vec::new();
+        let error = run(&parse(&[&path, "--profile"]), &mut io::empty(), &mut out, 2).unwrap_err();
+        assert!(format!("{error:#}").contains("--columns"), "{error:#}");
+        assert!(out.is_empty());
+        assert_eq!(
+            output(&[&path, "--profile", "--columns", "c0,c1", "--format", "csv"])
+                .lines()
+                .count(),
+            3
+        );
+
+        let parses = |arguments: &[&str]| {
+            Args::try_parse_from(std::iter::once("cli").chain(arguments.iter().copied())).is_ok()
+        };
+        assert!(!parses(&[&path, "--profile", "--stats"]));
+        assert!(!parses(&[&path, "--profile", "--sort", "c0"]));
+        assert!(!parses(&[
+            &path,
+            "--profile",
+            "--sql",
+            "SELECT c0 FROM dataset"
+        ]));
     }
 }
