@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, ValueEnum};
 
 const EXIT_CODES: &str = "\
@@ -11,12 +13,14 @@ Exit codes:
 ///
 /// By default prints a summary (row count, schema, row groups) and the first
 /// rows as a table. With --format csv, jsonl, parquet or arrow it writes only
-/// the rows, all of them unless --head is given, to standard output.
-/// --count, --schema and --stats print facts about the file instead of rows.
+/// the rows, all of them unless --head is given, to standard output or to
+/// --output. --count, --schema and --stats print facts about the file instead
+/// of rows. Converting is `cli in.csv -o out.parquet`.
 #[derive(Parser)]
 #[command(name = "cli", version, about, after_help = EXIT_CODES)]
 pub struct Args {
-    /// File, folder or URL to read
+    /// File, folder or URL to read, or - for standard input (Parquet, Arrow,
+    /// JSON or CSV, told apart by their first bytes)
     pub file: String,
 
     /// Number of rows to output [default: 10 for the table, at most 1,000;
@@ -37,9 +41,17 @@ pub struct Args {
     #[arg(long, value_name = "EXPR")]
     pub filter: Option<String>,
 
-    /// Output format
-    #[arg(long, value_enum, default_value_t = Format::Table)]
-    pub format: Format,
+    /// Output format [default: from --output's extension, otherwise table]
+    #[arg(long, value_enum)]
+    pub format: Option<Format>,
+
+    /// Write to this file instead of standard output. The file appears only
+    /// once it is complete (a temporary file next to it is renamed), and an
+    /// existing file is replaced. The format comes from the extension
+    /// (.csv, .jsonl, .json, .ndjson, .parquet, .arrow, .feather) unless
+    /// --format is given
+    #[arg(long, short, value_name = "PATH")]
+    pub output: Option<PathBuf>,
 
     /// Print only the table, without the summary and schema
     #[arg(long, short)]
@@ -106,7 +118,7 @@ mod tests {
         assert!(Args::try_parse_from(["cli", "f", "--count", "--head", "3"]).is_err());
         assert!(Args::try_parse_from(["cli", "f", "--count", "--filter", "a > 1"]).is_ok());
         let args = Args::try_parse_from(["cli", "f", "--format", "json"]).unwrap();
-        assert_eq!(args.format, Format::Jsonl);
+        assert_eq!(args.format, Some(Format::Jsonl));
     }
 
     #[test]

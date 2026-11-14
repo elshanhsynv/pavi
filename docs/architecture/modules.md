@@ -193,8 +193,9 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 
 | Arg | Meaning |
 |---|---|
-| `FILE` (positional, required) | Anything `ParquetSource::open` opens: a Parquet file, a folder, a CSV/JSON/Arrow file or a remote URL |
-| `--format F` (default `table`) | `table`, or `csv`, `jsonl` (alias `json`), `parquet`, `arrow`: rows only, streamed with `parquet_reader::export::BatchWriter` |
+| `FILE` (positional, required) | Anything `ParquetSource::open` opens: a Parquet file, a folder, a CSV/JSON/Arrow file or a remote URL; or `-`: standard input copied to `<temp>/pavi-stdin-<pid>-<nanos>/stdin.<ext>` (≤ `MAX_STDIN_BYTES`), the extension chosen from the first bytes (`PAR1`, `ARROW1`, an IPC continuation marker, `{`/`[`, else CSV), deleted after the run (`files.rs`) |
+| `--format F` | `table`, or `csv`, `jsonl` (alias `json`), `parquet`, `arrow`: rows only, streamed with `parquet_reader::export::BatchWriter`. Default: `--output`'s extension, else `table` |
+| `-o`, `--output PATH` | Write to `PATH` instead of stdout: into `<name>.pavi-cli-<pid>.tmp` next to it, `sync_all`, then `fs::rename`; removed on any error. Refused when `PATH` is the input file (`files::check_not_input`) |
 | `--head N` | Rows to output. Table: default 10, rejected if >1000 (`validate_head`, `MAX_HEAD_ROWS`). Other formats: default every row |
 | `--offset N` (default 0) | Skip N rows, or N matching rows with `--filter`. The table's `#` counts from N + 1 |
 | `--columns a,b` | Column names or 0-based indexes; a name is tried first, so a column called `7` is found by name |
