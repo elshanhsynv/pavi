@@ -7,6 +7,10 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
+# Schema and statistics rows, and joining a sorted table's batches; both
+# already in the tree through parquet_reader.
+arrow-schema.workspace = true
+arrow-select.workspace = true
 clap.workspace = true
 parquet_reader = { path = "../parquet" }
 # Terminal column widths for the preview table (CJK and most emoji take two
@@ -14,7 +18,6 @@ parquet_reader = { path = "../parquet" }
 unicode-width = "0.1"
 
 [dev-dependencies]
-arrow-schema.workspace = true
 parquet.workspace = true
 tempfile = "3"
 

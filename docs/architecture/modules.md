@@ -38,7 +38,7 @@ PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), eac
 | `pavi_runtime` → lib | library | Fixed worker pool; typed tasks (`OpenTask`, `PageTask`) with one bounded response channel each; cooperative cancellation; generation IDs | parquet_reader |
 | `pavi_query` → lib | library | SQL subset parser, `LogicalPlan` builder, `Planner` (flattens to `PhysicalPlan`), `QueryExecution` (incremental, blocking or polling) | parquet_reader, pavi_runtime, sqlparser |
 | `pavi` → bin `pavi` | GUI | eframe app, all UI, export, profiling, charts, session persistence | all three libs + eframe, egui_extras, rfd, serde(_json), chrono, parquet (writer) |
-| `cli` → bin `cli` | CLI | metadata + preview printer, row streaming, row count | **parquet_reader only** + clap |
+| `cli` → bin `cli` | CLI | metadata + preview printer, row streaming, sort, row count, schema and statistics | **parquet_reader only** + clap |
 | `pavi_bench` → bin `pavi-bench` | tool | prints CSV-like timing/cache metrics for open, page reads, a scan query | all three libs |
 
 Direction is strictly downward: `app → query → runtime → parquet_reader`. No cycles. No library depends on the GUI.
@@ -128,7 +128,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | `main()` (GUI) | Takes optional path from `argv[1]`; window 1448×900 (min 900×600), **`with_decorations(false)`** (custom title bar), centered; `run_native("PAVI", …)` | `crates/app/src/main.rs:12-27` |
 | `PaviApp::new` / `new_with_store` | Starts `Runtime` (worker count = CPU count, queue 32), loads session, reopens `argv[1]` or last file | `app.rs:335-396` |
 | `eframe::App for PaviApp` | `update()` = poll everything then draw; `save()` = `persist_session()` but **never called** (eframe `persistence` feature off) | `app.rs:1775-1831` |
-| `main()` / `run()` (CLI) | `Args::parse` → open → check columns and filter → count, stream rows (`stream_rows`) or print summary and preview | `crates/cli/src/main.rs` |
+| `main()` / `run()` (CLI) | `Args::parse` → open → check columns, filter and sort → count, schema/stats rows (`write_facts`), or rows through `Rows::for_each` (window, filtered or sorted reads) to a `BatchWriter` or the table | `crates/cli/src/main.rs` |
 
 ### UI layer
 
@@ -199,7 +199,10 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 | `--offset N` (default 0) | Skip N rows, or N matching rows with `--filter`. The table's `#` counts from N + 1 |
 | `--columns a,b` | Column names or 0-based indexes; a name is tried first, so a column called `7` is found by name |
 | `--filter "…"` | Same `FilterExpr` grammar as the GUI filter box |
-| `--count` | Print only the row count (footer), or the matching rows (a scan of the filter's columns). Excludes `--head`, `--offset`, `--columns`, `--format`, `--quiet` |
+| `--sort "a:desc,b"` | Up to 8 keys by name or index, `:asc` (default) or `:desc`, nulls last; through `read_sorted` with `SortBudget::default()` (`sort.rs`) |
+| `--count` | Print only the row count (footer), or the matching rows (a scan of the filter's columns). Excludes `--head`, `--offset`, `--columns`, `--format`, `--quiet`, `--sort` |
+| `--schema` | One row per column (index, name, Arrow type text, nullable), in any `--format` (`inspect.rs`). Excludes every row option except `--columns` and `--format` |
+| `--stats` | One row per row group × column from the footer's statistics (rows, nulls, min, max, distinct), in any `--format`; the table shows ≤1,000 rows (`inspect.rs`). Allows `--columns`, `--head`, `--format` |
 | `-q`, `--quiet` | Table without the summary |
 
 Table output goes to stdout: unless `--quiet`, for a folder its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges; then a box-drawn table with headers and cells cut to 4–32 terminal columns (numbers right-aligned, control characters escaped). Arguments are all checked before the first line is written. Exit codes: `0` success, also when the reader of stdout closes early (broken pipe); `1` for any `anyhow` error (printed as `Error: …` with Debug formatting on stderr, the same text Rust prints for an error returned from `main`); `2` for clap usage errors.
