@@ -263,9 +263,15 @@ sequenceDiagram
     participant PS as ParquetSource
     participant O as output::print_batch
     participant W as export::BatchWriter
-    Shell->>M: cli FILE [--format F] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats] [-q]
+    Shell->>M: cli FILE|- [--format F] [-o PATH] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats] [-q]
     M->>M: Args::parse (clap; usage error or excluded combination → exit 2)
     M->>M: validate_head (table only: default 10, or 1,000 for --stats; ≤1000)
+    opt FILE is -
+        M->>M: copy stdin to a temporary stdin.<ext> (format from the first bytes, ≤32 GiB)
+    end
+    opt -o PATH
+        M->>M: refuse PATH = FILE; format from PATH's extension unless --format; write into PATH.pavi-cli-<pid>.tmp
+    end
     M->>PS: open(FILE)
     M->>M: parse_columns (names first, then 0-based indexes)
     M->>PS: parse_filter → FilterExpr::parse + validate_filter
@@ -293,6 +299,7 @@ sequenceDiagram
             M->>O: print_batch → box table to stdout, # counting from offset + 1
         end
     end
+    M->>M: with -o: flush, sync_all, rename the temporary file to PATH (removed on any error)
     M-->>Shell: exit 0 (also when stdout's reader closed), or anyhow error → stderr, exit 1
 ```
 

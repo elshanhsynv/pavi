@@ -18,7 +18,7 @@ Tests are inline `#[cfg(test)] mod tests` blocks next to the code they test. The
 | `pavi_runtime` | Queueing, back-pressure, cancellation, shutdown |
 | `pavi_query` | SQL subset parsing and rejections, plan validation, execution order |
 | `pavi` (app) | `app_tests.rs` drives `PaviApp` without a window: open → poll → act → assert on state. Also unit tests in `state.rs`, `chart.rs`, `export.rs`, `profile.rs`, `session.rs` |
-| `cli` | Argument validation and `--help` text, `run()` against a temporary Parquet file written into a `Vec<u8>` with 2-row batches (every format, `--offset`/`--head`/`--filter`, `--count`, `--schema`, `--stats`, `--sort` with ties, nulls and several keys, column names, nothing printed before an error, broken pipes in every mode), a sort forced to spill with a 2-row `SortBudget`, excluded argument combinations, table layout (`output.rs`) |
+| `cli` | Argument validation and `--help` text, `run()` against a temporary Parquet file written into a `Vec<u8>` with 2-row batches (every format, `--offset`/`--head`/`--filter`, `--count`, `--schema`, `--stats`, `--sort` with ties, nulls and several keys, column names, nothing printed before an error, broken pipes in every mode), a sort forced to spill with a 2-row `SortBudget`, excluded argument combinations, table layout (`output.rs`); standard input as CSV, JSON and Parquet bytes, `--output` conversions by extension, no file (and no temporary file) left after a failed write, refusing to overwrite the input (`files.rs` and `run_to_file`) |
 | `parquet_reader::export` | Each format written to a `Vec<u8>`; CSV and JSON Lines text for every scalar type and nested values |
 
 ## Fixtures

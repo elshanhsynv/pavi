@@ -46,6 +46,8 @@ cli data/ --format jsonl --offset 1000 --head 100 | jq .
 cli flights.parquet --sort DEP_DELAY:desc --head 20 --filter "DISTANCE > 1000"
 cli flights.parquet --schema --format csv
 cli flights.parquet --stats --columns DEP_DELAY      # min/max per row group, no scan
+cli flights.csv -o flights.parquet                   # convert; the file appears when complete
+curl -s https://example.com/data.parquet | cli - --count
 ```
 
 `--format` is `table`, `csv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `cli --help` lists every option and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).

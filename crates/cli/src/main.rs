@@ -1,9 +1,11 @@
 mod args;
+mod files;
 mod inspect;
 mod output;
 mod sort;
 
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
@@ -27,10 +29,16 @@ const STREAM_BATCH_ROWS: u64 = PAGE_ROWS;
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    // `Stdout`, not its lock: the Parquet writer needs a `Send` output.
-    let mut out = BufWriter::new(io::stdout());
-    let result = run(&args, &mut out, STREAM_BATCH_ROWS)
-        .and_then(|()| out.flush().context("write to standard output"));
+    let mut input = io::stdin().lock();
+    let result = match &args.output {
+        Some(path) => run_to_file(&args, path, &mut input, STREAM_BATCH_ROWS),
+        None => {
+            // `Stdout`, not its lock: the Parquet writer needs a `Send` output.
+            let mut out = BufWriter::new(io::stdout());
+            run(&args, &mut input, &mut out, STREAM_BATCH_ROWS)
+                .and_then(|()| out.flush().context("write to standard output"))
+        }
+    };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -44,19 +52,53 @@ fn main() -> ExitCode {
     }
 }
 
+/// [`run`] into `path`, which appears only once the output is complete.
+fn run_to_file(
+    args: &Args,
+    path: &Path,
+    input: &mut dyn Read,
+    batch_rows: u64,
+) -> anyhow::Result<()> {
+    files::check_not_input(&args.file, path)?;
+    files::write_atomically(path, |out| run(args, input, out, batch_rows))
+}
+
+/// The output format: `--format`, else `--output`'s extension, else the table.
+fn output_format(args: &Args) -> anyhow::Result<Format> {
+    match (args.format, &args.output) {
+        (Some(format), _) => Ok(format),
+        // `--count` prints a number whatever the file is called.
+        (None, Some(path)) if !args.count => files::format_for_extension(path),
+        (None, _) => Ok(Format::Table),
+    }
+}
+
 /// Checks every argument against the file, then writes the output.
 /// Nothing is written until the arguments are known to be valid and, for the
-/// table, until its rows have been read.
-fn run(args: &Args, out: &mut (impl Write + Send), batch_rows: u64) -> anyhow::Result<()> {
+/// table, until its rows have been read. `input` is read only for `-`.
+fn run(
+    args: &Args,
+    input: &mut dyn Read,
+    out: &mut (impl Write + Send),
+    batch_rows: u64,
+) -> anyhow::Result<()> {
+    let format = output_format(args)?;
     // Rows the table holds: --head, or every statistics row up to the cap.
-    let table_rows = if args.format == Format::Table && !args.count && !args.schema {
+    let table_rows = if format == Format::Table && !args.count && !args.schema {
         let default = args.stats.then_some(MAX_HEAD_ROWS);
         Some(validate_head(args.head.or(default))?)
     } else {
         None
     };
 
-    let parquet = ParquetSource::open(&args.file)?;
+    // Declared before the source so it is deleted after the source closes it.
+    let stdin = (args.file == "-")
+        .then(|| files::copy_stdin(input))
+        .transpose()?;
+    let parquet = match &stdin {
+        Some(copy) => ParquetSource::open(&copy.path).context("read standard input")?,
+        None => ParquetSource::open(&args.file)?,
+    };
     let projection = parse_columns(args.columns.as_deref(), &parquet)?;
     let filter = args
         .filter
@@ -76,12 +118,12 @@ fn run(args: &Args, out: &mut (impl Write + Send), batch_rows: u64) -> anyhow::R
     }
     if args.schema {
         let batch = inspect::schema_batch(&parquet, &projection)?;
-        return write_facts(&batch, "Schema", None, args.format, out);
+        return write_facts(&batch, "Schema", None, format, out);
     }
     if args.stats {
         let batch = inspect::stats_batch(&parquet, &projection)?;
         let limit = table_rows.map_or(args.head, |rows| Some(rows as u64));
-        return write_facts(&batch, "Statistics", limit, args.format, out);
+        return write_facts(&batch, "Statistics", limit, format, out);
     }
 
     // An empty window carries the projected schema.
@@ -98,7 +140,7 @@ fn run(args: &Args, out: &mut (impl Write + Send), batch_rows: u64) -> anyhow::R
     };
 
     let Some(head) = table_rows else {
-        let mut writer = BatchWriter::new(export_format(args.format)?, out, schema.clone())?;
+        let mut writer = BatchWriter::new(export_format(format)?, out, schema.clone())?;
         rows.for_each(args.head.unwrap_or(u64::MAX), &mut |batch| {
             writer.write(&batch)
         })?;
@@ -542,7 +584,7 @@ mod tests {
     /// Runs with two-row batches, so streams cross batch and row-group edges.
     fn output(arguments: &[&str]) -> String {
         let mut out = Vec::new();
-        run(&parse(arguments), &mut out, 2).unwrap();
+        run(&parse(arguments), &mut io::empty(), &mut out, 2).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -631,6 +673,7 @@ mod tests {
             let mut out = Vec::new();
             run(
                 &parse(&[&path, "--format", format, "--filter", "id >= 3"]),
+                &mut io::empty(),
                 &mut out,
                 2,
             )
@@ -675,7 +718,7 @@ mod tests {
         ] {
             let mut out = Vec::new();
             assert!(
-                run(&parse(&arguments), &mut out, 2).is_err(),
+                run(&parse(&arguments), &mut io::empty(), &mut out, 2).is_err(),
                 "{arguments:?}"
             );
             assert!(out.is_empty(), "printed before failing on {arguments:?}");
@@ -697,7 +740,8 @@ mod tests {
             for mode in [&[][..], &["--schema"], &["--stats"], &["--sort", "id:desc"]] {
                 let mut arguments = vec![path.as_str(), "--format", format];
                 arguments.extend_from_slice(mode);
-                let error = run(&parse(&arguments), &mut ClosedPipe, 2).unwrap_err();
+                let error =
+                    run(&parse(&arguments), &mut io::empty(), &mut ClosedPipe, 2).unwrap_err();
                 assert!(is_broken_pipe(&error), "{arguments:?}: {error:?}");
             }
         }
@@ -840,5 +884,130 @@ mod tests {
             .unwrap();
             assert_eq!(ids, expected, "offset {offset}, limit {limit}");
         }
+    }
+
+    /// Runs with `stdin` as standard input.
+    fn output_with_stdin(arguments: &[&str], stdin: &[u8]) -> String {
+        let mut out = Vec::new();
+        run(&parse(arguments), &mut &stdin[..], &mut out, 2).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn reads_csv_json_and_parquet_from_standard_input() {
+        assert_eq!(
+            output_with_stdin(&["-", "--format", "csv"], b"id,name\n1,a\n2,b\n"),
+            "id,name\n1,a\n2,b\n"
+        );
+        assert_eq!(
+            output_with_stdin(&["-", "--count"], b"{\"x\":1}\n{\"x\":2}\n{\"x\":3}\n"),
+            "3\n"
+        );
+        let (_folder, path) = fixture();
+        let parquet = std::fs::read(&path).unwrap();
+        assert_eq!(
+            output_with_stdin(
+                &[
+                    "-",
+                    "--format",
+                    "csv",
+                    "--filter",
+                    "id > 3",
+                    "--columns",
+                    "name"
+                ],
+                &parquet
+            ),
+            "name\nd\ne\n"
+        );
+
+        let mut out = Vec::new();
+        let error = run(&parse(&["-"]), &mut io::empty(), &mut out, 2).unwrap_err();
+        assert!(format!("{error:#}").contains("standard input is empty"));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn converts_to_a_file_in_the_format_its_extension_names() {
+        let (folder, path) = fixture();
+        let target = |name: &str| folder.path().join(name);
+        let convert = |arguments: &[&str]| {
+            run_to_file(
+                &parse(arguments),
+                Path::new(arguments[2]),
+                &mut io::empty(),
+                2,
+            )
+        };
+
+        let parquet = target("out.parquet");
+        convert(&[
+            &path,
+            "-o",
+            parquet.to_str().unwrap(),
+            "--filter",
+            "id >= 2",
+        ])
+        .unwrap();
+        assert_eq!(ParquetSource::open(&parquet).unwrap().row_count(), 4);
+
+        let csv = target("out.csv");
+        convert(&[&path, "-o", csv.to_str().unwrap(), "--columns", "name"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&csv).unwrap(),
+            "name\na\nb\nc\nd\ne\n"
+        );
+
+        // --format wins over the extension; --schema and --count write too.
+        let text = target("schema.txt");
+        convert(&[
+            &path,
+            "-o",
+            text.to_str().unwrap(),
+            "--schema",
+            "--format",
+            "jsonl",
+        ])
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&text).unwrap().lines().count(), 3);
+        let count = target("count.txt");
+        convert(&[&path, "-o", count.to_str().unwrap(), "--count"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&count).unwrap(), "5\n");
+    }
+
+    #[test]
+    fn leaves_no_file_when_the_output_cannot_be_written() {
+        let (folder, path) = fixture();
+        for (name, extra) in [
+            // No format from this extension.
+            ("out.tsv", None),
+            // A bad filter fails after the temporary file was created.
+            ("bad.csv", Some(["--filter", "missing > 1"])),
+        ] {
+            let output = folder.path().join(name);
+            let mut arguments = vec![path.as_str(), "-o", output.to_str().unwrap()];
+            arguments.extend(extra.iter().flatten());
+            assert!(
+                run_to_file(&parse(&arguments), &output, &mut io::empty(), 2).is_err(),
+                "{name}"
+            );
+            assert!(!output.exists(), "{name}");
+        }
+        // Only the fixture is left: no temporary files.
+        assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn refuses_to_overwrite_the_file_being_read() {
+        let (_folder, path) = fixture();
+        let before = std::fs::read(&path).unwrap();
+        let arguments = [path.as_str(), "-o", &path, "--format", "parquet"];
+        let error =
+            run_to_file(&parse(&arguments), Path::new(&path), &mut io::empty(), 2).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is the file being read"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }
