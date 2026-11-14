@@ -46,6 +46,7 @@ cli data/ --format jsonl --offset 1000 --head 100 | jq .
 cli flights.parquet --sort DEP_DELAY:desc --head 20 --filter "DISTANCE > 1000"
 cli flights.parquet --schema --format csv
 cli flights.parquet --stats --columns DEP_DELAY      # min/max per row group, no scan
+cli flights.parquet --profile --format csv           # nulls, distinct, min, max, mean per column
 cli flights.csv -o flights.parquet                   # convert; the file appears when complete
 curl -s https://example.com/data.parquet | cli - --count
 cli flights.parquet --sql "SELECT ORIGIN, COUNT(*), AVG(DEP_DELAY) FROM flights GROUP BY ORIGIN"

@@ -100,6 +100,20 @@ pub struct Args {
     /// the file, e.g. airports.csv → airports). Repeat for more tables
     #[arg(long = "table", value_name = "[NAME=]PATH", requires = "sql")]
     pub tables: Vec<String>,
+
+    /// Profile each column (or each of --columns, at most 256) in one scan,
+    /// as the app's Profile window does: rows, nulls, distinct values (exact
+    /// up to 1,000), min, max, mean and, when every distinct value was counted,
+    /// the most frequent value. With
+    /// --filter, only matching rows. Lists, structs and maps show the footer's
+    /// counts only
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "count", "schema", "stats", "sql", "sort", "offset", "head", "quiet"
+        ]
+    )]
+    pub profile: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

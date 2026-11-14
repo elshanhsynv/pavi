@@ -89,7 +89,7 @@ crates/app/src/                (pavi)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), progress, temp-file + rename; the writers are parquet_reader::export::BatchWriter
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
-├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator
+├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator (parquet_reader::profile statistics + distribution chart), ColumnProfile (derefs to ColumnStats)
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
 ├── compare.rs      CompareState, SchemaDiff, key_query (SQL for rows only in one tab)
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
@@ -108,7 +108,7 @@ crates/app/src/                (pavi)
 
 ### Sharing between GUI and CLI
 
-- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `read_filtered_from`, `FilterExpr::parse`, `Projection`, the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling), and the `export` module (`ExportFormat`, `BatchWriter`: CSV, JSON Lines, Parquet and Arrow IPC written batch by batch to any `Write`).
+- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `read_filtered_from`, `FilterExpr::parse`, `Projection`, the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling), the `export` module (`ExportFormat`, `BatchWriter`: CSV, JSON Lines, Parquet and Arrow IPC written batch by batch to any `Write`), and the `profile` module (`StatsAccumulator`, `FileProfiler`, `ColumnStats` and the distinct-value caps; the app adds the distribution chart and its threads).
 - **Shared through `pavi_query` (CLI `--sql`, ADR 0011):** the runtime, the query engine and SQL subset, joins and subqueries, and `pavi_query::table_name`, which names the app's tabs and the CLI's `--table` files alike.
 - **GUI-only:** page cache use (`read_page`), the export task (thread, progress, temp file + rename), profiling, charts.
 - **Duplicated logic:** CLI has its own table printer and truncation (`crates/cli/src/output.rs`). Value → text conversion lives in one place, `value.rs`: display, CSV export, profiling and row-group statistics all use it. Aggregation keeps its own typed `Scalar` values (`source.rs::scalar_at`), which are turned back into Arrow arrays and displayed through `value.rs`. Type support is defined once in `types.rs` and used by sort, aggregates, filters and profiling; CSV export uses `value::is_scalar_type`. Charts keep their own checks.
@@ -197,6 +197,7 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 | `FILE` (positional, required) | Anything `ParquetSource::open` opens: a Parquet file, a folder, a CSV/JSON/Arrow file or a remote URL; or `-`: standard input copied to `<temp>/pavi-stdin-<pid>-<nanos>/stdin.<ext>` (≤ `MAX_STDIN_BYTES`), the extension chosen from the first bytes (`PAR1`, `ARROW1`, an IPC continuation marker, `{`/`[`, else CSV), deleted after the run (`files.rs`) |
 | `--format F` | `table`, or `csv`, `jsonl` (alias `json`), `parquet`, `arrow`: rows only, streamed with `parquet_reader::export::BatchWriter`. Default: `--output`'s extension, else `table` |
 | `--sql "QUERY"` | The app's SQL subset run by `pavi_query` on a `Runtime` started for it (`query.rs`). `FILE` is `dataset` and also its `table_name` (`stdin` for `-`). Planned before any output; `--head`/`--offset` cut the result, and the execution is cancelled once `--head` rows are out. The table shows the result without the file summary. Excludes `--filter`, `--sort`, `--columns`, `--count`, `--schema`, `--stats`, `--quiet` |
+| `--profile` | One row per column of `--columns` (≤ `MAX_FILE_PROFILE_COLUMNS`, else an error naming `--columns`): column, type, rows, nulls, distinct, distinct_capped, min, max, mean, top_value, top_count, from `parquet_reader::profile::FileProfiler` fed by `Rows::for_each` (so `--filter` works). The top value is left empty when the distinct count capped; a list, struct or map shows the footer's null count (empty when unknown). Excludes `--count`, `--schema`, `--stats`, `--sql`, `--sort`, `--offset`, `--head`, `--quiet` |
 | `--table [NAME=]PATH` | Another table for `--sql`, opened on the main thread; named `NAME` (letters, digits, `_`) or `table_name(PATH)`. Repeatable; requires `--sql` |
 | `-o`, `--output PATH` | Write to `PATH` instead of stdout: into `<name>.pavi-cli-<pid>.tmp` next to it, `sync_all`, then `fs::rename`; removed on any error. Refused when `PATH` is the input file (`files::check_not_input`) |
 | `--head N` | Rows to output. Table: default 10, rejected if >1000 (`validate_head`, `MAX_HEAD_ROWS`). Other formats: default every row |

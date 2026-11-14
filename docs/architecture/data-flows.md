@@ -197,8 +197,8 @@ sequenceDiagram
 
 - **Metadata/schema/stats** are computed once at open (`statistics::metadata_statistics`; min/max rebuilt as typed values and formatted like grid cells, byte strings capped at 128 chars) and rendered from memory each frame; long lists use `ScrollArea::show_rows` (virtualized) (`ui/inspector.rs:203-240`). Each top-level column is mapped to its Parquet leaf (`statistics::leaf_columns`); a nested column (several leaves, or one leaf under a group) has no statistics, and the other columns keep theirs. The selected cell, when it is a list, struct or map, is shown as a tree (`value::value_tree`, bounded).
 - **Selected cell:** `selected_cell_details` → `inspect_cell` on the in-memory batch (`app.rs:1560-1603`).
-- **Profile column:** `run_profile` (`app.rs:1482-1503`) → `ProfileTask::start` spawns thread `pavi-profile` (`profile.rs:83-119`), which runs a `scan().project([col])` query and polls it with a 5 ms sleep loop (`profile.rs:143-176`), building exact distinct counts, min/max/mean, string lengths and a distribution chart. Result returns via a capacity-1 channel; UI polls in `poll_profile` (`app.rs:1513-1543`). Exact distinct counting is capped at 4,096 values and 128 bytes per value; past that the profile ends with an error (`profile.rs:275-294`).
-- **Profile all columns:** `run_file_profile` → `FileProfileTask::start` spawns thread `pavi-file-profile`, which runs one `scan().project(columns)` query over the first 256 columns and feeds each batch's columns to one `ProfileAccumulator` each (no distribution chart). Lists, structs and maps get their type and footer null count only. Each column counts at most 1,000 distinct values / 64 KB and then stops counting and marks the count as a lower bound instead of failing, so the whole profile holds about 256 × 64 KB at most. Rows read are shared through an atomic counter for the progress text; cancellation is checked every batch. `poll_file_profile` drops results of an older generation; the Profile window shows the rest.
+- **Profile column:** `run_profile` (`app.rs:1482-1503`) → `ProfileTask::start` spawns thread `pavi-profile` (`profile.rs:83-119`), which runs a `scan().project([col])` query and polls it with a 5 ms sleep loop (`profile.rs:143-176`), building exact distinct counts, min/max/mean and string lengths (`parquet_reader::profile::StatsAccumulator`, shared with the CLI) and a distribution chart (the app's `ProfileAccumulator` adds it). Result returns via a capacity-1 channel; UI polls in `poll_profile` (`app.rs:1513-1543`). Exact distinct counting is capped at 4,096 values and 128 bytes per value; past that the profile ends with an error (`profile.rs:275-294`).
+- **Profile all columns:** `run_file_profile` → `FileProfileTask::start` spawns thread `pavi-file-profile`, which runs one `scan().project(columns)` query over the first 256 columns and feeds each batch to a `parquet_reader::profile::FileProfiler`, one accumulator per column (no distribution chart). The CLI's `--profile` feeds the same `FileProfiler` from its own synchronous reads, so both report the same numbers. Lists, structs and maps get their type and footer null count only. Each column counts at most 1,000 distinct values / 64 KB and then stops counting and marks the count as a lower bound instead of failing, so the whole profile holds about 256 × 64 KB at most. Rows read are shared through an atomic counter for the progress text; cancellation is checked every batch. `poll_file_profile` drops results of an older generation; the Profile window shows the rest.
 
 ```mermaid
 sequenceDiagram
@@ -264,7 +264,7 @@ sequenceDiagram
     participant O as output::print_batch
     participant W as export::BatchWriter
     participant Q as pavi_query (--sql)
-    Shell->>M: cli FILE|- [--format F] [-o PATH] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats | --sql "…" [--table [NAME=]PATH]…] [-q]
+    Shell->>M: cli FILE|- [--format F] [-o PATH] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats | --profile | --sql "…" [--table [NAME=]PATH]…] [-q]
     M->>M: Args::parse (clap; usage error or excluded combination → exit 2)
     M->>M: validate_head (table only: default 10, or 1,000 for --stats; ≤1000)
     opt FILE is -
@@ -283,6 +283,9 @@ sequenceDiagram
     else --schema / --stats
         M->>PS: schema / metadata().columns() row-group statistics (footer only)
         M->>Shell: one batch → table (stats: first --head rows, ≤1000) or BatchWriter
+    else --profile
+        M->>PS: FileProfiler over --columns (≤256); Rows::for_each (filtered or window reads, 4,096 rows a step) → push_batch
+        M->>Shell: one row per column → table or BatchWriter
     else --sql
         M->>PS: open each --table; Tables = dataset + table_name(FILE) + --table names
         M->>Q: SqlAst::parse → to_logical_plan_with(tables) → Planner::validate (errors before output)

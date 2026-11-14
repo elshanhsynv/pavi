@@ -1,76 +1,49 @@
 use std::{
-    collections::BTreeMap,
+    ops::Deref,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use arrow_array::{
-    Array, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, RecordBatch, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
-};
-use arrow_schema::{DataType, TimeUnit};
-use parquet_reader::types::{is_comparable, is_decimal, is_string};
-use parquet_reader::{ColumnInfo, ParquetSource};
+use arrow_array::RecordBatch;
+use arrow_schema::DataType;
+use parquet_reader::ParquetSource;
+pub use parquet_reader::profile::MAX_FILE_PROFILE_COLUMNS;
+use parquet_reader::profile::{ColumnStats, FileProfiler, StatsAccumulator, metadata_null_count};
+#[cfg(test)]
+pub use parquet_reader::profile::{FrequentValue, StringLengthStats};
+use parquet_reader::types::{is_decimal, is_numeric};
 use pavi_query::{LogicalPlan, QueryEngine, QueryPoll};
 use pavi_runtime::{CancellationToken, GenerationId, RuntimeHandle};
 
 use crate::chart::{ChartAccumulator, ChartConfig, ChartKind, ChartModel, MAX_INPUT_ROWS};
 
-pub const MAX_DISTINCT_VALUES: usize = 4_096;
-pub const MAX_DISTINCT_BYTES: usize = 1_024 * 1_024;
-pub const MAX_PROFILE_VALUE_BYTES: usize = 128;
-const FREQUENT_VALUE_LIMIT: usize = 10;
-/// Columns one whole-file profile covers; wider files are profiled in part.
-pub const MAX_FILE_PROFILE_COLUMNS: usize = 256;
-/// Distinct values counted exactly per column in a whole-file profile; past it
-/// the count reads "more than".
-pub const FILE_PROFILE_DISTINCT_VALUES: usize = 1_000;
-/// Bytes of distinct values kept per column in a whole-file profile.
-pub const FILE_PROFILE_DISTINCT_BYTES: usize = 64 * 1024;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct FrequentValue {
-    pub value: String,
-    pub count: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct StringLengthStats {
-    pub min: usize,
-    pub max: usize,
-    pub mean: f64,
-}
-
+/// A column's profile (`parquet_reader::profile`, shared with the CLI) and, for
+/// a one-column profile of a number, its distribution chart. It reads as its
+/// statistics: `profile.min`, `profile.null_count`, …
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnProfile {
-    pub column: usize,
-    pub name: String,
-    pub data_type: DataType,
-    pub row_count: u64,
-    pub null_count: u64,
-    pub metadata_null_count: Option<u64>,
-    pub distinct_count: usize,
-    /// The column has more distinct values than were counted: `distinct_count`
-    /// is a lower bound (whole-file profiles only).
-    pub distinct_capped: bool,
-    pub min: Option<String>,
-    pub max: Option<String>,
-    pub mean: Option<f64>,
-    pub string_lengths: Option<StringLengthStats>,
-    pub frequent_values: Vec<FrequentValue>,
+    pub stats: ColumnStats,
     pub distribution: Option<ChartModel>,
     pub distribution_sampled: bool,
-    pub non_finite_count: u64,
 }
 
-impl ColumnProfile {
-    pub fn non_null_count(&self) -> u64 {
-        self.row_count.saturating_sub(self.null_count)
+impl Deref for ColumnProfile {
+    type Target = ColumnStats;
+
+    fn deref(&self) -> &ColumnStats {
+        &self.stats
+    }
+}
+
+impl From<ColumnStats> for ColumnProfile {
+    fn from(stats: ColumnStats) -> Self {
+        Self {
+            stats,
+            distribution: None,
+            distribution_sampled: false,
+        }
     }
 }
 
@@ -145,15 +118,6 @@ impl ProfileTask {
     }
 }
 
-pub fn metadata_null_count(column: &ColumnInfo) -> Option<u64> {
-    column
-        .row_group_statistics
-        .iter()
-        .try_fold(0_u64, |sum, stats| {
-            sum.checked_add(stats.as_ref()?.null_count?)
-        })
-}
-
 fn profile_column(
     source: std::sync::Arc<ParquetSource>,
     column: usize,
@@ -187,35 +151,12 @@ fn profile_column(
     }
 }
 
+/// A one-column profile: the shared statistics plus, for numbers and
+/// decimals, a bounded histogram of the values.
 struct ProfileAccumulator {
-    column: usize,
-    name: String,
-    data_type: DataType,
-    metadata_null_count: Option<u64>,
-    row_count: u64,
-    null_count: u64,
-    distinct: BTreeMap<String, u64>,
-    distinct_bytes: usize,
-    min: Option<String>,
-    max: Option<String>,
-    numeric_min: Option<f64>,
-    numeric_max: Option<f64>,
-    /// Dates and timestamps are ordered by their stored value, not their text.
-    temporal_min: Option<i64>,
-    temporal_max: Option<i64>,
-    numeric_sum: f64,
-    numeric_count: u64,
-    non_finite_count: u64,
-    string_length_min: Option<usize>,
-    string_length_max: usize,
-    string_length_sum: u64,
+    stats: StatsAccumulator,
     chart: Option<ChartAccumulator>,
     distribution_sampled: bool,
-    distinct_limit: usize,
-    distinct_bytes_limit: usize,
-    /// Past the distinct limits, stop counting instead of failing.
-    lenient: bool,
-    distinct_capped: bool,
 }
 
 impl ProfileAccumulator {
@@ -225,11 +166,8 @@ impl ProfileAccumulator {
         data_type: DataType,
         metadata_null_count: Option<u64>,
     ) -> Result<Self> {
-        if !is_comparable(&data_type) {
-            bail!("profiling does not support {data_type:?}; use Inspector metadata instead");
-        }
-        let chart = numeric_type(&data_type)
-            .map(|_| {
+        let chart = (is_numeric(&data_type) || is_decimal(&data_type))
+            .then(|| {
                 ChartAccumulator::new(ChartConfig {
                     kind: ChartKind::Histogram,
                     x_column: name.clone(),
@@ -241,299 +179,30 @@ impl ProfileAccumulator {
             })
             .transpose()?;
         Ok(Self {
-            column,
-            name,
-            data_type,
-            metadata_null_count,
-            row_count: 0,
-            null_count: 0,
-            distinct: BTreeMap::new(),
-            distinct_bytes: 0,
-            min: None,
-            max: None,
-            numeric_min: None,
-            numeric_max: None,
-            temporal_min: None,
-            temporal_max: None,
-            numeric_sum: 0.0,
-            numeric_count: 0,
-            non_finite_count: 0,
-            string_length_min: None,
-            string_length_max: 0,
-            string_length_sum: 0,
+            stats: StatsAccumulator::new(column, name, data_type, metadata_null_count)?,
             chart,
             distribution_sampled: false,
-            distinct_limit: MAX_DISTINCT_VALUES,
-            distinct_bytes_limit: MAX_DISTINCT_BYTES,
-            lenient: false,
-            distinct_capped: false,
         })
     }
 
-    /// An accumulator for a whole-file profile: no distribution chart, and a
-    /// smaller distinct count that caps instead of failing.
-    fn for_file(
-        column: usize,
-        name: String,
-        data_type: DataType,
-        metadata_null_count: Option<u64>,
-    ) -> Result<Self> {
-        let mut accumulator = Self::new(column, name, data_type, metadata_null_count)?;
-        accumulator.chart = None;
-        accumulator.distinct_limit = FILE_PROFILE_DISTINCT_VALUES;
-        accumulator.distinct_bytes_limit = FILE_PROFILE_DISTINCT_BYTES;
-        accumulator.lenient = true;
-        Ok(accumulator)
-    }
-
     fn push_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let array = batch.column(0);
-        if array.data_type() != &self.data_type {
-            bail!("profile batch type changed");
-        }
+        self.stats.push_batch(batch)?;
         if let Some(chart) = &mut self.chart
             && !self.distribution_sampled
             && !chart.push_batch(batch)?
         {
             self.distribution_sampled = true;
         }
-        for row in 0..batch.num_rows() {
-            self.row_count = self.row_count.saturating_add(1);
-            if array.is_null(row) {
-                self.null_count = self.null_count.saturating_add(1);
-                continue;
-            }
-            let value = scalar_text(array.as_ref(), row)?;
-            self.record_distinct(&value)?;
-            if let Some(number) = numeric(array.as_ref(), row)? {
-                self.record_numeric(number, &value)?;
-            } else if let Some(key) = temporal_key(array.as_ref(), row)? {
-                self.record_temporal(key, &value);
-            } else {
-                self.record_text(&value, is_string(&self.data_type));
-            }
-        }
         Ok(())
-    }
-
-    fn record_distinct(&mut self, value: &str) -> Result<()> {
-        if self.distinct_capped {
-            return Ok(());
-        }
-        let over = if value.len() > MAX_PROFILE_VALUE_BYTES {
-            Some(format!(
-                "distinct values longer than {MAX_PROFILE_VALUE_BYTES} bytes are not retained exactly"
-            ))
-        } else if !self.distinct.contains_key(value) {
-            let next_bytes = self.distinct_bytes.saturating_add(value.len());
-            if self.distinct.len() == self.distinct_limit {
-                Some(format!(
-                    "exact distinct count exceeds the {}-value profile limit",
-                    self.distinct_limit
-                ))
-            } else if next_bytes > self.distinct_bytes_limit {
-                Some(format!(
-                    "exact distinct values exceed the {}-byte profile limit",
-                    self.distinct_bytes_limit
-                ))
-            } else {
-                self.distinct_bytes = next_bytes;
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(reason) = over {
-            if !self.lenient {
-                bail!(reason);
-            }
-            // Keep the count reached; stop tracking values to bound memory.
-            self.distinct_capped = true;
-            return Ok(());
-        }
-        let count = self.distinct.entry(value.to_owned()).or_default();
-        *count = count.saturating_add(1);
-        Ok(())
-    }
-
-    fn record_numeric(&mut self, number: f64, value: &str) -> Result<()> {
-        if !number.is_finite() {
-            self.non_finite_count = self.non_finite_count.saturating_add(1);
-            return Ok(());
-        }
-        if self.numeric_min.is_none_or(|minimum| number < minimum) {
-            self.numeric_min = Some(number);
-            self.min = Some(value.to_owned());
-        }
-        if self.numeric_max.is_none_or(|maximum| number > maximum) {
-            self.numeric_max = Some(number);
-            self.max = Some(value.to_owned());
-        }
-        self.numeric_sum += number;
-        if !self.numeric_sum.is_finite() {
-            bail!("numeric mean overflowed while profiling");
-        }
-        self.numeric_count = self.numeric_count.saturating_add(1);
-        Ok(())
-    }
-
-    fn record_temporal(&mut self, key: i64, value: &str) {
-        if self.temporal_min.is_none_or(|minimum| key < minimum) {
-            self.temporal_min = Some(key);
-            self.min = Some(value.to_owned());
-        }
-        if self.temporal_max.is_none_or(|maximum| key > maximum) {
-            self.temporal_max = Some(key);
-            self.max = Some(value.to_owned());
-        }
-    }
-
-    /// Text and booleans: min/max by text; string lengths only for text columns.
-    fn record_text(&mut self, value: &str, measure_length: bool) {
-        if self.min.as_deref().is_none_or(|minimum| value < minimum) {
-            self.min = Some(value.to_owned());
-        }
-        if self.max.as_deref().is_none_or(|maximum| value > maximum) {
-            self.max = Some(value.to_owned());
-        }
-        if !measure_length {
-            return;
-        }
-        let length = value.chars().count();
-        self.string_length_min = Some(self.string_length_min.map_or(length, |min| min.min(length)));
-        self.string_length_max = self.string_length_max.max(length);
-        self.string_length_sum = self.string_length_sum.saturating_add(length as u64);
     }
 
     fn finish(self) -> ColumnProfile {
-        let distinct_count = self.distinct.len();
-        let distinct_capped = self.distinct_capped;
-        let mut frequent_values = self
-            .distinct
-            .into_iter()
-            .map(|(value, count)| FrequentValue { value, count })
-            .collect::<Vec<_>>();
-        frequent_values.sort_by(|left, right| {
-            right
-                .count
-                .cmp(&left.count)
-                .then_with(|| left.value.cmp(&right.value))
-        });
-        frequent_values.truncate(FREQUENT_VALUE_LIMIT);
-        let string_lengths = self.string_length_min.map(|min| StringLengthStats {
-            min,
-            max: self.string_length_max,
-            mean: self.string_length_sum as f64
-                / self.row_count.saturating_sub(self.null_count).max(1) as f64,
-        });
         ColumnProfile {
-            column: self.column,
-            name: self.name,
-            data_type: self.data_type,
-            row_count: self.row_count,
-            null_count: self.null_count,
-            metadata_null_count: self.metadata_null_count,
-            distinct_count,
-            distinct_capped,
-            min: self.min,
-            max: self.max,
-            mean: (self.numeric_count > 0).then(|| self.numeric_sum / self.numeric_count as f64),
-            string_lengths,
-            frequent_values,
+            stats: self.stats.finish(),
             distribution: self.chart.map(ChartAccumulator::finish),
             distribution_sampled: self.distribution_sampled,
-            non_finite_count: self.non_finite_count,
         }
     }
-}
-
-fn numeric_type(data_type: &DataType) -> Option<()> {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-    )
-    .then_some(())
-    .or_else(|| is_decimal(data_type).then_some(()))
-}
-
-/// Profile text for one non-null value, from the shared scalar formatter.
-/// Profiling accepts the comparable types (`types::is_comparable`).
-fn scalar_text(array: &dyn Array, row: usize) -> Result<String> {
-    if !is_comparable(array.data_type()) {
-        bail!("profiling does not support {:?}", array.data_type());
-    }
-    parquet_reader::value::scalar_text(array, row)?.context("profile value is unexpectedly null")
-}
-
-/// The stored value of a date, timestamp or time of day, for ordering; `None` for
-/// other types.
-fn temporal_key(array: &dyn Array, row: usize) -> Result<Option<i64>> {
-    macro_rules! key {
-        ($array:ty) => {
-            Some(
-                array
-                    .as_any()
-                    .downcast_ref::<$array>()
-                    .context("read temporal profile value")?
-                    .value(row)
-                    .into(),
-            )
-        };
-    }
-    Ok(match array.data_type() {
-        DataType::Date32 => key!(Date32Array),
-        DataType::Date64 => key!(Date64Array),
-        DataType::Timestamp(TimeUnit::Second, _) => key!(TimestampSecondArray),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => key!(TimestampMillisecondArray),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => key!(TimestampMicrosecondArray),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => key!(TimestampNanosecondArray),
-        DataType::Time32(TimeUnit::Second) => key!(Time32SecondArray),
-        DataType::Time32(TimeUnit::Millisecond) => key!(Time32MillisecondArray),
-        DataType::Time64(TimeUnit::Microsecond) => key!(Time64MicrosecondArray),
-        DataType::Time64(TimeUnit::Nanosecond) => key!(Time64NanosecondArray),
-        _ => None,
-    })
-}
-
-fn numeric(array: &dyn Array, row: usize) -> Result<Option<f64>> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    macro_rules! value {
-        ($array:ty) => {
-            array
-                .as_any()
-                .downcast_ref::<$array>()
-                .context("read numeric profile value")?
-                .value(row) as f64
-        };
-    }
-    Ok(Some(match array.data_type() {
-        DataType::Int8 => value!(Int8Array),
-        DataType::Int16 => value!(Int16Array),
-        DataType::Int32 => value!(Int32Array),
-        DataType::Int64 => value!(Int64Array),
-        DataType::UInt8 => value!(UInt8Array),
-        DataType::UInt16 => value!(UInt16Array),
-        DataType::UInt32 => value!(UInt32Array),
-        DataType::UInt64 => value!(UInt64Array),
-        DataType::Float32 => value!(Float32Array),
-        DataType::Float64 => value!(Float64Array),
-        data_type if is_decimal(data_type) => {
-            parquet_reader::value::decimal_f64(array, row).context("read decimal profile value")?
-        }
-        data_type if is_comparable(data_type) => return Ok(None),
-        data_type => bail!("profiling does not support {data_type:?}"),
-    }))
 }
 
 /// What a whole-file profile reports.
@@ -623,6 +292,8 @@ impl FileProfileTask {
     }
 }
 
+/// The whole-file profile on the worker pool; the statistics are
+/// `parquet_reader::profile::FileProfiler`'s, as in the CLI's `--profile`.
 fn profile_file(
     source: std::sync::Arc<ParquetSource>,
     columns: Vec<usize>,
@@ -631,54 +302,9 @@ fn profile_file(
     cancellation: &CancellationToken,
     scanned: &std::sync::atomic::AtomicU64,
 ) -> Result<Vec<ColumnProfile>> {
-    if columns.len() > MAX_FILE_PROFILE_COLUMNS {
-        bail!("a profile covers at most {MAX_FILE_PROFILE_COLUMNS} columns");
-    }
-    let metadata = source.metadata();
-    let mut accumulators = Vec::new();
-    let mut profiles: Vec<Option<ColumnProfile>> = Vec::new();
-    for &column in &columns {
-        let info = metadata
-            .columns()
-            .get(column)
-            .context("profile column is out of range")?;
-        let null_count = metadata_null_count(info);
-        if is_comparable(&info.data_type) {
-            accumulators.push(ProfileAccumulator::for_file(
-                column,
-                info.name.clone(),
-                info.data_type.clone(),
-                null_count,
-            )?);
-            profiles.push(None);
-        } else {
-            // Lists, structs and maps: their type and what the footer says.
-            profiles.push(Some(ColumnProfile {
-                column,
-                name: info.name.clone(),
-                data_type: info.data_type.clone(),
-                row_count: source.row_count(),
-                null_count: null_count.unwrap_or(0),
-                metadata_null_count: null_count,
-                distinct_count: 0,
-                distinct_capped: false,
-                min: None,
-                max: None,
-                mean: None,
-                string_lengths: None,
-                frequent_values: Vec::new(),
-                distribution: None,
-                distribution_sampled: false,
-                non_finite_count: 0,
-            }));
-        }
-    }
-    if !accumulators.is_empty() {
-        let read = accumulators
-            .iter()
-            .map(|accumulator| accumulator.column)
-            .collect::<Vec<_>>();
-        let plan = LogicalPlan::scan(source).project(read);
+    let mut profiler = FileProfiler::new(&source, &columns)?;
+    if !profiler.read_columns().is_empty() {
+        let plan = LogicalPlan::scan(source).project(profiler.read_columns().to_vec());
         let engine = QueryEngine::from_handle(runtime);
         let mut execution = engine.execute(&plan, generation)?;
         loop {
@@ -688,30 +314,22 @@ fn profile_file(
             }
             match execution.poll_next_batch()? {
                 QueryPoll::Batch(batch) => {
-                    let batch = batch.batch;
                     scanned.fetch_add(
-                        batch.num_rows() as u64,
+                        batch.batch.num_rows() as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    for (index, accumulator) in accumulators.iter_mut().enumerate() {
-                        accumulator.push_batch(&batch.project(&[index])?)?;
-                    }
+                    profiler.push_batch(&batch.batch)?;
                 }
                 QueryPoll::Finished => break,
                 QueryPoll::Pending => thread::sleep(Duration::from_millis(5)),
             }
         }
     }
-    let mut finished = accumulators.into_iter().map(ProfileAccumulator::finish);
-    profiles
+    Ok(profiler
+        .finish()
         .into_iter()
-        .map(|profile| match profile {
-            Some(profile) => Ok(profile),
-            None => finished
-                .next()
-                .context("profile accumulators and columns disagree"),
-        })
-        .collect()
+        .map(ColumnProfile::from)
+        .collect())
 }
 
 /// The whole-file profile of a tab: shown in its own window.
@@ -791,14 +409,13 @@ impl ProfileState {
 mod tests {
     use std::{fs::File, sync::Arc, thread};
 
-    use arrow_array::{BinaryArray, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
     use pavi_runtime::{Runtime, RuntimeConfig};
     use tempfile::TempDir;
 
     use super::*;
-    use parquet_reader::ColumnStatistics;
 
     fn source() -> (TempDir, Arc<ParquetSource>) {
         let directory = TempDir::new().unwrap();
@@ -955,49 +572,6 @@ mod tests {
         assert!(profile.mean.is_none());
     }
 
-    #[test]
-    fn metadata_null_counts_are_used_only_when_complete() {
-        let column = ColumnInfo {
-            index: 0,
-            name: "number".to_string(),
-            data_type: DataType::Int32,
-            nullable: true,
-            row_group_statistics: vec![
-                Some(ColumnStatistics {
-                    min: None,
-                    max: None,
-                    null_count: Some(2),
-                    distinct_count: None,
-                }),
-                Some(ColumnStatistics {
-                    min: None,
-                    max: None,
-                    null_count: Some(3),
-                    distinct_count: None,
-                }),
-            ],
-        };
-        assert_eq!(metadata_null_count(&column), Some(5));
-        let missing = ColumnInfo {
-            row_group_statistics: vec![None],
-            ..column
-        };
-        assert_eq!(metadata_null_count(&missing), None);
-    }
-
-    #[test]
-    fn rejects_unsupported_values_and_unbounded_exact_distinct_state() {
-        assert!(ProfileAccumulator::new(0, "binary".to_string(), DataType::Binary, None).is_err());
-        let mut accumulator =
-            ProfileAccumulator::new(0, "text".to_string(), DataType::Utf8, None).unwrap();
-        for index in 0..MAX_DISTINCT_VALUES {
-            accumulator.record_distinct(&index.to_string()).unwrap();
-        }
-        assert!(accumulator.record_distinct("one-too-many").is_err());
-        let binary = BinaryArray::from(vec![Some(b"x".as_slice())]);
-        assert!(scalar_text(&binary, 0).is_err());
-    }
-
     fn profile_array(array: arrow_array::ArrayRef) -> ColumnProfile {
         let data_type = array.data_type().clone();
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1038,41 +612,12 @@ mod tests {
         let views = profile_array(Arc::new(StringViewArray::from(vec!["pear", "fig"])));
         assert_eq!(views.min.as_deref(), Some("fig"));
         assert_eq!(views.max.as_deref(), Some("pear"));
-        assert_eq!(views.string_lengths.map(|lengths| lengths.max), Some(4));
+        assert_eq!(
+            views.string_lengths.as_ref().map(|lengths| lengths.max),
+            Some(4)
+        );
 
         assert!(ProfileAccumulator::new(0, "b".to_string(), DataType::Binary, None).is_err());
-    }
-
-    #[test]
-    fn whole_file_profiles_cap_distinct_counts_instead_of_failing() {
-        let values = (FILE_PROFILE_DISTINCT_VALUES + 500) as i32;
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "number",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from_iter_values(0..values))],
-        )
-        .unwrap();
-        let mut file =
-            ProfileAccumulator::for_file(0, "number".to_string(), DataType::Int32, None).unwrap();
-        file.push_batch(&batch).unwrap();
-        let profile = file.finish();
-        assert!(profile.distinct_capped);
-        assert_eq!(profile.distinct_count, FILE_PROFILE_DISTINCT_VALUES);
-        // Min, max and mean still cover every row.
-        assert_eq!(
-            profile.max.as_deref(),
-            Some(values - 1).map(|max| max.to_string()).as_deref()
-        );
-        assert!(profile.distribution.is_none());
-
-        let mut column =
-            ProfileAccumulator::new(0, "number".to_string(), DataType::Int32, None).unwrap();
-        column.push_batch(&batch).unwrap();
-        assert!(!column.finish().distinct_capped);
     }
 
     #[test]
