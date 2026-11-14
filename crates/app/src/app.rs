@@ -991,12 +991,9 @@ impl PaviApp {
             .column_names
             .get(source)
             .ok_or("That column is no longer shown")?;
-        // A column whose name is a number would be read as a column position.
-        let column = if name.parse::<usize>().is_ok() {
-            source.to_string()
-        } else {
-            name.clone()
-        };
+        // Filters find a column by name before trying a position, so even a
+        // column whose name is a number is written by name.
+        let column = name.clone();
         if array.is_null(offset) {
             let op = if exclude {
                 FilterOp::IsNotNull

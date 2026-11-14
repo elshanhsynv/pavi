@@ -854,6 +854,23 @@ mod tests {
     }
 
     #[test]
+    fn filters_and_queries_a_column_whose_name_is_a_number() {
+        let (_folder, path) = fixture();
+        // `7` is the third column's name, not position 7.
+        assert_eq!(output(&[&path, "--count", "--filter", "7 IS NULL"]), "4\n");
+        assert_eq!(
+            output(&[
+                &path,
+                "--format",
+                "csv",
+                "--sql",
+                "SELECT id FROM dataset WHERE `7` = 'x'",
+            ]),
+            "id\n1\n"
+        );
+    }
+
+    #[test]
     fn rejects_bad_arguments_before_printing_anything() {
         let (_folder, path) = fixture();
         for arguments in [
