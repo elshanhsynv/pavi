@@ -16,5 +16,5 @@ pub use planner::{PhysicalPlan, Planner};
 pub use prep::{MAX_JOINS, MAX_SUBQUERY_DEPTH};
 pub use sql::{
     SqlAggregate, SqlAggregateExpr, SqlAst, SqlColumn, SqlFrom, SqlJoin, SqlPredicate,
-    SqlProjection, SqlRelation, SqlSort, SqlTable, Tables,
+    SqlProjection, SqlRelation, SqlSort, SqlTable, Tables, table_name,
 };

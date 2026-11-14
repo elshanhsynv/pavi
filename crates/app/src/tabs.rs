@@ -357,43 +357,8 @@ impl PaviApp {
     }
 }
 
-/// A SQL table name for a file or folder: its name without extensions, with
-/// characters other than letters, digits and `_` turned into `_`, not starting
-/// with a digit, and not one of `taken` (ignoring case).
-pub(crate) fn table_name(path: &Path, taken: &[String]) -> String {
-    let shown = parquet_reader::display_path(path);
-    let stem = shown
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let stem = stem.split('.').next().unwrap_or_default();
-    let mut name = stem
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
-        name.insert_str(0, "t_");
-    }
-    let free = |candidate: &str| {
-        !candidate.eq_ignore_ascii_case("dataset")
-            && !taken
-                .iter()
-                .any(|taken| taken.eq_ignore_ascii_case(candidate))
-    };
-    if free(&name) {
-        return name;
-    }
-    (2..)
-        .map(|suffix| format!("{name}_{suffix}"))
-        .find(|candidate| free(candidate))
-        .unwrap_or(name)
-}
+/// SQL table names, shared with the CLI (`pavi_query::table_name`).
+pub(crate) use pavi_query::table_name;
 
 impl PaviApp {
     /// The open tabs' datasets, in tab order, with the open one marked.

@@ -263,7 +263,8 @@ sequenceDiagram
     participant PS as ParquetSource
     participant O as output::print_batch
     participant W as export::BatchWriter
-    Shell->>M: cli FILE|- [--format F] [-o PATH] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats] [-q]
+    participant Q as pavi_query (--sql)
+    Shell->>M: cli FILE|- [--format F] [-o PATH] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats | --sql "…" [--table [NAME=]PATH]…] [-q]
     M->>M: Args::parse (clap; usage error or excluded combination → exit 2)
     M->>M: validate_head (table only: default 10, or 1,000 for --stats; ≤1000)
     opt FILE is -
@@ -282,6 +283,11 @@ sequenceDiagram
     else --schema / --stats
         M->>PS: schema / metadata().columns() row-group statistics (footer only)
         M->>Shell: one batch → table (stats: first --head rows, ≤1000) or BatchWriter
+    else --sql
+        M->>PS: open each --table; Tables = dataset + table_name(FILE) + --table names
+        M->>Q: SqlAst::parse → to_logical_plan_with(tables) → Planner::validate (errors before output)
+        M->>Q: Runtime::new, QueryEngine::execute, next_batch until --head rows (then cancel)
+        M->>Shell: rows → table ("Result", no file summary) or BatchWriter
     else rows (Rows::for_each, skipping --offset rows, stopping after --head)
         alt --sort
             M->>PS: read_sorted(filter, proj, keys, SortBudget, top = offset + head)
@@ -303,4 +309,4 @@ sequenceDiagram
     M-->>Shell: exit 0 (also when stdout's reader closed), or anyhow error → stderr, exit 1
 ```
 
-All of it runs on the main thread. The table holds ≤1,000 rows of the projected columns; the streamed formats and `--count` hold one 4,096-row batch (`STREAM_BATCH_ROWS`) at a time, plus the Parquet writer's open row group, so they have no row limit (a selective filter may still scan the whole file). `--sort` goes through `read_sorted` like the app's sort: with `--head`, only the best `offset + head` rows are kept while scanning (when that fits the sort budget); otherwise up to `SortBudget` rows stay in memory and the rest spill to temporary files, merged 4,096 rows at a time. `--schema` and `--stats` read no data pages: they turn the footer already in memory into rows, so they print or stream like data. The table reads its rows before printing the summary, so a read error leaves stdout empty too. The streamed formats write only rows, no summary, with the same `BatchWriter` the app's export uses, so their text matches an exported file. Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.
+All of it runs on the main thread, except `--sql`, which starts a worker pool and runs the plan exactly as the app's SQL editor does (ADR 0011): the main thread blocks on `QueryExecution::next_batch` instead of polling, and joins and subqueries are prepared on `pavi-query-prep` first (ADR 0009). The table holds ≤1,000 rows of the projected columns; the streamed formats and `--count` hold one 4,096-row batch (`STREAM_BATCH_ROWS`) at a time, plus the Parquet writer's open row group, so they have no row limit (a selective filter may still scan the whole file). `--sort` goes through `read_sorted` like the app's sort: with `--head`, only the best `offset + head` rows are kept while scanning (when that fits the sort budget); otherwise up to `SortBudget` rows stay in memory and the rest spill to temporary files, merged 4,096 rows at a time. `--schema` and `--stats` read no data pages: they turn the footer already in memory into rows, so they print or stream like data. The table reads its rows before printing the summary, so a read error leaves stdout empty too. The streamed formats write only rows, no summary, with the same `BatchWriter` the app's export uses, so their text matches an exported file. Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.

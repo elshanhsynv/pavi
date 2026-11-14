@@ -67,6 +67,45 @@ impl Tables {
     }
 }
 
+/// A SQL table name for a file or folder: its name without extensions, with
+/// characters other than letters, digits and `_` turned into `_`, not starting
+/// with a digit, and not `dataset` or one of `taken` (ignoring case). The app
+/// names its tabs with it and the CLI its `--table` files (ADR 0009, 0011).
+pub fn table_name(path: &std::path::Path, taken: &[String]) -> String {
+    let shown = parquet_reader::display_path(path);
+    let stem = shown
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = stem.split('.').next().unwrap_or_default();
+    let mut name = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert_str(0, "t_");
+    }
+    let free = |candidate: &str| {
+        !candidate.eq_ignore_ascii_case("dataset")
+            && !taken
+                .iter()
+                .any(|taken| taken.eq_ignore_ascii_case(candidate))
+    };
+    if free(&name) {
+        return name;
+    }
+    (2..)
+        .map(|suffix| format!("{name}_{suffix}"))
+        .find(|candidate| free(candidate))
+        .unwrap_or(name)
+}
+
 /// A column, optionally qualified by a table name or alias (`f.ORIGIN`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlColumn {

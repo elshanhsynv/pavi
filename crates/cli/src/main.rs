@@ -2,11 +2,13 @@ mod args;
 mod files;
 mod inspect;
 mod output;
+mod query;
 mod sort;
 
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use args::{Args, Format};
@@ -126,6 +128,26 @@ fn run(
         return write_facts(&batch, "Statistics", limit, format, out);
     }
 
+    let output = RowOutput {
+        format,
+        table_rows,
+        head: args.head,
+        offset: args.offset,
+    };
+
+    if let Some(sql) = &args.sql {
+        let dataset_path = if stdin.is_some() {
+            Path::new("stdin")
+        } else {
+            Path::new(&args.file)
+        };
+        let tables = query::tables(Arc::new(parquet), dataset_path, &args.tables)?;
+        let query = query::plan(sql, &tables)?;
+        return output.write(&query.schema, "Result", None, out, |window, emit| {
+            query.run(window, emit)
+        });
+    }
+
     // An empty window carries the projected schema.
     let schema = parquet.read_window(0, 0, &projection)?.schema();
     let rows = Rows {
@@ -138,27 +160,60 @@ fn run(
         batch_rows,
         sort_budget: SortBudget::default(),
     };
+    let summary = (!args.quiet).then_some(&parquet);
+    output.write(&schema, "Preview", summary, out, |window, emit| {
+        rows.for_each(window.left, emit)
+    })
+}
 
-    let Some(head) = table_rows else {
-        let mut writer = BatchWriter::new(export_format(format)?, out, schema.clone())?;
-        rows.for_each(args.head.unwrap_or(u64::MAX), &mut |batch| {
-            writer.write(&batch)
+/// Where rows go: a table of at most `table_rows` rows, or a streamed format.
+struct RowOutput {
+    format: Format,
+    table_rows: Option<usize>,
+    head: Option<u64>,
+    offset: u64,
+}
+
+impl RowOutput {
+    /// Writes the rows `produce` hands out within the window of `--offset` and
+    /// `--head` (or the table's row count). The table is printed only once
+    /// every row is in, after `summary` if given.
+    fn write(
+        &self,
+        schema: &SchemaRef,
+        title: &str,
+        summary: Option<&ParquetSource>,
+        out: &mut (impl Write + Send),
+        produce: impl FnOnce(
+            Window,
+            &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let window = |left| Window {
+            skip: self.offset,
+            left,
+        };
+        let Some(head) = self.table_rows else {
+            let mut writer = BatchWriter::new(export_format(self.format)?, out, schema.clone())?;
+            produce(window(self.head.unwrap_or(u64::MAX)), &mut |batch| {
+                writer.write(&batch)
+            })?;
+            return writer.finish();
+        };
+
+        let mut batches = Vec::new();
+        produce(window(head as u64), &mut |batch| {
+            batches.push(batch);
+            Ok(())
         })?;
-        return writer.finish();
-    };
+        let batch = arrow_select::concat::concat_batches(schema, &batches)?;
 
-    let mut batches = Vec::new();
-    rows.for_each(head as u64, &mut |batch| {
-        batches.push(batch);
+        if let Some(parquet) = summary {
+            print_summary(parquet, out)?;
+        }
+        print_batch(&batch, title, self.offset.saturating_add(1), out)?;
         Ok(())
-    })?;
-    let batch = arrow_select::concat::concat_batches(&schema, &batches)?;
-
-    if !args.quiet {
-        print_summary(&parquet, out)?;
     }
-    print_batch(&batch, "Preview", args.offset.saturating_add(1), out)?;
-    Ok(())
 }
 
 /// Writes a `--schema` or `--stats` batch, cut to `limit` rows.
@@ -1009,5 +1064,152 @@ mod tests {
             "{error:#}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// `labels.csv` next to the fixture: labels for ids 1 and 3.
+    fn labels(folder: &tempfile::TempDir) -> String {
+        let path = folder.path().join("labels.csv");
+        std::fs::write(&path, "id,label\n1,one\n3,three\n").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn runs_sql_with_group_by_on_the_file_by_either_name() {
+        let (_folder, path) = fixture();
+        let totals = output(&[
+            &path,
+            "--format",
+            "csv",
+            "--sql",
+            "SELECT COUNT(*), SUM(id) FROM dataset WHERE id > 1",
+        ]);
+        assert_eq!(totals.lines().nth(1), Some("4,14"), "{totals}");
+        let grouped = output(&[
+            &path,
+            "--format",
+            "csv",
+            "--sql",
+            "SELECT `7`, COUNT(*) FROM dataset GROUP BY `7`",
+        ]);
+        let mut groups = grouped.lines().skip(1).collect::<Vec<_>>();
+        groups.sort_unstable();
+        assert_eq!(groups, [",4", "x,1"], "{grouped}");
+        // The file's own name works as well as `dataset`.
+        assert_eq!(
+            output(&[
+                &path,
+                "--format",
+                "csv",
+                "--sql",
+                "SELECT name FROM t WHERE id >= 4 ORDER BY id DESC",
+            ]),
+            "name\ne\nd\n"
+        );
+        let table = output(&[&path, "--sql", "SELECT id, name FROM dataset LIMIT 2"]);
+        assert!(table.starts_with("\nResult: 2 rows × 2 columns"), "{table}");
+        assert!(!table.contains("Rows: 5"), "no file summary: {table}");
+    }
+
+    #[test]
+    fn joins_other_files_named_by_table() {
+        let (folder, path) = fixture();
+        let labels = labels(&folder);
+        let join = "SELECT t.name, l.label FROM dataset AS t \
+                    JOIN labels AS l ON t.id = l.id ORDER BY t.id";
+        assert_eq!(
+            output(&[&path, "--format", "csv", "--table", &labels, "--sql", join]),
+            "name,label\na,one\nc,three\n"
+        );
+        // NAME=PATH names it; a subquery can use it too.
+        let named = format!("lookup={labels}");
+        assert_eq!(
+            output(&[
+                &path,
+                "--format",
+                "csv",
+                "--table",
+                &named,
+                "--sql",
+                "SELECT name FROM dataset WHERE id NOT IN (SELECT id FROM lookup) ORDER BY id",
+            ]),
+            "name\nb\nd\ne\n"
+        );
+    }
+
+    #[test]
+    fn cuts_sql_results_with_offset_and_head_and_writes_files() {
+        let (folder, path) = fixture();
+        let sql = "SELECT id FROM dataset ORDER BY id DESC";
+        assert_eq!(
+            output(&[
+                &path, "--format", "csv", "--offset", "1", "--head", "2", "--sql", sql
+            ]),
+            "id\n4\n3\n"
+        );
+        let table = output(&[&path, "--offset", "3", "--sql", sql]);
+        assert!(table.contains("│   4 │    2 │"), "{table}");
+
+        let parquet = folder.path().join("result.parquet");
+        let arguments = [path.as_str(), "-o", parquet.to_str().unwrap(), "--sql", sql];
+        run_to_file(&parse(&arguments), &parquet, &mut io::empty(), 2).unwrap();
+        assert_eq!(ParquetSource::open(&parquet).unwrap().row_count(), 5);
+    }
+
+    #[test]
+    fn reports_sql_errors_before_printing_anything() {
+        let (folder, path) = fixture();
+        let labels = labels(&folder);
+        let taken = format!("dataset={labels}");
+        for arguments in [
+            vec![path.as_str(), "--sql", "SELEC id FROM dataset"],
+            vec![&path, "--sql", "SELECT nope FROM dataset"],
+            vec![&path, "--sql", "SELECT id FROM missing"],
+            vec![
+                &path,
+                "--sql",
+                "SELECT id FROM dataset",
+                "--table",
+                "nope.csv",
+            ],
+            vec![&path, "--sql", "SELECT id FROM dataset", "--table", &taken],
+            vec![
+                &path,
+                "--format",
+                "csv",
+                "--sql",
+                "SELECT id FROM dataset UNION SELECT id FROM dataset",
+            ],
+        ] {
+            let mut out = Vec::new();
+            assert!(
+                run(&parse(&arguments), &mut io::empty(), &mut out, 2).is_err(),
+                "{arguments:?}"
+            );
+            assert!(out.is_empty(), "printed before failing on {arguments:?}");
+        }
+        // --table needs --sql, and --sql replaces the row options.
+        let parses = |arguments: &[&str]| {
+            Args::try_parse_from(std::iter::once("cli").chain(arguments.iter().copied())).is_ok()
+        };
+        assert!(!parses(&[&path, "--table", &labels]));
+        assert!(!parses(&[&path, "--sql", "SELECT 1", "--filter", "id > 1"]));
+        assert!(!parses(&[&path, "--sql", "SELECT 1", "--count"]));
+    }
+
+    #[test]
+    fn runs_sql_on_standard_input() {
+        assert_eq!(
+            output_with_stdin(
+                &[
+                    "-",
+                    "--format",
+                    "csv",
+                    "--sql",
+                    "SELECT b FROM stdin WHERE a = 2"
+                ],
+                b"a,b\n1,x\n2,y\n"
+            ),
+            "b\ny\n"
+        );
     }
 }

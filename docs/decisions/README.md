@@ -36,3 +36,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0008](0008-remote-files.md) | Remote files (S3, GCS, Azure, HTTPS) are read with blocking HTTP range requests |
 | [0009](0009-joins-and-subqueries.md) | Joins and subqueries are evaluated into a temporary table, then queried (amends 0004) |
 | [0010](0010-light-theme.md) | A light theme beside the dark one, from one `Palette` type (amends DESIGN.md principle 5) |
+| [0011](0011-cli-sql.md) | The CLI runs `--sql` through `pavi_query` and the worker pool (amends "the CLI uses only `parquet_reader`") |
