@@ -4,6 +4,12 @@ version.workspace = true
 edition = "2024"
 publish = false
 
+# The package stays `cli` (`cargo run -p cli`); the program is `pavi-cli`, so
+# it is recognisable next to `pavi` on PATH and in the release zip.
+[[bin]]
+name = "pavi-cli"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true

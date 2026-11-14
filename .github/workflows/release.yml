@@ -65,7 +65,7 @@ jobs:
             Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName sign /fd SHA256 /f $pfx /p $env:CERT_PASSWORD `
             /tr http://timestamp.digicert.com /td SHA256 `
-            target\release\pavi.exe target\release\cli.exe
+            target\release\pavi.exe target\release\pavi-cli.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Remove-Item $pfx
 
@@ -75,7 +75,7 @@ jobs:
           $version = "$env:GITHUB_REF_NAME".TrimStart("v")
           $name = "pavi-$version-windows-x64"
           New-Item -ItemType Directory -Force dist\$name | Out-Null
-          Copy-Item target\release\pavi.exe, target\release\cli.exe, README.md, CHANGELOG.md dist\$name
+          Copy-Item target\release\pavi.exe, target\release\pavi-cli.exe, README.md, CHANGELOG.md dist\$name
           Compress-Archive -Path dist\$name\* -DestinationPath dist\$name.zip -Force
           $hash = (Get-FileHash dist\$name.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii dist\$name.zip.sha256

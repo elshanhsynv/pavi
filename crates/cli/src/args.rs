@@ -17,7 +17,7 @@ Exit codes:
 /// --output. --count, --schema and --stats print facts about the file instead
 /// of rows. Converting is `cli in.csv -o out.parquet`.
 #[derive(Parser)]
-#[command(name = "cli", version, about, after_help = EXIT_CODES)]
+#[command(name = "pavi-cli", version, about, after_help = EXIT_CODES)]
 pub struct Args {
     /// File, folder or URL to read, or - for standard input (Parquet, Arrow,
     /// JSON or CSV, told apart by their first bytes)
@@ -56,6 +56,16 @@ pub struct Args {
     /// Print only the table, without the summary and schema
     #[arg(long, short)]
     pub quiet: bool,
+
+    /// Never show the progress line. It appears on standard error, only when
+    /// that is a terminal, once a scan, sort or open takes over a second
+    #[arg(long)]
+    pub no_progress: bool,
+
+    /// Draw the table with ASCII (+ - |) instead of box-drawing characters,
+    /// for consoles and code pages that can't show them
+    #[arg(long)]
+    pub ascii: bool,
 
     /// Sort by these columns, comma-separated, each by name or index and
     /// optionally followed by :asc or :desc (e.g. "DEP_DELAY:desc,FL_DATE").

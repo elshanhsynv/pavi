@@ -35,26 +35,26 @@ crates/
 
 ## Command line
 
-`cli` (`cli.exe` in the release zip) reads anything the app opens. By default it prints a summary and the first rows as a table; with `--format` it writes only the rows to standard output, for pipelines.
+`pavi-cli` (`pavi-cli.exe` in the release zip; `cargo run -p cli --` from source) reads anything the app opens. By default it prints a summary and the first rows as a table; with `--format` it writes only the rows to standard output, for pipelines.
 
 ```bash
-cli flights.parquet                                    # summary + first 10 rows
-cli flights.parquet -q --head 50 --columns FL_DATE,DEP_DELAY
-cli flights.parquet --count --filter "DEP_DELAY > 60"
-cli flights.parquet --format csv --filter "DEP_DELAY > 60" > late.csv
-cli data/ --format jsonl --offset 1000 --head 100 | jq .
-cli flights.parquet --sort DEP_DELAY:desc --head 20 --filter "DISTANCE > 1000"
-cli flights.parquet --schema --format csv
-cli flights.parquet --stats --columns DEP_DELAY      # min/max per row group, no scan
-cli flights.parquet --profile --format csv           # nulls, distinct, min, max, mean per column
-cli flights.csv -o flights.parquet                   # convert; the file appears when complete
-curl -s https://example.com/data.parquet | cli - --count
-cli flights.parquet --sql "SELECT ORIGIN, COUNT(*), AVG(DEP_DELAY) FROM flights GROUP BY ORIGIN"
-cli flights.parquet --table airports.csv --format csv \
+pavi-cli flights.parquet                                    # summary + first 10 rows
+pavi-cli flights.parquet -q --head 50 --columns FL_DATE,DEP_DELAY
+pavi-cli flights.parquet --count --filter "DEP_DELAY > 60"
+pavi-cli flights.parquet --format csv --filter "DEP_DELAY > 60" > late.csv
+pavi-cli data/ --format jsonl --offset 1000 --head 100 | jq .
+pavi-cli flights.parquet --sort DEP_DELAY:desc --head 20 --filter "DISTANCE > 1000"
+pavi-cli flights.parquet --schema --format csv
+pavi-cli flights.parquet --stats --columns DEP_DELAY      # min/max per row group, no scan
+pavi-cli flights.parquet --profile --format csv           # nulls, distinct, min, max, mean per column
+pavi-cli flights.csv -o flights.parquet                   # convert; the file appears when complete
+curl -s https://example.com/data.parquet | pavi-cli - --count
+pavi-cli flights.parquet --sql "SELECT ORIGIN, COUNT(*), AVG(DEP_DELAY) FROM flights GROUP BY ORIGIN"
+pavi-cli flights.parquet --table airports.csv --format csv \
     --sql "SELECT f.FL_DATE, a.name FROM flights AS f JOIN airports AS a ON f.ORIGIN = a.code"
 ```
 
-`--format` is `table`, `csv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `cli --help` lists every option and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
+`--format` is `table`, `csv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `pavi-cli --help` lists every option and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
 
 ## Current limits
 
