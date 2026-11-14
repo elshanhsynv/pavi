@@ -25,13 +25,27 @@ Pavi is a native desktop explorer for **Parquet** files with a bounded Arrow-bas
 
 ```text
 crates/
-├── cli/        # CLI for development and testing
+├── cli/        # Command-line preview, count and row streaming
 ├── parquet/    # Parquet data source, caching, decoding, metadata
 ├── runtime/    # Fixed worker pool and cooperative cancellation
 ├── query/      # Logical plans, SQL, filters, sorting, aggregates
 ├── app/        # Native explorer, charts, inspector, sessions, export
 └── bench/      # Reproducible performance measurements
 ```
+
+## Command line
+
+`cli` (`cli.exe` in the release zip) reads anything the app opens. By default it prints a summary and the first rows as a table; with `--format` it writes only the rows to standard output, for pipelines.
+
+```bash
+cli flights.parquet                                    # summary + first 10 rows
+cli flights.parquet -q --head 50 --columns FL_DATE,DEP_DELAY
+cli flights.parquet --count --filter "DEP_DELAY > 60"
+cli flights.parquet --format csv --filter "DEP_DELAY > 60" > late.csv
+cli data/ --format jsonl --offset 1000 --head 100 | jq .
+```
+
+`--format` is `table`, `csv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `cli --help` lists every option and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
 
 ## Current limits
 

@@ -220,7 +220,7 @@ sequenceDiagram
 
 ## 4.7 Export and clipboard
 
-- **Export** (`app.rs:842-886`, `export.rs:76-206`): save dialog (blocks UI), build `ExportInput` = the current filter/SQL/sort `LogicalPlan`, or a full-scan plan, or one selected row; spawn `pavi-export` thread. It writes to `<file>.pavi-<gen>.tmp`, driving `poll_next_batch` with a 5 ms sleep loop, writing each batch as CSV, Parquet (`ArrowWriter`), JSON Lines (`JsonWriter`: one object per row; scalars are `value::scalar_text`, numbers and booleans unquoted, NaN and infinity as strings, binary as `0x` hex; lists as arrays, structs and maps as objects, ≤64 levels) or Arrow IPC (`arrow_ipc::writer::FileWriter`), sending best-effort progress (`try_send`, capacity 1), then `fs::rename` to the target. Cancel/failure deletes the temp file. CSV accepts every non-nested type and writes each field with `value::scalar_text`, the same text the grid shows, untruncated; nulls are empty fields and binary is `0x`-prefixed hex.
+- **Export** (`app.rs:842-886`, `export.rs:76-206`): save dialog (blocks UI), build `ExportInput` = the current filter/SQL/sort `LogicalPlan`, or a full-scan plan, or one selected row; spawn `pavi-export` thread. It writes to `<file>.pavi-<gen>.tmp`, driving `poll_next_batch` with a 5 ms sleep loop, writing each batch as CSV, Parquet (`ArrowWriter`), JSON Lines (`parquet_reader::export::BatchWriter`, shared with the CLI; `JsonWriter`: one object per row; scalars are `value::scalar_text`, numbers and booleans unquoted, NaN and infinity as strings, binary as `0x` hex; lists as arrays, structs and maps as objects, ≤64 levels) or Arrow IPC (`arrow_ipc::writer::FileWriter`), sending best-effort progress (`try_send`, capacity 1), then `fs::rename` to the target. Cancel/failure deletes the temp file. CSV accepts every non-nested type and writes each field with `value::scalar_text`, the same text the grid shows, untruncated; nulls are empty fields and binary is `0x`-prefixed hex.
 - **Copy:** Ctrl+C copies the selected cell range (TSV) from in-memory batches (`app.rs:1659-1751`) using the same 256-char display formatting, capped at 64 KB; fails if any selected row has been evicted from the window.
 
 ```mermaid
@@ -262,20 +262,28 @@ sequenceDiagram
     participant M as cli main
     participant PS as ParquetSource
     participant O as output::print_batch
-    Shell->>M: cli FILE [--head N] [--columns i,j] [--filter "c OP v"]
+    participant W as export::BatchWriter
+    Shell->>M: cli FILE [--format F] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--count] [-q]
     M->>M: Args::parse (clap; usage error → exit 2)
-    M->>M: validate_head (≤1000)
+    M->>M: validate_head (table only: default 10, ≤1000)
     M->>PS: open(FILE)
-    M->>M: parse_columns (indexes only)
+    M->>M: parse_columns (names first, then 0-based indexes)
     M->>PS: parse_filter → FilterExpr::parse + validate_filter
-    M->>Shell: Rows / Columns / Row groups / Schema / ≤10 row-group ranges
-    alt --filter
-        M->>PS: read_filtered_window(filter, 0, N, proj)
-    else
-        M->>PS: read_window(0, N, proj)
+    alt --count
+        M->>PS: row_count, or read_filtered_from over the filter's columns, 4,096 rows a step
+        M->>Shell: the number
+    else --format csv / jsonl / parquet / arrow
+        loop until --head rows or the end
+            M->>PS: read_window(row, 4,096) or read_filtered_from(next_row, 4,096), skipping --offset (matching) rows
+            M->>W: write(batch) → stdout
+        end
+        M->>W: finish (Parquet/Arrow footer)
+    else table
+        M->>Shell: Rows / Columns / Row groups / Schema / ≤10 row-group ranges (unless --quiet)
+        M->>PS: read_filtered_window(filter, offset, N, proj) or read_window(offset, N, proj)
+        M->>O: print_batch → box table to stdout, # counting from offset + 1
     end
-    M->>O: print_batch → box table to stdout
     M-->>Shell: exit 0 (also when stdout's reader closed), or anyhow error → stderr, exit 1
 ```
 
-All of it runs on the main thread; memory is ≤1,000 rows of the projected columns (a selective filter may still scan the whole file). Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.
+All of it runs on the main thread. The table holds ≤1,000 rows of the projected columns; the streamed formats and `--count` hold one 4,096-row batch (`STREAM_BATCH_ROWS`) at a time, plus the Parquet writer's open row group, so they have no row limit (a selective filter may still scan the whole file). The streamed formats write only rows, no summary, with the same `BatchWriter` the app's export uses, so their text matches an exported file. Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.

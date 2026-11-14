@@ -2,6 +2,7 @@ pub mod aggregate;
 pub mod cache;
 pub mod convert;
 pub mod dataset;
+pub mod export;
 pub mod filter;
 mod footer;
 pub mod join;
