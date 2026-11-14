@@ -38,7 +38,7 @@ PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), eac
 | `pavi_runtime` → lib | library | Fixed worker pool; typed tasks (`OpenTask`, `PageTask`) with one bounded response channel each; cooperative cancellation; generation IDs | parquet_reader |
 | `pavi_query` → lib | library | SQL subset parser, `LogicalPlan` builder, `Planner` (flattens to `PhysicalPlan`), `QueryExecution` (incremental, blocking or polling) | parquet_reader, pavi_runtime, sqlparser |
 | `pavi` → bin `pavi` | GUI | eframe app, all UI, export, profiling, charts, session persistence | all three libs + eframe, egui_extras, rfd, serde(_json), chrono, parquet (writer) |
-| `cli` → bin `cli` | CLI | metadata + preview printer, row streaming, sort, row count, schema and statistics, `--sql` | `parquet_reader` + clap; `pavi_query` and `pavi_runtime` for `--sql` only (ADR 0011) |
+| `cli` → bin `pavi-cli` | CLI | metadata + preview printer, row streaming, sort, row count, schema and statistics, `--sql` | `parquet_reader` + clap; `pavi_query` and `pavi_runtime` for `--sql` only (ADR 0011) |
 | `pavi_bench` → bin `pavi-bench` | tool | prints CSV-like timing/cache metrics for open, page reads, a scan query | all three libs |
 
 Direction is strictly downward: `app → query → runtime → parquet_reader`. No cycles. No library depends on the GUI.
@@ -209,5 +209,7 @@ One implicit command. Arguments (`crates/cli/src/args.rs`):
 | `--schema` | One row per column (index, name, Arrow type text, nullable), in any `--format` (`inspect.rs`). Excludes every row option except `--columns` and `--format` |
 | `--stats` | One row per row group × column from the footer's statistics (rows, nulls, min, max, distinct), in any `--format`; the table shows ≤1,000 rows (`inspect.rs`). Allows `--columns`, `--head`, `--format` |
 | `-q`, `--quiet` | Table without the summary |
+| `--no-progress` | Never show the progress line (`progress.rs`). Otherwise it shows on stderr when stderr is a terminal and the work has run over a second, updated at most every 200 ms through the readers' checkpoints (open share, rows scanned for filters, sorts, counts and profiles, rows read for plain reads), and blanked before output. Off while rows stream to a terminal on stdout; not shown for `--sql` |
+| `--ascii` | Table drawn with `+ - |`, `~` for cut text and `x` in the title (`output::Borders`) |
 
 Table output goes to stdout: unless `--quiet`, for a folder its file count and partition columns; row/column/row-group counts, schema (`{:?}` of `DataType`), first 10 row-group ranges; then a box-drawn table with headers and cells cut to 4–32 terminal columns (numbers right-aligned, control characters escaped). Arguments are all checked before the first line is written. Exit codes: `0` success, also when the reader of stdout closes early (broken pipe); `1` for any `anyhow` error (printed as `Error: …` with Debug formatting on stderr, the same text Rust prints for an error returned from `main`); `2` for clap usage errors.

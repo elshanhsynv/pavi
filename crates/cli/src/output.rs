@@ -8,12 +8,70 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MIN_COLUMN_WIDTH: usize = 4;
 const MAX_COLUMN_WIDTH: usize = 32;
 
+/// The characters a table is drawn with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Borders {
+    /// Box-drawing lines, `…` for cut text and `×` in the title.
+    Unicode,
+    /// `+ - |`, `~` for cut text and `x` in the title (`--ascii`), for
+    /// consoles and code pages without box-drawing characters.
+    Ascii,
+}
+
+impl Borders {
+    fn horizontal(self) -> char {
+        match self {
+            Self::Unicode => '─',
+            Self::Ascii => '-',
+        }
+    }
+
+    fn vertical(self) -> char {
+        match self {
+            Self::Unicode => '│',
+            Self::Ascii => '|',
+        }
+    }
+
+    /// Left, middle and right joints of the top, header and bottom rules.
+    fn joints(self, rule: Rule) -> [char; 3] {
+        match (self, rule) {
+            (Self::Unicode, Rule::Top) => ['┌', '┬', '┐'],
+            (Self::Unicode, Rule::Middle) => ['├', '┼', '┤'],
+            (Self::Unicode, Rule::Bottom) => ['└', '┴', '┘'],
+            (Self::Ascii, _) => ['+', '+', '+'],
+        }
+    }
+
+    fn ellipsis(self) -> char {
+        match self {
+            Self::Unicode => '…',
+            Self::Ascii => '~',
+        }
+    }
+
+    fn times(self) -> char {
+        match self {
+            Self::Unicode => '×',
+            Self::Ascii => 'x',
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Rule {
+    Top,
+    Middle,
+    Bottom,
+}
+
 /// Prints `batch` as a table under `title` ("Preview: 3 rows × 2 columns");
 /// the `#` column counts from `first_number`.
 pub fn print_batch(
     batch: &RecordBatch,
     title: &str,
     first_number: u64,
+    borders: Borders,
     out: &mut impl Write,
 ) -> io::Result<()> {
     let rows = batch.num_rows();
@@ -22,8 +80,9 @@ pub fn print_batch(
     writeln!(out)?;
     writeln!(
         out,
-        "{title}: {rows} {} × {columns} {}",
+        "{title}: {rows} {} {} {columns} {}",
         plural(rows, "row", "rows"),
+        borders.times(),
         plural(columns, "column", "columns")
     )?;
     writeln!(out)?;
@@ -74,50 +133,63 @@ pub fn print_batch(
         );
     }
 
-    write_rule(out, &widths, ['┌', '┬', '┐'])?;
+    let bar = borders.vertical();
+    write_rule(out, &widths, borders, Rule::Top)?;
 
-    write!(out, "│ {:>width$} │", "#", width = widths[0])?;
+    write!(out, "{bar} {:>width$} {bar}", "#", width = widths[0])?;
     for (header, &width) in headers.iter().zip(&widths[1..]) {
         write!(out, " ")?;
-        write_padded(out, header, width, false)?;
-        write!(out, " │")?;
+        write_padded(out, header, width, false, borders)?;
+        write!(out, " {bar}")?;
     }
     writeln!(out)?;
 
-    write_rule(out, &widths, ['├', '┼', '┤'])?;
+    write_rule(out, &widths, borders, Rule::Middle)?;
 
     for (number, row) in (first_number..).zip(&cells) {
-        write!(out, "│ {:>width$} │", number, width = widths[0])?;
+        write!(out, "{bar} {:>width$} {bar}", number, width = widths[0])?;
 
         for ((value, &width), &right) in row.iter().zip(&widths[1..]).zip(&right_aligned) {
             write!(out, " ")?;
-            write_padded(out, value, width, right)?;
-            write!(out, " │")?;
+            write_padded(out, value, width, right, borders)?;
+            write!(out, " {bar}")?;
         }
         writeln!(out)?;
     }
 
-    write_rule(out, &widths, ['└', '┴', '┘'])
+    write_rule(out, &widths, borders, Rule::Bottom)
 }
 
 fn plural<'a>(count: usize, one: &'a str, many: &'a str) -> &'a str {
     if count == 1 { one } else { many }
 }
 
-/// Writes a horizontal border: `corners` are the left, middle and right joints.
-fn write_rule(out: &mut impl Write, widths: &[usize], corners: [char; 3]) -> io::Result<()> {
-    let [left, middle, right] = corners;
+/// Writes a horizontal border with the joints `borders` has for `rule`.
+fn write_rule(
+    out: &mut impl Write,
+    widths: &[usize],
+    borders: Borders,
+    rule: Rule,
+) -> io::Result<()> {
+    let [left, middle, right] = borders.joints(rule);
+    let line = borders.horizontal().to_string();
     write!(out, "{left}")?;
     for (i, width) in widths.iter().enumerate() {
         let joint = if i + 1 == widths.len() { right } else { middle };
-        write!(out, "{}{joint}", "─".repeat(width + 2))?;
+        write!(out, "{}{joint}", line.repeat(width + 2))?;
     }
     writeln!(out)
 }
 
 /// Writes `value` cut to `width` terminal columns and padded to exactly `width`.
-fn write_padded(out: &mut impl Write, value: &str, width: usize, right: bool) -> io::Result<()> {
-    let value = truncate(value, width);
+fn write_padded(
+    out: &mut impl Write,
+    value: &str,
+    width: usize,
+    right: bool,
+    borders: Borders,
+) -> io::Result<()> {
+    let value = truncate(value, width, borders.ellipsis());
     let padding = " ".repeat(width.saturating_sub(value.width()));
     if right {
         write!(out, "{padding}{value}")
@@ -145,13 +217,14 @@ fn one_line(value: &str) -> String {
     result
 }
 
-/// Cuts `value` to at most `width` terminal columns, ending in `…` when cut.
-fn truncate(value: &str, width: usize) -> String {
+/// Cuts `value` to at most `width` terminal columns, ending in `ellipsis`
+/// (one column wide) when cut.
+fn truncate(value: &str, width: usize, ellipsis: char) -> String {
     if value.width() <= width {
         return value.to_owned();
     }
     if width <= 1 {
-        return "…".to_owned();
+        return ellipsis.to_string();
     }
 
     let mut result = String::new();
@@ -164,7 +237,7 @@ fn truncate(value: &str, width: usize) -> String {
         used += char_width;
         result.push(c);
     }
-    result.push('…');
+    result.push(ellipsis);
     result
 }
 
@@ -179,7 +252,7 @@ mod tests {
 
     fn render(batch: &RecordBatch) -> String {
         let mut out = Vec::new();
-        print_batch(batch, "Preview", 1, &mut out).unwrap();
+        print_batch(batch, "Preview", 1, Borders::Unicode, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -236,12 +309,51 @@ mod tests {
     }
 
     #[test]
+    fn draws_ascii_tables_with_only_ascii() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(StringArray::from(vec!["x".repeat(40)])),
+            ],
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        print_batch(&batch, "Preview", 1, Borders::Ascii, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(text.is_ascii(), "{text}");
+        assert!(text.contains("Preview: 1 row x 2 columns\n"), "{text}");
+        assert!(text.contains("+-----+------+"), "{text}");
+        assert!(
+            text.contains("|   1 |    7 | xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx~ |"),
+            "{text}"
+        );
+        let lines = table_lines_ascii(&text);
+        assert_eq!(lines.len(), 5);
+        assert!(
+            lines.iter().all(|line| line.len() == lines[0].len()),
+            "{text}"
+        );
+    }
+
+    fn table_lines_ascii(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.starts_with(['+', '|']))
+            .collect()
+    }
+
+    #[test]
     fn truncates_by_terminal_columns() {
-        assert_eq!(truncate("abc", 3), "abc");
-        assert_eq!(truncate("abcd", 3), "ab…");
+        assert_eq!(truncate("abc", 3, '…'), "abc");
+        assert_eq!(truncate("abcd", 3, '…'), "ab…");
         // Each of these takes two columns; a half-filled column is left as padding.
-        assert_eq!(truncate("日本語", 4), "日…");
-        assert_eq!(truncate("日本語", 1), "…");
+        assert_eq!(truncate("日本語", 4, '…'), "日…");
+        assert_eq!(truncate("日本語", 1, '…'), "…");
         assert_eq!(one_line("a\u{1b}b\r"), "a\\u{1b}b\\r");
     }
 }

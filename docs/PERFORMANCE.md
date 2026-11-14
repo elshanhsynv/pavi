@@ -78,7 +78,7 @@ sub-frame operations aren't held to timer noise. A change that breaks a target n
 | App start to window, file given on the command line | `Start-Process` until the window exists | 177 ms | — | 76 ms | < 300 ms |
 | App memory after loading a file | working set 5 s after start | 96 MB | — | 114 MB | < 200 MB |
 | CLI open + 1,000-row preview (includes process start) | wall time | 167 ms | 167 ms | 237 ms | < 400 ms |
-| Full scan: filter matching nothing on a text column | `cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
+| Full scan: filter matching nothing on a text column | `pavi-cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
 | Frame time while scrolling | not yet measured | | | | < 16 ms (60 fps) |
 | Cancel a running scan | not yet measured | | | | < 50 ms |
 

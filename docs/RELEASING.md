@@ -1,7 +1,7 @@
 # Releasing
 
 A release is a tag `vX.Y.Z` on `main`. Pushing the tag runs `.github/workflows/release.yml`,
-which re-runs every check, builds `pavi.exe` and `cli.exe` for Windows x64, and publishes a
+which re-runs every check, builds `pavi.exe` and `pavi-cli.exe` for Windows x64, and publishes a
 GitHub Release with a zip, its SHA-256 checksum, and the CHANGELOG section as notes.
 
 ## Steps
@@ -29,7 +29,7 @@ and `git tag -d vX.Y.Z`) and the draft release if one was created, then tag agai
 
 ## What users get
 
-`pavi-X.Y.Z-windows-x64.zip` with `pavi.exe` (the app; no console window), `cli.exe`,
+`pavi-X.Y.Z-windows-x64.zip` with `pavi.exe` (the app; no console window), `pavi-cli.exe`,
 `README.md` and `CHANGELOG.md`, plus `pavi-X.Y.Z-windows-x64.zip.sha256`.
 Release builds use `[profile.release]` (thin LTO, one codegen unit).
 

@@ -8,6 +8,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- CLI: a progress line on the terminal ("Counting: 13,064,960 of 1,000,000,000 rows (1%)") while opening, scanning, sorting, counting or profiling takes more than a second. It goes to standard error, is erased when the output appears, and never shows in pipes or logs; `--no-progress` turns it off.
+- CLI: `--ascii` draws tables with `+ - |` for consoles and code pages that can't show box-drawing characters.
 - CLI: `--profile` profiles every column (or `--columns`, up to 256) in one scan, as the app's Profile window does: rows, nulls, distinct values, min, max, mean and the most frequent value, in any format. With `--filter`, only matching rows are profiled.
 - CLI: `--sql "SELECT …"` runs the app's SQL (WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX with GROUP BY, joins and subqueries) and outputs the result in any format or to a file. The file is the table `dataset`, or its own name (`flights`); `--table [NAME=]PATH` adds other files to join, named as the app names its tabs.
 - CLI: `--format csv`, `jsonl`, `parquet` or `arrow` writes the rows, and only the rows, to standard output, so the CLI works in pipelines. These formats stream every row unless `--head` is given; the table stays at most 1,000 rows.
@@ -19,6 +21,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - CLI: `-` reads standard input (Parquet, Arrow, JSON or CSV, told apart by their first bytes), e.g. `curl … | cli - --count`.
 
 ### Changed
+- The command-line program is now `pavi-cli` (`pavi-cli.exe` in the release zip) instead of `cli`.
 - The table's `#` column counts from `--offset`, so it shows row numbers in the file (or match numbers with `--filter`).
 - The CLI summary shows column types as `Int64` or `Timestamp(µs, "UTC")` instead of Rust's debug form.
 

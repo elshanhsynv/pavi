@@ -2,10 +2,11 @@ mod args;
 mod files;
 mod inspect;
 mod output;
+mod progress;
 mod query;
 mod sort;
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -15,11 +16,12 @@ use args::{Args, Format};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use clap::Parser;
-use output::print_batch;
+use output::{Borders, print_batch};
 use parquet_reader::export::{BatchWriter, ExportFormat};
 use parquet_reader::{
     FilterExpr, PAGE_ROWS, ParquetSource, Projection, SortBudget, SortOutput, SortSpec,
 };
+use progress::Progress;
 
 /// Most rows the table format prints; it holds them all in memory to size columns.
 const MAX_HEAD_ROWS: u64 = 1_000;
@@ -85,6 +87,11 @@ fn run(
     batch_rows: u64,
 ) -> anyhow::Result<()> {
     let format = output_format(args)?;
+    let borders = if args.ascii {
+        Borders::Ascii
+    } else {
+        Borders::Unicode
+    };
     // Rows the table holds: --head, or every statistics row up to the cap.
     let table_rows = if format == Format::Table && !args.count && !args.schema {
         let default = args.stats.then_some(MAX_HEAD_ROWS);
@@ -93,14 +100,27 @@ fn run(
         None
     };
 
+    // Rows streamed to a terminal show their own progress; a note on the same
+    // screen would only get in their way.
+    let streams_to_terminal =
+        format != Format::Table && args.output.is_none() && io::stdout().is_terminal();
+    let progress = Progress::new(args.no_progress || streams_to_terminal);
+
     // Declared before the source so it is deleted after the source closes it.
     let stdin = (args.file == "-")
         .then(|| files::copy_stdin(input))
         .transpose()?;
-    let parquet = match &stdin {
-        Some(copy) => ParquetSource::open(&copy.path).context("read standard input")?,
-        None => ParquetSource::open(&args.file)?,
+    let opening = |share| {
+        progress.share("Opening", share);
+        false
     };
+    let parquet = match &stdin {
+        Some(copy) => {
+            ParquetSource::open_cancellable(&copy.path, &opening).context("read standard input")?
+        }
+        None => ParquetSource::open_cancellable(&args.file, &opening)?,
+    };
+    progress.clear();
     let projection = parse_columns(args.columns.as_deref(), &parquet)?;
     let filter = args
         .filter
@@ -114,23 +134,31 @@ fn run(
         .transpose()?;
 
     if args.count {
-        let rows = count_rows(&parquet, filter.as_ref(), batch_rows)?;
+        let rows = count_rows(&parquet, filter.as_ref(), batch_rows, &progress)?;
+        progress.clear();
         writeln!(out, "{rows}")?;
         return Ok(());
     }
     if args.schema {
         let batch = inspect::schema_batch(&parquet, &projection)?;
-        return write_facts(&batch, "Schema", None, format, out);
+        return write_facts(&batch, "Schema", None, format, borders, out);
     }
     if args.stats {
         let batch = inspect::stats_batch(&parquet, &projection)?;
         let limit = table_rows.map_or(args.head, |rows| Some(rows as u64));
-        return write_facts(&batch, "Statistics", limit, format, out);
+        return write_facts(&batch, "Statistics", limit, format, borders, out);
     }
     if args.profile {
-        let profiles = profile_columns(&parquet, &projection, filter.as_ref(), batch_rows)?;
+        let profiles = profile_columns(
+            &parquet,
+            &projection,
+            filter.as_ref(),
+            batch_rows,
+            &progress,
+        )?;
+        progress.clear();
         let batch = inspect::profile_batch(&profiles)?;
-        return write_facts(&batch, "Profile", None, format, out);
+        return write_facts(&batch, "Profile", None, format, borders, out);
     }
 
     let output = RowOutput {
@@ -138,6 +166,8 @@ fn run(
         table_rows,
         head: args.head,
         offset: args.offset,
+        progress: &progress,
+        borders,
     };
 
     if let Some(sql) = &args.sql {
@@ -164,6 +194,7 @@ fn run(
         offset: args.offset,
         batch_rows,
         sort_budget: SortBudget::default(),
+        progress: &progress,
     };
     let summary = (!args.quiet).then_some(&parquet);
     output.write(&schema, "Preview", summary, out, |window, emit| {
@@ -172,14 +203,17 @@ fn run(
 }
 
 /// Where rows go: a table of at most `table_rows` rows, or a streamed format.
-struct RowOutput {
+struct RowOutput<'a> {
     format: Format,
     table_rows: Option<usize>,
     head: Option<u64>,
     offset: u64,
+    /// Blanked before the table is printed.
+    progress: &'a Progress,
+    borders: Borders,
 }
 
-impl RowOutput {
+impl RowOutput<'_> {
     /// Writes the rows `produce` hands out within the window of `--offset` and
     /// `--head` (or the table's row count). The table is printed only once
     /// every row is in, after `summary` if given.
@@ -213,10 +247,17 @@ impl RowOutput {
         })?;
         let batch = arrow_select::concat::concat_batches(schema, &batches)?;
 
+        self.progress.clear();
         if let Some(parquet) = summary {
             print_summary(parquet, out)?;
         }
-        print_batch(&batch, title, self.offset.saturating_add(1), out)?;
+        print_batch(
+            &batch,
+            title,
+            self.offset.saturating_add(1),
+            self.borders,
+            out,
+        )?;
         Ok(())
     }
 }
@@ -229,6 +270,7 @@ fn profile_columns(
     projection: &Projection,
     filter: Option<&FilterExpr>,
     batch_rows: u64,
+    progress: &Progress,
 ) -> anyhow::Result<Vec<parquet_reader::profile::ColumnStats>> {
     let columns = projection.as_slice();
     if columns.len() > parquet_reader::profile::MAX_FILE_PROFILE_COLUMNS {
@@ -251,6 +293,7 @@ fn profile_columns(
             offset: 0,
             batch_rows,
             sort_budget: SortBudget::default(),
+            progress,
         }
         .for_each(u64::MAX, &mut |batch| profiler.push_batch(&batch))?;
     }
@@ -263,6 +306,7 @@ fn write_facts(
     title: &str,
     limit: Option<u64>,
     format: Format,
+    borders: Borders,
     out: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
     let total = batch.num_rows();
@@ -272,7 +316,7 @@ fn write_facts(
     let batch = batch.slice(0, shown);
 
     if format == Format::Table {
-        print_batch(&batch, title, 1, out)?;
+        print_batch(&batch, title, 1, borders, out)?;
         if shown < total {
             writeln!(
                 out,
@@ -334,6 +378,8 @@ struct Rows<'a> {
     batch_rows: u64,
     /// Rows and bytes a sort keeps in memory before it spills.
     sort_budget: SortBudget,
+    /// Told the rows read so far.
+    progress: &'a Progress,
 }
 
 impl Rows<'_> {
@@ -358,6 +404,7 @@ impl Rows<'_> {
                         .read_window(row, to_usize(count)?, self.projection)?;
                     self.deliver(batch, emit)?;
                     row += count;
+                    self.progress.rows("Reading", row, total);
                 }
                 Ok(())
             }
@@ -373,7 +420,10 @@ impl Rows<'_> {
                         next_row,
                         to_usize(self.batch_rows)?,
                         self.projection,
-                        &|_| false,
+                        &|scanned| {
+                            self.progress.rows("Scanning", scanned, total);
+                            false
+                        },
                     )?;
                     if read.next_row <= next_row {
                         bail!("filtered read did not move past row {next_row}");
@@ -407,7 +457,11 @@ impl Rows<'_> {
             sort,
             self.sort_budget,
             top,
-            &|_| false,
+            &|scanned| {
+                self.progress
+                    .rows("Sorting", scanned, self.parquet.row_count());
+                false
+            },
         )?;
         let mut window = Window {
             skip: self.offset,
@@ -459,6 +513,7 @@ fn count_rows(
     parquet: &ParquetSource,
     filter: Option<&FilterExpr>,
     batch_rows: u64,
+    progress: &Progress,
 ) -> anyhow::Result<u64> {
     let Some(filter) = filter else {
         return Ok(parquet.row_count());
@@ -474,7 +529,10 @@ fn count_rows(
             next_row,
             to_usize(batch_rows)?,
             &projection,
-            &|_| false,
+            &|scanned| {
+                progress.rows("Counting", scanned, total);
+                false
+            },
         )?;
         if window.next_row <= next_row {
             bail!("filtered read did not move past row {next_row}");
@@ -966,6 +1024,7 @@ mod tests {
                 batch_rows: 2,
                 // Two rows in memory: six rows spill into runs.
                 sort_budget: SortBudget::new(2, 1 << 20).unwrap(),
+                progress: &Progress::hidden(),
             };
             let mut ids = Vec::new();
             rows.for_each(limit, &mut |batch| {
