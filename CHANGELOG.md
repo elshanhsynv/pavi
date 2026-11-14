@@ -11,9 +11,12 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - CLI: `--format csv`, `jsonl`, `parquet` or `arrow` writes the rows, and only the rows, to standard output, so the CLI works in pipelines. These formats stream every row unless `--head` is given; the table stays at most 1,000 rows.
 - CLI: `--columns` takes column names as well as numbers, `--offset N` skips rows (or matching rows with `--filter`), `--count` prints only the number of (matching) rows, and `--quiet` leaves out the summary above the table.
 - CLI: `--help` describes every option and the exit codes, and `--version` prints the version.
+- CLI: `--sort "DEP_DELAY:desc,FL_DATE"` sorts by up to 8 columns, with `--filter`, `--offset`, `--head` and every format. Sorts larger than memory spill to temporary files, as in the app.
+- CLI: `--schema` prints each column's index, name, type and nullability, and `--stats` prints the row-group statistics (rows, nulls, min, max, distinct count) from the file footer without reading any data. Both work with `--columns` and every `--format`.
 
 ### Changed
 - The table's `#` column counts from `--offset`, so it shows row numbers in the file (or match numbers with `--filter`).
+- The CLI summary shows column types as `Int64` or `Timestamp(µs, "UTC")` instead of Rust's debug form.
 
 ## [0.3.0] - 2026-11-12
 

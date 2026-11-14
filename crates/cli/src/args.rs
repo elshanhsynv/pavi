@@ -12,6 +12,7 @@ Exit codes:
 /// By default prints a summary (row count, schema, row groups) and the first
 /// rows as a table. With --format csv, jsonl, parquet or arrow it writes only
 /// the rows, all of them unless --head is given, to standard output.
+/// --count, --schema and --stats print facts about the file instead of rows.
 #[derive(Parser)]
 #[command(name = "cli", version, about, after_help = EXIT_CODES)]
 pub struct Args {
@@ -44,9 +45,31 @@ pub struct Args {
     #[arg(long, short)]
     pub quiet: bool,
 
+    /// Sort by these columns, comma-separated, each by name or index and
+    /// optionally followed by :asc or :desc (e.g. "DEP_DELAY:desc,FL_DATE").
+    /// Nulls sort last. Works with --filter; sorts larger than memory spill
+    /// to temporary files
+    #[arg(long, value_name = "KEYS")]
+    pub sort: Option<String>,
+
     /// Print only the number of rows (that match --filter, if given)
-    #[arg(long, conflicts_with_all = ["head", "offset", "columns", "format", "quiet"])]
+    #[arg(long, conflicts_with_all = ["head", "offset", "columns", "format", "quiet", "sort"])]
     pub count: bool,
+
+    /// Print the schema instead of rows: index, name, type and nullability of
+    /// each column (or of --columns), in any --format
+    #[arg(
+        long,
+        conflicts_with_all = ["stats", "count", "sort", "filter", "offset", "head", "quiet"]
+    )]
+    pub schema: bool,
+
+    /// Print the footer's statistics instead of rows, without reading any
+    /// data: rows, nulls, min, max and distinct count per row group and column
+    /// (or per --columns), in any --format. The table shows at most 1,000
+    /// rows; --head limits them
+    #[arg(long, conflicts_with_all = ["count", "sort", "filter", "offset", "quiet"])]
+    pub stats: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -84,5 +107,31 @@ mod tests {
         assert!(Args::try_parse_from(["cli", "f", "--count", "--filter", "a > 1"]).is_ok());
         let args = Args::try_parse_from(["cli", "f", "--format", "json"]).unwrap();
         assert_eq!(args.format, Format::Jsonl);
+    }
+
+    #[test]
+    fn inspection_modes_exclude_each_other_and_row_options() {
+        let parses = |arguments: &[&str]| {
+            Args::try_parse_from(std::iter::once("cli").chain(arguments.iter().copied())).is_ok()
+        };
+        assert!(!parses(&["f", "--schema", "--stats"]));
+        assert!(!parses(&["f", "--schema", "--count"]));
+        assert!(!parses(&["f", "--stats", "--count"]));
+        assert!(!parses(&["f", "--schema", "--head", "2"]));
+        assert!(!parses(&["f", "--stats", "--filter", "a > 1"]));
+        assert!(!parses(&["f", "--stats", "--sort", "a"]));
+        assert!(!parses(&["f", "--count", "--sort", "a"]));
+        assert!(parses(&[
+            "f",
+            "--schema",
+            "--columns",
+            "a",
+            "--format",
+            "csv"
+        ]));
+        assert!(parses(&["f", "--stats", "--head", "5", "--columns", "a"]));
+        assert!(parses(&[
+            "f", "--sort", "a:desc", "--filter", "a > 1", "--offset", "2"
+        ]));
     }
 }

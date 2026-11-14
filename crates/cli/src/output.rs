@@ -8,15 +8,21 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const MIN_COLUMN_WIDTH: usize = 4;
 const MAX_COLUMN_WIDTH: usize = 32;
 
-/// Prints `batch` as a table; the `#` column counts from `first_number`.
-pub fn print_batch(batch: &RecordBatch, first_number: u64, out: &mut impl Write) -> io::Result<()> {
+/// Prints `batch` as a table under `title` ("Preview: 3 rows × 2 columns");
+/// the `#` column counts from `first_number`.
+pub fn print_batch(
+    batch: &RecordBatch,
+    title: &str,
+    first_number: u64,
+    out: &mut impl Write,
+) -> io::Result<()> {
     let rows = batch.num_rows();
     let columns = batch.num_columns();
 
     writeln!(out)?;
     writeln!(
         out,
-        "Preview: {rows} {} × {columns} {}",
+        "{title}: {rows} {} × {columns} {}",
         plural(rows, "row", "rows"),
         plural(columns, "column", "columns")
     )?;
@@ -173,7 +179,7 @@ mod tests {
 
     fn render(batch: &RecordBatch) -> String {
         let mut out = Vec::new();
-        print_batch(batch, 1, &mut out).unwrap();
+        print_batch(batch, "Preview", 1, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 

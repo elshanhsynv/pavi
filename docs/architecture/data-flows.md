@@ -263,27 +263,37 @@ sequenceDiagram
     participant PS as ParquetSource
     participant O as output::print_batch
     participant W as export::BatchWriter
-    Shell->>M: cli FILE [--format F] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--count] [-q]
-    M->>M: Args::parse (clap; usage error → exit 2)
-    M->>M: validate_head (table only: default 10, ≤1000)
+    Shell->>M: cli FILE [--format F] [--head N] [--offset N] [--columns a,b] [--filter "…"] [--sort "a:desc,b"] [--count | --schema | --stats] [-q]
+    M->>M: Args::parse (clap; usage error or excluded combination → exit 2)
+    M->>M: validate_head (table only: default 10, or 1,000 for --stats; ≤1000)
     M->>PS: open(FILE)
     M->>M: parse_columns (names first, then 0-based indexes)
     M->>PS: parse_filter → FilterExpr::parse + validate_filter
+    M->>PS: parse_sort → validate_sort (≤8 keys, sortable types)
     alt --count
         M->>PS: row_count, or read_filtered_from over the filter's columns, 4,096 rows a step
         M->>Shell: the number
-    else --format csv / jsonl / parquet / arrow
-        loop until --head rows or the end
-            M->>PS: read_window(row, 4,096) or read_filtered_from(next_row, 4,096), skipping --offset (matching) rows
-            M->>W: write(batch) → stdout
+    else --schema / --stats
+        M->>PS: schema / metadata().columns() row-group statistics (footer only)
+        M->>Shell: one batch → table (stats: first --head rows, ≤1000) or BatchWriter
+    else rows (Rows::for_each, skipping --offset rows, stopping after --head)
+        alt --sort
+            M->>PS: read_sorted(filter, proj, keys, SortBudget, top = offset + head)
+            Note over M,PS: InMemory batches, or a SortMerge read 4,096 rows a step after spilling (ADR 0005)
+        else --filter
+            M->>PS: read_filtered_from(next_row, 4,096)
+        else
+            M->>PS: read_window(row, 4,096) from row = offset
         end
-        M->>W: finish (Parquet/Arrow footer)
-    else table
-        M->>Shell: Rows / Columns / Row groups / Schema / ≤10 row-group ranges (unless --quiet)
-        M->>PS: read_filtered_window(filter, offset, N, proj) or read_window(offset, N, proj)
-        M->>O: print_batch → box table to stdout, # counting from offset + 1
+        alt --format csv / jsonl / parquet / arrow
+            M->>W: write(batch) → stdout, then finish (Parquet/Arrow footer)
+        else table
+            M->>M: collect ≤ head rows, concat
+            M->>Shell: Rows / Columns / Row groups / Schema / ≤10 row-group ranges (unless --quiet)
+            M->>O: print_batch → box table to stdout, # counting from offset + 1
+        end
     end
     M-->>Shell: exit 0 (also when stdout's reader closed), or anyhow error → stderr, exit 1
 ```
 
-All of it runs on the main thread. The table holds ≤1,000 rows of the projected columns; the streamed formats and `--count` hold one 4,096-row batch (`STREAM_BATCH_ROWS`) at a time, plus the Parquet writer's open row group, so they have no row limit (a selective filter may still scan the whole file). The streamed formats write only rows, no summary, with the same `BatchWriter` the app's export uses, so their text matches an exported file. Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.
+All of it runs on the main thread. The table holds ≤1,000 rows of the projected columns; the streamed formats and `--count` hold one 4,096-row batch (`STREAM_BATCH_ROWS`) at a time, plus the Parquet writer's open row group, so they have no row limit (a selective filter may still scan the whole file). `--sort` goes through `read_sorted` like the app's sort: with `--head`, only the best `offset + head` rows are kept while scanning (when that fits the sort budget); otherwise up to `SortBudget` rows stay in memory and the rest spill to temporary files, merged 4,096 rows at a time. `--schema` and `--stats` read no data pages: they turn the footer already in memory into rows, so they print or stream like data. The table reads its rows before printing the summary, so a read error leaves stdout empty too. The streamed formats write only rows, no summary, with the same `BatchWriter` the app's export uses, so their text matches an exported file. Every argument is checked before anything is printed, so a bad `--columns` or `--filter` leaves stdout empty. Output goes through one buffered writer; a broken pipe (`cli … | head`) ends the run quietly with exit 0 instead of a panic. The table measures text in terminal columns (`unicode-width`), cuts headers and values at 32 columns, shows line breaks, tabs and other control characters as `\n`, `\t`, `\u{…}`, and right-aligns numbers.

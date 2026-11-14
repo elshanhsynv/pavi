@@ -30,6 +30,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |
 | CLI table preview | 1,000 rows (`--head`), each cell ≤ 1,024 bytes | `cli::MAX_HEAD_ROWS`, `value::DEFAULT_CELL_LIMIT` |
 | CLI streamed output (`--format csv/jsonl/parquet/arrow`) and `--count` | one 4,096-row batch of the projected (for `--count`, the filter's) columns; Parquet also buffers its open row group, as in the app's export. No row limit | `cli::STREAM_BATCH_ROWS` |
+| CLI `--sort` | the app's sort budget in memory (100,000 rows / 128 MB, or the best `offset + head` rows with `--head`), then spill files up to 32 GiB in the temporary folder, deleted when the run ends | `SortBudget::DEFAULT_MAX_*`, `spill::MAX_SPILL_BYTES` |
+| CLI `--stats` table | 1,000 rows (row group × column) unless `--head` is lower; streamed formats print every row. The rows come from the footer, which is bounded at open | `cli::MAX_HEAD_ROWS`, `MAX_DATASET_METADATA_BYTES` |
 | Rows per scan reader (filter, sort and aggregate scans read consecutive row groups of one file with one reader; its dictionary pages are checked when it opens) | 1,048,576 rows | `SCAN_RUN_ROWS` in `crates/parquet/src/source.rs` |
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |

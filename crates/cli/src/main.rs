@@ -1,15 +1,21 @@
 mod args;
+mod inspect;
 mod output;
+mod sort;
 
 use std::io::{self, BufWriter, Write};
 use std::process::ExitCode;
 
 use anyhow::{Context, bail};
 use args::{Args, Format};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use clap::Parser;
 use output::print_batch;
 use parquet_reader::export::{BatchWriter, ExportFormat};
-use parquet_reader::{FilterExpr, PAGE_ROWS, ParquetSource, Projection};
+use parquet_reader::{
+    FilterExpr, PAGE_ROWS, ParquetSource, Projection, SortBudget, SortOutput, SortSpec,
+};
 
 /// Most rows the table format prints; it holds them all in memory to size columns.
 const MAX_HEAD_ROWS: u64 = 1_000;
@@ -39,11 +45,15 @@ fn main() -> ExitCode {
 }
 
 /// Checks every argument against the file, then writes the output.
-/// Nothing is written until the arguments are known to be valid.
+/// Nothing is written until the arguments are known to be valid and, for the
+/// table, until its rows have been read.
 fn run(args: &Args, out: &mut (impl Write + Send), batch_rows: u64) -> anyhow::Result<()> {
-    let table_head = match args.format {
-        Format::Table if !args.count => Some(validate_head(args.head)?),
-        _ => None,
+    // Rows the table holds: --head, or every statistics row up to the cap.
+    let table_rows = if args.format == Format::Table && !args.count && !args.schema {
+        let default = args.stats.then_some(MAX_HEAD_ROWS);
+        Some(validate_head(args.head.or(default))?)
+    } else {
+        None
     };
 
     let parquet = ParquetSource::open(&args.file)?;
@@ -53,45 +63,90 @@ fn run(args: &Args, out: &mut (impl Write + Send), batch_rows: u64) -> anyhow::R
         .as_deref()
         .map(|text| parse_filter(&parquet, text))
         .transpose()?;
+    let sort = args
+        .sort
+        .as_deref()
+        .map(|text| sort::parse_sort(text, &parquet))
+        .transpose()?;
 
     if args.count {
         let rows = count_rows(&parquet, filter.as_ref(), batch_rows)?;
         writeln!(out, "{rows}")?;
         return Ok(());
     }
+    if args.schema {
+        let batch = inspect::schema_batch(&parquet, &projection)?;
+        return write_facts(&batch, "Schema", None, args.format, out);
+    }
+    if args.stats {
+        let batch = inspect::stats_batch(&parquet, &projection)?;
+        let limit = table_rows.map_or(args.head, |rows| Some(rows as u64));
+        return write_facts(&batch, "Statistics", limit, args.format, out);
+    }
 
-    let Some(head) = table_head else {
-        let format = export_format(args.format)?;
-        let limit = args.head.unwrap_or(u64::MAX);
-        return stream_rows(
-            &parquet,
-            filter.as_ref(),
-            &projection,
-            args.offset,
-            limit,
-            batch_rows,
-            // An empty window carries the projected schema.
-            BatchWriter::new(
-                format,
-                out,
-                parquet.read_window(0, 0, &projection)?.schema(),
-            )?,
-        );
+    // An empty window carries the projected schema.
+    let schema = parquet.read_window(0, 0, &projection)?.schema();
+    let rows = Rows {
+        parquet: &parquet,
+        filter: filter.as_ref(),
+        sort: sort.as_deref(),
+        projection: &projection,
+        schema: &schema,
+        offset: args.offset,
+        batch_rows,
+        sort_budget: SortBudget::default(),
     };
+
+    let Some(head) = table_rows else {
+        let mut writer = BatchWriter::new(export_format(args.format)?, out, schema.clone())?;
+        rows.for_each(args.head.unwrap_or(u64::MAX), &mut |batch| {
+            writer.write(&batch)
+        })?;
+        return writer.finish();
+    };
+
+    let mut batches = Vec::new();
+    rows.for_each(head as u64, &mut |batch| {
+        batches.push(batch);
+        Ok(())
+    })?;
+    let batch = arrow_select::concat::concat_batches(&schema, &batches)?;
 
     if !args.quiet {
         print_summary(&parquet, out)?;
     }
-
-    let batch = if let Some(filter) = &filter {
-        parquet.read_filtered_window(filter, args.offset, head, &projection)?
-    } else {
-        let first_row = args.offset.min(parquet.row_count());
-        parquet.read_window(first_row, head, &projection)?
-    };
-
-    print_batch(&batch, args.offset.saturating_add(1), out)?;
+    print_batch(&batch, "Preview", args.offset.saturating_add(1), out)?;
     Ok(())
+}
+
+/// Writes a `--schema` or `--stats` batch, cut to `limit` rows.
+fn write_facts(
+    batch: &RecordBatch,
+    title: &str,
+    limit: Option<u64>,
+    format: Format,
+    out: &mut (impl Write + Send),
+) -> anyhow::Result<()> {
+    let total = batch.num_rows();
+    let shown = limit.map_or(total, |limit| {
+        usize::try_from(limit).map_or(total, |limit| limit.min(total))
+    });
+    let batch = batch.slice(0, shown);
+
+    if format == Format::Table {
+        print_batch(&batch, title, 1, out)?;
+        if shown < total {
+            writeln!(
+                out,
+                "{shown} of {total} rows shown; use --head (up to {MAX_HEAD_ROWS}) \
+                 or --format csv for the rest"
+            )?;
+        }
+        return Ok(());
+    }
+    let mut writer = BatchWriter::new(export_format(format)?, out, batch.schema())?;
+    writer.write(&batch)?;
+    writer.finish()
 }
 
 fn export_format(format: Format) -> anyhow::Result<ExportFormat> {
@@ -104,59 +159,161 @@ fn export_format(format: Format) -> anyhow::Result<ExportFormat> {
     })
 }
 
-/// Writes up to `limit` rows after skipping `offset` (matching) rows, one
-/// batch of at most `batch_rows` rows at a time.
-fn stream_rows<W: Write + Send>(
-    parquet: &ParquetSource,
-    filter: Option<&FilterExpr>,
-    projection: &Projection,
-    offset: u64,
-    limit: u64,
-    batch_rows: u64,
-    mut writer: BatchWriter<W>,
-) -> anyhow::Result<()> {
-    let total = parquet.row_count();
-    match filter {
-        None => {
-            let mut row = offset.min(total);
-            let end = row.saturating_add(limit).min(total);
-            while row < end {
-                let count = (end - row).min(batch_rows);
-                writer.write(&parquet.read_window(row, to_usize(count)?, projection)?)?;
-                row += count;
-            }
-        }
-        Some(filter) => {
-            let mut next_row = 0;
-            let mut skip = offset;
-            let mut left = limit;
-            while left > 0 && next_row < total {
-                let wanted = skip.saturating_add(left).min(batch_rows);
-                let window = parquet.read_filtered_from(
-                    filter,
-                    next_row,
-                    to_usize(wanted)?,
-                    projection,
-                    &|_| false,
-                )?;
-                if window.next_row <= next_row {
-                    bail!("filtered read did not move past row {next_row}");
-                }
-                next_row = window.next_row;
+/// Skips the first `skip` rows of a run of batches, then keeps up to `left`.
+struct Window {
+    skip: u64,
+    left: u64,
+}
 
-                let mut batch = window.batch;
-                let skipped = skip.min(batch.num_rows() as u64);
-                skip -= skipped;
-                let kept = (batch.num_rows() as u64 - skipped).min(left);
-                batch = batch.slice(to_usize(skipped)?, to_usize(kept)?);
-                left -= kept;
-                if batch.num_rows() > 0 {
-                    writer.write(&batch)?;
+impl Window {
+    fn is_done(&self) -> bool {
+        self.left == 0
+    }
+
+    /// The part of `batch` inside the window, if any.
+    fn take(&mut self, batch: &RecordBatch) -> Option<RecordBatch> {
+        let rows = batch.num_rows();
+        let skipped = usize::try_from(self.skip).map_or(rows, |skip| skip.min(rows));
+        self.skip -= skipped as u64;
+        let kept =
+            usize::try_from(self.left).map_or(rows - skipped, |left| left.min(rows - skipped));
+        self.left -= kept as u64;
+        (kept > 0).then(|| batch.slice(skipped, kept))
+    }
+}
+
+/// The rows to output: optionally filtered and sorted, after `offset` rows.
+struct Rows<'a> {
+    parquet: &'a ParquetSource,
+    filter: Option<&'a FilterExpr>,
+    sort: Option<&'a [SortSpec]>,
+    projection: &'a Projection,
+    /// Every batch handed out is given this schema, so a writer sees one
+    /// schema whichever read produced the rows.
+    schema: &'a SchemaRef,
+    offset: u64,
+    /// Rows read per step.
+    batch_rows: u64,
+    /// Rows and bytes a sort keeps in memory before it spills.
+    sort_budget: SortBudget,
+}
+
+impl Rows<'_> {
+    /// Hands up to `limit` rows to `emit`, one batch of at most `batch_rows`
+    /// rows (or a sort's page) at a time.
+    fn for_each(
+        &self,
+        limit: u64,
+        emit: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let total = self.parquet.row_count();
+        match (self.sort, self.filter) {
+            (Some(sort), filter) => self.sorted(sort, filter, limit, emit),
+            (None, None) => {
+                // The offset is where the reads start.
+                let mut row = self.offset.min(total);
+                let end = row.saturating_add(limit).min(total);
+                while row < end {
+                    let count = (end - row).min(self.batch_rows);
+                    let batch = self
+                        .parquet
+                        .read_window(row, to_usize(count)?, self.projection)?;
+                    self.deliver(batch, emit)?;
+                    row += count;
                 }
+                Ok(())
+            }
+            (None, Some(filter)) => {
+                let mut window = Window {
+                    skip: self.offset,
+                    left: limit,
+                };
+                let mut next_row = 0;
+                while !window.is_done() && next_row < total {
+                    let read = self.parquet.read_filtered_from(
+                        filter,
+                        next_row,
+                        to_usize(self.batch_rows)?,
+                        self.projection,
+                        &|_| false,
+                    )?;
+                    if read.next_row <= next_row {
+                        bail!("filtered read did not move past row {next_row}");
+                    }
+                    next_row = read.next_row;
+                    if let Some(batch) = window.take(&read.batch) {
+                        self.deliver(batch, emit)?;
+                    }
+                }
+                Ok(())
             }
         }
     }
-    writer.finish()
+
+    /// Sorted rows through `read_sorted`: kept in memory up to the sort
+    /// budget, spilled to temporary files past it (ADR 0005). With a limit,
+    /// only the best `offset + limit` rows are kept while scanning.
+    fn sorted(
+        &self,
+        sort: &[SortSpec],
+        filter: Option<&FilterExpr>,
+        limit: u64,
+        emit: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let top = (limit != u64::MAX)
+            .then(|| usize::try_from(self.offset.saturating_add(limit)).ok())
+            .flatten();
+        let output = self.parquet.read_sorted(
+            filter,
+            self.projection,
+            sort,
+            self.sort_budget,
+            top,
+            &|_| false,
+        )?;
+        let mut window = Window {
+            skip: self.offset,
+            left: limit,
+        };
+        match output {
+            SortOutput::InMemory(batches) => {
+                for batch in &batches {
+                    if window.is_done() {
+                        break;
+                    }
+                    if let Some(batch) = window.take(batch) {
+                        self.deliver(batch, emit)?;
+                    }
+                }
+            }
+            SortOutput::Spilled(mut merge) => {
+                while !window.is_done() {
+                    let (batches, finished) =
+                        merge.next_rows(to_usize(self.batch_rows)?, &|| false)?;
+                    for batch in &batches {
+                        if let Some(batch) = window.take(batch) {
+                            self.deliver(batch, emit)?;
+                        }
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver(
+        &self,
+        batch: RecordBatch,
+        emit: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        emit(RecordBatch::try_new(
+            self.schema.clone(),
+            batch.columns().to_vec(),
+        )?)
+    }
 }
 
 /// The row count from the footer, or a scan that reads only the filter's columns.
@@ -209,7 +366,7 @@ fn print_summary(parquet: &ParquetSource, out: &mut impl Write) -> io::Result<()
 
     writeln!(out, "Schema:")?;
     for (i, field) in parquet.schema().fields().iter().enumerate() {
-        writeln!(out, "{:>3} {:<20} {:?}", i, field.name(), field.data_type())?;
+        writeln!(out, "{:>3} {:<20} {}", i, field.name(), field.data_type())?;
     }
     writeln!(out)?;
 
@@ -258,14 +415,12 @@ fn parse_filter(parquet: &ParquetSource, text: &str) -> anyhow::Result<FilterExp
     Ok(filter)
 }
 
-/// Columns by name or 0-based index. A column whose name looks like a
-/// number is found by its name first.
+/// Columns by name or 0-based index, for `--columns`.
 fn parse_columns(columns: Option<&str>, parquet: &ParquetSource) -> anyhow::Result<Projection> {
     let column_count = parquet.column_count();
     let Some(columns) = columns else {
         return Ok(Projection::all(column_count));
     };
-    let schema = parquet.schema();
 
     let mut result = Vec::new();
     for value in columns.split(',') {
@@ -273,25 +428,30 @@ fn parse_columns(columns: Option<&str>, parquet: &ParquetSource) -> anyhow::Resu
         if value.is_empty() {
             bail!("empty column in --columns");
         }
-
-        let index = match schema.index_of(value) {
-            Ok(index) => index,
-            Err(_) => value.parse::<usize>().map_err(|_| {
-                anyhow::anyhow!("unknown column {value:?}; give a column name or a 0-based index")
-            })?,
-        };
-
-        if index >= column_count {
-            bail!(
-                "column index {index} is out of range; \
-                 file has {column_count} columns (0..{})",
-                column_count.saturating_sub(1)
-            );
-        }
-        result.push(index);
+        result.push(resolve_column(value, parquet)?);
     }
 
     Projection::columns(result, column_count)
+}
+
+/// One column by name or 0-based index. A column whose name looks like a
+/// number is found by its name first.
+fn resolve_column(value: &str, parquet: &ParquetSource) -> anyhow::Result<usize> {
+    let column_count = parquet.column_count();
+    let index = match parquet.schema().index_of(value) {
+        Ok(index) => index,
+        Err(_) => value.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("unknown column {value:?}; give a column name or a 0-based index")
+        })?,
+    };
+    if index >= column_count {
+        bail!(
+            "column index {index} is out of range; \
+             file has {column_count} columns (0..{})",
+            column_count.saturating_sub(1)
+        );
+    }
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -307,7 +467,8 @@ mod tests {
 
     use super::*;
 
-    /// Five rows, `id` 1..=5 and `name` a..=e, in row groups of two.
+    /// Five rows, `id` 1..=5, `name` a..=e and `7` with one value, in row
+    /// groups of two.
     fn fixture() -> (tempfile::TempDir, String) {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("t.parquet");
@@ -338,6 +499,40 @@ mod tests {
             ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(properties)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
+    }
+
+    /// Six rows with ties and nulls in `group`, in row groups of two.
+    fn sort_fixture() -> (tempfile::TempDir, String) {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("s.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("group", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+                Arc::new(StringArray::from(vec![
+                    Some("b"),
+                    None,
+                    Some("a"),
+                    Some("b"),
+                    None,
+                    Some("a"),
+                ])),
+            ],
+        )
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let path = path.to_string_lossy().into_owned();
+        (folder, path)
     }
 
     fn parse(arguments: &[&str]) -> Args {
@@ -377,6 +572,7 @@ mod tests {
         let text = output(&[&path, "--filter", "id >= 2", "--columns", "1"]);
 
         assert!(text.starts_with("Rows: 5\nColumns: 3\n"), "{text}");
+        assert!(text.contains("  0 id                   Int64\n"), "{text}");
         assert!(text.contains("Preview: 4 rows × 1 column"), "{text}");
         assert!(text.contains("│   1 │ b    │"), "{text}");
     }
@@ -470,6 +666,12 @@ mod tests {
             vec![&path, "--columns", "nope"],
             vec![&path, "--head", "1001"],
             vec![&path, "--format", "csv", "--filter", "missing > 1"],
+            vec![&path, "--sort", "nope"],
+            vec![&path, "--sort", "id,id:desc"],
+            vec![&path, "--sort", "id:sideways"],
+            vec![&path, "--sort", "id,"],
+            vec![&path, "--stats", "--head", "1001"],
+            vec![&path, "--schema", "--columns", "nope"],
         ] {
             let mut out = Vec::new();
             assert!(
@@ -492,8 +694,12 @@ mod tests {
     fn treats_a_closed_pipe_as_the_end_of_output() {
         let (_folder, path) = fixture();
         for format in ["table", "csv", "jsonl", "parquet", "arrow"] {
-            let error = run(&parse(&[&path, "--format", format]), &mut ClosedPipe, 2).unwrap_err();
-            assert!(is_broken_pipe(&error), "{format}: {error:?}");
+            for mode in [&[][..], &["--schema"], &["--stats"], &["--sort", "id:desc"]] {
+                let mut arguments = vec![path.as_str(), "--format", format];
+                arguments.extend_from_slice(mode);
+                let error = run(&parse(&arguments), &mut ClosedPipe, 2).unwrap_err();
+                assert!(is_broken_pipe(&error), "{arguments:?}: {error:?}");
+            }
         }
         assert!(!is_broken_pipe(&anyhow::anyhow!("other")));
     }
@@ -511,5 +717,128 @@ mod tests {
         assert!(columns("nope").is_err());
         assert!(columns("0,").is_err());
         assert!(columns("id,0").is_err());
+    }
+
+    #[test]
+    fn prints_the_schema_in_every_format() {
+        let (_folder, path) = fixture();
+        assert_eq!(
+            output(&[&path, "--schema", "--format", "csv"]),
+            "index,name,type,nullable\n0,id,Int64,false\n1,name,Utf8,false\n2,7,Utf8,true\n"
+        );
+        assert_eq!(
+            output(&[&path, "--schema", "--format", "jsonl", "--columns", "7"]),
+            "{\"index\":2,\"name\":\"7\",\"type\":\"Utf8\",\"nullable\":true}\n"
+        );
+        let table = output(&[&path, "--schema"]);
+        assert!(table.starts_with("\nSchema: 3 rows × 4 columns"), "{table}");
+        assert!(table.contains("│ id   │ Int64 │ false    │"), "{table}");
+    }
+
+    #[test]
+    fn prints_row_group_statistics_without_reading_rows() {
+        let (_folder, path) = fixture();
+        assert_eq!(
+            output(&[&path, "--stats", "--format", "csv", "--columns", "id,7"]),
+            concat!(
+                "row_group,column,rows,nulls,min,max,distinct\n",
+                "0,id,2,0,1,2,\n",
+                "0,7,2,1,x,x,\n",
+                "1,id,2,0,3,4,\n",
+                "1,7,2,2,,,\n",
+                "2,id,1,0,5,5,\n",
+                "2,7,1,1,,,\n",
+            )
+        );
+        let table = output(&[&path, "--stats", "--head", "2"]);
+        assert!(
+            table.starts_with("\nStatistics: 2 rows × 7 columns"),
+            "{table}"
+        );
+        assert!(
+            table.ends_with(
+                "2 of 9 rows shown; use --head (up to 1000) or --format csv for the rest\n"
+            ),
+            "{table}"
+        );
+        // Streamed formats show every row unless --head is given.
+        let csv = output(&[&path, "--stats", "--format", "csv"]);
+        assert_eq!(csv.lines().count(), 1 + 9);
+    }
+
+    #[test]
+    fn sorts_with_nulls_last_ties_in_file_order_and_several_keys() {
+        let (_folder, path) = sort_fixture();
+        assert_eq!(
+            output(&[&path, "--format", "csv", "--sort", "group"]),
+            "id,group\n3,a\n6,a\n1,b\n4,b\n2,\n5,\n"
+        );
+        assert_eq!(
+            output(&[&path, "--format", "csv", "--sort", "group:desc,id:desc"]),
+            "id,group\n4,b\n1,b\n6,a\n3,a\n5,\n2,\n"
+        );
+        assert_eq!(
+            output(&[&path, "--format", "csv", "--sort", "1:DESC , 0"]),
+            "id,group\n1,b\n4,b\n3,a\n6,a\n2,\n5,\n"
+        );
+    }
+
+    #[test]
+    fn sorts_filtered_rows_with_offset_and_head_in_every_output() {
+        let (_folder, path) = sort_fixture();
+        let sorted = [
+            &path[..],
+            "--sort",
+            "id:desc",
+            "--filter",
+            "group IS NOT NULL",
+            "--offset",
+            "1",
+            "--head",
+            "2",
+        ];
+        let mut csv = sorted.to_vec();
+        csv.extend(["--format", "csv"]);
+        assert_eq!(output(&csv), "id,group\n4,b\n3,a\n");
+
+        let table = output(&sorted);
+        assert!(table.contains("│   2 │    4 │ b     │"), "{table}");
+        assert!(table.contains("│   3 │    3 │ a     │"), "{table}");
+    }
+
+    #[test]
+    fn streams_a_sort_that_spills_to_disk() {
+        let (_folder, path) = sort_fixture();
+        let parquet = ParquetSource::open(&path).unwrap();
+        let projection = Projection::all(2);
+        let schema = parquet.read_window(0, 0, &projection).unwrap().schema();
+        let sort = sort::parse_sort("group:desc,id", &parquet).unwrap();
+        for (offset, limit, expected) in
+            [(0, u64::MAX, vec![1, 4, 3, 6, 2, 5]), (1, 3, vec![4, 3, 6])]
+        {
+            let rows = Rows {
+                parquet: &parquet,
+                filter: None,
+                sort: Some(&sort),
+                projection: &projection,
+                schema: &schema,
+                offset,
+                batch_rows: 2,
+                // Two rows in memory: six rows spill into runs.
+                sort_budget: SortBudget::new(2, 1 << 20).unwrap(),
+            };
+            let mut ids = Vec::new();
+            rows.for_each(limit, &mut |batch| {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                ids.extend(column.values().iter().copied());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ids, expected, "offset {offset}, limit {limit}");
+        }
     }
 }
