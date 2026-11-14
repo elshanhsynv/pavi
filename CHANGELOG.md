@@ -22,6 +22,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - The table's `#` column counts from `--offset`, so it shows row numbers in the file (or match numbers with `--filter`).
 - The CLI summary shows column types as `Int64` or `Timestamp(µs, "UTC")` instead of Rust's debug form.
 
+### Fixed
+- Filters and SQL `WHERE` on a column whose name is a number (such as `2023`) use that column. A bare number in a filter was always read as a column position, so such a column couldn't be filtered and SQL could read the wrong column. A number now means a position only when no column has that name.
+
 ## [0.3.0] - 2026-11-12
 
 ### Added

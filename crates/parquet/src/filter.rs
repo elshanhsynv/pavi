@@ -81,7 +81,8 @@ impl FilterExpr {
     /// ```
     ///
     /// Keywords are case-insensitive. Quote a value (`"..."` or `'...'`) when it
-    /// contains a keyword, a comma or parentheses.
+    /// contains a keyword, a comma or parentheses. A `column` is a column's
+    /// name or, when no column has that name, its 0-based position.
     pub fn parse(input: &str) -> Result<Self> {
         let filter = parse_filter(input, 0)?;
         filter.check_size()?;
@@ -585,19 +586,24 @@ impl Comparison {
         }
     }
 
+    /// The source column this test reads: the column named `column`, or else,
+    /// when `column` is a number, the column at that 0-based position. A name
+    /// is tried first, so a column called `7` is found by its name.
     pub fn column_index(&self, schema: &Schema) -> Result<usize> {
+        if let Some(index) = schema
+            .fields()
+            .iter()
+            .position(|field| field.name() == &self.column)
+        {
+            return Ok(index);
+        }
         if let Ok(index) = self.column.parse::<usize>() {
             if index < schema.fields().len() {
                 return Ok(index);
             }
             bail!("filter column index {index} out of range");
         }
-
-        schema
-            .fields()
-            .iter()
-            .position(|field| field.name() == &self.column)
-            .ok_or_else(|| anyhow!("unknown filter column '{}'", self.column))
+        bail!("unknown filter column '{}'", self.column)
     }
 
     pub fn validate_schema(&self, schema: &Schema) -> Result<()> {
@@ -1254,6 +1260,32 @@ mod tests {
 
     fn test(column: &str, op: FilterOp, value: &str) -> FilterExpr {
         FilterExpr::compare(column, op, value)
+    }
+
+    #[test]
+    fn finds_columns_by_name_before_position() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("0", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]);
+        let column = |text: &str| {
+            Comparison::parse(&format!("{text} IS NULL"))
+                .unwrap()
+                .column_index(&schema)
+        };
+        // "0" is a column's name here, not position 0.
+        assert_eq!(column("0").unwrap(), 1);
+        // No column is called "2", so it is the position.
+        assert_eq!(column("2").unwrap(), 2);
+        assert_eq!(column("b").unwrap(), 2);
+        assert!(
+            column("3")
+                .unwrap_err()
+                .to_string()
+                .contains("out of range")
+        );
+        assert!(column("zz").unwrap_err().to_string().contains("unknown"));
     }
 
     #[test]
