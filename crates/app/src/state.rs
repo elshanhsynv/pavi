@@ -250,6 +250,13 @@ impl GridState {
         self.generation
     }
 
+    /// A new generation for the same grid, so responses to earlier reads are
+    /// dropped; the selection and columns stay.
+    pub fn next_generation(&mut self) -> GenerationId {
+        self.generation = GenerationId(self.generation.0.saturating_add(1));
+        self.generation
+    }
+
     pub fn ready(&mut self, rows: u64, columns: usize) {
         self.rows = rows;
         self.columns = columns;
@@ -383,6 +390,9 @@ impl GridState {
         self.loaded.clear();
     }
 
+    /// Selects row `row` of a result window that starts at result row
+    /// `first_result`, as a click in the result grid does.
+    #[cfg(test)]
     pub fn select_filtered(&mut self, first_result: u64, row: u64, column: usize) -> bool {
         if row >= self.rows || column >= self.columns {
             return false;

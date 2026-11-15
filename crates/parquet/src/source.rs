@@ -978,6 +978,66 @@ impl ParquetSource {
         })
     }
 
+    /// Counts the rows that pass `filter` in each row group, in row-group order:
+    /// one entry per row group, so as long as the footer's row-group list. Only
+    /// the filter's columns are read, and row groups the footer statistics rule
+    /// out count 0 without being read. With the counts, a filtered result can be
+    /// entered anywhere: its match `n` is in the first row group whose running
+    /// total passes `n`. `checkpoint` works as in [`Self::read_filtered_from`].
+    pub fn count_matches_by_row_group(
+        &self,
+        filter: &FilterExpr,
+        checkpoint: &dyn Fn(u64) -> bool,
+    ) -> Result<Vec<u64>> {
+        let row_groups = self.row_groups();
+        let mut counts = vec![0_u64; row_groups.len()];
+        let columns = filter
+            .columns(&self.dataset_metadata.schema)?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let read_projection = Projection::columns(columns, self.column_count())?;
+        let keep = |row_group: &RowGroupInfo| self.row_group_might_match(filter, row_group);
+        let mut next_group = 0;
+        // The row group of the row being counted; rows only move forward.
+        let mut group = 0;
+        while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
+            let (file, mut reader, mut batch_first_row) =
+                self.run_reader(&run, &read_projection, 0)?;
+            while let Some(batch) = reader.next().transpose()? {
+                if checkpoint(batch_first_row) {
+                    return Err(Cancelled.into());
+                }
+                let batch = self.reorder_batch(batch, &read_projection, file)?;
+                let mask = self.evaluate_filter(filter, &batch, &read_projection)?;
+                let rows = batch.num_rows();
+                // A batch can cross into the next row group: split it there.
+                let mut offset = 0;
+                while offset < rows {
+                    let row = batch_first_row + offset as u64;
+                    while row_groups
+                        .get(group)
+                        .is_some_and(|info| row >= info.first_row + info.row_count)
+                    {
+                        group += 1;
+                    }
+                    let info = row_groups
+                        .get(group)
+                        .ok_or_else(|| anyhow!("row {row} is past the last row group"))?;
+                    let length = usize::try_from(info.first_row + info.row_count - row)
+                        .unwrap_or(usize::MAX)
+                        .min(rows - offset);
+                    let count = counts
+                        .get_mut(group)
+                        .ok_or_else(|| anyhow!("row group {group} has no count"))?;
+                    *count += mask.slice(offset, length).true_count() as u64;
+                    offset += length;
+                }
+                batch_first_row += rows as u64;
+            }
+        }
+        Ok(counts)
+    }
+
     /// Reads, sorts, and returns 4,096-row output batches for one supported sort key.
     ///
     /// Rows that pass `filter` must fit in `budget`. With `limit` (at most
@@ -3442,6 +3502,54 @@ mod tests {
             source
                 .read_filtered_from(&filter, 30_001, 1, &projection, &|_| false)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn counts_filter_matches_per_row_group() {
+        // Row groups of 10,000 rows, read in batches that don't line up with them.
+        let (_directory, source) = numbered_file(30_000, 10_000);
+        let bucket = FilterExpr::parse("bucket == 3").unwrap();
+        let counts = source
+            .count_matches_by_row_group(&bucket, &|_| false)
+            .unwrap();
+        let expected = (0..3)
+            .map(|group| {
+                (group * 10_000..(group + 1) * 10_000)
+                    .filter(|id| id % 7 == 3)
+                    .count() as u64
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts, expected);
+
+        // Groups the statistics rule out are 0 without being read.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let record = |row| {
+            seen.lock().unwrap().push(row);
+            false
+        };
+        let late = FilterExpr::parse("id >= 25000").unwrap();
+        assert_eq!(
+            source.count_matches_by_row_group(&late, &record).unwrap(),
+            [0, 0, 5_000]
+        );
+        assert!(seen.lock().unwrap().iter().all(|row| *row >= 20_000));
+
+        // Uneven groups: a batch that crosses a boundary is split there.
+        let (_directory, uneven) = numbered_file(10_000, 3_333);
+        let all = FilterExpr::parse("id >= 0").unwrap();
+        assert_eq!(
+            uneven.count_matches_by_row_group(&all, &|_| false).unwrap(),
+            [3_333, 3_333, 3_333, 1]
+        );
+
+        let stop = FilterExpr::parse("bucket == 1").unwrap();
+        assert!(
+            source
+                .count_matches_by_row_group(&stop, &|_| true)
+                .unwrap_err()
+                .downcast_ref::<Cancelled>()
+                .is_some()
         );
     }
 

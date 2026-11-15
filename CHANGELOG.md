@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- Filter, SQL and sort results can be entered anywhere: "Go to row", Home, End, the arrow keys and a new scrollbar for the whole result reach any row, and scrolling up brings back rows scrolled past. A filter's matches are counted in the background ("rows 1–4,096 of 999,999,989"), after which a jump only reads the row group that holds the row, even in a billion-row file.
 - CLI: `--sql` shows the progress line too: how much of a join or subquery is prepared, then the rows scanned.
 - CLI: `--profile` reports text lengths (`min_length`, `max_length`, `mean_length`, in characters) for text columns.
 - CLI: `--input-format csv|json|arrow|parquet` reads a file whatever its extension says (a CSV saved as `.txt`), or standard input whatever its first bytes suggest.
@@ -17,6 +18,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - CLI: with `--filter`, the table's `#` column shows each row's number in the file, not its place among the matches. With `--sort` or `--sql` it still counts the result.
 
 ### Fixed
+- The arrow keys, Page Up/Down, Home and End scroll the selected cell into view.
+- Text wider than its column ends in "…" instead of being cut off; numbers keep their first digits instead of losing them to the left edge.
 - CLI: a null cell in the table shows as `∅` (`NULL` with `--ascii`), so it can't be mistaken for the text "null".
 - CLI: the table stays aligned with emoji that have a skin tone, emoji made of several (👨‍👩‍👧), flags and accents typed as separate marks, and never cuts them in half.
 

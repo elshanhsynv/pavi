@@ -12,7 +12,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Source page cache | 8 pages / 128 MB | `parquet_reader::cache::DEFAULT_MAX_PAGES`, `DEFAULT_MAX_BYTES` |
 | UI loaded pages | 8 pages | `pavi::pages::MAX_LOADED_PAGES` |
 | Page size | 4,096 rows | `parquet_reader::page::PAGE_ROWS` |
-| Filter/SQL/sort result window | 8 batches (~32k rows) | `pavi::results::MAX_FILTERED_BATCHES` |
+| Filter/SQL/sort result window | 8 batches (~32k rows); a jump keeps 2,048 rows above its target | `pavi::results::MAX_FILTERED_BATCHES`, `JUMP_CONTEXT_ROWS` |
+| Filter match count (ADR 0012) | One `u64` per row group of the file (the footer's list), no other buffer | `ParquetSource::count_matches_by_row_group` |
 | Sort rows in memory (larger sorts spill, ADR 0005) | 100,000 rows / 128 MB | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
 | Sort spill files | 32 GiB per sort | `spill::MAX_SPILL_BYTES` |
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |

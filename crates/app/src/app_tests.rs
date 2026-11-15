@@ -435,14 +435,50 @@ fn keyboard_and_shift_selection_work_after_the_result_window_slides() {
     send_grid_key(&mut app, egui::Key::ArrowRight, true);
     assert_eq!(app.grid.selection, Some((first + 11, 1)));
     assert!(app.grid.is_selected(first + 11, 0));
-    send_grid_key(&mut app, egui::Key::Home, false);
-    assert_eq!(app.grid.selection, Some((first, 1)));
+    // Up from the first row held reads the rows above it again (ADR 0012).
+    assert!(app.grid.select_filtered(first, 0, 1));
     send_grid_key(&mut app, egui::Key::ArrowUp, false);
+    poll_until_jumped(&mut app);
+    assert_eq!(app.grid.selection, Some((first - 1, 1)));
+    assert!(app.filtered.as_ref().unwrap().first_result < first - 1);
+
+    // Home is the result's first row, End its last once the matches are counted.
+    send_grid_key(&mut app, egui::Key::Home, false);
+    poll_until_jumped(&mut app);
+    assert_eq!(app.grid.selection, Some((0, 1)));
+    for _ in 0..2_000 {
+        app.poll_filtered();
+        if app.filtered.as_ref().unwrap().total().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(app.filtered.as_ref().unwrap().total(), Some(rows as u64));
+    send_grid_key(&mut app, egui::Key::End, false);
+    poll_until_jumped(&mut app);
+    assert_eq!(app.grid.selection, Some((rows as u64 - 1, 1)));
+    send_grid_key(&mut app, egui::Key::ArrowDown, false);
     assert_eq!(
         app.grid.selection,
-        Some((first, 1)),
-        "stays inside the window"
+        Some((rows as u64 - 1, 1)),
+        "stays on the last row"
     );
+}
+
+/// Polls until a jump in a result has shown its row.
+fn poll_until_jumped(app: &mut PaviApp) {
+    for _ in 0..5_000 {
+        app.poll_filtered();
+        if app
+            .filtered
+            .as_ref()
+            .is_none_or(|filtered| filtered.pending_jump.is_none())
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the jump did not finish");
 }
 
 #[test]
@@ -2287,4 +2323,97 @@ fn only_macos_keeps_the_system_window_frame() {
     for os in ["windows", "linux", "freebsd"] {
         assert!(!native_window_frame_on(os), "{os}");
     }
+}
+
+#[test]
+fn jumps_anywhere_in_filter_sql_and_sort_results() {
+    // 100 row groups of 1,000 rows; every odd id is "beta".
+    let rows = 100_000_u64;
+    let (_directory, source, path) = source(rows as usize);
+    let mut app = make_app(source, path);
+    let id_at = |app: &PaviApp, row: u64| {
+        let first = app.filtered.as_ref().unwrap().first_result;
+        app.filtered_cell_text(row - first, 0).unwrap()
+    };
+
+    app.filter_input = "name == 'beta'".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    for _ in 0..2_000 {
+        app.poll_filtered();
+        if app.filtered.as_ref().unwrap().total().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(app.filtered.as_ref().unwrap().total(), Some(rows / 2));
+
+    // Far past the rows held: reading starts at the row group that holds the
+    // rows just above it, not at the start of the file.
+    app.jump_row_input = "40001".to_string();
+    app.jump_to_input();
+    assert!(
+        app.status.starts_with("Going to row 40,001"),
+        "{}",
+        app.status
+    );
+    poll_until_jumped(&mut app);
+    let filtered = app.filtered.as_ref().unwrap();
+    assert_eq!(filtered.first_result, 40_000 - JUMP_CONTEXT_ROWS);
+    assert_eq!(app.grid.selection, Some((40_000, 0)));
+    assert_eq!(id_at(&app, 40_000), "80001");
+    assert_eq!(app.jump_target, Some(40_000));
+
+    // Past the end is refused with the result's size.
+    app.jump_row_input = "50001".to_string();
+    app.jump_to_input();
+    assert_eq!(app.status, "The result has 50,000 rows");
+
+    // SQL isn't counted: forward reads on, dropping the rows in between ...
+    let history = app.session.query_history.len();
+    app.sql_input = "SELECT id FROM dataset WHERE name = 'beta'".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert_eq!(app.filtered.as_ref().unwrap().total(), None);
+    app.jump_to_result(45_000);
+    assert!(
+        app.status.starts_with("Reading on to row 45,001"),
+        "{}",
+        app.status
+    );
+    poll_until_jumped(&mut app);
+    assert_eq!(id_at(&app, 45_000), "90001");
+    // ... and back reads it again from the start, keeping one history entry.
+    // The first run finished once; reading it again added nothing.
+    app.jump_to_result(30_000);
+    assert!(
+        app.status.starts_with("Reading the result again"),
+        "{}",
+        app.status
+    );
+    poll_until_jumped(&mut app);
+    assert_eq!(id_at(&app, 30_000), "60001");
+    assert_eq!(
+        app.filtered.as_ref().unwrap().first_result,
+        30_000 - JUMP_CONTEXT_ROWS
+    );
+    for _ in 0..30 {
+        poll_until_idle(&mut app);
+        app.request_more_filtered();
+    }
+    assert_eq!(app.session.query_history.len(), history + 1);
+
+    // A sort of the whole file knows its size at once: End is its last row.
+    app.cancel_filter();
+    app.apply_sort(vec![SortSpec::new(
+        0,
+        SortDirection::Descending,
+        NullOrder::Last,
+    )]);
+    poll_until_idle(&mut app);
+    assert_eq!(app.filtered.as_ref().unwrap().total(), Some(rows));
+    send_grid_key(&mut app, egui::Key::End, false);
+    poll_until_jumped(&mut app);
+    assert_eq!(app.grid.selection.map(|(row, _)| row), Some(rows - 1));
+    assert_eq!(id_at(&app, rows - 1), "0");
 }

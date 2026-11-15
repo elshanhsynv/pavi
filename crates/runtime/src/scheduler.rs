@@ -114,6 +114,9 @@ enum ReadOperation {
         aggregate: AggregateSpec,
         budget: GroupBudget,
     },
+    CountMatches {
+        filter: FilterExpr,
+    },
 }
 
 struct PageRequest {
@@ -409,6 +412,25 @@ impl RuntimeHandle {
         )
     }
 
+    /// Counts the rows matching `filter` in each row group, reading only the
+    /// filter's columns; the outcome is [`PageOutcome::Counted`]. The scan
+    /// reports its position and stops between batches when cancelled.
+    pub fn submit_match_counts(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: FilterExpr,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::CountMatches { filter },
+            None,
+        )
+    }
+
     fn submit_read(
         &self,
         source: Arc<ParquetSource>,
@@ -652,6 +674,9 @@ fn read_source(
         } => source
             .read_aggregated(filter.as_ref(), &aggregate, budget, checkpoint)
             .map(PageOutcome::Batch),
+        ReadOperation::CountMatches { filter } => source
+            .count_matches_by_row_group(&filter, checkpoint)
+            .map(PageOutcome::Counted),
     }
 }
 

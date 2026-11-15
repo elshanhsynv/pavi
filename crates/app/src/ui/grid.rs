@@ -124,6 +124,21 @@ impl PaviApp {
         let selected_row = self.grid.selection.map(|(row, _)| row);
         let area = ui.available_rect_before_wrap();
         let mut jump_row = None;
+        let mut reveal_row = None;
+        if let Some(row) = self.reveal_row.take() {
+            if windowed {
+                // Scroll by as little as brings the row into view.
+                if let Some((first, last)) = self.drawn_rows {
+                    if row <= first {
+                        self.scroll_grid_to(row, header_rows);
+                    } else if row >= last {
+                        self.scroll_grid_to(row.saturating_sub(last - first) + 1, header_rows);
+                    }
+                }
+            } else {
+                reveal_row = Some(ui_row_count(row));
+            }
+        }
         if let Some(row) = self.jump_target.take() {
             if windowed {
                 // Move the window around the target and set the scroll offset
@@ -191,6 +206,8 @@ impl PaviApp {
                     if let Some(row) = jump_row {
                         table = table
                             .scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
+                    } else if let Some(row) = reveal_row {
+                        table = table.scroll_to_row(row.saturating_add(header_rows), None);
                     }
                     table
                         .header(
@@ -287,6 +304,14 @@ impl PaviApp {
         };
         let first_result = filtered.first_result;
         let rows = filtered.rows;
+        let received = filtered.received_rows();
+        let total = filtered.total();
+        let counted_rows = filtered
+            .count
+            .as_ref()
+            .and_then(crate::results::MatchCount::scanned_rows);
+        let pending_jump = filtered.pending_jump;
+        let file_rows = dataset.source.row_count();
         let finished = filtered.finished;
         let error = filtered.error.clone();
         let kind = filtered.kind;
@@ -308,6 +333,16 @@ impl PaviApp {
                     ui.add(egui::Spinner::new().color(theme::accent()));
                     ui.label(
                         RichText::new(match scanned {
+                            _ if pending_jump.is_some() => format!(
+                                "Going to row {}…{}",
+                                theme::number(pending_jump.unwrap_or_default() + 1),
+                                scanned
+                                    .map(|fraction| format!(
+                                        " {} of the file scanned",
+                                        super::status::percent(fraction)
+                                    ))
+                                    .unwrap_or_default()
+                            ),
                             Some(fraction) if preparing => format!(
                                 "{} query running… joining tables, {} done",
                                 kind.label(),
@@ -379,9 +414,18 @@ impl PaviApp {
                 if let Some(error) = error {
                     widgets::error(ui, &error);
                 }
+                let size = match (total, counted_rows) {
+                    (Some(total), _) => format!("of {}", theme::number(total)),
+                    (None, Some(counted)) => format!(
+                        "of at least {} · counting, {} of the file read",
+                        theme::number(received),
+                        super::status::percent(counted as f32 / file_rows.max(1) as f32)
+                    ),
+                    (None, None) => format!("of at least {}", theme::number(received)),
+                };
                 ui.label(
                     RichText::new(format!(
-                        "{} result · rows {}–{} loaded",
+                        "{} result · rows {}–{} {size}",
                         kind.label(),
                         theme::number(first_result + 1),
                         theme::number(first_result + rows),
@@ -397,105 +441,156 @@ impl PaviApp {
         let scroll_x = self.grid_scroll_x.take();
         let mut frame = PinnedFrame::default();
         let area = ui.available_rect_before_wrap();
+        // A result larger than the rows held gets PAVI's scrollbar for all of
+        // it, which jumps (ADR 0012).
+        let bar_total = total.unwrap_or(received);
+        let scrollbar = (first_result > 0 || bar_total > first_result + rows).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(area.right() - SCROLLBAR_WIDTH, area.top()),
+                area.max,
+            )
+        });
+        let table_area = if scrollbar.is_some() {
+            area.with_max_x(area.right() - SCROLLBAR_WIDTH - 2.0)
+        } else {
+            area
+        };
+        let reveal = self
+            .reveal_row
+            .take()
+            .and_then(|row| row.checked_sub(first_result))
+            .map(ui_row_count);
+        let mut drawn: Option<(u64, u64)> = None;
         let mut sideways = egui::ScrollArea::horizontal().id_salt("filtered_grid_horizontal");
         if let Some(x) = scroll_x {
             sideways = sideways.horizontal_scroll_offset(x);
         }
-        let output = sideways.show(ui, |ui| {
-            ui.set_min_width(
-                ((0..columns)
-                    .map(|column| {
-                        if aggregate {
+        let output = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(table_area), |ui| {
+                sideways.show(ui, |ui| {
+                    ui.set_min_width(
+                        ((0..columns)
+                            .map(|column| {
+                                if aggregate {
+                                    INITIAL_COLUMN_WIDTH
+                                } else {
+                                    self.column_layout
+                                        .width(display_columns[column].0, INITIAL_COLUMN_WIDTH)
+                                }
+                            })
+                            .sum::<f32>()
+                            + gutter)
+                            .max(ui.available_width()),
+                    );
+                    let mut table = TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .cell_layout(Layout::left_to_right(Align::Center))
+                        .column(Column::exact(gutter));
+                    for (source, _) in &display_columns {
+                        let width = if aggregate {
                             INITIAL_COLUMN_WIDTH
                         } else {
-                            self.column_layout
-                                .width(display_columns[column].0, INITIAL_COLUMN_WIDTH)
-                        }
-                    })
-                    .sum::<f32>()
-                    + gutter)
-                    .max(ui.available_width()),
-            );
-            let mut table = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .cell_layout(Layout::left_to_right(Align::Center))
-                .column(Column::exact(gutter));
-            for (source, _) in &display_columns {
-                let width = if aggregate {
-                    INITIAL_COLUMN_WIDTH
-                } else {
-                    self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
-                };
-                table = table.column(Column::initial(width).at_least(72.0));
-            }
-            table = table.column(Column::remainder());
-            if let Some(row) = jump_target {
-                table = table.scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
-            }
-            table
-                .header(
-                    if self.freeze_header {
-                        HEADER_HEIGHT
-                    } else {
-                        0.0
-                    },
-                    |header| {
-                        if self.freeze_header {
-                            frame.header = Some(self.render_headers(header, &headers));
-                        }
-                    },
-                )
-                .body(|body| {
-                    body.rows(
-                        ROW_HEIGHT,
-                        ui_row_count(rows).saturating_add(header_rows),
-                        |mut table_row| {
-                            let index = table_row.index();
-                            if index < header_rows {
-                                frame.header = Some(self.render_headers(table_row, &headers));
-                                frame.header_in_body = true;
-                                return;
-                            }
-                            let row_index = (index - header_rows) as u64;
-                            if row_index.saturating_add(1) == rows {
-                                self.request_more_filtered();
-                            }
-                            let result_row = first_result.saturating_add(row_index);
-                            let current_row = selected_row == Some(result_row);
-                            let (gutter_rect, _) =
-                                table_row.col(|ui| row_number(ui, result_row, current_row));
-                            let mut cells = Vec::new();
-                            for (column, (_, batch_column)) in display_columns.iter().enumerate() {
-                                let look = CellLook {
-                                    selected: self.grid.is_selected(result_row, column),
-                                    current_row,
-                                    numeric: headers[column].numeric,
-                                };
-                                let text = self
-                                    .filtered_cell_text(row_index, *batch_column)
-                                    .unwrap_or_else(|| "…".to_string());
-                                let (rect, _) = table_row.col(|ui| {
-                                    self.data_cell(ui, result_row, column, &text, look);
-                                });
-                                if column < pinned {
-                                    cells.push(PinnedCell { rect, text, look });
+                            self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
+                        };
+                        table = table.column(Column::initial(width).at_least(72.0));
+                    }
+                    table = table.column(Column::remainder());
+                    if let Some(row) = jump_target {
+                        table = table
+                            .scroll_to_row(row.saturating_add(header_rows), Some(Align::Center));
+                    } else if let Some(row) = reveal {
+                        table = table.scroll_to_row(row.saturating_add(header_rows), None);
+                    }
+                    table
+                        .header(
+                            if self.freeze_header {
+                                HEADER_HEIGHT
+                            } else {
+                                0.0
+                            },
+                            |header| {
+                                if self.freeze_header {
+                                    frame.header = Some(self.render_headers(header, &headers));
                                 }
-                            }
-                            table_row.col(|_| {});
-                            frame.rows.push(PinnedRow {
-                                row: result_row,
-                                stripe: index % 2 == 0,
-                                current: current_row,
-                                gutter: gutter_rect,
-                                cells,
-                            });
-                        },
-                    );
+                            },
+                        )
+                        .body(|body| {
+                            body.rows(
+                                ROW_HEIGHT,
+                                ui_row_count(rows).saturating_add(header_rows),
+                                |mut table_row| {
+                                    let index = table_row.index();
+                                    if index < header_rows {
+                                        frame.header =
+                                            Some(self.render_headers(table_row, &headers));
+                                        frame.header_in_body = true;
+                                        return;
+                                    }
+                                    let row_index = (index - header_rows) as u64;
+                                    if row_index.saturating_add(1) == rows {
+                                        self.request_more_filtered();
+                                    }
+                                    let result_row = first_result.saturating_add(row_index);
+                                    drawn = Some(drawn.map_or(
+                                        (result_row, result_row),
+                                        |(first, last)| {
+                                            (first.min(result_row), last.max(result_row))
+                                        },
+                                    ));
+                                    let current_row = selected_row == Some(result_row);
+                                    let (gutter_rect, _) =
+                                        table_row.col(|ui| row_number(ui, result_row, current_row));
+                                    let mut cells = Vec::new();
+                                    for (column, (_, batch_column)) in
+                                        display_columns.iter().enumerate()
+                                    {
+                                        let look = CellLook {
+                                            selected: self.grid.is_selected(result_row, column),
+                                            current_row,
+                                            numeric: headers[column].numeric,
+                                        };
+                                        let text = self
+                                            .filtered_cell_text(row_index, *batch_column)
+                                            .unwrap_or_else(|| "…".to_string());
+                                        let (rect, _) = table_row.col(|ui| {
+                                            self.data_cell(ui, result_row, column, &text, look);
+                                        });
+                                        if column < pinned {
+                                            cells.push(PinnedCell { rect, text, look });
+                                        }
+                                    }
+                                    table_row.col(|_| {});
+                                    frame.rows.push(PinnedRow {
+                                        row: result_row,
+                                        stripe: index % 2 == 0,
+                                        current: current_row,
+                                        gutter: gutter_rect,
+                                        cells,
+                                    });
+                                },
+                            );
+                        })
                 })
-        });
+            })
+            .inner;
         self.grid_view_x = (output.state.offset.x, output.inner_rect.width() - gutter);
-        self.draw_pinned(ui, frame, &headers, area, output.inner.inner_rect);
+        self.draw_pinned(ui, frame, &headers, table_area, output.inner.inner_rect);
+        if let (Some(bar), Some((first, last))) = (scrollbar, drawn) {
+            if let Some(top) = row_scrollbar(ui, bar, bar_total.max(1), first, last) {
+                self.jump_to_result(top.saturating_add((last - first) / 2));
+                ui.ctx().request_repaint();
+            } else if first == first_result
+                && first_result > 0
+                && pending_jump.is_none()
+                && ui.rect_contains_pointer(table_area)
+                && ui.input(|input| input.smooth_scroll_delta.y > 0.0)
+            {
+                // Scrolled up past the rows held: read the ones above (ADR 0012).
+                self.jump_to_result(first_result - 1);
+                ui.ctx().request_repaint();
+            }
+        }
         self.apply_header_action(ui.ctx());
         self.apply_cell_action(ui.ctx());
     }
@@ -662,26 +757,49 @@ impl PaviApp {
                 column_delta,
                 ctx.input(|input| input.modifiers.shift),
             );
-            if let Some((row, _)) = self.grid.selection
-                && let Some(page) = self.grid.page_for_row(row)
-            {
-                self.request_page(page);
+            if let Some((row, _)) = self.grid.selection {
+                self.reveal_row = Some(row);
+                if let Some(page) = self.grid.page_for_row(row) {
+                    self.request_page(page);
+                }
             }
             return;
         }
         let (row, column) = self.grid.selection.unwrap_or((first_row, 0));
-        let last_row = first_row.saturating_add(self.grid.rows.saturating_sub(1));
+        // A result reaches past the rows held: its first row, and its last once
+        // its size is known (ADR 0012).
+        let (first, last_row) = match &self.filtered {
+            Some(filtered) => (
+                0,
+                filtered
+                    .total()
+                    .unwrap_or_else(|| filtered.received_rows())
+                    .saturating_sub(1),
+            ),
+            None => (
+                first_row,
+                first_row.saturating_add(self.grid.rows.saturating_sub(1)),
+            ),
+        };
         let target_row = if home {
-            first_row
+            first
         } else if end {
             last_row
         } else {
-            row.saturating_add_signed(row_delta)
-                .clamp(first_row, last_row)
+            row.saturating_add_signed(row_delta).clamp(first, last_row)
         };
         let target_column = column
             .saturating_add_signed(column_delta as isize)
             .min(self.grid.columns.saturating_sub(1));
+        if self
+            .filtered
+            .as_ref()
+            .is_some_and(|filtered| !filtered.holds(target_row))
+        {
+            self.jump_to_result(target_row);
+            return;
+        }
+        self.reveal_row = Some(target_row);
         let extend = ctx.input(|input| input.modifiers.shift);
         if extend {
             self.grid.extend_selection(target_row, target_column);
@@ -1275,24 +1393,26 @@ fn cell_value(ui: &mut egui::Ui, text: &str, look: CellLook) -> egui::Response {
         "…" => theme::disabled(),
         _ => theme::text(),
     };
-    let drawn = if look.numeric {
-        painter.text(
-            egui::pos2(rect.right() - pad, rect.center().y),
-            egui::Align2::RIGHT_CENTER,
-            text,
-            theme::body(),
-            color,
-        )
+    // Text wider than the cell ends in "…", so a right-aligned number keeps
+    // its first digits instead of losing them to the cell's left edge.
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat::simple(theme::body(), color),
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width((rect.width() - pad * 2.0).max(0.0));
+    let galley = ui.fonts(|fonts| fonts.layout_job(job));
+    let x = if look.numeric {
+        rect.right() - pad - galley.size().x
     } else {
-        painter.text(
-            egui::pos2(rect.left() + pad, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            theme::body(),
-            color,
-        )
+        rect.left() + pad
     };
-    if drawn.width() + pad * 2.0 > rect.width() {
+    let elided = galley.elided;
+    painter.galley(
+        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    if elided {
         response.on_hover_text(text)
     } else {
         response

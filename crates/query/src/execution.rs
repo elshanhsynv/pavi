@@ -150,6 +150,52 @@ impl QueryEngine {
         })
     }
 
+    /// Runs a filtered scan (a filter, with or without a projection, and no
+    /// sort, aggregate, limit, join or subquery) from source row `start_row`
+    /// instead of the start of the file. The rows before it are not read, so a
+    /// result can be entered part-way: with per-row-group match counts
+    /// (`RuntimeHandle::submit_match_counts`), starting at a row group's first
+    /// row starts the result at that group's first match.
+    pub fn execute_from_row(
+        &self,
+        logical: &LogicalPlan,
+        start_row: u64,
+        generation_id: GenerationId,
+    ) -> Result<QueryExecution> {
+        if logical.prepared().is_some() {
+            bail!("a query that joins tables or uses subqueries can't start part-way");
+        }
+        let plan = Planner::plan(logical)?;
+        if plan.filter.is_none()
+            || !plan.sort.is_empty()
+            || plan.aggregate.is_some()
+            || plan.limit.is_some()
+        {
+            bail!("only a filtered scan without sort, aggregate or limit can start part-way");
+        }
+        let row_count = plan.source.row_count();
+        if start_row > row_count {
+            bail!("start row {start_row} is past the {row_count} rows of the file");
+        }
+        let mut running = Running::new(
+            plan,
+            self.runtime.clone(),
+            self.sort_budget,
+            self.group_budget,
+            generation_id,
+        );
+        running.next_filter_row = start_row;
+        if start_row == row_count {
+            running.finished = true;
+        }
+        running.schedule_first()?;
+        Ok(QueryExecution {
+            generation_id,
+            stage: Stage::Running(Box::new(running)),
+            cancelled: false,
+        })
+    }
+
     pub fn output_schema(&self, logical: &LogicalPlan) -> Result<SchemaRef> {
         Planner::validate(logical)
     }
@@ -265,7 +311,19 @@ impl Running {
         generation_id: GenerationId,
     ) -> Result<Self> {
         let plan = Planner::plan(logical)?;
-        let mut execution = Running {
+        let mut execution = Self::new(plan, runtime, sort_budget, group_budget, generation_id);
+        execution.schedule_first()?;
+        Ok(execution)
+    }
+
+    fn new(
+        plan: PhysicalPlan,
+        runtime: RuntimeHandle,
+        sort_budget: SortBudget,
+        group_budget: GroupBudget,
+        generation_id: GenerationId,
+    ) -> Self {
+        Running {
             runtime,
             sort_budget,
             group_budget,
@@ -283,13 +341,20 @@ impl Running {
             sort_submitted: false,
             sort_merge: None,
             aggregate_submitted: false,
-        };
-        if let Err(error) = execution.schedule_next()
+        }
+    }
+
+    /// Submits the first read; a full queue is retried by the first poll.
+    fn schedule_first(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        if let Err(error) = self.schedule_next()
             && !is_queue_full(&error)
         {
             return Err(error);
         }
-        Ok(execution)
+        Ok(())
     }
 
     /// Source rows the scan in flight has passed, or `None` when no filter, sort
@@ -357,6 +422,7 @@ impl Running {
                 PageOutcome::Filtered(window) => {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
+                PageOutcome::Counted(_) => bail!("runtime returned match counts for a query read"),
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
                     return Err(error).context(format!("query task {} failed", response.task_id.0));
@@ -424,6 +490,7 @@ impl Running {
                 PageOutcome::Filtered(window) => {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
+                PageOutcome::Counted(_) => bail!("runtime returned match counts for a query read"),
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
                     return Err(error).context(format!("query task {} failed", response.task_id.0));
@@ -1019,6 +1086,57 @@ mod tests {
             &[10_000, 10_010, 10_020]
         );
         assert!(execution.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn starts_a_filtered_scan_part_way_through_the_file() {
+        let (_dir, source, _) = source();
+        let rows = source.row_count();
+        let logical = LogicalPlan::scan(Arc::clone(&source))
+            .filter(Filter::parse("id >= 0").unwrap())
+            .project(vec![0]);
+        let runtime = runtime();
+        let engine = QueryEngine::new(&runtime);
+        let mut execution = engine
+            .execute_from_row(&logical, rows - 25, GenerationId(4))
+            .unwrap();
+        let mut ids = Vec::new();
+        while let Some(batch) = execution.next_batch().unwrap() {
+            assert_eq!(batch.generation_id, GenerationId(4));
+            ids.extend_from_slice(
+                batch
+                    .batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+        let first = i32::try_from(rows - 25).unwrap();
+        assert_eq!(ids, (first..first + 25).collect::<Vec<_>>());
+
+        // At the very end there is nothing to read.
+        let mut end = engine
+            .execute_from_row(&logical, rows, GenerationId(5))
+            .unwrap();
+        assert!(end.next_batch().unwrap().is_none());
+
+        // Only plain filtered scans can start part-way.
+        assert!(
+            engine
+                .execute_from_row(&logical, rows + 1, GenerationId(6))
+                .is_err()
+        );
+        for plan in [
+            LogicalPlan::scan(Arc::clone(&source)).project(vec![0]),
+            logical.clone().limit(3),
+            logical
+                .clone()
+                .sort(0, SortDirection::Descending, NullOrder::Last),
+        ] {
+            assert!(engine.execute_from_row(&plan, 0, GenerationId(7)).is_err());
+        }
     }
 
     #[test]
