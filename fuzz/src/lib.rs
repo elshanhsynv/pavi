@@ -296,6 +296,10 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT id FROM dataset WHERE name NOT IN (SELECT name FROM dataset WHERE id < 3)",
     "SELECT id FROM dataset WHERE score > (SELECT AVG(score) FROM dataset)",
     "SELECT name FROM (SELECT id, name FROM dataset WHERE id < 10) t ORDER BY id DESC",
+    "SELECT category, COUNT(*) AS n FROM dataset GROUP BY category HAVING n > 1 ORDER BY n DESC, 1",
+    "SELECT active, COUNT(DISTINCT name), SUM(score) FROM dataset GROUP BY active ORDER BY SUM(score) LIMIT 1",
+    "SELECT DISTINCT category, active FROM dataset ORDER BY category DESC",
+    "SELECT id AS key, name AS label FROM dataset ORDER BY key DESC LIMIT 4",
 ];
 
 /// One runtime shared by fuzz inputs that need the query engine. It is kept in a

@@ -101,8 +101,9 @@ pub struct Args {
     /// Run a SQL query and output its rows, e.g. "SELECT ORIGIN, COUNT(*)
     /// FROM dataset GROUP BY ORIGIN". FILE is the table `dataset` (and also
     /// its file name, e.g. `flights`); --table adds more. The same subset as
-    /// the app's SQL editor: WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX with
-    /// GROUP BY, INNER/LEFT joins and subqueries. --head and --offset cut the
+    /// the app's SQL editor: WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX and
+    /// COUNT(DISTINCT …) with GROUP BY and HAVING, SELECT DISTINCT, AS aliases,
+    /// INNER/LEFT joins and subqueries. --head and --offset cut the
     /// result
     #[arg(
         long,

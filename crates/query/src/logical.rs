@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use parquet_reader::{
-    AggregateExpr, AggregateFunction, AggregateSpec, FilterExpr, NullOrder, ParquetSource,
-    SortDirection, SortSpec,
+    AggregateExpr, AggregateSpec, FilterExpr, FilterOp, NullOrder, ParquetSource, SortDirection,
+    SortSpec,
 };
 
 use crate::prep::{Prep, Relation};
@@ -40,6 +40,101 @@ pub struct Aggregate {
     pub(crate) spec: AggregateSpec,
 }
 
+/// What a query does to its result after any aggregate, before `LIMIT`:
+/// `HAVING`, `ORDER BY` on the result's own columns (an aggregate's
+/// results), and column aliases. Column numbers are the result's columns.
+/// `HAVING` and the sort apply to an aggregate's one bounded batch only.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Output {
+    pub(crate) having: Option<OutputFilter>,
+    /// Keys on result columns, most significant first.
+    pub(crate) sort: Vec<SortSpec>,
+    /// A new name for each result column that has one, in result order.
+    pub(crate) names: Vec<Option<String>>,
+}
+
+/// A `HAVING` test on result columns, by number.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutputFilter {
+    Compare {
+        column: usize,
+        op: FilterOp,
+        value: String,
+    },
+    And(Vec<OutputFilter>),
+    Or(Vec<OutputFilter>),
+}
+
+impl OutputFilter {
+    /// The filter on a result whose columns are `schema`, naming each column
+    /// by its result name.
+    pub(crate) fn to_filter(&self, schema: &Schema) -> Result<FilterExpr> {
+        Ok(match self {
+            Self::Compare { column, op, value } => FilterExpr::compare(
+                schema
+                    .fields()
+                    .get(*column)
+                    .ok_or_else(|| anyhow!("HAVING column {column} is out of range"))?
+                    .name()
+                    .clone(),
+                op.clone(),
+                value.clone(),
+            ),
+            Self::And(parts) => FilterExpr::And(
+                parts
+                    .iter()
+                    .map(|part| part.to_filter(schema))
+                    .collect::<Result<_>>()?,
+            ),
+            Self::Or(parts) => FilterExpr::Or(
+                parts
+                    .iter()
+                    .map(|part| part.to_filter(schema))
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
+}
+
+impl Output {
+    pub fn new(
+        having: Option<OutputFilter>,
+        sort: Vec<SortSpec>,
+        names: Vec<Option<String>>,
+    ) -> Self {
+        Self {
+            having,
+            sort,
+            names,
+        }
+    }
+
+    /// Whether it renames any column.
+    pub fn renames(&self) -> bool {
+        self.names.iter().any(Option::is_some)
+    }
+
+    /// `schema` with the new names.
+    pub(crate) fn rename(&self, schema: &Schema) -> Result<SchemaRef> {
+        if self.names.len() > schema.fields().len() {
+            bail!("more column aliases than result columns");
+        }
+        Ok(Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, field)| match self.names.get(index).cloned().flatten() {
+                        Some(name) => field.as_ref().clone().with_name(name),
+                        None => field.as_ref().clone(),
+                    },
+                )
+                .collect::<Vec<_>>(),
+        )))
+    }
+}
+
 /// Rows prepared before the query runs: joined tables and subqueries (ADR 0009).
 /// `schema` is what they will look like; column indexes above this leaf refer
 /// to its columns.
@@ -72,6 +167,10 @@ pub enum LogicalPlan {
     Aggregate {
         input: Box<LogicalPlan>,
         aggregate: Aggregate,
+    },
+    Output {
+        input: Box<LogicalPlan>,
+        output: Output,
     },
 }
 
@@ -194,6 +293,14 @@ impl LogicalPlan {
         })
     }
 
+    /// `HAVING`, a sort of the result's own columns and aliases (see [`Output`]).
+    pub fn output(self, output: Output) -> Self {
+        Self::Output {
+            input: Box::new(self),
+            output,
+        }
+    }
+
     /// Whether the query joins tables or uses subqueries, so its rows are
     /// prepared before it runs and its columns are not one table's (ADR 0009).
     pub fn is_prepared(&self) -> bool {
@@ -209,7 +316,8 @@ impl LogicalPlan {
             | Self::Filter { input, .. }
             | Self::Limit { input, .. }
             | Self::Sort { input, .. }
-            | Self::Aggregate { input, .. } => input.prepared(),
+            | Self::Aggregate { input, .. }
+            | Self::Output { input, .. } => input.prepared(),
         }
     }
 
@@ -217,9 +325,10 @@ impl LogicalPlan {
         match self {
             Self::Projection { .. } | Self::Aggregate { .. } => true,
             Self::Scan(_) | Self::Prepared(_) => false,
-            Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
-                input.shapes_output()
-            }
+            Self::Filter { input, .. }
+            | Self::Limit { input, .. }
+            | Self::Sort { input, .. }
+            | Self::Output { input, .. } => input.shapes_output(),
         }
     }
 
@@ -282,27 +391,9 @@ impl LogicalPlan {
                     .expressions()
                     .iter()
                     .map(|expression| {
-                        Ok(match (expression.function(), expression.column()) {
-                            (AggregateFunction::Count, None) => AggregateExpr::count_all(),
-                            (AggregateFunction::Count, Some(column)) => {
-                                AggregateExpr::count(map(column)?)
-                            }
-                            (AggregateFunction::Sum, Some(column)) => {
-                                AggregateExpr::sum(map(column)?)
-                            }
-                            (AggregateFunction::Avg, Some(column)) => {
-                                AggregateExpr::avg(map(column)?)
-                            }
-                            (AggregateFunction::Min, Some(column)) => {
-                                AggregateExpr::min(map(column)?)
-                            }
-                            (AggregateFunction::Max, Some(column)) => {
-                                AggregateExpr::max(map(column)?)
-                            }
-                            (_, None) => *expression,
-                        })
+                        Ok(expression.with_column(expression.column().map(map).transpose()?))
                     })
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect::<Result<Vec<AggregateExpr>>>()?;
                 let group_by = spec
                     .group_by()
                     .iter()
@@ -313,6 +404,11 @@ impl LogicalPlan {
                     aggregate: Aggregate::new(AggregateSpec::grouped_by(group_by, expressions)?),
                 }
             }
+            // Its columns are the result's, which binding doesn't change.
+            Self::Output { input, output } => Self::Output {
+                input: Box::new(input.bind_inner(relation, reshape)?),
+                output: output.clone(),
+            },
         })
     }
 
@@ -324,6 +420,10 @@ impl LogicalPlan {
                 limit,
             },
             Self::Sort { input, .. } => input.replace_sort(keys),
+            Self::Output { input, output } => Self::Output {
+                input: Box::new(input.replace_sort(keys)),
+                output,
+            },
             plan => Self::Sort {
                 input: Box::new(plan),
                 sort: Sort::by(keys),
