@@ -340,14 +340,42 @@ impl ParquetSource {
         path: impl AsRef<Path>,
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
-        let path = path.as_ref().to_owned();
+        Self::open_with(path.as_ref(), None, checkpoint)
+    }
+
+    /// Like [`Self::open_cancellable`], but reads a file (local or remote) as
+    /// `format` whatever its extension, e.g. a CSV file named `.txt`. A folder
+    /// is always read as Parquet files.
+    pub fn open_as(
+        path: impl AsRef<Path>,
+        format: FileFormat,
+        checkpoint: &dyn Fn(f64) -> bool,
+    ) -> Result<Self> {
+        Self::open_with(path.as_ref(), Some(format), checkpoint)
+    }
+
+    fn open_with(
+        path: &Path,
+        format: Option<FileFormat>,
+        checkpoint: &dyn Fn(f64) -> bool,
+    ) -> Result<Self> {
+        let path = path.to_owned();
         if remote::is_remote(&path) {
-            return Self::open_remote(path, checkpoint);
+            return Self::open_remote(path, format, checkpoint);
         }
         let file_info = FileInfo::from(
             std::fs::metadata(&path).with_context(|| format!("open {}", path.display()))?,
         );
-        let format = FileFormat::from_path(&path);
+        if file_info.is_dir
+            && let Some(format) = format.filter(|format| *format != FileFormat::Parquet)
+        {
+            bail!(
+                "{} is a folder, which is read as Parquet files, not as {}",
+                path.display(),
+                format.name()
+            );
+        }
+        let format = format.unwrap_or_else(|| FileFormat::from_path(&path));
         if !file_info.is_dir && format != FileFormat::Parquet {
             return Self::open_converted(path.clone(), &path, file_info, format, checkpoint);
         }
@@ -437,7 +465,11 @@ impl ParquetSource {
     /// Opens an `https`, `http`, `s3`, `gs` or `az` URL (ADR 0008). A Parquet
     /// object is read with range requests; anything else, or a Parquet object
     /// on a server without range requests, is downloaded first.
-    fn open_remote(path: PathBuf, checkpoint: &dyn Fn(f64) -> bool) -> Result<Self> {
+    fn open_remote(
+        path: PathBuf,
+        format: Option<FileFormat>,
+        checkpoint: &dyn Fn(f64) -> bool,
+    ) -> Result<Self> {
         let url = path
             .to_str()
             .ok_or_else(|| anyhow!("the URL is not valid text"))?
@@ -449,7 +481,7 @@ impl ParquetSource {
             modified: object.modified(),
             is_dir: false,
         };
-        let format = FileFormat::from_path(&path);
+        let format = format.unwrap_or_else(|| FileFormat::from_path(&path));
         if format == FileFormat::Parquet && object.supports_ranges() {
             let location = Location::Remote(object);
             let (bytes, arrow_metadata) = open_file(&location, &path)?;
@@ -866,6 +898,7 @@ impl ParquetSource {
             return Ok(FilteredWindow {
                 batch: self.empty_batch(projection),
                 next_row: start_row,
+                rows: Vec::new(),
             });
         }
 
@@ -884,6 +917,9 @@ impl ParquetSource {
 
         let mut remaining = row_count;
         let mut batches = Vec::new();
+        // One source row number per match taken, bounded like the batch by
+        // `row_count`.
+        let mut rows = Vec::new();
         let mut next_group = 0;
         let keep = |row_group: &RowGroupInfo| self.row_group_might_match(filter, row_group);
         while let Some(run) = self.next_scan_run(&mut next_group, start_row, &keep)? {
@@ -911,17 +947,24 @@ impl ParquetSource {
                     projection,
                     &output_positions,
                 )?);
+                rows.extend(
+                    mask.values()
+                        .set_indices()
+                        .skip(first)
+                        .take(take)
+                        .map(|index| batch_first_row + index as u64),
+                );
                 remaining -= take;
                 if remaining == 0 {
                     // Resume right after the source row of the last match taken.
-                    let last = mask
-                        .values()
-                        .set_indices()
-                        .nth(first + take - 1)
+                    let last = rows
+                        .last()
+                        .copied()
                         .ok_or_else(|| anyhow!("filter mask lost a match"))?;
                     return Ok(FilteredWindow {
                         batch: self.concat_or_empty(projection, batches)?,
-                        next_row: batch_first_row + last as u64 + 1,
+                        next_row: last + 1,
+                        rows,
                     });
                 }
                 batch_first_row += batch_rows;
@@ -931,6 +974,7 @@ impl ParquetSource {
         Ok(FilteredWindow {
             batch: self.concat_or_empty(projection, batches)?,
             next_row: total_rows,
+            rows,
         })
     }
 
@@ -1584,6 +1628,8 @@ pub struct FilteredWindow {
     pub batch: RecordBatch,
     /// Source row to continue scanning from; equal to the row count at the end.
     pub next_row: u64,
+    /// The 0-based source row of each row of `batch`, in order.
+    pub rows: Vec<u64>,
 }
 
 /// Column positions and direction for sorting buffered rows. `sequence` holds each
@@ -3354,6 +3400,12 @@ mod tests {
                 .read_filtered_from(&filter, next_row, 1_000, &projection, &|_| false)
                 .unwrap();
             assert!(window.next_row > next_row || window.batch.num_rows() == 0);
+            // `id` is the row's position, so `rows` must list the same numbers.
+            let positions = ids(&window.batch)
+                .into_iter()
+                .map(|id| id as u64)
+                .collect::<Vec<_>>();
+            assert_eq!(window.rows, positions);
             seen.extend(ids(&window.batch));
             next_row = window.next_row;
             if next_row == source.row_count() {
@@ -3384,6 +3436,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ids(&late.batch), [25_000, 25_001, 25_002]);
+        assert_eq!(late.rows, [25_000, 25_001, 25_002]);
         assert_eq!(late.next_row, 25_003);
         assert!(
             source
@@ -4439,5 +4492,26 @@ mod tests {
                 .unwrap();
             assert_eq!(ids(&sorted[0]), expected);
         }
+    }
+
+    #[test]
+    fn opens_a_file_in_the_format_asked_for_whatever_its_extension() {
+        let directory = TempDir::new().unwrap();
+        let text = directory.path().join("export.txt");
+        std::fs::write(&text, "id,name\n1,a\n2,b\n").unwrap();
+
+        // By its extension a .txt file is taken for Parquet, which it isn't.
+        assert!(ParquetSource::open(&text).is_err());
+        let source = ParquetSource::open_as(&text, FileFormat::Csv, &|_| false).unwrap();
+        assert_eq!(source.row_count(), 2);
+        assert_eq!(source.format(), FileFormat::Csv);
+        assert_eq!(source.schema().field(1).name(), "name");
+
+        // A folder is always Parquet files.
+        let Err(error) = ParquetSource::open_as(directory.path(), FileFormat::Csv, &|_| false)
+        else {
+            panic!("a folder opened as CSV");
+        };
+        assert!(format!("{error:#}").contains("folder"), "{error:#}");
     }
 }

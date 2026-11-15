@@ -28,7 +28,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Comparisons in one filter | 64 (each `IN` value counts), 16 levels deep | `filter::MAX_FILTER_TERMS`, `MAX_FILTER_DEPTH` |
 | `LIKE` pattern | 256 characters | `filter::MAX_LIKE_PATTERN_CHARS` |
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |
-| CLI table preview | 1,000 rows (`--head`), each cell ≤ 1,024 bytes | `cli::MAX_HEAD_ROWS`, `value::DEFAULT_CELL_LIMIT` |
+| CLI table preview | 1,000 rows (`--head`), each cell ≤ 1,024 bytes, plus one row number per row under `--filter` | `cli::MAX_HEAD_ROWS`, `value::DEFAULT_CELL_LIMIT` |
 | CLI streamed output (`--format csv/jsonl/parquet/arrow`) and `--count` | one 4,096-row batch of the projected (for `--count`, the filter's) columns; Parquet also buffers its open row group, as in the app's export. No row limit | `cli::STREAM_BATCH_ROWS` |
 | CLI `--sql` | the query engine's own budgets, as in the app: sort, `GroupBudget`, the join build side (`MAX_JOIN_BUILD_ROWS` / `_BYTES`) and the prepared table (`MAX_PREPARED_BYTES`); one worker pool of `available_parallelism` threads with a 32-task queue. The table holds ≤1,000 result rows | `RuntimeConfig::default()`, ADR 0009, 0011 |
 | CLI `--sort` | the app's sort budget in memory (100,000 rows / 128 MB, or the best `offset + head` rows with `--head`), then spill files up to 32 GiB in the temporary folder, deleted when the run ends | `SortBudget::DEFAULT_MAX_*`, `spill::MAX_SPILL_BYTES` |
