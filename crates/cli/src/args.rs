@@ -113,7 +113,7 @@ pub struct Args {
 
     /// Profile each column (or each of --columns, at most 256) in one scan,
     /// as the app's Profile window does: rows, nulls, distinct values (exact
-    /// up to 1,000), min, max, mean and, when every distinct value was counted,
+    /// up to 1,000), min, max, mean, text lengths and, when every distinct value was counted,
     /// the most frequent value. With
     /// --filter, only matching rows. Lists, structs and maps show the footer's
     /// counts only

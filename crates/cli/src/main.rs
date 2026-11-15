@@ -179,7 +179,7 @@ fn run(
         let tables = query::tables(Arc::new(parquet), dataset_path, &args.tables)?;
         let query = query::plan(sql, &tables)?;
         return output.write(&query.schema, "Result", None, out, |window, emit| {
-            query.run(window, emit)
+            query.run(window, &progress, emit)
         });
     }
 
@@ -1330,8 +1330,7 @@ mod tests {
         );
     }
 
-    const PROFILE_HEADER: &str =
-        "column,type,rows,nulls,distinct,distinct_capped,min,max,mean,top_value,top_count\n";
+    const PROFILE_HEADER: &str = "column,type,rows,nulls,distinct,distinct_capped,min,max,mean,min_length,max_length,mean_length,top_value,top_count\n";
 
     #[test]
     fn profiles_every_column_or_the_chosen_ones_in_any_format() {
@@ -1339,9 +1338,9 @@ mod tests {
         assert_eq!(
             output(&[&path, "--profile", "--format", "csv"]),
             format!(
-                "{PROFILE_HEADER}id,Int64,5,0,5,false,1,5,3,1,1\n\
-                 name,Utf8,5,0,5,false,a,e,,a,1\n\
-                 7,Utf8,5,4,1,false,x,x,,x,1\n"
+                "{PROFILE_HEADER}id,Int64,5,0,5,false,1,5,3,,,,1,1\n\
+                 name,Utf8,5,0,5,false,a,e,,1,1,1,a,1\n\
+                 7,Utf8,5,4,1,false,x,x,,1,1,1,x,1\n"
             )
         );
         // Only matching rows, and only --columns.
@@ -1356,11 +1355,11 @@ mod tests {
                 "--filter",
                 "id >= 4",
             ]),
-            format!("{PROFILE_HEADER}id,Int64,2,0,2,false,4,5,4.5,4,1\n")
+            format!("{PROFILE_HEADER}id,Int64,2,0,2,false,4,5,4.5,,,,4,1\n")
         );
         let table = output(&[&path, "--profile"]);
         assert!(
-            table.starts_with("\nProfile: 3 rows × 11 columns"),
+            table.starts_with("\nProfile: 3 rows × 14 columns"),
             "{table}"
         );
     }
@@ -1395,7 +1394,7 @@ mod tests {
         // row; the most frequent value is left out as it would be a guess.
         assert_eq!(
             lines[1],
-            format!("n,Int64,{rows},0,1000,true,0,{},549.5,,", rows - 1)
+            format!("n,Int64,{rows},0,1000,true,0,{},549.5,,,,,", rows - 1)
         );
         // A list column: its type and what the footer says, nothing measured.
         let footer_nulls = ParquetSource::open(&path).unwrap().metadata().columns()[1]
@@ -1406,7 +1405,7 @@ mod tests {
             .map_or(String::new(), |nulls| nulls.to_string());
         assert_eq!(
             lines[2],
-            format!("tags,List(Int32),{rows},{footer_nulls},0,false,,,,,"),
+            format!("tags,List(Int32),{rows},{footer_nulls},0,false,,,,,,,,"),
             "{csv}"
         );
     }

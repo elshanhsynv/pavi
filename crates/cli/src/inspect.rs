@@ -13,7 +13,8 @@ use parquet_reader::{ParquetSource, Projection};
 
 /// One row per profiled column, from `parquet_reader::profile` (the numbers the
 /// app's Profile window shows): rows, nulls, distinct values (`distinct_capped`
-/// when there are more than were counted), min, max, mean, and the most
+/// when there are more than were counted), min, max, mean, string lengths
+/// (min, max, mean, for text columns), and the most
 /// frequent value with its count (only when every distinct value was counted).
 pub fn profile_batch(profiles: &[ColumnStats]) -> Result<RecordBatch> {
     // Once the distinct count caps, values stop being counted, so the most
@@ -35,6 +36,9 @@ pub fn profile_batch(profiles: &[ColumnStats]) -> Result<RecordBatch> {
             Field::new("min", DataType::Utf8, true),
             Field::new("max", DataType::Utf8, true),
             Field::new("mean", DataType::Float64, true),
+            Field::new("min_length", DataType::UInt64, true),
+            Field::new("max_length", DataType::UInt64, true),
+            Field::new("mean_length", DataType::Float64, true),
             Field::new("top_value", DataType::Utf8, true),
             Field::new("top_count", DataType::UInt64, true),
         ])),
@@ -72,6 +76,22 @@ pub fn profile_batch(profiles: &[ColumnStats]) -> Result<RecordBatch> {
             Arc::new(Float64Array::from_iter(
                 profiles.iter().map(|profile| profile.mean),
             )),
+            // Text columns only: lengths in characters, over non-null values.
+            Arc::new(UInt64Array::from_iter(profiles.iter().map(|profile| {
+                profile
+                    .string_lengths
+                    .as_ref()
+                    .map(|lengths| lengths.min as u64)
+            }))),
+            Arc::new(UInt64Array::from_iter(profiles.iter().map(|profile| {
+                profile
+                    .string_lengths
+                    .as_ref()
+                    .map(|lengths| lengths.max as u64)
+            }))),
+            Arc::new(Float64Array::from_iter(profiles.iter().map(|profile| {
+                profile.string_lengths.as_ref().map(|lengths| lengths.mean)
+            }))),
             Arc::new(StringArray::from_iter(
                 profiles
                     .iter()

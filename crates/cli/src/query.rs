@@ -1,17 +1,25 @@
 //! `--sql`: the app's SQL subset, run by `pavi_query` on the worker pool
-//! (ADR 0011). The main thread waits for each result batch.
+//! (ADR 0011). The main thread polls for each result batch, as the app's
+//! export does, and reports progress meanwhile.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use parquet_reader::ParquetSource;
-use pavi_query::{QueryEngine, SqlAst, Tables, table_name};
+use pavi_query::{QueryEngine, QueryPoll, SqlAst, Tables, table_name};
 use pavi_runtime::{GenerationId, Runtime, RuntimeConfig};
 
 use crate::Window;
+use crate::progress::Progress;
+
+/// Wait between polls while the workers have no batch ready (the app's
+/// export waits the same).
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The tables a query can name: `dataset` and `dataset_path`'s own name for
 /// the main file, then each `--table [NAME=]PATH`, opened here.
@@ -78,6 +86,7 @@ impl Query {
     pub fn run(
         &self,
         mut window: Window,
+        progress: &Progress,
         emit: &mut dyn FnMut(RecordBatch) -> Result<()>,
     ) -> Result<()> {
         // Declared first so it outlives the execution that uses its workers.
@@ -85,8 +94,22 @@ impl Query {
         let engine = QueryEngine::new(&runtime);
         let mut execution = engine.execute(&self.plan, GenerationId(1))?;
         while !window.is_done() {
-            let Some(batch) = execution.next_batch()? else {
-                return Ok(());
+            // Polled rather than waited on, so the progress line can follow
+            // the preparation of joins and subqueries and the scan.
+            let batch = match execution.poll_next_batch()? {
+                QueryPoll::Batch(batch) => batch,
+                QueryPoll::Finished => return Ok(()),
+                QueryPoll::Pending => {
+                    if let Some(share) = execution.preparing_progress() {
+                        progress.share("Preparing joins and subqueries", f64::from(share));
+                    } else if let Some(scanned) = execution.scanned_rows() {
+                        // The table being scanned may be any of the query's
+                        // tables, or the prepared one, so no total is shown.
+                        progress.count("Scanning", scanned);
+                    }
+                    thread::sleep(POLL_INTERVAL);
+                    continue;
+                }
             };
             if let Some(batch) = window.take(&batch.batch) {
                 emit(RecordBatch::try_new(
