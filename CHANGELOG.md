@@ -7,6 +7,14 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Added
+- CLI: `--sql` shows the progress line too: how much of a join or subquery is prepared, then the rows scanned.
+- CLI: `--profile` reports text lengths (`min_length`, `max_length`, `mean_length`, in characters) for text columns.
+
+### Fixed
+- CLI: a null cell in the table shows as `∅` (`NULL` with `--ascii`), so it can't be mistaken for the text "null".
+- CLI: the table stays aligned with emoji that have a skin tone, emoji made of several (👨‍👩‍👧), flags and accents typed as separate marks, and never cuts them in half.
+
 ## [0.4.0] - 2026-11-14
 
 This release turns the command-line tool into a full companion to the app: it streams, converts, sorts, queries and profiles files in scripts and pipelines. **The program is renamed from `cli` to `pavi-cli`**; scripts that call it need the new name. Run `pavi-cli --help` for every option.

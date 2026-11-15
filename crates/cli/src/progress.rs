@@ -50,6 +50,13 @@ impl Progress {
         }
     }
 
+    /// Reports `done` rows when the total is not known.
+    pub fn count(&self, label: &str, done: u64) {
+        if self.due() {
+            self.show(&format!("{label}: {} rows", grouped(done)));
+        }
+    }
+
     /// Reports a share (0 to 1) of an open: a folder's files, a download, a
     /// conversion.
     pub fn share(&self, label: &str, done: f64) {

@@ -1014,6 +1014,7 @@ dependencies = [
  "pavi_query",
  "pavi_runtime",
  "tempfile",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

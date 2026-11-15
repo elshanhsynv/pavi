@@ -1,8 +1,9 @@
 use std::io::{self, Write};
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use parquet_reader::value::format_cell;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 /// Column widths are terminal columns (a CJK character or most emoji take two).
 const MIN_COLUMN_WIDTH: usize = 4;
@@ -54,6 +55,16 @@ impl Borders {
         match self {
             Self::Unicode => '×',
             Self::Ascii => 'x',
+        }
+    }
+
+    /// A null cell: a mark no text value is likely to be, so a null can be
+    /// told from the text "null" (nested nulls inside lists and structs still
+    /// read `null`, as in the grid).
+    fn null(self) -> &'static str {
+        match self {
+            Self::Unicode => "∅",
+            Self::Ascii => "NULL",
         }
     }
 }
@@ -108,7 +119,14 @@ pub fn print_batch(
     let cells: Vec<Vec<String>> = (0..rows)
         .map(|row| {
             (0..columns)
-                .map(|column| one_line(&format_cell(batch.column(column).as_ref(), row)))
+                .map(|column| {
+                    let array = batch.column(column);
+                    if array.is_null(row) {
+                        borders.null().to_owned()
+                    } else {
+                        one_line(&format_cell(array.as_ref(), row))
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -121,13 +139,12 @@ pub fn print_batch(
     for (column, header) in headers.iter().enumerate() {
         let value_width = cells
             .iter()
-            .map(|row| row[column].width())
+            .map(|row| display_width(&row[column]))
             .max()
             .unwrap_or(0);
 
         widths.push(
-            header
-                .width()
+            display_width(header)
                 .max(value_width)
                 .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH),
         );
@@ -190,7 +207,7 @@ fn write_padded(
     borders: Borders,
 ) -> io::Result<()> {
     let value = truncate(value, width, borders.ellipsis());
-    let padding = " ".repeat(width.saturating_sub(value.width()));
+    let padding = " ".repeat(width.saturating_sub(display_width(&value)));
     if right {
         write!(out, "{padding}{value}")
     } else {
@@ -220,25 +237,55 @@ fn one_line(value: &str) -> String {
 /// Cuts `value` to at most `width` terminal columns, ending in `ellipsis`
 /// (one column wide) when cut.
 fn truncate(value: &str, width: usize, ellipsis: char) -> String {
-    if value.width() <= width {
+    if display_width(value) <= width {
         return value.to_owned();
     }
     if width <= 1 {
         return ellipsis.to_string();
     }
 
+    // Cut between whole graphemes, so an emoji with a skin tone or a letter
+    // with its accent is never split.
     let mut result = String::new();
     let mut used = 0;
-    for c in value.chars() {
-        let char_width = c.width().unwrap_or(0);
-        if used + char_width > width - 1 {
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = grapheme_width(grapheme);
+        if used + grapheme_width > width - 1 {
             break;
         }
-        used += char_width;
-        result.push(c);
+        used += grapheme_width;
+        result.push_str(grapheme);
     }
     result.push(ellipsis);
     result
+}
+
+/// Terminal columns `value` takes, measured per grapheme (what a terminal
+/// draws as one character), not per code point.
+fn display_width(value: &str) -> usize {
+    if value.is_ascii() {
+        // Control characters were escaped (`one_line`), so each byte is one column.
+        return value.len();
+    }
+    value.graphemes(true).map(grapheme_width).sum()
+}
+
+/// Columns one grapheme takes: two for emoji drawn as pictures (a variation
+/// selector U+FE0F, or a flag made of two regional indicators); otherwise its
+/// widest code point, so modifiers, zero-width joiners and combining marks add
+/// nothing (`👍🏽` and `👨‍👩‍👧` are two columns, `é` written as `e` + `´` one).
+fn grapheme_width(grapheme: &str) -> usize {
+    let regional = |c: char| ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+    if grapheme.contains('\u{FE0F}')
+        || (grapheme.chars().count() == 2 && grapheme.chars().all(regional))
+    {
+        return 2;
+    }
+    grapheme
+        .chars()
+        .map(|c| c.width().unwrap_or(0))
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -276,7 +323,7 @@ mod tests {
                 Arc::new(Int64Array::from(vec![1, 22, 333])),
                 Arc::new(StringArray::from(vec![
                     Some("日本語テキスト日本語テキスト日本語テキスト"),
-                    Some("Ünïcödé 👍"),
+                    Some("Ünïcödé 👍🏽 👨\u{200d}👩\u{200d}👧 🇺🇸 e\u{301}"),
                     None,
                 ])),
                 Arc::new(StringArray::from(vec!["line1\nline2", "tab\there", "ok"])),
@@ -287,14 +334,52 @@ mod tests {
         let text = render(&batch);
         let lines = table_lines(&text);
         assert_eq!(lines.len(), 3 + 1 + 3, "rules, header and rows:\n{text}");
-        let width = lines[0].width();
+        let width = display_width(lines[0]);
         for line in &lines {
-            assert_eq!(line.width(), width, "misaligned line {line:?} in\n{text}");
+            assert_eq!(
+                display_width(line),
+                width,
+                "misaligned line {line:?} in\n{text}"
+            );
         }
         assert!(text.contains("line1\\nline2"));
         assert!(text.contains("tab\\there"));
         assert!(!text.contains(long_header));
         assert!(text.contains("a_really_long_header_name_that_…"));
+        // The null cell is marked, so it can't be taken for the text "null".
+        assert!(text.contains("│ ∅ "), "{text}");
+    }
+
+    #[test]
+    fn measures_and_cuts_whole_graphemes() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("日本"), 4);
+        assert_eq!(display_width("👍🏽"), 2);
+        assert_eq!(display_width("👨\u{200d}👩\u{200d}👧"), 2);
+        assert_eq!(display_width("🇺🇸"), 2);
+        assert_eq!(display_width("❤\u{fe0f}"), 2);
+        assert_eq!(display_width("e\u{301}"), 1);
+        // A skin tone is never cut off its emoji.
+        assert_eq!(truncate("ab👍🏽cd", 4, '…'), "ab…");
+        assert_eq!(truncate("ab👍🏽cd", 5, '…'), "ab👍🏽…");
+    }
+
+    #[test]
+    fn marks_null_cells_apart_from_the_text_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some("null"), None]))],
+        )
+        .unwrap();
+        let unicode = render(&batch);
+        assert!(unicode.contains("│   1 │ null │"), "{unicode}");
+        assert!(unicode.contains("│   2 │ ∅    │"), "{unicode}");
+
+        let mut out = Vec::new();
+        print_batch(&batch, "Preview", 1, Borders::Ascii, &mut out).unwrap();
+        let ascii = String::from_utf8(out).unwrap();
+        assert!(ascii.contains("|   2 | NULL |"), "{ascii}");
     }
 
     #[test]
