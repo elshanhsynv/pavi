@@ -16,6 +16,9 @@ pub enum PageOutcome {
     /// A sort too large for memory spilled to disk; read its rows with
     /// `RuntimeHandle::submit_sort_merge`.
     SortSpilled(Arc<Mutex<SortMerge>>),
+    /// Rows matching a filter in each row group, in row-group order (see
+    /// `RuntimeHandle::submit_match_counts`).
+    Counted(Vec<u64>),
     /// Rows from a spilled sort, and whether it has handed out every row.
     Merged {
         batches: Vec<RecordBatch>,

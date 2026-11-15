@@ -650,18 +650,15 @@ impl PaviApp {
             Ok(one_based) if one_based > 0 => {
                 let row = one_based - 1;
                 if let Some(filtered) = &self.filtered {
-                    if row < filtered.first_result
-                        || row >= filtered.first_result.saturating_add(filtered.rows)
+                    if let Some(total) = filtered.total()
+                        && row >= total
                     {
-                        self.status =
-                            "That result row is outside the current bounded window".to_string();
+                        self.status = format!("The result has {} rows", theme::number(total));
                         return;
                     }
-                    self.grid.select_filtered(
-                        filtered.first_result,
-                        row - filtered.first_result,
-                        0,
-                    );
+                    // Anywhere in the result: read on to it, or start nearer (ADR 0012).
+                    self.jump_to_result(row);
+                    return;
                 } else if row < self.grid.rows {
                     self.grid.jump_to_row(row);
                 } else {

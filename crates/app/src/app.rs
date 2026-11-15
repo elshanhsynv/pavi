@@ -33,7 +33,7 @@ use crate::profile::{
     FileProfileEvent, FileProfileTask, MAX_FILE_PROFILE_COLUMNS, ProfileEvent, ProfileState,
     ProfileTask,
 };
-use crate::results::{FilteredGrid, QueryKind};
+use crate::results::{FilteredGrid, JUMP_CONTEXT_ROWS, MatchCount, QueryKind};
 use crate::session::{
     GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore, ThemeChoice,
 };
@@ -47,6 +47,24 @@ const CELL_LIMIT: usize = 256;
 /// Longest cell value "Filter to this value" accepts; longer ones are refused.
 const MAX_FILTER_VALUE_BYTES: usize = 1024;
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+/// How often the grid redraws while only a result's match count is running.
+const COUNT_REPAINT: Duration = Duration::from_millis(250);
+
+/// Starts counting a filter's matches per row group in the background, for a
+/// result's size and to enter it anywhere (ADR 0012). `None` when the runtime
+/// can't take the task now; the result then works without a count.
+fn match_count(
+    runtime: &Runtime,
+    source: &Arc<ParquetSource>,
+    filter: &FilterExpr,
+    generation: GenerationId,
+) -> Option<MatchCount> {
+    runtime
+        .handle()
+        .submit_match_counts(Arc::clone(source), filter.clone(), generation)
+        .ok()
+        .map(MatchCount::new)
+}
 
 fn ui_row_count(rows: u64) -> usize {
     rows.min(usize::MAX as u64) as usize
@@ -95,6 +113,9 @@ pub(crate) struct PaviApp {
     column_search: String,
     jump_row_input: String,
     jump_target: Option<u64>,
+    /// A row to scroll into view, as little as needed (a keyboard move); a
+    /// `jump_target` is centred instead.
+    reveal_row: Option<u64>,
     export: ExportState,
     path_input: String,
     filter_input: String,
@@ -251,6 +272,7 @@ impl PaviApp {
             column_search: String::new(),
             jump_row_input: String::new(),
             jump_target: None,
+            reveal_row: None,
             export: ExportState::default(),
             path_input: reopened_path.as_ref().map_or_else(String::new, |path| {
                 parquet_reader::display_path(path).display().to_string()
@@ -1110,6 +1132,10 @@ impl PaviApp {
                     projected_columns,
                     execution,
                 );
+                filtered.count = self
+                    .dataset
+                    .as_ref()
+                    .and_then(|dataset| match_count(runtime, &dataset.source, &filter, generation));
                 filtered.filter = Some(filter);
                 self.filtered = Some(filtered);
                 self.refresh_grid_columns();
@@ -1352,6 +1378,16 @@ impl PaviApp {
             Ok(execution) => {
                 let mut filtered =
                     FilteredGrid::new(kind, plan, sort, false, projected_columns, execution);
+                // A sort keeps every row it sorts: the filter's matches, or the file.
+                filtered.count = match (&active_filter, kind, &self.dataset) {
+                    (Some(filter), _, Some(dataset)) => {
+                        match_count(runtime, &dataset.source, filter, generation)
+                    }
+                    (None, QueryKind::Sort, Some(dataset)) => {
+                        Some(MatchCount::known(dataset.source.row_count()))
+                    }
+                    _ => None,
+                };
                 filtered.filter = active_filter;
                 self.filtered = Some(filtered);
                 self.refresh_grid_columns();
@@ -1400,6 +1436,9 @@ impl PaviApp {
         };
         let mut status = None;
         let mut sql_history = None;
+        if let Some(count) = &mut filtered.count {
+            count.poll();
+        }
         while filtered.needs_more() {
             let Some(execution) = &mut filtered.execution else {
                 break;
@@ -1409,21 +1448,23 @@ impl PaviApp {
                 Ok(QueryPoll::Finished) => {
                     filtered.execution = None;
                     filtered.finished = true;
-                    status = Some(if filtered.rows == 0 {
+                    status = Some(if filtered.received_rows() == 0 {
                         filtered.kind.empty_message().to_string()
                     } else {
                         format!(
-                            "{} results: {} rows loaded",
+                            "{} result: {} rows",
                             filtered.kind.label(),
-                            filtered.received_rows()
+                            ui::theme::number(filtered.received_rows())
                         )
                     });
-                    if filtered.kind == QueryKind::Sql {
+                    // A rerun to jump back is not another query.
+                    if filtered.kind == QueryKind::Sql && !filtered.completed_once {
                         sql_history = Some((true, Some(filtered.received_rows())));
                     }
+                    filtered.completed_once = true;
                 }
                 Ok(QueryPoll::Batch(batch)) if batch.generation_id == self.grid.generation => {
-                    if filtered.rows == 0 {
+                    if filtered.rows == 0 && filtered.pending_jump.is_none() {
                         // The scan-time message ("Sorting …") is no longer true.
                         status = Some(format!(
                             "{} result ready; more rows load as you scroll",
@@ -1455,11 +1496,108 @@ impl PaviApp {
         }
         self.grid.first_row = filtered.first_result;
         self.grid.rows = filtered.rows;
+        // A row jumped to: show it once it has arrived, or say why it can't be.
+        if let Some(target) = filtered.pending_jump {
+            if filtered.holds(target) {
+                filtered.pending_jump = None;
+                self.grid.select(target, filtered.pending_column);
+                self.jump_target = Some(target);
+                status = Some(format!("Row {}", ui::theme::number(target + 1)));
+            } else if filtered.finished {
+                filtered.pending_jump = None;
+                if filtered.error.is_none() {
+                    status = Some(format!(
+                        "The result has {} rows",
+                        ui::theme::number(filtered.received_rows())
+                    ));
+                }
+            }
+        }
         if let Some(status) = status {
             self.status = status;
         }
         if let Some((success, row_count)) = sql_history {
             self.record_sql_history(success, row_count);
+        }
+    }
+
+    /// Shows result row `target` of a filter, SQL or sort result (ADR 0012):
+    /// from the rows held, by reading on to it, or by reading the result again,
+    /// from the row group that holds it once a filter's matches are counted.
+    pub(super) fn jump_to_result(&mut self, target: u64) {
+        let Some(filtered) = &mut self.filtered else {
+            return;
+        };
+        let target = match filtered.total() {
+            Some(0) => return,
+            Some(total) => target.min(total - 1),
+            None => target,
+        };
+        if filtered.holds(target) {
+            filtered.pending_jump = None;
+            self.grid.first_row = filtered.first_result;
+            self.grid.rows = filtered.rows;
+            let column = self.grid.selection.map_or(0, |(_, column)| column);
+            self.grid.select(target, column);
+            self.jump_target = Some(target);
+            return;
+        }
+        let start = target.saturating_sub(JUMP_CONTEXT_ROWS);
+        let row = ui::theme::number(target + 1);
+        filtered.pending_column = self.grid.selection.map_or(0, |(_, column)| column);
+        // A plain filter whose matches are counted can start at the row group
+        // that holds `start`.
+        let entry = self
+            .dataset
+            .as_ref()
+            .filter(|_| filtered.kind == QueryKind::Filter && filtered.sort.is_empty())
+            .and_then(|dataset| {
+                filtered
+                    .count
+                    .as_ref()?
+                    .entry_for(start, dataset.source.row_groups())
+            });
+        // Ahead of the rows read so far, reading on is cheaper unless that row
+        // group starts even further ahead.
+        let reads_on = target >= filtered.received_rows()
+            && filtered.execution.is_some()
+            && entry.is_none_or(|(_, before)| before <= filtered.received_rows());
+        if reads_on {
+            filtered.pending_jump = Some(target);
+            filtered.skip_forward(start);
+            self.grid.first_row = filtered.first_result;
+            self.grid.rows = 0;
+            self.status = format!("Reading on to row {row}…");
+            return;
+        }
+        let Some(runtime) = &self.runtime else {
+            self.status = "Background runtime is unavailable".to_string();
+            return;
+        };
+        let generation = self.grid.next_generation();
+        let engine = QueryEngine::new(runtime);
+        let started = match entry {
+            Some((source_row, before)) => engine
+                .execute_from_row(&filtered.plan, source_row, generation)
+                .map(|execution| (execution, before)),
+            None => engine
+                .execute(&filtered.plan, generation)
+                .map(|execution| (execution, 0)),
+        };
+        match started {
+            Ok((execution, base)) => {
+                let from_start = base == 0 && start > 0;
+                filtered.restart(execution, base, start);
+                filtered.pending_jump = Some(target);
+                self.grid.first_row = filtered.first_result;
+                self.grid.rows = 0;
+                self.status = if from_start {
+                    format!("Reading the result again up to row {row}…")
+                } else {
+                    format!("Going to row {row}…")
+                };
+            }
+            Err(error) => self.status = format!("Go to row {row}: {error:#}"),
         }
     }
 
@@ -2225,7 +2363,9 @@ impl eframe::App for PaviApp {
                     selection: self.grid.selection,
                     dataset: self.dataset.as_ref().zip(compression).map(
                         |(dataset, compression)| ui::status::DatasetSummary {
-                            rows: self.grid.rows,
+                            rows: self.filtered.as_ref().map_or(self.grid.rows, |filtered| {
+                                filtered.total().unwrap_or_else(|| filtered.received_rows())
+                            }),
                             columns: self.grid.columns,
                             row_groups: dataset.source.row_groups().len(),
                             compression,
@@ -2257,6 +2397,15 @@ impl eframe::App for PaviApp {
             || self.export.is_running()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self
+            .filtered
+            .as_ref()
+            .and_then(|filtered| filtered.count.as_ref())
+            .is_some_and(MatchCount::running)
+        {
+            // Only the match count runs: pick it up, and show its progress,
+            // without redrawing every frame.
+            ctx.request_repaint_after(COUNT_REPAINT);
         }
     }
 }

@@ -35,6 +35,7 @@ pub(super) struct TabState {
     column_search: String,
     jump_row_input: String,
     jump_target: Option<u64>,
+    reveal_row: Option<u64>,
     export: ExportState,
     filter_input: String,
     filter_error: Option<String>,
@@ -69,6 +70,7 @@ impl TabState {
             column_search: String::new(),
             jump_row_input: String::new(),
             jump_target: None,
+            reveal_row: None,
             export: ExportState::default(),
             filter_input: String::new(),
             filter_error: None,
@@ -156,6 +158,7 @@ impl PaviApp {
         swap(&mut self.column_search, &mut tab.column_search);
         swap(&mut self.jump_row_input, &mut tab.jump_row_input);
         swap(&mut self.jump_target, &mut tab.jump_target);
+        swap(&mut self.reveal_row, &mut tab.reveal_row);
         swap(&mut self.export, &mut tab.export);
         swap(&mut self.filter_input, &mut tab.filter_input);
         swap(&mut self.filter_error, &mut tab.filter_error);

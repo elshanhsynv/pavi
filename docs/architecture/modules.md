@@ -83,7 +83,7 @@ crates/app/src/                (pavi)
 ├── main.rs         NativeOptions + eframe::run_native
 ├── app.rs          PaviApp + Dataset: actions (open, filter, SQL, sort, export, chart, profile), polling, grid window
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
-├── results.rs      FilteredGrid, QueryKind: the bounded filter/SQL/sort result window
+├── results.rs      FilteredGrid, QueryKind, MatchCount: the bounded filter/SQL/sort result window, its size and jumps (ADR 0012)
 ├── app_tests.rs    57 tests driving PaviApp without a window
 ├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
