@@ -6,6 +6,7 @@ mod progress;
 mod query;
 mod sort;
 
+use std::cell::RefCell;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -16,7 +17,7 @@ use args::{Args, Format};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use clap::Parser;
-use output::{Borders, print_batch};
+use output::{Borders, RowNumbers, print_batch};
 use parquet_reader::export::{BatchWriter, ExportFormat};
 use parquet_reader::{
     FilterExpr, PAGE_ROWS, ParquetSource, Projection, SortBudget, SortOutput, SortSpec,
@@ -114,11 +115,14 @@ fn run(
         progress.share("Opening", share);
         false
     };
+    // --input-format overrides the extension (and, for stdin, the first bytes).
+    let open = |path: &Path| match args.input_format {
+        Some(format) => ParquetSource::open_as(path, format.file_format(), &opening),
+        None => ParquetSource::open_cancellable(path, &opening),
+    };
     let parquet = match &stdin {
-        Some(copy) => {
-            ParquetSource::open_cancellable(&copy.path, &opening).context("read standard input")?
-        }
-        None => ParquetSource::open_cancellable(&args.file, &opening)?,
+        Some(copy) => open(&copy.path).context("read standard input")?,
+        None => open(Path::new(&args.file))?,
     };
     progress.clear();
     let projection = parse_columns(args.columns.as_deref(), &parquet)?;
@@ -178,13 +182,17 @@ fn run(
         };
         let tables = query::tables(Arc::new(parquet), dataset_path, &args.tables)?;
         let query = query::plan(sql, &tables)?;
-        return output.write(&query.schema, "Result", None, out, |window, emit| {
+        return output.write(&query.schema, "Result", None, None, out, |window, emit| {
             query.run(window, &progress, emit)
         });
     }
 
     // An empty window carries the projected schema.
     let schema = parquet.read_window(0, 0, &projection)?.schema();
+    // A filtered table numbers its rows by where they are in the file; the
+    // table holds at most 1,000 rows, so their positions are kept beside them.
+    let positions = RefCell::new(Vec::new());
+    let numbered = table_rows.is_some() && filter.is_some() && sort.is_none();
     let rows = Rows {
         parquet: &parquet,
         filter: filter.as_ref(),
@@ -195,11 +203,17 @@ fn run(
         batch_rows,
         sort_budget: SortBudget::default(),
         progress: &progress,
+        positions: numbered.then_some(&positions),
     };
     let summary = (!args.quiet).then_some(&parquet);
-    output.write(&schema, "Preview", summary, out, |window, emit| {
-        rows.for_each(window.left, emit)
-    })
+    output.write(
+        &schema,
+        "Preview",
+        summary,
+        numbered.then_some(&positions),
+        out,
+        |window, emit| rows.for_each(window.left, emit),
+    )
 }
 
 /// Where rows go: a table of at most `table_rows` rows, or a streamed format.
@@ -216,12 +230,15 @@ struct RowOutput<'a> {
 impl RowOutput<'_> {
     /// Writes the rows `produce` hands out within the window of `--offset` and
     /// `--head` (or the table's row count). The table is printed only once
-    /// every row is in, after `summary` if given.
+    /// every row is in, after `summary` if given; its `#` column shows the
+    /// 0-based file `positions` plus one when given, else counts from the
+    /// offset.
     fn write(
         &self,
         schema: &SchemaRef,
         title: &str,
         summary: Option<&ParquetSource>,
+        positions: Option<&RefCell<Vec<u64>>>,
         out: &mut (impl Write + Send),
         produce: impl FnOnce(
             Window,
@@ -233,7 +250,7 @@ impl RowOutput<'_> {
             left,
         };
         let Some(head) = self.table_rows else {
-            let mut writer = BatchWriter::new(export_format(self.format)?, out, schema.clone())?;
+            let mut writer = batch_writer(self.format, out, schema.clone())?;
             produce(window(self.head.unwrap_or(u64::MAX)), &mut |batch| {
                 writer.write(&batch)
             })?;
@@ -251,13 +268,18 @@ impl RowOutput<'_> {
         if let Some(parquet) = summary {
             print_summary(parquet, out)?;
         }
-        print_batch(
-            &batch,
-            title,
-            self.offset.saturating_add(1),
-            self.borders,
-            out,
-        )?;
+        let listed = positions.map(|positions| {
+            positions
+                .borrow()
+                .iter()
+                .map(|position| position.saturating_add(1))
+                .collect::<Vec<_>>()
+        });
+        let numbers = match &listed {
+            Some(numbers) if numbers.len() == batch.num_rows() => RowNumbers::Listed(numbers),
+            _ => RowNumbers::From(self.offset.saturating_add(1)),
+        };
+        print_batch(&batch, title, numbers, self.borders, out)?;
         Ok(())
     }
 }
@@ -294,6 +316,7 @@ fn profile_columns(
             batch_rows,
             sort_budget: SortBudget::default(),
             progress,
+            positions: None,
         }
         .for_each(u64::MAX, &mut |batch| profiler.push_batch(&batch))?;
     }
@@ -316,7 +339,7 @@ fn write_facts(
     let batch = batch.slice(0, shown);
 
     if format == Format::Table {
-        print_batch(&batch, title, 1, borders, out)?;
+        print_batch(&batch, title, RowNumbers::From(1), borders, out)?;
         if shown < total {
             writeln!(
                 out,
@@ -326,19 +349,26 @@ fn write_facts(
         }
         return Ok(());
     }
-    let mut writer = BatchWriter::new(export_format(format)?, out, batch.schema())?;
+    let mut writer = batch_writer(format, out, batch.schema())?;
     writer.write(&batch)?;
     writer.finish()
 }
 
-fn export_format(format: Format) -> anyhow::Result<ExportFormat> {
-    Ok(match format {
+/// The writer for a streamed `format`, with the app's export writers.
+fn batch_writer<W: Write + Send>(
+    format: Format,
+    out: W,
+    schema: SchemaRef,
+) -> anyhow::Result<BatchWriter<W>> {
+    let format = match format {
         Format::Csv => ExportFormat::Csv,
+        Format::Tsv => return BatchWriter::tsv(out, schema),
         Format::Jsonl => ExportFormat::Json,
         Format::Parquet => ExportFormat::Parquet,
         Format::Arrow => ExportFormat::Arrow,
         Format::Table => bail!("the table is not a streamed format"),
-    })
+    };
+    BatchWriter::new(format, out, schema)
 }
 
 /// Skips the first `skip` rows of a run of batches, then keeps up to `left`.
@@ -354,13 +384,19 @@ impl Window {
 
     /// The part of `batch` inside the window, if any.
     fn take(&mut self, batch: &RecordBatch) -> Option<RecordBatch> {
-        let rows = batch.num_rows();
+        self.take_range(batch.num_rows())
+            .map(|(start, length)| batch.slice(start, length))
+    }
+
+    /// Which of the next `rows` rows fall inside the window, as a start and a
+    /// length, if any.
+    fn take_range(&mut self, rows: usize) -> Option<(usize, usize)> {
         let skipped = usize::try_from(self.skip).map_or(rows, |skip| skip.min(rows));
         self.skip -= skipped as u64;
         let kept =
             usize::try_from(self.left).map_or(rows - skipped, |left| left.min(rows - skipped));
         self.left -= kept as u64;
-        (kept > 0).then(|| batch.slice(skipped, kept))
+        (kept > 0).then_some((skipped, kept))
     }
 }
 
@@ -380,6 +416,9 @@ struct Rows<'a> {
     sort_budget: SortBudget,
     /// Told the rows read so far.
     progress: &'a Progress,
+    /// When given, filtered reads add the 0-based file position of each row
+    /// they hand out (only for the table, which holds at most 1,000 rows).
+    positions: Option<&'a RefCell<Vec<u64>>>,
 }
 
 impl Rows<'_> {
@@ -429,8 +468,13 @@ impl Rows<'_> {
                         bail!("filtered read did not move past row {next_row}");
                     }
                     next_row = read.next_row;
-                    if let Some(batch) = window.take(&read.batch) {
-                        self.deliver(batch, emit)?;
+                    if let Some((start, length)) = window.take_range(read.batch.num_rows()) {
+                        if let Some(positions) = self.positions {
+                            positions
+                                .borrow_mut()
+                                .extend(read.rows.iter().skip(start).take(length));
+                        }
+                        self.deliver(read.batch.slice(start, length), emit)?;
                     }
                 }
                 Ok(())
@@ -770,7 +814,33 @@ mod tests {
         assert!(text.starts_with("Rows: 5\nColumns: 3\n"), "{text}");
         assert!(text.contains("  0 id                   Int64\n"), "{text}");
         assert!(text.contains("Preview: 4 rows × 1 column"), "{text}");
-        assert!(text.contains("│   1 │ b    │"), "{text}");
+        // `#` is the row's number in the file: `b` is the second row.
+        assert!(text.contains("│   2 │ b    │"), "{text}");
+        assert!(text.contains("│   5 │ e    │"), "{text}");
+    }
+
+    #[test]
+    fn numbers_filtered_rows_by_their_place_in_the_file() {
+        let (_folder, path) = fixture();
+        // Matches are rows 1, 3, 4 and 5; skip one, show two.
+        let text = output(&[
+            &path,
+            "-q",
+            "--filter",
+            "id != 2",
+            "--offset",
+            "1",
+            "--head",
+            "2",
+            "--columns",
+            "name",
+        ]);
+        assert!(text.contains("│   3 │ c    │"), "{text}");
+        assert!(text.contains("│   4 │ d    │"), "{text}");
+        assert!(!text.contains("│   1 │"), "{text}");
+        // A sort numbers its rows by rank instead.
+        let sorted = output(&[&path, "-q", "--filter", "id != 2", "--sort", "id:desc"]);
+        assert!(sorted.contains("│   1 │    5 │"), "{sorted}");
     }
 
     #[test]
@@ -1042,6 +1112,7 @@ mod tests {
                 // Two rows in memory: six rows spill into runs.
                 sort_budget: SortBudget::new(2, 1 << 20).unwrap(),
                 progress: &Progress::hidden(),
+                positions: None,
             };
             let mut ids = Vec::new();
             rows.for_each(limit, &mut |batch| {
@@ -1063,6 +1134,47 @@ mod tests {
         let mut out = Vec::new();
         run(&parse(arguments), &mut &stdin[..], &mut out, 2).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn reads_files_as_the_input_format_asked_for_and_writes_tsv() {
+        let folder = tempfile::tempdir().unwrap();
+        let text = folder.path().join("export.txt");
+        std::fs::write(&text, "id,name\n1,\"a, b\"\n2,\"tab\there\"\n").unwrap();
+        let text = text.to_string_lossy().into_owned();
+
+        // A .txt file would be read as Parquet; --input-format says it's CSV.
+        let mut out = Vec::new();
+        assert!(run(&parse(&[&text, "--count"]), &mut io::empty(), &mut out, 2).is_err());
+        assert_eq!(
+            output(&[&text, "--input-format", "csv", "--format", "tsv"]),
+            "id\tname\n1\ta, b\n2\t\"tab\there\"\n"
+        );
+
+        // Standard input that starts like JSON but is CSV.
+        assert_eq!(
+            output_with_stdin(
+                &["-", "--input-format", "csv", "--format", "csv"],
+                b"[x],y\n1,2\n"
+            ),
+            "[x],y\n1,2\n"
+        );
+
+        // .tsv names the format for --output.
+        let tsv = folder.path().join("out.tsv");
+        let arguments = [
+            text.as_str(),
+            "--input-format",
+            "csv",
+            "-o",
+            tsv.to_str().unwrap(),
+        ];
+        run_to_file(&parse(&arguments), &tsv, &mut io::empty(), 2).unwrap();
+        assert!(
+            std::fs::read_to_string(&tsv)
+                .unwrap()
+                .starts_with("id\tname\n")
+        );
     }
 
     #[test]
@@ -1152,7 +1264,7 @@ mod tests {
         let (folder, path) = fixture();
         for (name, extra) in [
             // No format from this extension.
-            ("out.tsv", None),
+            ("out.txt", None),
             // A bad filter fails after the temporary file was created.
             ("bad.csv", Some(["--filter", "missing > 1"])),
         ] {

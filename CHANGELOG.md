@@ -10,6 +10,11 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ### Added
 - CLI: `--sql` shows the progress line too: how much of a join or subquery is prepared, then the rows scanned.
 - CLI: `--profile` reports text lengths (`min_length`, `max_length`, `mean_length`, in characters) for text columns.
+- CLI: `--input-format csv|json|arrow|parquet` reads a file whatever its extension says (a CSV saved as `.txt`), or standard input whatever its first bytes suggest.
+- CLI: `--format tsv` (and `-o out.tsv`) writes tab-separated text.
+
+### Changed
+- CLI: with `--filter`, the table's `#` column shows each row's number in the file, not its place among the matches. With `--sort` or `--sql` it still counts the result.
 
 ### Fixed
 - CLI: a null cell in the table shows as `∅` (`NULL` with `--ascii`), so it can't be mistaken for the text "null".

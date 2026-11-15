@@ -23,6 +23,11 @@ pub struct Args {
     /// JSON or CSV, told apart by their first bytes)
     pub file: String,
 
+    /// Read FILE as this format whatever its extension says (e.g. a CSV file
+    /// named .txt), or standard input whatever its first bytes suggest
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    pub input_format: Option<InputFormat>,
+
     /// Number of rows to output [default: 10 for the table, at most 1,000;
     /// every row for the other formats]
     #[arg(long, value_name = "N")]
@@ -48,7 +53,7 @@ pub struct Args {
     /// Write to this file instead of standard output. The file appears only
     /// once it is complete (a temporary file next to it is renamed), and an
     /// existing file is replaced. The format comes from the extension
-    /// (.csv, .jsonl, .json, .ndjson, .parquet, .arrow, .feather) unless
+    /// (.csv, .tsv, .jsonl, .json, .ndjson, .parquet, .arrow, .feather) unless
     /// --format is given
     #[arg(long, short, value_name = "PATH")]
     pub output: Option<PathBuf>,
@@ -139,6 +144,32 @@ pub enum Format {
     Parquet,
     /// An Arrow IPC file (Feather v2)
     Arrow,
+    /// Tab-separated text with a header line; nulls are empty fields
+    Tsv,
+}
+
+/// How to read FILE when its extension (or, for -, its first bytes) would
+/// mislead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum InputFormat {
+    Parquet,
+    /// Comma, tab, semicolon or pipe separated, with a header line
+    Csv,
+    /// JSON Lines, or one array of objects
+    Json,
+    /// An Arrow IPC file or stream
+    Arrow,
+}
+
+impl InputFormat {
+    pub fn file_format(self) -> parquet_reader::FileFormat {
+        match self {
+            Self::Parquet => parquet_reader::FileFormat::Parquet,
+            Self::Csv => parquet_reader::FileFormat::Csv,
+            Self::Json => parquet_reader::FileFormat::Json,
+            Self::Arrow => parquet_reader::FileFormat::Arrow,
+        }
+    }
 }
 
 #[cfg(test)]

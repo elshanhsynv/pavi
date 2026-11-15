@@ -76,12 +76,30 @@ enum Rule {
     Bottom,
 }
 
+/// What the table's `#` column shows.
+#[derive(Clone, Copy, Debug)]
+pub enum RowNumbers<'a> {
+    /// Consecutive numbers from this one.
+    From(u64),
+    /// One number per row, such as the file rows filtered rows came from.
+    Listed(&'a [u64]),
+}
+
+impl RowNumbers<'_> {
+    fn get(self, row: usize) -> u64 {
+        match self {
+            Self::From(first) => first.saturating_add(row as u64),
+            Self::Listed(numbers) => numbers.get(row).copied().unwrap_or_default(),
+        }
+    }
+}
+
 /// Prints `batch` as a table under `title` ("Preview: 3 rows × 2 columns");
-/// the `#` column counts from `first_number`.
+/// the `#` column shows `numbers`.
 pub fn print_batch(
     batch: &RecordBatch,
     title: &str,
-    first_number: u64,
+    numbers: RowNumbers<'_>,
     borders: Borders,
     out: &mut impl Write,
 ) -> io::Result<()> {
@@ -133,8 +151,11 @@ pub fn print_batch(
 
     // First column is the row number.
     let mut widths = Vec::with_capacity(columns + 1);
-    let last_number = first_number.saturating_add(rows.saturating_sub(1) as u64);
-    widths.push(last_number.to_string().len().max(3));
+    let number_width = (0..rows)
+        .map(|row| numbers.get(row).to_string().len())
+        .max()
+        .unwrap_or(0);
+    widths.push(number_width.max(3));
 
     for (column, header) in headers.iter().enumerate() {
         let value_width = cells
@@ -163,7 +184,8 @@ pub fn print_batch(
 
     write_rule(out, &widths, borders, Rule::Middle)?;
 
-    for (number, row) in (first_number..).zip(&cells) {
+    for (index, row) in cells.iter().enumerate() {
+        let number = numbers.get(index);
         write!(out, "{bar} {:>width$} {bar}", number, width = widths[0])?;
 
         for ((value, &width), &right) in row.iter().zip(&widths[1..]).zip(&right_aligned) {
@@ -299,7 +321,14 @@ mod tests {
 
     fn render(batch: &RecordBatch) -> String {
         let mut out = Vec::new();
-        print_batch(batch, "Preview", 1, Borders::Unicode, &mut out).unwrap();
+        print_batch(
+            batch,
+            "Preview",
+            RowNumbers::From(1),
+            Borders::Unicode,
+            &mut out,
+        )
+        .unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -377,7 +406,14 @@ mod tests {
         assert!(unicode.contains("│   2 │ ∅    │"), "{unicode}");
 
         let mut out = Vec::new();
-        print_batch(&batch, "Preview", 1, Borders::Ascii, &mut out).unwrap();
+        print_batch(
+            &batch,
+            "Preview",
+            RowNumbers::From(1),
+            Borders::Ascii,
+            &mut out,
+        )
+        .unwrap();
         let ascii = String::from_utf8(out).unwrap();
         assert!(ascii.contains("|   2 | NULL |"), "{ascii}");
     }
@@ -408,7 +444,14 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        print_batch(&batch, "Preview", 1, Borders::Ascii, &mut out).unwrap();
+        print_batch(
+            &batch,
+            "Preview",
+            RowNumbers::From(1),
+            Borders::Ascii,
+            &mut out,
+        )
+        .unwrap();
         let text = String::from_utf8(out).unwrap();
 
         assert!(text.is_ascii(), "{text}");

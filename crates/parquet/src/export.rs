@@ -73,6 +73,12 @@ impl<W: Write + Send> BatchWriter<W> {
         }
     }
 
+    /// Tab-separated text: CSV's rules with a tab between fields (the CLI's
+    /// `--format tsv`; not one of the app's export formats).
+    pub fn tsv(output: W, schema: SchemaRef) -> Result<Self> {
+        Ok(Self::Csv(CsvWriter::with_delimiter(output, schema, b'\t')?))
+    }
+
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         match self {
             Self::Csv(writer) => writer.write(batch),
@@ -299,21 +305,36 @@ fn is_json_number(text: &str) -> bool {
 pub struct CsvWriter<W> {
     output: W,
     schema: SchemaRef,
+    /// `,` for CSV, a tab for TSV.
+    delimiter: u8,
 }
 
 impl<W: Write> CsvWriter<W> {
-    pub fn new(mut output: W, schema: SchemaRef) -> Result<Self> {
+    pub fn new(output: W, schema: SchemaRef) -> Result<Self> {
+        Self::with_delimiter(output, schema, b',')
+    }
+
+    /// Delimited text with `delimiter` between fields, such as `b'\t'` for
+    /// TSV. Fields holding the delimiter, a quote or a line break are quoted.
+    pub fn with_delimiter(mut output: W, schema: SchemaRef, delimiter: u8) -> Result<Self> {
+        if matches!(delimiter, b'"' | b'\n' | b'\r') || !delimiter.is_ascii() {
+            bail!("{delimiter:?} can't separate delimited fields");
+        }
         for field in schema.fields() {
             ensure_csv_type(field.data_type())?;
         }
         for (index, field) in schema.fields().iter().enumerate() {
             if index > 0 {
-                output.write_all(b",")?;
+                output.write_all(&[delimiter])?;
             }
-            write_csv_text(&mut output, field.name())?;
+            write_csv_text(&mut output, field.name(), delimiter)?;
         }
         output.write_all(b"\n")?;
-        Ok(Self { output, schema })
+        Ok(Self {
+            output,
+            schema,
+            delimiter,
+        })
     }
 
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -323,9 +344,14 @@ impl<W: Write> CsvWriter<W> {
         for row in 0..batch.num_rows() {
             for column in 0..batch.num_columns() {
                 if column > 0 {
-                    self.output.write_all(b",")?;
+                    self.output.write_all(&[self.delimiter])?;
                 }
-                write_csv_value(&mut self.output, batch.column(column).as_ref(), row)?;
+                write_csv_value(
+                    &mut self.output,
+                    batch.column(column).as_ref(),
+                    row,
+                    self.delimiter,
+                )?;
             }
             self.output.write_all(b"\n")?;
         }
@@ -348,7 +374,12 @@ fn ensure_csv_type(data_type: &DataType) -> Result<()> {
 
 /// Writes one CSV field using the shared scalar text; nulls are empty fields and
 /// binary values keep the `0x`-prefixed hex form.
-fn write_csv_value(output: &mut impl Write, array: &dyn Array, row: usize) -> Result<()> {
+fn write_csv_value(
+    output: &mut impl Write,
+    array: &dyn Array,
+    row: usize,
+    delimiter: u8,
+) -> Result<()> {
     let Some(text) = scalar_text(array, row)? else {
         return Ok(());
     };
@@ -357,7 +388,7 @@ fn write_csv_value(output: &mut impl Write, array: &dyn Array, row: usize) -> Re
         output.write_all(text.as_bytes())?;
         return Ok(());
     }
-    write_csv_text(output, &text)
+    write_csv_text(output, &text, delimiter)
 }
 
 fn is_binary(data_type: &DataType) -> bool {
@@ -372,11 +403,11 @@ fn is_binary(data_type: &DataType) -> bool {
     }
 }
 
-fn write_csv_text(output: &mut impl Write, value: &str) -> Result<()> {
+fn write_csv_text(output: &mut impl Write, value: &str, delimiter: u8) -> Result<()> {
     let quote = value
         .as_bytes()
         .iter()
-        .any(|byte| matches!(byte, b',' | b'"' | b'\n' | b'\r'));
+        .any(|&byte| byte == delimiter || matches!(byte, b'"' | b'\n' | b'\r'));
     if quote {
         output.write_all(b"\"")?;
     }
@@ -493,6 +524,36 @@ mod tests {
                 ExportFormat::Arrow => assert!(output.starts_with(b"ARROW1")),
             }
         }
+    }
+
+    #[test]
+    fn writes_tab_separated_text_quoting_what_needs_it() {
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "name",
+                Arc::new(StringArray::from(vec![
+                    Some("a,b"),
+                    Some("tab\there"),
+                    Some("say \"hi\""),
+                    None,
+                ])) as ArrayRef,
+            ),
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let mut output = Vec::new();
+        let mut writer = BatchWriter::tsv(&mut output, batch.schema()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        // A comma needs no quotes in TSV; a tab and a quote do.
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "name\tid\na,b\t1\n\"tab\there\"\t2\n\"say \"\"hi\"\"\"\t3\n\t4\n"
+        );
+        assert!(CsvWriter::with_delimiter(Vec::new(), batch.schema(), b'"').is_err());
     }
 
     #[test]

@@ -305,7 +305,7 @@ sequenceDiagram
         else table
             M->>M: collect ≤ head rows, concat
             M->>Shell: Rows / Columns / Row groups / Schema / ≤10 row-group ranges (unless --quiet)
-            M->>O: print_batch → box table to stdout, # counting from offset + 1
+            M->>O: print_batch → box table to stdout, # counting from offset + 1 (with --filter and no --sort: each row's row in the file)
         end
     end
     M->>M: with -o: flush, sync_all, rename the temporary file to PATH (removed on any error)
