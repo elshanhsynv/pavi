@@ -8,6 +8,9 @@ pub enum AggregateFunction {
     Avg,
     Min,
     Max,
+    /// `COUNT(DISTINCT column)`: distinct non-null values. Its values count
+    /// against the group budget.
+    CountDistinct,
 }
 
 /// One aggregate expression over an optional source column.
@@ -60,6 +63,19 @@ impl AggregateExpr {
         }
     }
 
+    pub fn count_distinct(column: usize) -> Self {
+        Self {
+            function: AggregateFunction::CountDistinct,
+            column: Some(column),
+        }
+    }
+
+    /// The same aggregate over another column (for plans whose columns are
+    /// renumbered).
+    pub fn with_column(self, column: Option<usize>) -> Self {
+        Self { column, ..self }
+    }
+
     pub fn function(self) -> AggregateFunction {
         self.function
     }
@@ -88,14 +104,15 @@ impl AggregateSpec {
         Self::grouped_by(vec![group_by], expressions)
     }
 
-    /// Groups by every column in `group_by`, in that order.
+    /// Groups by every column in `group_by`, in that order. With no
+    /// expressions it lists each distinct combination once (`SELECT DISTINCT`).
     pub fn grouped_by(
         group_by: impl Into<Vec<usize>>,
         expressions: impl Into<Vec<AggregateExpr>>,
     ) -> Result<Self> {
         let expressions = expressions.into();
         let group_by = group_by.into();
-        if expressions.is_empty() {
+        if expressions.is_empty() && group_by.is_empty() {
             bail!("aggregate needs at least one expression");
         }
         if group_by.len() > MAX_GROUP_COLUMNS {
@@ -172,6 +189,8 @@ mod tests {
     #[test]
     fn rejects_empty_or_unbounded_specs() {
         assert!(AggregateSpec::new([]).is_err());
+        // Distinct values: groups without aggregates.
+        assert!(AggregateSpec::grouped_by(vec![0], []).is_ok());
         assert!(GroupBudget::new(0, 1).is_err());
         assert!(GroupBudget::new(1, 0).is_err());
     }

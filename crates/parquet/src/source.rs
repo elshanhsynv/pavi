@@ -48,6 +48,9 @@ use crate::{
 };
 
 const BATCH_SIZE: usize = 4096;
+/// Bytes one `COUNT(DISTINCT …)` value costs besides its own, for its slot
+/// in the hash set; counted against the group budget.
+const DISTINCT_ENTRY_BYTES: usize = 32;
 
 /// A scan stops adding row groups to one reader's run past this many rows, so the
 /// up-front dictionary checks of a run stay small when a filtered page ends early.
@@ -1796,6 +1799,11 @@ enum Accumulator {
     },
     Min(Option<Scalar>),
     Max(Option<Scalar>),
+    /// The distinct values seen, and their bytes.
+    CountDistinct {
+        values: HashSet<Scalar>,
+        bytes: usize,
+    },
 }
 
 impl Accumulator {
@@ -1816,6 +1824,10 @@ impl Accumulator {
             }),
             AggregateFunction::Min => Ok(Self::Min(None)),
             AggregateFunction::Max => Ok(Self::Max(None)),
+            AggregateFunction::CountDistinct => Ok(Self::CountDistinct {
+                values: HashSet::new(),
+                bytes: 0,
+            }),
         }
     }
 
@@ -1912,6 +1924,15 @@ impl Accumulator {
                     *current = Some(value);
                 }
             }
+            Self::CountDistinct { values, bytes } => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let size = value.bytes() + DISTINCT_ENTRY_BYTES;
+                if values.insert(value) {
+                    *bytes = bytes.saturating_add(size);
+                }
+            }
         }
         Ok(())
     }
@@ -1930,12 +1951,14 @@ impl Accumulator {
             } if *count > 0 => Some(Scalar::F64((sum / *count as f64 / divisor).to_bits())),
             Self::Avg { .. } => None,
             Self::Min(value) | Self::Max(value) => value.clone(),
+            Self::CountDistinct { values, .. } => Some(Scalar::U64(values.len() as u64)),
         }
     }
 
     fn bytes(&self) -> usize {
         match self {
             Self::Min(Some(value)) | Self::Max(Some(value)) => value.bytes(),
+            Self::CountDistinct { bytes, .. } => 16 + bytes,
             _ => 16,
         }
     }
@@ -2184,7 +2207,10 @@ impl GroupCollector {
             fields.push(Field::new(
                 aggregate_name(*expression, &self.input_names[index]),
                 output_type.clone(),
-                expression.function() != AggregateFunction::Count,
+                !matches!(
+                    expression.function(),
+                    AggregateFunction::Count | AggregateFunction::CountDistinct
+                ),
             ));
         }
         Arc::new(Schema::new(fields))
@@ -2193,7 +2219,7 @@ impl GroupCollector {
 
 fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) -> Result<DataType> {
     match expression.function() {
-        AggregateFunction::Count => Ok(DataType::UInt64),
+        AggregateFunction::Count | AggregateFunction::CountDistinct => Ok(DataType::UInt64),
         AggregateFunction::Sum if input.is_some_and(is_signed_integer) => Ok(DataType::Int64),
         // A sum keeps the scale and gets the widest decimal precision.
         AggregateFunction::Sum => match input {
@@ -2221,9 +2247,13 @@ fn aggregate_name(expression: AggregateExpr, input: &Option<String>) -> String {
         AggregateFunction::Avg => "AVG",
         AggregateFunction::Min => "MIN",
         AggregateFunction::Max => "MAX",
+        AggregateFunction::CountDistinct => "COUNT",
     };
     match (expression.function(), expression.column(), input) {
         (AggregateFunction::Count, None, _) => "COUNT(*)".to_string(),
+        (AggregateFunction::CountDistinct, Some(_), Some(column)) => {
+            format!("COUNT(DISTINCT {column})")
+        }
         (_, Some(_), Some(column)) => format!("{function}({column})"),
         _ => function.to_string(),
     }
@@ -2652,8 +2682,10 @@ pub fn check_aggregate(schema: &Schema, aggregate: &AggregateSpec) -> Result<()>
             (AggregateFunction::Count, _) => {}
             (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
                 if is_summable(field.data_type()) => {}
-            (AggregateFunction::Min | AggregateFunction::Max, Some(field))
-                if is_comparable(field.data_type()) => {}
+            (
+                AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::CountDistinct,
+                Some(field),
+            ) if is_comparable(field.data_type()) => {}
             (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
                 "{:?} is not supported for {:?} columns",
                 expression.function(),
@@ -2662,6 +2694,10 @@ pub fn check_aggregate(schema: &Schema, aggregate: &AggregateSpec) -> Result<()>
             (AggregateFunction::Min | AggregateFunction::Max, Some(field)) => bail!(
                 "{:?} is not supported for {:?} columns",
                 expression.function(),
+                field.data_type()
+            ),
+            (AggregateFunction::CountDistinct, Some(field)) => bail!(
+                "COUNT(DISTINCT …) is not supported for {:?} columns",
                 field.data_type()
             ),
             (_, None) => bail!("only COUNT may use *"),

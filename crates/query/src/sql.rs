@@ -8,9 +8,9 @@ use parquet_reader::{
 };
 use sqlparser::{
     ast::{
-        BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-        GroupByExpr, JoinConstraint, JoinOperator, OrderBy, OrderByKind, Query, SelectItem,
-        SetExpr, Statement, TableFactor, UnaryOperator,
+        BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy, OrderByKind, Query,
+        SelectItem, SetExpr, Statement, TableFactor, UnaryOperator,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -18,7 +18,7 @@ use sqlparser::{
 
 use crate::{
     AggregateExpr, AggregateFunction, Filter, LogicalPlan, Planner,
-    logical::Prepared,
+    logical::{Output, OutputFilter, Prepared},
     prep::{MAX_JOINS, MAX_SUBQUERY_DEPTH, Prep, PrepFilter, PrepValue},
 };
 
@@ -151,7 +151,10 @@ impl std::fmt::Display for SqlColumn {
 pub struct SqlAst {
     from: SqlFrom,
     projection: SqlProjection,
+    /// `AS` names of the SELECT items, in result order; `None` where there is none.
+    aliases: Vec<Option<String>>,
     predicate: Option<SqlPredicate>,
+    having: Option<SqlHaving>,
     /// ORDER BY keys, most significant first.
     sort: Vec<SqlSort>,
     limit: Option<usize>,
@@ -202,6 +205,120 @@ pub struct SqlAggregate {
 pub struct SqlAggregateExpr {
     pub function: AggregateFunction,
     pub column: Option<SqlColumn>,
+}
+
+impl SqlAggregateExpr {
+    /// The same aggregate of the same column (names compare ignoring case).
+    fn same(&self, other: &Self) -> bool {
+        self.function == other.function
+            && match (&self.column, &other.column) {
+                (Some(left), Some(right)) => left.same(right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl std::fmt::Display for SqlAggregateExpr {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let function = match self.function {
+            AggregateFunction::Count | AggregateFunction::CountDistinct => "COUNT",
+            AggregateFunction::Sum => "SUM",
+            AggregateFunction::Avg => "AVG",
+            AggregateFunction::Min => "MIN",
+            AggregateFunction::Max => "MAX",
+        };
+        match (&self.column, self.function) {
+            (None, _) => write!(formatter, "{function}(*)"),
+            (Some(column), AggregateFunction::CountDistinct) => {
+                write!(formatter, "COUNT(DISTINCT {column})")
+            }
+            (Some(column), _) => write!(formatter, "{function}({column})"),
+        }
+    }
+}
+
+/// A result column named by `ORDER BY` or `HAVING`: a column (or a SELECT
+/// alias), an aggregate, or a 1-based position in the SELECT list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlTarget {
+    Column(SqlColumn),
+    Aggregate(SqlAggregateExpr),
+    Position(usize),
+}
+
+impl SqlTarget {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Column(left), Self::Column(right)) => left.same(right),
+            (Self::Aggregate(left), Self::Aggregate(right)) => left.same(right),
+            (Self::Position(left), Self::Position(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SqlTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column(column) => column.fmt(formatter),
+            Self::Aggregate(aggregate) => aggregate.fmt(formatter),
+            Self::Position(position) => position.fmt(formatter),
+        }
+    }
+}
+
+/// A `HAVING` clause: tests on result columns joined by `AND` and `OR`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlHaving {
+    Compare {
+        target: SqlTarget,
+        op: FilterOp,
+        value: String,
+    },
+    And(Vec<SqlHaving>),
+    Or(Vec<SqlHaving>),
+}
+
+impl SqlHaving {
+    fn compare(target: SqlTarget, op: FilterOp, value: impl Into<String>) -> Self {
+        Self::Compare {
+            target,
+            op,
+            value: value.into(),
+        }
+    }
+
+    fn targets<'a>(&'a self, targets: &mut Vec<&'a SqlTarget>) {
+        match self {
+            Self::Compare { target, .. } => targets.push(target),
+            Self::And(parts) | Self::Or(parts) => {
+                parts.iter().for_each(|part| part.targets(targets))
+            }
+        }
+    }
+
+    fn to_output(&self, index_of: &dyn Fn(&SqlTarget) -> Result<usize>) -> Result<OutputFilter> {
+        Ok(match self {
+            Self::Compare { target, op, value } => OutputFilter::Compare {
+                column: index_of(target)?,
+                op: op.clone(),
+                value: value.clone(),
+            },
+            Self::And(parts) => OutputFilter::And(
+                parts
+                    .iter()
+                    .map(|part| part.to_output(index_of))
+                    .collect::<Result<_>>()?,
+            ),
+            Self::Or(parts) => OutputFilter::Or(
+                parts
+                    .iter()
+                    .map(|part| part.to_output(index_of))
+                    .collect::<Result<_>>()?,
+            ),
+        })
+    }
 }
 
 /// A `WHERE` clause: comparisons joined by `AND` and `OR`. `IN`, `BETWEEN` and
@@ -342,7 +459,7 @@ impl SqlPredicate {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlSort {
-    pub column: SqlColumn,
+    pub target: SqlTarget,
     pub direction: SortDirection,
     pub nulls: NullOrder,
 }
@@ -382,14 +499,23 @@ impl SqlAst {
             bail!("only a single SELECT is supported (no UNION)");
         };
         reject_select_clauses(select)?;
+        let distinct = match &select.distinct {
+            None | Some(Distinct::All) => false,
+            Some(Distinct::Distinct) => true,
+            Some(Distinct::On(_)) => bail!("DISTINCT ON is not supported; use SELECT DISTINCT"),
+        };
+        let (projection, aliases) =
+            parse_projection(&select.projection, &select.group_by, distinct)?;
         Ok(Self {
             from: parse_from(&select.from, depth)?,
-            projection: parse_projection(&select.projection, &select.group_by)?,
+            projection,
+            aliases,
             predicate: select
                 .selection
                 .as_ref()
                 .map(|selection| parse_predicate(selection, depth))
                 .transpose()?,
+            having: select.having.as_ref().map(parse_having).transpose()?,
             sort,
             limit,
         })
@@ -492,6 +618,9 @@ impl SqlAst {
                             (AggregateFunction::Avg, Some(column)) => AggregateExpr::avg(column),
                             (AggregateFunction::Min, Some(column)) => AggregateExpr::min(column),
                             (AggregateFunction::Max, Some(column)) => AggregateExpr::max(column),
+                            (AggregateFunction::CountDistinct, Some(column)) => {
+                                AggregateExpr::count_distinct(column)
+                            }
                             (_, None) => bail!("only COUNT may use *"),
                         })
                     })
@@ -504,17 +633,45 @@ impl SqlAst {
                 (None, Some((group_by, expressions)))
             }
         };
-        let sort = self
-            .sort
-            .iter()
-            .map(|sort| {
-                Ok(SortSpec::new(
-                    resolve(&sort.column)?,
-                    sort.direction,
-                    sort.nulls,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // ORDER BY and HAVING: on an aggregate they name its result columns
+        // (an output step); otherwise ORDER BY sorts the input's columns.
+        let mut output_sort = Vec::new();
+        let mut having = None;
+        let mut sort = Vec::new();
+        if let SqlProjection::Aggregates(aggregate) = &self.projection {
+            let index_of = |target: &SqlTarget| self.result_index(aggregate, target);
+            for key in &self.sort {
+                output_sort.push(SortSpec::new(
+                    index_of(&key.target)?,
+                    key.direction,
+                    key.nulls,
+                ));
+            }
+            having = self
+                .having
+                .as_ref()
+                .map(|having| having.to_output(&index_of))
+                .transpose()?;
+        } else {
+            if self.having.is_some() {
+                bail!("HAVING needs GROUP BY or an aggregate; filter rows with WHERE");
+            }
+            for key in &self.sort {
+                let column = match &key.target {
+                    SqlTarget::Column(column) => match self.alias_position(column) {
+                        Some(position) => self.selected_column(position, resolve)?,
+                        None => resolve(column)?,
+                    },
+                    SqlTarget::Position(position) => {
+                        self.selected_column(position.saturating_sub(1), resolve)?
+                    }
+                    SqlTarget::Aggregate(aggregate) => {
+                        bail!("ORDER BY {aggregate} needs the aggregate in SELECT")
+                    }
+                };
+                sort.push(SortSpec::new(column, key.direction, key.nulls));
+            }
+        }
 
         if let Some(filter) = filter {
             plan = plan.filter(filter);
@@ -530,15 +687,79 @@ impl SqlAst {
             };
         }
         if !sort.is_empty() {
-            if matches!(self.projection, SqlProjection::Aggregates(_)) {
-                bail!("ORDER BY aggregate results is not supported");
-            }
             plan = plan.sort_by(sort);
+        }
+        if having.is_some() || !output_sort.is_empty() || self.aliases.iter().any(Option::is_some) {
+            plan = plan.output(Output::new(having, output_sort, self.aliases.clone()));
         }
         if let Some(limit) = self.limit {
             plan = plan.limit(limit);
         }
         Ok(plan)
+    }
+
+    /// Where `column` is a SELECT alias, its position in the SELECT list.
+    fn alias_position(&self, column: &SqlColumn) -> Option<usize> {
+        if column.table.is_some() {
+            return None;
+        }
+        self.aliases.iter().position(|alias| {
+            alias
+                .as_ref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(&column.name))
+        })
+    }
+
+    /// The input column the SELECT item at `position` (0-based) reads, for a
+    /// query without aggregates.
+    fn selected_column(
+        &self,
+        position: usize,
+        resolve: &dyn Fn(&SqlColumn) -> Result<usize>,
+    ) -> Result<usize> {
+        match &self.projection {
+            SqlProjection::Columns(columns) => resolve(columns.get(position).ok_or_else(|| {
+                anyhow!(
+                    "ORDER BY {} is past the {} selected columns",
+                    position + 1,
+                    columns.len()
+                )
+            })?),
+            // SELECT *: positions are the input's columns.
+            _ => Ok(position),
+        }
+    }
+
+    /// The result column an aggregate query's ORDER BY or HAVING names: a
+    /// GROUP BY column, an aggregate in SELECT, an alias or a position.
+    fn result_index(&self, aggregate: &SqlAggregate, target: &SqlTarget) -> Result<usize> {
+        let groups = aggregate.group_by.len();
+        let columns = groups + aggregate.expressions.len();
+        match target {
+            SqlTarget::Position(position) if (1..=columns).contains(position) => Ok(position - 1),
+            SqlTarget::Position(position) => {
+                bail!("position {position} is not one of the {columns} result columns")
+            }
+            SqlTarget::Column(column) => self
+                .alias_position(column)
+                .or_else(|| {
+                    aggregate
+                        .group_by
+                        .iter()
+                        .position(|group| group.same(column))
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{column} is not a result column; name a GROUP BY column, an aggregate in SELECT or an alias"
+                    )
+                }),
+            SqlTarget::Aggregate(wanted) => aggregate
+                .expressions
+                .iter()
+                .position(|expression| expression.same(wanted))
+                .map(|position| groups + position)
+                .ok_or_else(|| anyhow!("{wanted} must also be in SELECT to sort or filter by it")),
+        }
     }
 
     /// Every column the query names outside subqueries.
@@ -557,7 +778,23 @@ impl SqlAst {
                 );
             }
         }
-        columns.extend(self.sort.iter().map(|sort| &sort.column));
+        let mut targets = self
+            .sort
+            .iter()
+            .map(|sort| &sort.target)
+            .collect::<Vec<_>>();
+        if let Some(having) = &self.having {
+            having.targets(&mut targets);
+        }
+        for target in targets {
+            match target {
+                SqlTarget::Column(column) if self.alias_position(column).is_none() => {
+                    columns.push(column)
+                }
+                SqlTarget::Aggregate(aggregate) => columns.extend(aggregate.column.as_ref()),
+                SqlTarget::Column(_) | SqlTarget::Position(_) => {}
+            }
+        }
         if let Some(predicate) = &self.predicate {
             predicate.columns(&mut columns);
         }
@@ -959,7 +1196,7 @@ fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<SqlSort>> {
                 bail!("ORDER BY WITH FILL is not supported");
             }
             Ok(SqlSort {
-                column: parse_column(&expression.expr)?,
+                target: parse_target(&expression.expr, "ORDER BY")?,
                 direction: if expression.options.asc == Some(false) {
                     SortDirection::Descending
                 } else {
@@ -973,8 +1210,32 @@ fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<SqlSort>> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    reject_repeats(sort.iter().map(|key| &key.column), "ORDER BY")?;
+    for (index, key) in sort.iter().enumerate() {
+        if sort
+            .get(..index)
+            .is_some_and(|earlier| earlier.iter().any(|other| other.target.same(&key.target)))
+        {
+            bail!("ORDER BY names {} twice", key.target);
+        }
+    }
     Ok(sort)
+}
+
+/// A result column named in `clause`: a column or alias, an aggregate, or a
+/// 1-based position in the SELECT list.
+fn parse_target(expression: &Expr, clause: &str) -> Result<SqlTarget> {
+    match expression {
+        Expr::Nested(inner) => parse_target(inner, clause),
+        Expr::Function(function) => Ok(SqlTarget::Aggregate(parse_aggregate(function)?)),
+        Expr::Value(_) => match parse_literal(expression)?.parse::<usize>() {
+            Ok(position) if position > 0 => Ok(SqlTarget::Position(position)),
+            _ => bail!("{clause} takes a column, an aggregate or a position from 1"),
+        },
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            Ok(SqlTarget::Column(parse_column(expression)?))
+        }
+        _ => bail!("{clause} takes a column, an aggregate or a position from 1"),
+    }
 }
 
 /// Fails when a column appears twice (names compare case-insensitively).
@@ -990,8 +1251,8 @@ fn reject_repeats<'a>(columns: impl Iterator<Item = &'a SqlColumn>, clause: &str
 }
 
 fn reject_select_clauses(select: &sqlparser::ast::Select) -> Result<()> {
-    if select.distinct.is_some() || select.top.is_some() {
-        bail!("SELECT DISTINCT and TOP are not supported");
+    if select.top.is_some() {
+        bail!("TOP is not supported; use LIMIT");
     }
     if select.into.is_some()
         || !select.lateral_views.is_empty()
@@ -999,7 +1260,6 @@ fn reject_select_clauses(select: &sqlparser::ast::Select) -> Result<()> {
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
-        || select.having.is_some()
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || !select.connect_by.is_empty()
@@ -1122,13 +1382,22 @@ fn parse_on(condition: &Expr, on: &mut Vec<(SqlColumn, SqlColumn)>) -> Result<()
     }
 }
 
-fn parse_projection(items: &[SelectItem], group_by: &GroupByExpr) -> Result<SqlProjection> {
+/// The SELECT list, and the `AS` name of each item. `SELECT DISTINCT` and
+/// `GROUP BY` without aggregates list each distinct combination once.
+fn parse_projection(
+    items: &[SelectItem],
+    group_by: &GroupByExpr,
+    distinct: bool,
+) -> Result<(SqlProjection, Vec<Option<String>>)> {
     if matches!(items, [SelectItem::Wildcard(_)]) {
         if !matches!(group_by, GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty())
         {
             bail!("SELECT * cannot be combined with GROUP BY");
         }
-        return Ok(SqlProjection::All);
+        if distinct {
+            bail!("SELECT DISTINCT needs the columns named, not *");
+        }
+        return Ok((SqlProjection::All, Vec::new()));
     }
     if items.is_empty() {
         bail!("SELECT needs at least one column");
@@ -1136,28 +1405,71 @@ fn parse_projection(items: &[SelectItem], group_by: &GroupByExpr) -> Result<SqlP
     let group_by = parse_group_by(group_by)?;
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
+    let mut aliases: Vec<Option<String>> = Vec::new();
     for item in items {
-        match item {
-            SelectItem::UnnamedExpr(
-                expression @ (Expr::Identifier(_) | Expr::CompoundIdentifier(_)),
-            ) => columns.push(parse_column(expression)?),
-            SelectItem::UnnamedExpr(Expr::Function(function)) => {
-                aggregates.push(parse_aggregate(function)?)
-            }
+        let (expression, alias) = match item {
+            SelectItem::UnnamedExpr(expression) => (expression, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
             SelectItem::QualifiedWildcard(_, _) => {
                 bail!("table.* is not supported; use * or name the columns")
             }
             SelectItem::Wildcard(_) => {
                 bail!("SELECT * cannot be combined with explicit columns")
             }
+            SelectItem::ExprWithAliases { .. } => {
+                bail!("a SELECT item has one alias")
+            }
+        };
+        match expression {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                if !aggregates.is_empty() {
+                    bail!(
+                        "SELECT must list the GROUP BY columns first, in the same order, then aggregates"
+                    );
+                }
+                columns.push(parse_column(expression)?);
+            }
+            Expr::Function(function) => aggregates.push(parse_aggregate(function)?),
             _ => bail!("SELECT items must be column names or supported aggregates"),
         }
+        if let Some(name) = &alias
+            && aliases
+                .iter()
+                .flatten()
+                .any(|earlier| earlier.eq_ignore_ascii_case(name))
+        {
+            bail!("two result columns are called {name}");
+        }
+        aliases.push(alias);
     }
     if aggregates.is_empty() {
-        if !group_by.is_empty() {
-            bail!("GROUP BY requires at least one aggregate");
+        if !distinct && group_by.is_empty() {
+            return Ok((SqlProjection::Columns(columns), aliases));
         }
-        return Ok(SqlProjection::Columns(columns));
+        // Each distinct combination once: a grouping without aggregates.
+        let same = group_by.is_empty()
+            || (columns.len() == group_by.len()
+                && columns
+                    .iter()
+                    .zip(&group_by)
+                    .all(|(column, group)| column.same(group)));
+        if !same {
+            bail!("SELECT must list the GROUP BY columns, in the same order");
+        }
+        reject_repeats(columns.iter(), "SELECT DISTINCT")?;
+        if columns.len() > MAX_GROUP_COLUMNS {
+            bail!(
+                "SELECT DISTINCT names {} columns; the limit is {MAX_GROUP_COLUMNS}",
+                columns.len()
+            );
+        }
+        return Ok((
+            SqlProjection::Aggregates(SqlAggregate {
+                group_by: columns,
+                expressions: Vec::new(),
+            }),
+            aliases,
+        ));
     }
     if group_by.is_empty() && !columns.is_empty() {
         bail!("aggregate SELECT cannot include ordinary columns without GROUP BY");
@@ -1172,10 +1484,14 @@ fn parse_projection(items: &[SelectItem], group_by: &GroupByExpr) -> Result<SqlP
     if !same {
         bail!("SELECT must list the GROUP BY columns first, in the same order, then aggregates");
     }
-    Ok(SqlProjection::Aggregates(SqlAggregate {
-        group_by,
-        expressions: aggregates,
-    }))
+    // Grouped rows are distinct already, so DISTINCT changes nothing here.
+    Ok((
+        SqlProjection::Aggregates(SqlAggregate {
+            group_by,
+            expressions: aggregates,
+        }),
+        aliases,
+    ))
 }
 
 fn parse_group_by(group_by: &GroupByExpr) -> Result<Vec<SqlColumn>> {
@@ -1211,11 +1527,16 @@ fn parse_aggregate(function: &Function) -> Result<SqlAggregateExpr> {
     let FunctionArguments::List(arguments) = &function.args else {
         bail!("aggregate needs parentheses");
     };
-    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
-        bail!("DISTINCT and aggregate argument clauses are not supported");
+    if !arguments.clauses.is_empty() {
+        bail!("aggregate argument clauses are not supported");
     }
+    let distinct = arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct);
     let function_name = function.name.to_string().to_ascii_uppercase();
+    if distinct && function_name != "COUNT" {
+        bail!("only COUNT supports DISTINCT");
+    }
     let function = match function_name.as_str() {
+        "COUNT" if distinct => AggregateFunction::CountDistinct,
         "COUNT" => AggregateFunction::Count,
         "SUM" => AggregateFunction::Sum,
         "AVG" => AggregateFunction::Avg,
@@ -1231,6 +1552,9 @@ fn parse_aggregate(function: &Function) -> Result<SqlAggregateExpr> {
         }
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(expression))] => {
             Some(parse_column(expression)?)
+        }
+        [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if distinct => {
+            bail!("COUNT(DISTINCT …) needs a column, not *")
         }
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] => bail!("only COUNT may use *"),
         _ => bail!("aggregate needs exactly one column argument"),
@@ -1378,6 +1702,81 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
         _ => {
             bail!("WHERE supports comparisons, IN, BETWEEN, LIKE and IS NULL, joined by AND and OR")
         }
+    }
+}
+
+/// `HAVING`: comparisons, `IN`, `BETWEEN` and `IS [NOT] NULL` on result
+/// columns (GROUP BY columns, aggregates, aliases), joined by `AND` and `OR`.
+fn parse_having(expression: &Expr) -> Result<SqlHaving> {
+    let target = |expression: &Expr| parse_target(expression, "HAVING");
+    match expression {
+        Expr::Nested(inner) => parse_having(inner),
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::And | BinaryOperator::Or),
+            right,
+        } => {
+            let parts = vec![parse_having(left)?, parse_having(right)?];
+            Ok(if *op == BinaryOperator::And {
+                SqlHaving::And(parts)
+            } else {
+                SqlHaving::Or(parts)
+            })
+        }
+        Expr::BinaryOp { left, op, right } => Ok(SqlHaving::compare(
+            target(left)?,
+            comparison_op(op)?,
+            parse_literal(right)?,
+        )),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let target = target(expr)?;
+            let op = if *negated { FilterOp::Ne } else { FilterOp::Eq };
+            let mut tests = list
+                .iter()
+                .map(|value| {
+                    Ok(SqlHaving::compare(
+                        target.clone(),
+                        op.clone(),
+                        parse_literal(value)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(match (tests.len(), negated) {
+                (0, _) => bail!("IN needs at least one value"),
+                (1, _) => tests.remove(0),
+                (_, true) => SqlHaving::And(tests),
+                (_, false) => SqlHaving::Or(tests),
+            })
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let target = target(expr)?;
+            let (low, high) = (parse_literal(low)?, parse_literal(high)?);
+            Ok(if *negated {
+                SqlHaving::Or(vec![
+                    SqlHaving::compare(target.clone(), FilterOp::Lt, low),
+                    SqlHaving::compare(target, FilterOp::Gt, high),
+                ])
+            } else {
+                SqlHaving::And(vec![
+                    SqlHaving::compare(target.clone(), FilterOp::Ge, low),
+                    SqlHaving::compare(target, FilterOp::Le, high),
+                ])
+            })
+        }
+        Expr::IsNull(expr) => Ok(SqlHaving::compare(target(expr)?, FilterOp::IsNull, "")),
+        Expr::IsNotNull(expr) => Ok(SqlHaving::compare(target(expr)?, FilterOp::IsNotNull, "")),
+        _ => bail!(
+            "HAVING supports comparisons, IN, BETWEEN and IS NULL on result columns, joined by AND and OR"
+        ),
     }
 }
 
@@ -1536,6 +1935,208 @@ mod tests {
         batches
     }
 
+    /// Seven flights: carrier and delay (one null).
+    fn flights() -> (TempDir, Arc<ParquetSource>) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("flights.parquet");
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "carrier",
+                Arc::new(StringArray::from(vec![
+                    "AA", "AA", "BB", "BB", "BB", "CC", "AA",
+                ])) as arrow_array::ArrayRef,
+            ),
+            (
+                "delay",
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    Some(20),
+                    Some(5),
+                    Some(5),
+                    None,
+                    Some(30),
+                    Some(10),
+                ])),
+            ),
+        ])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (directory, Arc::new(ParquetSource::open(path).unwrap()))
+    }
+
+    /// The rows of a result as text, one `Vec` per row.
+    fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            parquet_reader::value::scalar_text(column.as_ref(), row)
+                                .unwrap()
+                                .unwrap_or_else(|| "null".to_owned())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows
+    }
+
+    fn names(batches: &[RecordBatch]) -> Vec<String> {
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    #[test]
+    fn sorts_filters_and_names_aggregate_results() {
+        let (_directory, source) = flights();
+        let run = |sql: &str| execute(sql, Arc::clone(&source));
+
+        // ORDER BY an alias of an aggregate, then a GROUP BY column; ties
+        // keep the order the groups were first seen in.
+        let counts = run(
+            "SELECT carrier, COUNT(*) AS n FROM dataset GROUP BY carrier ORDER BY n DESC, carrier",
+        );
+        assert_eq!(names(&counts), ["carrier", "n"]);
+        assert_eq!(rows(&counts), [["AA", "3"], ["BB", "3"], ["CC", "1"]]);
+
+        // ORDER BY the aggregate itself, and LIMIT after the sort.
+        let top = run(
+            "SELECT carrier, SUM(delay) FROM dataset GROUP BY carrier ORDER BY SUM(delay) DESC LIMIT 2",
+        );
+        assert_eq!(rows(&top), [["AA", "40"], ["CC", "30"]]);
+
+        // HAVING on an aggregate, an alias and a GROUP BY column.
+        let having =
+            run("SELECT carrier, COUNT(*) FROM dataset GROUP BY carrier HAVING COUNT(*) > 1");
+        assert_eq!(rows(&having), [["AA", "3"], ["BB", "3"]]);
+        let both = run(
+            "SELECT carrier, COUNT(*) AS n FROM dataset GROUP BY carrier \
+             HAVING n >= 3 AND carrier <> 'AA'",
+        );
+        assert_eq!(rows(&both), [["BB", "3"]]);
+        let between = run(
+            "SELECT carrier, AVG(delay) AS mean FROM dataset GROUP BY carrier \
+             HAVING mean BETWEEN 5 AND 15 ORDER BY 1 DESC",
+        );
+        assert_eq!(rows(&between), [["BB", "5"], ["AA", "13.333333333333334"]]);
+
+        // COUNT(DISTINCT …) skips nulls; ORDER BY a position.
+        let distinct = run(
+            "SELECT carrier, COUNT(DISTINCT delay) FROM dataset GROUP BY carrier ORDER BY 2 DESC",
+        );
+        assert_eq!(names(&distinct), ["carrier", "COUNT(DISTINCT delay)"]);
+        assert_eq!(rows(&distinct), [["AA", "2"], ["BB", "1"], ["CC", "1"]]);
+        assert_eq!(
+            rows(&run(
+                "SELECT COUNT(DISTINCT carrier) AS carriers FROM dataset"
+            )),
+            [["3"]]
+        );
+
+        // SELECT DISTINCT, and GROUP BY without aggregates.
+        assert_eq!(
+            rows(&run(
+                "SELECT DISTINCT carrier FROM dataset ORDER BY carrier DESC"
+            )),
+            [["CC"], ["BB"], ["AA"]]
+        );
+        assert_eq!(
+            rows(&run("SELECT carrier FROM dataset GROUP BY carrier")),
+            [["AA"], ["BB"], ["CC"]]
+        );
+        assert_eq!(
+            run("SELECT DISTINCT carrier, delay FROM dataset")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            5
+        );
+
+        // Aliases on plain columns, and ORDER BY one (nulls last).
+        let aliased = run("SELECT delay AS d, carrier FROM dataset ORDER BY d DESC LIMIT 2");
+        assert_eq!(names(&aliased), ["d", "carrier"]);
+        assert_eq!(rows(&aliased), [["30", "CC"], ["20", "AA"]]);
+
+        // A query over a subquery is prepared first; the output step still applies.
+        let nested = run(
+            "SELECT carrier, COUNT(*) AS n FROM (SELECT carrier FROM dataset WHERE delay > 5) AS t \
+             GROUP BY carrier ORDER BY n DESC",
+        );
+        assert_eq!(rows(&nested), [["AA", "3"], ["CC", "1"]]);
+    }
+
+    #[test]
+    fn explains_what_aggregate_ordering_and_having_cannot_do() {
+        let (_directory, source) = flights();
+        for (sql, message) in [
+            (
+                "SELECT carrier, COUNT(*) FROM dataset GROUP BY carrier ORDER BY MAX(delay)",
+                "MAX(delay) must also be in SELECT",
+            ),
+            (
+                "SELECT carrier, COUNT(*) FROM dataset GROUP BY carrier ORDER BY delay",
+                "delay is not a result column",
+            ),
+            (
+                "SELECT carrier FROM dataset HAVING carrier = 'AA'",
+                "HAVING needs GROUP BY or an aggregate",
+            ),
+            (
+                "SELECT carrier, COUNT(*) FROM dataset GROUP BY carrier ORDER BY 3",
+                "position 3 is not one of the 2 result columns",
+            ),
+            (
+                "SELECT carrier FROM dataset ORDER BY COUNT(*)",
+                "ORDER BY COUNT(*) needs the aggregate in SELECT",
+            ),
+            (
+                "SELECT DISTINCT * FROM dataset",
+                "SELECT DISTINCT needs the columns named",
+            ),
+            (
+                "SELECT COUNT(*), carrier FROM dataset GROUP BY carrier",
+                "SELECT must list the GROUP BY columns first",
+            ),
+            (
+                "SELECT carrier AS x, COUNT(*) AS X FROM dataset GROUP BY carrier",
+                "two result columns are called X",
+            ),
+            (
+                "SELECT SUM(DISTINCT delay) FROM dataset",
+                "only COUNT supports DISTINCT",
+            ),
+            (
+                "SELECT COUNT(DISTINCT *) FROM dataset",
+                "COUNT(DISTINCT …) needs a column, not *",
+            ),
+            (
+                "SELECT DISTINCT ON (carrier) carrier FROM dataset",
+                "DISTINCT ON is not supported",
+            ),
+            (
+                "SELECT carrier, COUNT(*) FROM dataset GROUP BY carrier HAVING COUNT(*) > 'x'",
+                "HAVING",
+            ),
+        ] {
+            let error = SqlAst::parse(sql)
+                .and_then(|parsed| parsed.to_logical_plan(Arc::clone(&source)))
+                .err()
+                .unwrap_or_else(|| panic!("{sql} should be refused"));
+            assert!(format!("{error:#}").contains(message), "{sql}: {error:#}");
+        }
+    }
+
     #[test]
     fn translates_select_star_and_projection() {
         let (_directory, source) = source();
@@ -1677,7 +2278,7 @@ mod tests {
         assert_eq!(
             ast.sort(),
             [SqlSort {
-                column: SqlColumn::new("id"),
+                target: SqlTarget::Column(SqlColumn::new("id")),
                 direction: SortDirection::Descending,
                 nulls: NullOrder::Last,
             }]
@@ -1809,7 +2410,7 @@ mod tests {
         for sql in [
             "SELECT id, COUNT(*) FROM dataset",
             "SELECT name, COUNT(*) FROM dataset GROUP BY id",
-            "SELECT COUNT(DISTINCT id) FROM dataset",
+            "SELECT SUM(DISTINCT id) FROM dataset",
             "SELECT SUM(name) FROM dataset",
             "SELECT COUNT(*) FROM dataset GROUP BY id, name",
         ] {

@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- SQL: `ORDER BY` an aggregate's results (`ORDER BY COUNT(*) DESC`, an alias, or a position such as `ORDER BY 2`), `HAVING` (e.g. `HAVING COUNT(*) > 100`), `SELECT DISTINCT`, `COUNT(DISTINCT column)`, and `AS` aliases, which name the result's columns. `GROUP BY` without aggregates lists each value once.
 - Filter, SQL and sort results can be entered anywhere: "Go to row", Home, End, the arrow keys and a new scrollbar for the whole result reach any row, and scrolling up brings back rows scrolled past. A filter's matches are counted in the background ("rows 1–4,096 of 999,999,989"), after which a jump only reads the row group that holds the row, even in a billion-row file.
 - CLI: `--sql` shows the progress line too: how much of a join or subquery is prepared, then the rows scanned.
 - CLI: `--profile` reports text lengths (`min_length`, `max_length`, `mean_length`, in characters) for text columns.

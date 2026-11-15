@@ -2417,3 +2417,66 @@ fn jumps_anywhere_in_filter_sql_and_sort_results() {
     assert_eq!(app.grid.selection.map(|(row, _)| row), Some(rows - 1));
     assert_eq!(id_at(&app, rows - 1), "0");
 }
+
+#[test]
+fn runs_sql_with_having_order_by_aggregates_and_aliases() {
+    let (_directory, source, path) = source(11);
+    let mut app = make_app(source, path);
+    let column_names = |app: &PaviApp| {
+        app.filtered.as_ref().unwrap().batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>()
+    };
+    let cells = |app: &PaviApp| {
+        (0..app.grid.rows)
+            .map(|row| {
+                (0..app.grid.columns)
+                    .map(|column| app.filtered_cell_text(row, column).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // 6 "alpha" and 5 "beta" rows.
+    app.sql_input = "SELECT name, COUNT(*) AS n, COUNT(DISTINCT id) FROM dataset \
+                     GROUP BY name HAVING n > 5 ORDER BY n DESC"
+        .to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert!(app.filtered.as_ref().unwrap().aggregate);
+    assert_eq!(column_names(&app), ["name", "n", "COUNT(DISTINCT id)"]);
+    assert_eq!(cells(&app), [["alpha", "6", "6"]]);
+
+    // An alias on a plain column names the result's column, so the grid
+    // shows the result as it names it.
+    app.sql_input = "SELECT id AS key, name FROM dataset ORDER BY key DESC LIMIT 3".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert!(app.filtered.as_ref().unwrap().aggregate);
+    assert_eq!(column_names(&app), ["key", "name"]);
+    assert_eq!(
+        cells(&app),
+        [["10", "alpha"], ["9", "beta"], ["8", "alpha"]]
+    );
+
+    app.sql_input = "SELECT DISTINCT name FROM dataset ORDER BY name DESC".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert_eq!(cells(&app), [["beta"], ["alpha"]]);
+
+    // What isn't supported says so under the editor.
+    app.sql_input = "SELECT name FROM dataset HAVING name = 'alpha'".to_string();
+    app.run_sql();
+    assert!(
+        app.sql_error
+            .as_deref()
+            .is_some_and(|error| error.contains("HAVING needs GROUP BY")),
+        "{:?}",
+        app.sql_error
+    );
+}

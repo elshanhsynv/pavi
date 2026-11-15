@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "parquet_reader"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -790,6 +790,7 @@ dependencies = [
  "parquet",
  "ring",
  "rustls-native-certs",
+ "serde_json",
  "ureq",
 ]
 
@@ -809,11 +810,13 @@ dependencies = [
 
 [[package]]
 name = "pavi_query"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "arrow-ord",
  "arrow-schema",
+ "arrow-select",
  "parquet_reader",
  "pavi_runtime",
  "sqlparser",
@@ -821,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "pavi_runtime"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",

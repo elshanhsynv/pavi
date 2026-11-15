@@ -12,7 +12,7 @@ use pavi_runtime::{
     SubmitError, TaskId,
 };
 
-use crate::{LogicalPlan, PhysicalPlan, Planner, prep::PrepTask};
+use crate::{LogicalPlan, PhysicalPlan, Planner, logical::Output, prep::PrepTask};
 
 pub struct QueryEngine {
     runtime: RuntimeHandle,
@@ -302,6 +302,57 @@ impl QueryExecution {
     }
 }
 
+/// Applies a plan's output step to a result batch: the aliases, then `HAVING`
+/// and the sort of the result's columns. The planner allows those two only
+/// on an aggregate, whose whole result is this one batch, bounded by its
+/// group budget.
+fn shape_output(output: Option<&Output>, batch: RecordBatch) -> Result<RecordBatch> {
+    let Some(output) = output else {
+        return Ok(batch);
+    };
+    let mut batch = if output.renames() {
+        RecordBatch::try_new(output.rename(batch.schema_ref())?, batch.columns().to_vec())?
+    } else {
+        batch
+    };
+    if let Some(having) = &output.having {
+        let mask = having
+            .to_filter(batch.schema_ref())?
+            .evaluate_batch(&batch)
+            .context("evaluate HAVING")?;
+        batch = arrow_select::filter::filter_record_batch(&batch, &mask)?;
+    }
+    if !output.sort.is_empty() && batch.num_rows() > 1 {
+        let mut keys = output
+            .sort
+            .iter()
+            .map(|key| {
+                Ok(arrow_ord::sort::SortColumn {
+                    values: Arc::clone(
+                        batch
+                            .columns()
+                            .get(key.column)
+                            .context("ORDER BY column is out of range")?,
+                    ),
+                    options: Some(arrow_schema::SortOptions {
+                        descending: key.direction == parquet_reader::SortDirection::Descending,
+                        nulls_first: key.nulls == parquet_reader::NullOrder::First,
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Ties keep the order the groups were first seen in.
+        let rows = u32::try_from(batch.num_rows()).context("aggregate result is too large")?;
+        keys.push(arrow_ord::sort::SortColumn {
+            values: Arc::new(arrow_array::UInt32Array::from_iter_values(0..rows)),
+            options: None,
+        });
+        let order = arrow_ord::sort::lexsort_to_indices(&keys, None)?;
+        batch = arrow_select::take::take_record_batch(&batch, &order)?;
+    }
+    Ok(batch)
+}
+
 impl Running {
     fn start(
         logical: &LogicalPlan,
@@ -385,8 +436,9 @@ impl Running {
             if self.cancelled {
                 bail!("query execution was cancelled");
             }
-            if let Some(batch) = self.buffered.pop_front() {
-                return Ok(self.apply_limit(batch));
+            if let Some((task_id, batch)) = self.buffered.pop_front() {
+                let batch = shape_output(self.plan.output.as_ref(), batch)?;
+                return Ok(self.apply_limit((task_id, batch)));
             }
             if self.finished {
                 return Ok(None);
@@ -437,9 +489,10 @@ impl Running {
             if self.cancelled {
                 bail!("query execution was cancelled");
             }
-            if let Some(batch) = self.buffered.pop_front() {
+            if let Some((task_id, batch)) = self.buffered.pop_front() {
+                let batch = shape_output(self.plan.output.as_ref(), batch)?;
                 return Ok(self
-                    .apply_limit(batch)
+                    .apply_limit((task_id, batch))
                     .map_or(QueryPoll::Finished, QueryPoll::Batch));
             }
             if self.finished {
@@ -1417,6 +1470,39 @@ mod tests {
         assert!(
             format!("{:#}", byte_limited.next_batch().unwrap_err())
                 .contains("group budget of 1 bytes")
+        );
+    }
+
+    #[test]
+    fn counts_distinct_values_within_the_group_budget() {
+        let (_dir, source, _) = source();
+        let rows = source.row_count();
+        let runtime = runtime();
+        let logical = LogicalPlan::scan(Arc::clone(&source))
+            .aggregate(vec![AggregateExpr::count_distinct(0)])
+            .unwrap();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&logical, GenerationId(30))
+            .unwrap();
+        let batch = execution.next_batch().unwrap().unwrap().batch;
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap()
+                .value(0),
+            rows
+        );
+
+        // Every distinct value is held, so many of them hit the byte budget.
+        let mut limited =
+            QueryEngine::with_group_budget(&runtime, GroupBudget::new(10, 4 * 1024).unwrap())
+                .execute(&logical, GenerationId(31))
+                .unwrap();
+        assert!(
+            format!("{:#}", limited.next_batch().unwrap_err())
+                .contains("group budget of 4096 bytes")
         );
     }
 

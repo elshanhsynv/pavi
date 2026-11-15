@@ -11,7 +11,7 @@ pub(crate) const MAX_SUGGESTIONS: usize = 8;
 const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "LIMIT", "AND", "OR", "NOT", "IN",
     "BETWEEN", "LIKE", "IS", "NULL", "ASC", "DESC", "NULLS", "FIRST", "LAST", "TRUE", "FALSE",
-    "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS",
+    "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS", "HAVING", "DISTINCT",
 ];
 /// Aggregate functions, highlighted apart from keywords.
 const FUNCTIONS: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX"];

@@ -1201,17 +1201,20 @@ impl PaviApp {
             Planner::validate(&plan)
                 .map(|schema| ((0..schema.fields().len()).collect(), Vec::new(), true))
         } else {
-            Planner::plan(&plan).map(|plan| {
+            Planner::plan(&plan).and_then(|plan| {
                 let aggregate = plan.aggregate();
-                (
-                    if let Some(aggregate) = aggregate {
-                        (0..aggregate.expressions().len() + aggregate.group_by().len()).collect()
+                // Aliases rename the result's columns: it is shown as it names
+                // them, like an aggregate's.
+                let own_names = aggregate.is_some() || plan.renames_columns();
+                Ok((
+                    if own_names {
+                        (0..plan.output_schema()?.fields().len()).collect()
                     } else {
                         plan.projected_columns().to_vec()
                     },
                     plan.sort().to_vec(),
-                    aggregate.is_some(),
-                )
+                    own_names,
+                ))
             })
         };
         let (projected_columns, sort, aggregate): (Vec<usize>, _, _) = match planned {

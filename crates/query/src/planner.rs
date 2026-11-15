@@ -7,7 +7,10 @@ use parquet_reader::{
     check_aggregate, check_sort,
 };
 
-use crate::{LogicalPlan, logical::Prepared};
+use crate::{
+    LogicalPlan,
+    logical::{Output, Prepared},
+};
 
 pub struct PhysicalPlan {
     pub(crate) source: Arc<ParquetSource>,
@@ -17,12 +20,28 @@ pub struct PhysicalPlan {
     /// Sort keys, most significant first; empty when there is no sort.
     pub(crate) sort: Vec<SortSpec>,
     pub(crate) aggregate: Option<AggregateSpec>,
+    /// `HAVING`, a sort of the result and aliases, applied before `limit`.
+    pub(crate) output: Option<Output>,
 }
 
 pub struct Planner;
 
 impl PhysicalPlan {
     pub fn output_schema(&self) -> Result<SchemaRef> {
+        let schema = self.unnamed_schema()?;
+        match &self.output {
+            Some(output) => output.rename(&schema),
+            None => Ok(schema),
+        }
+    }
+
+    /// Whether aliases rename the result's columns.
+    pub fn renames_columns(&self) -> bool {
+        self.output.as_ref().is_some_and(Output::renames)
+    }
+
+    /// The result's schema before aliases rename it.
+    fn unnamed_schema(&self) -> Result<SchemaRef> {
         if let Some(aggregate) = &self.aggregate {
             return self.source.aggregate_schema(aggregate);
         }
@@ -92,24 +111,29 @@ impl Planner {
         if let Some(sort) = &state.sort {
             check_sort(&schema, sort).context("validate query sort")?;
         }
-        if let Some(aggregate) = &state.aggregate {
+        let result = if let Some(aggregate) = &state.aggregate {
             if projection.is_some() {
                 bail!("projection cannot be combined with aggregate output");
             }
             if state.sort.is_some() {
-                bail!("ORDER BY aggregate results is not supported");
+                bail!("sort an aggregate's results with ORDER BY on its result columns");
             }
             check_aggregate(&schema, aggregate).context("validate query aggregate")?;
-            return aggregate_output_schema(&schema, aggregate);
+            aggregate_output_schema(&schema, aggregate)?
+        } else {
+            let projection = projection.unwrap_or_else(|| Projection::all(column_count));
+            Arc::new(Schema::new(
+                projection
+                    .as_slice()
+                    .iter()
+                    .map(|column| schema.field(*column).clone())
+                    .collect::<Vec<_>>(),
+            ))
+        };
+        match &state.output {
+            Some(output) => check_output(output, &result, state.aggregate.is_some()),
+            None => Ok(result),
         }
-        let projection = projection.unwrap_or_else(|| Projection::all(column_count));
-        Ok(Arc::new(Schema::new(
-            projection
-                .as_slice()
-                .iter()
-                .map(|column| schema.field(*column).clone())
-                .collect::<Vec<_>>(),
-        )))
     }
 
     pub fn plan(logical: &LogicalPlan) -> Result<PhysicalPlan> {
@@ -138,21 +162,52 @@ impl Planner {
                 bail!("projection cannot be combined with aggregate output");
             }
             if state.sort.is_some() {
-                bail!("ORDER BY aggregate results is not supported");
+                bail!("sort an aggregate's results with ORDER BY on its result columns");
             }
             source
                 .validate_aggregate(aggregate)
                 .context("validate query aggregate")?;
         }
-        Ok(PhysicalPlan {
+        let plan = PhysicalPlan {
             source,
             projection,
             filter: state.filter,
             limit: state.limit,
             sort: state.sort.unwrap_or_default(),
             aggregate: state.aggregate,
+            output: None,
+        };
+        if let Some(output) = &state.output {
+            check_output(
+                output,
+                plan.unnamed_schema()?.as_ref(),
+                plan.aggregate.is_some(),
+            )?;
+        }
+        Ok(PhysicalPlan {
+            output: state.output,
+            ..plan
         })
     }
+}
+
+/// Checks `HAVING`, the result sort and aliases against the result's schema
+/// before renaming, and returns the schema after it.
+fn check_output(output: &Output, result: &Schema, aggregate: bool) -> Result<SchemaRef> {
+    if !aggregate && (output.having.is_some() || !output.sort.is_empty()) {
+        bail!("HAVING and ORDER BY on result columns need GROUP BY or an aggregate");
+    }
+    let renamed = output.rename(result)?;
+    if let Some(having) = &output.having {
+        having
+            .to_filter(&renamed)?
+            .validate_schema(&renamed)
+            .context("validate HAVING")?;
+    }
+    if !output.sort.is_empty() {
+        check_sort(&renamed, &output.sort).context("validate ORDER BY")?;
+    }
+    Ok(renamed)
 }
 
 #[derive(Default)]
@@ -164,6 +219,7 @@ struct PlanState {
     limit: Option<usize>,
     sort: Option<Vec<SortSpec>>,
     aggregate: Option<AggregateSpec>,
+    output: Option<Output>,
 }
 
 fn collect(plan: &LogicalPlan, state: &mut PlanState) -> Result<()> {
@@ -207,6 +263,12 @@ fn collect(plan: &LogicalPlan, state: &mut PlanState) -> Result<()> {
             collect(input, state)?;
             if state.aggregate.replace(aggregate.spec().clone()).is_some() {
                 bail!("query plan contains more than one aggregate");
+            }
+        }
+        LogicalPlan::Output { input, output } => {
+            collect(input, state)?;
+            if state.output.replace(output.clone()).is_some() {
+                bail!("query plan contains more than one output step");
             }
         }
     }

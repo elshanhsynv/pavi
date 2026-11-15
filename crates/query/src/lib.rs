@@ -7,7 +7,9 @@ mod prep;
 mod sql;
 
 pub use execution::{QueryBatch, QueryEngine, QueryExecution, QueryPoll};
-pub use logical::{Aggregate, Filter, Limit, LogicalPlan, Prepared, Projection, Scan, Sort};
+pub use logical::{
+    Aggregate, Filter, Limit, LogicalPlan, Output, OutputFilter, Prepared, Projection, Scan, Sort,
+};
 pub use parquet_reader::{
     AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget, NullOrder, SortBudget,
     SortDirection, SortSpec,
