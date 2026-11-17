@@ -469,6 +469,11 @@ fn temporal_key(array: &dyn Array, row: usize) -> Result<Option<i64>> {
         DataType::Time32(TimeUnit::Millisecond) => key!(Time32MillisecondArray),
         DataType::Time64(TimeUnit::Microsecond) => key!(Time64MicrosecondArray),
         DataType::Time64(TimeUnit::Nanosecond) => key!(Time64NanosecondArray),
+        // Lengths of time by their length, not their text (PT10S > PT9S).
+        DataType::Duration(TimeUnit::Second) => key!(arrow_array::DurationSecondArray),
+        DataType::Duration(TimeUnit::Millisecond) => key!(arrow_array::DurationMillisecondArray),
+        DataType::Duration(TimeUnit::Microsecond) => key!(arrow_array::DurationMicrosecondArray),
+        DataType::Duration(TimeUnit::Nanosecond) => key!(arrow_array::DurationNanosecondArray),
         _ => None,
     })
 }
@@ -618,15 +623,24 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_values_and_unbounded_exact_distinct_state() {
-        assert!(StatsAccumulator::new(0, "binary".to_string(), DataType::Binary, None).is_err());
+        assert!(
+            StatsAccumulator::new(
+                0,
+                "interval".to_string(),
+                DataType::Interval(arrow_schema::IntervalUnit::DayTime),
+                None
+            )
+            .is_err()
+        );
         let mut accumulator =
             StatsAccumulator::new(0, "text".to_string(), DataType::Utf8, None).unwrap();
         for index in 0..MAX_DISTINCT_VALUES {
             accumulator.record_distinct(&index.to_string()).unwrap();
         }
         assert!(accumulator.record_distinct("one-too-many").is_err());
+        // Binary values are profiled as their hex, as the grid shows them.
         let binary = BinaryArray::from(vec![Some(b"x".as_slice())]);
-        assert!(profile_text(&binary, 0).is_err());
+        assert_eq!(profile_text(&binary, 0).unwrap(), "78");
     }
 
     #[test]

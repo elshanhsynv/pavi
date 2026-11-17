@@ -11,7 +11,7 @@ memory use before users do. It covers the inputs PAVI does not control (see `SEC
 | `sql_query` | SQL-workspace text | `SqlAst::parse` → logical plan → `Planner::plan` → the matching aggregate/sort/filter/window read, then formatting |
 
 The fixture file the text targets run against has integers, floats, text, booleans, dates,
-time-zoned timestamps, decimals, a dictionary, a list and a struct column (`fuzz/src/lib.rs`).
+time-zoned timestamps, decimals, a dictionary, a duration, a binary, a list and a struct column (`fuzz/src/lib.rs`).
 
 ## Running
 

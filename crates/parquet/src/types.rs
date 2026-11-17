@@ -6,6 +6,9 @@
 //! | SUM, AVG                                           | [`is_summable`]       |
 //! | `contains` filter                                  | [`is_string`]         |
 //! | CSV export                                         | `value::is_scalar_type` |
+//!
+//! Columns are read as [`read_type`]: dictionary-encoded columns as their
+//! values, so every operation treats them as it treats those values.
 
 use arrow_schema::DataType;
 
@@ -33,7 +36,8 @@ pub fn is_numeric(data_type: &DataType) -> bool {
 }
 
 /// Decimals PAVI can compare and sum: their unscaled values fit in an `i128`.
-/// `Decimal256` is shown and exported but not compared.
+/// A `Decimal256` of up to 38 digits is read as a `Decimal128` ([`read_type`]);
+/// a wider one is shown and exported but not compared.
 pub fn is_decimal(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -67,6 +71,22 @@ pub fn is_temporal(data_type: &DataType) -> bool {
     )
 }
 
+/// Lengths of time, in any unit.
+pub fn is_duration(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Duration(_))
+}
+
+/// Bytes in any Arrow layout; compared byte by byte.
+pub fn is_binary(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
 /// Types with a total order that PAVI can compare: sort keys, MIN/MAX, GROUP BY
 /// keys, filter predicates and profiling.
 pub fn is_comparable(data_type: &DataType) -> bool {
@@ -76,6 +96,22 @@ pub fn is_comparable(data_type: &DataType) -> bool {
         || is_string(data_type)
         || is_temporal(data_type)
         || is_time(data_type)
+        || is_duration(data_type)
+        || is_binary(data_type)
+}
+
+/// The type a column of `data_type` is read as. A dictionary-encoded column
+/// (pandas' categoricals, for one) is read as its values; a `Decimal256` of
+/// up to 38 digits as the `Decimal128` that holds it exactly. Everything else
+/// as it is. Both conversions keep every value, and cost one cast per batch.
+pub fn read_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Dictionary(_, values) => read_type(values),
+        DataType::Decimal256(precision, scale) if *precision <= 38 => {
+            DataType::Decimal128(*precision, *scale)
+        }
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -98,16 +134,38 @@ mod tests {
             DataType::Decimal128(38, -3),
             DataType::Time32(TimeUnit::Second),
             DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Duration(TimeUnit::Millisecond),
+            DataType::Binary,
+            DataType::FixedSizeBinary(16),
+            DataType::BinaryView,
         ] {
             assert!(is_comparable(&data_type), "{data_type:?}");
         }
         for data_type in [
-            DataType::Binary,
             DataType::Decimal256(76, 2),
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            DataType::Interval(arrow_schema::IntervalUnit::DayTime),
         ] {
             assert!(!is_comparable(&data_type), "{data_type:?}");
         }
+        // Dictionaries are read as their values, narrow Decimal256 as Decimal128.
+        assert_eq!(
+            read_type(&DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(DataType::LargeUtf8)
+            )),
+            DataType::LargeUtf8
+        );
+        assert_eq!(
+            read_type(&DataType::Decimal256(20, 4)),
+            DataType::Decimal128(20, 4)
+        );
+        assert_eq!(
+            read_type(&DataType::Decimal256(60, 4)),
+            DataType::Decimal256(60, 4)
+        );
+        // Durations can be compared, not summed.
+        assert!(!is_summable(&DataType::Duration(TimeUnit::Second)));
         assert!(is_numeric(&DataType::Int8) && !is_numeric(&DataType::Date32));
         // Decimals can be summed; times of day cannot.
         assert!(

@@ -140,6 +140,20 @@ pub fn fixture_batch(rows: i32) -> RecordBatch {
             )),
         ),
         ("category", Arc::new(category)),
+        (
+            "wait",
+            Arc::new(arrow_array::DurationMillisecondArray::from_iter(
+                ids.clone()
+                    .map(|id| (id % 7 != 0).then_some(i64::from(id) * 250)),
+            )),
+        ),
+        (
+            "blob",
+            Arc::new(arrow_array::BinaryArray::from_iter(
+                ids.clone()
+                    .map(|id| (id % 5 != 1).then(|| id.to_le_bytes().to_vec())),
+            )),
+        ),
         ("tags", Arc::new(tags)),
         ("point", Arc::new(point)),
     ];
@@ -269,6 +283,8 @@ pub const FILTER_SEEDS: &[&str] = &[
     "name LIKE me-_% AND text IS NOT NULL OR amount IS NULL",
     "amount > 10.5 AND at < 01:30:00",
     "amount == 12.340 OR at BETWEEN 00:10:00 AND 00:20:00.5",
+    "wait >= PT1.5S AND wait < 5000",
+    "blob == 0x05000000 OR category == 'red'",
 ];
 
 pub const SQL_SEEDS: &[&str] = &[
@@ -305,6 +321,7 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT name FROM dataset WHERE LENGTH(name) > small AND NOT (active) ORDER BY ROUND(score / 3, 1) DESC",
     "SELECT CAST(score AS DECIMAL(10, 2)), TRY_CAST(name AS INT), COALESCE(amount, 0) FROM dataset",
     "SELECT ROUND(AVG(score), 2) AS mean, category, SUM(score) / COUNT(*) FROM dataset GROUP BY category HAVING mean > 1 ORDER BY 2",
+    "SELECT category, MIN(wait), MAX(blob), COUNT(DISTINCT blob) FROM dataset WHERE wait > 'PT1S' GROUP BY category ORDER BY MIN(wait) DESC",
 ];
 
 /// One runtime shared by fuzz inputs that need the query engine. It is kept in a

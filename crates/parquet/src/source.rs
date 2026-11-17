@@ -9,8 +9,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array,
-    Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    Decimal32Array, Decimal64Array, Decimal128Array, DurationMicrosecondArray,
+    DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, RecordBatch, RecordBatchOptions, StringArray, StringViewArray,
     Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
@@ -584,6 +586,14 @@ impl ParquetSource {
                 if other.is_nullable() && !field.is_nullable() {
                     *field = field.clone().with_nullable(true);
                 }
+            }
+        }
+        // Columns are read as `types::read_type`: dictionaries as their values,
+        // and so on. `reorder_batch` casts each decoded batch to match.
+        for field in &mut fields {
+            let read = crate::types::read_type(field.data_type());
+            if &read != field.data_type() {
+                *field = field.clone().with_data_type(read);
             }
         }
         let file_columns = fields.len();
@@ -1648,11 +1658,20 @@ impl ParquetSource {
                     let value = file.partition_values.get(partition).cloned().flatten();
                     return constant_array(data_type, value.as_deref(), rows);
                 }
-                decoded
+                let array = decoded
                     .iter()
                     .position(|read_column| *read_column == column)
                     .map(|position| batch.column(position).clone())
-                    .ok_or_else(|| anyhow!("projected column {column} was not decoded"))
+                    .ok_or_else(|| anyhow!("projected column {column} was not decoded"))?;
+                // A column stored as a dictionary (or a narrow Decimal256) is
+                // read as its values (`types::read_type`).
+                let wanted = self.dataset_metadata.schema.field(column).data_type();
+                if array.data_type() == wanted {
+                    Ok(array)
+                } else {
+                    arrow_cast::cast(&array, wanted)
+                        .with_context(|| format!("read column {column} as {wanted}"))
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(RecordBatch::try_new_with_options(
@@ -1758,12 +1777,17 @@ pub(crate) enum Scalar {
     Time(i64),
     /// Unscaled decimal; one column always has one scale.
     Decimal(i128),
+    /// A length of time in the column's unit.
+    Duration(i64),
+    /// Binary values, compared byte by byte.
+    Bytes(Vec<u8>),
 }
 
 impl Scalar {
     fn bytes(&self) -> usize {
         match self {
             Self::Utf8(value) => 16 + value.len(),
+            Self::Bytes(value) => 16 + value.len(),
             _ => 16,
         }
     }
@@ -2462,6 +2486,61 @@ pub(crate) fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> 
                 .context("read decimal aggregate value")?
                 .value(row),
         )),
+        DataType::Duration(unit) => {
+            let value = match unit {
+                TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<DurationSecondArray>()
+                    .map(|array| array.value(row)),
+                TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<DurationMillisecondArray>()
+                    .map(|array| array.value(row)),
+                TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<DurationMicrosecondArray>()
+                    .map(|array| array.value(row)),
+                TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<DurationNanosecondArray>()
+                    .map(|array| array.value(row)),
+            };
+            Ok(Scalar::Duration(
+                value.context("read duration aggregate value")?,
+            ))
+        }
+        DataType::Binary => Ok(Scalar::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .context("read binary aggregate value")?
+                .value(row)
+                .to_vec(),
+        )),
+        DataType::LargeBinary => Ok(Scalar::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .context("read binary aggregate value")?
+                .value(row)
+                .to_vec(),
+        )),
+        DataType::BinaryView => Ok(Scalar::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .context("read binary aggregate value")?
+                .value(row)
+                .to_vec(),
+        )),
+        DataType::FixedSizeBinary(_) => Ok(Scalar::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .context("read binary aggregate value")?
+                .value(row)
+                .to_vec(),
+        )),
         _ => bail!("aggregate cannot read unsupported {data_type:?} values"),
     }
 }
@@ -2480,6 +2559,8 @@ fn scalar_compare(left: &Scalar, right: &Scalar) -> std::cmp::Ordering {
         (Scalar::Timestamp(left), Scalar::Timestamp(right)) => left.cmp(right),
         (Scalar::Time(left), Scalar::Time(right)) => left.cmp(right),
         (Scalar::Decimal(left), Scalar::Decimal(right)) => left.cmp(right),
+        (Scalar::Duration(left), Scalar::Duration(right)) => left.cmp(right),
+        (Scalar::Bytes(left), Scalar::Bytes(right)) => left.cmp(right),
         _ => std::cmp::Ordering::Equal,
     }
 }
@@ -2615,6 +2696,36 @@ fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayR
                 _ => bail!("aggregate output type mismatch"),
             }
         ))),
+        DataType::Duration(unit) => {
+            let ticks = values!(|value: &Scalar| match value {
+                Scalar::Duration(value) => Ok(*value),
+                _ => bail!("aggregate output type mismatch"),
+            });
+            match unit {
+                TimeUnit::Second => Arc::new(DurationSecondArray::from(ticks)) as ArrayRef,
+                TimeUnit::Millisecond => Arc::new(DurationMillisecondArray::from(ticks)),
+                TimeUnit::Microsecond => Arc::new(DurationMicrosecondArray::from(ticks)),
+                TimeUnit::Nanosecond => Arc::new(DurationNanosecondArray::from(ticks)),
+            }
+        }
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => {
+            let bytes = values!(|value: &Scalar| match value {
+                Scalar::Bytes(value) => Ok(value.clone()),
+                _ => bail!("aggregate output type mismatch"),
+            });
+            match data_type {
+                DataType::Binary => Arc::new(BinaryArray::from_iter(bytes)) as ArrayRef,
+                DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter(bytes)),
+                DataType::BinaryView => Arc::new(BinaryViewArray::from_iter(bytes)),
+                DataType::FixedSizeBinary(size) => Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(bytes.into_iter(), *size)?,
+                ),
+                _ => bail!("aggregate output type mismatch"),
+            }
+        }
         DataType::Decimal32(precision, scale) => Arc::new(
             Decimal32Array::from(values!(|value: &Scalar| match value {
                 Scalar::Decimal(value) => i32::try_from(*value).context("decimal out of range"),
@@ -3539,6 +3650,180 @@ mod tests {
                 .read_filtered_from(&filter, 30_001, 1, &projection, &|_| false)
                 .is_err()
         );
+    }
+
+    /// Six rows in row groups of two: an id, a dictionary column, a duration,
+    /// binary and a narrow Decimal256, each with a null.
+    fn more_types_file() -> (TempDir, ParquetSource) {
+        use arrow_array::{
+            DictionaryArray, DurationMillisecondArray, Int32Array, types::Int32Type,
+        };
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("types.parquet");
+        // Written as a Decimal256 of 20 digits, as pyarrow can.
+        let amounts = arrow_cast::cast(
+            &arrow_array::Decimal128Array::from(vec![
+                Some(150),
+                Some(250),
+                None,
+                Some(100),
+                Some(999),
+                Some(250),
+            ])
+            .with_precision_and_scale(20, 2)
+            .unwrap(),
+            &DataType::Decimal256(20, 2),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..6)) as ArrayRef,
+            ),
+            (
+                "cat",
+                Arc::new(
+                    vec![Some("a"), Some("b"), Some("a"), None, Some("c"), Some("b")]
+                        .into_iter()
+                        .collect::<DictionaryArray<Int32Type>>(),
+                ),
+            ),
+            (
+                "d",
+                Arc::new(DurationMillisecondArray::from(vec![
+                    Some(1_000),
+                    Some(2_000),
+                    None,
+                    Some(1_500),
+                    Some(3_000),
+                    Some(2_000),
+                ])),
+            ),
+            (
+                "bin",
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"hi".as_slice()),
+                    Some(b"\x00".as_slice()),
+                    None,
+                    Some(b"zz".as_slice()),
+                    Some(b"hi".as_slice()),
+                    Some(b"a".as_slice()),
+                ])),
+            ),
+            ("amount", amounts),
+        ])
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            batch.schema(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(2))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (directory, ParquetSource::open(&path).unwrap())
+    }
+
+    #[test]
+    fn filters_sorts_and_groups_dictionaries_durations_binary_and_wide_decimals() {
+        let (_directory, source) = more_types_file();
+        assert_eq!(source.row_groups().len(), 3);
+        let schema = source.schema();
+        // Dictionaries are read as their values; a narrow Decimal256 as Decimal128.
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &DataType::Duration(TimeUnit::Millisecond)
+        );
+        assert_eq!(schema.field(3).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(4).data_type(), &DataType::Decimal128(20, 2));
+
+        let projection = Projection::all(5);
+        let matching = |filter: &str| {
+            let filter = FilterExpr::parse(filter).unwrap();
+            ids(&source
+                .read_filtered_window(&filter, 0, 10, &projection)
+                .unwrap())
+        };
+        assert_eq!(matching("cat == 'b'"), [1, 5]);
+        assert_eq!(matching("cat LIKE 'a%'"), [0, 2]);
+        assert_eq!(matching("cat IS NULL"), [3]);
+        // Durations: ISO 8601 as the grid shows them, or a number in the column's unit.
+        assert_eq!(matching("d >= PT2S"), [1, 4, 5]);
+        assert_eq!(matching("d == 1500"), [3]);
+        assert_eq!(matching("d < PT1.5S"), [0]);
+        assert_eq!(matching("d == P0DT0.0025S"), Vec::<i32>::new());
+        // Binary: hex, with or without 0x, compared byte by byte.
+        assert_eq!(matching("bin == 0x6869"), [0, 4]);
+        assert_eq!(matching("bin > 61"), [0, 3, 4]);
+        assert_eq!(matching("amount > 2.00"), [1, 4, 5]);
+
+        // Grouping, MIN and MAX keep each type.
+        let spec = AggregateSpec::grouped_by(
+            vec![1],
+            vec![
+                AggregateExpr::count_all(),
+                AggregateExpr::min(2),
+                AggregateExpr::max(3),
+                AggregateExpr::max(4),
+            ],
+        )
+        .unwrap();
+        let grouped = source
+            .read_aggregated(None, &spec, GroupBudget::default(), &|_| false)
+            .unwrap();
+        let text = |column: usize| {
+            (0..grouped.num_rows())
+                .map(|row| {
+                    crate::value::scalar_text(grouped.column(column).as_ref(), row)
+                        .unwrap()
+                        .unwrap_or_else(|| "null".to_owned())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(0), ["a", "b", "null", "c"]);
+        assert_eq!(text(1), ["2", "2", "1", "1"]);
+        assert_eq!(text(2), ["PT1S", "PT2S", "PT1.5S", "PT3S"]);
+        assert_eq!(text(3), ["6869", "61", "7a7a", "6869"]);
+        assert_eq!(text(4), ["1.50", "2.50", "1.00", "9.99"]);
+
+        // Sorting by a duration, nulls last, ties in file order.
+        let sorted = match source
+            .read_sorted(
+                None,
+                &projection,
+                &[SortSpec::new(2, SortDirection::Descending, NullOrder::Last)],
+                SortBudget::default(),
+                None,
+                &|_| false,
+            )
+            .unwrap()
+        {
+            SortOutput::InMemory(batches) => batches.iter().flat_map(ids).collect::<Vec<_>>(),
+            SortOutput::Spilled(_) => panic!("six rows fit in memory"),
+        };
+        assert_eq!(sorted, [4, 1, 5, 3, 0, 2]);
+
+        for (filter, message) in [
+            ("bin == zz", "is not binary"),
+            ("d > one hour", "is not a length of time"),
+            (
+                "bin contains 68",
+                "contains is only supported for text columns",
+            ),
+        ] {
+            let error = source
+                .validate_filter(&FilterExpr::parse(filter).unwrap())
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(message),
+                "{filter}: {error:#}"
+            );
+        }
     }
 
     #[test]
