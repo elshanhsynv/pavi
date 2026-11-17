@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Date32Array, Date64Array, Decimal128Array, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    ArrayRef, Date32Array, Date64Array, Decimal128Array, DurationMicrosecondArray,
+    DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType, Schema, TimeUnit};
@@ -165,6 +166,17 @@ fn int64_text(value: i64, data_type: &DataType) -> String {
                 None => return value.to_string(),
             }
         }
+        // Durations as the grid shows them (`PT90S`).
+        DataType::Duration(TimeUnit::Second) => Arc::new(DurationSecondArray::from(vec![value])),
+        DataType::Duration(TimeUnit::Millisecond) => {
+            Arc::new(DurationMillisecondArray::from(vec![value]))
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            Arc::new(DurationMicrosecondArray::from(vec![value]))
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            Arc::new(DurationNanosecondArray::from(vec![value]))
+        }
         _ => return value.to_string(),
     };
     typed_text(&array).unwrap_or_else(|| value.to_string())
@@ -180,6 +192,21 @@ fn bytes_text(value: &[u8], data_type: &DataType) -> String {
             .and_then(|unscaled| decimal(unscaled, *scale))
             .and_then(|array| typed_text(&array))
     {
+        return text;
+    }
+    // Binary columns are hex as the grid shows them, even when the bytes
+    // happen to be text.
+    if crate::types::is_binary(data_type) {
+        let shown = value
+            .get(..value.len().min(STAT_VALUE_LIMIT / 2))
+            .unwrap_or(value);
+        let mut text = shown
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if shown.len() < value.len() {
+            text.push_str("...");
+        }
         return text;
     }
     format_stat_bytes(value)
@@ -273,9 +300,19 @@ mod tests {
         assert_eq!(bytes_text(&[0x30, 0x39], &decimal), "12.345");
         assert_eq!(bytes_text(&[0xff, 0xfb], &decimal), "-0.005");
         assert_eq!(bytes_text(b"alpha", &DataType::Utf8), "alpha");
+        // Binary columns read as the grid shows them: hex, even when the
+        // bytes happen to be text.
+        assert_eq!(bytes_text(&[0xff, 0x00], &DataType::Binary), "ff00");
+        assert_eq!(bytes_text(b"hi", &DataType::LargeBinary), "6869");
+        // Bytes that aren't text in other columns keep the bounded form.
         assert_eq!(
-            bytes_text(&[0xff, 0x00], &DataType::Binary),
+            bytes_text(&[0xff, 0x00], &DataType::Utf8),
             "0xff00 (2 bytes)"
+        );
+        // Durations read like the grid's ISO 8601.
+        assert_eq!(
+            int64_text(90, &DataType::Duration(TimeUnit::Second)),
+            "PT90S"
         );
     }
 }

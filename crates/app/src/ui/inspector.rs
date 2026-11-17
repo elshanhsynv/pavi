@@ -520,6 +520,11 @@ pub fn type_label(data_type: &DataType) -> String {
         | DataType::Decimal128(precision, scale)
         | DataType::Decimal256(precision, scale) => format!("dec({precision},{scale})"),
         DataType::Time32(_) | DataType::Time64(_) => "time".into(),
+        DataType::Duration(_) => "dur".into(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "bytes".into(),
         DataType::Struct(fields) => format!("struct<{}>", fields.len()),
         DataType::Map(_, _) => "map".into(),
         _ => data_type.to_string(),
@@ -571,5 +576,10 @@ mod tests {
             type_label(&DataType::Time64(arrow_schema::TimeUnit::Microsecond)),
             "time"
         );
+        assert_eq!(
+            type_label(&DataType::Duration(arrow_schema::TimeUnit::Nanosecond)),
+            "dur"
+        );
+        assert_eq!(type_label(&DataType::FixedSizeBinary(16)), "bytes");
     }
 }

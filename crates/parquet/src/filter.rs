@@ -2,9 +2,11 @@ use std::cmp::Ordering;
 
 use anyhow::{Result, anyhow, bail};
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
-    RecordBatch, StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Decimal32Array,
+    Decimal64Array, Decimal128Array, DurationMicrosecondArray, DurationMillisecondArray,
+    DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
+    StringArray, StringViewArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
@@ -18,7 +20,7 @@ use arrow_cast::parse::{Parser, string_to_datetime};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use parquet::file::statistics::Statistics;
 
-use crate::types::{is_comparable, is_numeric, is_string};
+use crate::types::{is_binary, is_comparable, is_numeric, is_string};
 
 /// Most comparisons one filter may hold, counting every value of an `IN` list.
 pub const MAX_FILTER_TERMS: usize = 64;
@@ -644,6 +646,8 @@ impl Comparison {
             self.value
                 .parse::<bool>()
                 .map_err(|_| anyhow!("'{}' is not a boolean", self.value))?;
+        } else if is_binary(data_type) {
+            binary_value(&self.value)?;
         } else if !is_string(data_type) {
             self.ordered_value(data_type)?;
         }
@@ -678,6 +682,7 @@ impl Comparison {
             DataType::Decimal32(_, scale)
             | DataType::Decimal64(_, scale)
             | DataType::Decimal128(_, scale) => decimal_value(value, *scale),
+            DataType::Duration(unit) => duration_value(value, *unit),
             // A Float32 column holds the nearest f32 to what was written; read the
             // filter value the same way, so `x == 9.083333` matches the cell that
             // displays as 9.083333.
@@ -698,6 +703,10 @@ impl Comparison {
             DataType::Time32(_) | DataType::Time64(_) => {
                 anyhow!("'{value}' is not a time of day (expected HH:MM:SS or HH:MM:SS.fff)")
             }
+            DataType::Duration(unit) => anyhow!(
+                "'{value}' is not a length of time (expected a number of {}, or ISO 8601 like PT1H30M or P2DT6H)",
+                unit_name(*unit)
+            ),
             _ => anyhow!("'{value}' is not a number"),
         })
     }
@@ -724,6 +733,16 @@ impl Comparison {
             }
             DataType::Utf8View => {
                 self.evaluate_strings(array, |a: &StringViewArray, row| a.value(row))?
+            }
+            DataType::Binary => self.evaluate_bytes(array, |a: &BinaryArray, row| a.value(row))?,
+            DataType::LargeBinary => {
+                self.evaluate_bytes(array, |a: &LargeBinaryArray, row| a.value(row))?
+            }
+            DataType::BinaryView => {
+                self.evaluate_bytes(array, |a: &BinaryViewArray, row| a.value(row))?
+            }
+            DataType::FixedSizeBinary(_) => {
+                self.evaluate_bytes(array, |a: &FixedSizeBinaryArray, row| a.value(row))?
             }
             _ => {
                 let expected = self.ordered_value(data_type)?;
@@ -772,6 +791,18 @@ impl Comparison {
                     DataType::Decimal32(_, _) => ordered!(Decimal32Array, Number::Int),
                     DataType::Decimal64(_, _) => ordered!(Decimal64Array, Number::Int),
                     DataType::Decimal128(_, _) => ordered!(Decimal128Array, Number::Int),
+                    DataType::Duration(TimeUnit::Second) => {
+                        ordered!(DurationSecondArray, Number::Int)
+                    }
+                    DataType::Duration(TimeUnit::Millisecond) => {
+                        ordered!(DurationMillisecondArray, Number::Int)
+                    }
+                    DataType::Duration(TimeUnit::Microsecond) => {
+                        ordered!(DurationMicrosecondArray, Number::Int)
+                    }
+                    DataType::Duration(TimeUnit::Nanosecond) => {
+                        ordered!(DurationNanosecondArray, Number::Int)
+                    }
                     other => bail!("filtering is not supported for {other:?} columns"),
                 }
             }
@@ -896,6 +927,28 @@ impl Comparison {
         })))
     }
 
+    /// Binary values compared byte by byte with the filter's hex value.
+    fn evaluate_bytes<T>(
+        &self,
+        array: &dyn Array,
+        value_at: impl Fn(&T, usize) -> &[u8],
+    ) -> Result<BooleanArray>
+    where
+        T: Array + 'static,
+    {
+        let array = array
+            .as_any()
+            .downcast_ref::<T>()
+            .ok_or_else(|| anyhow!("binary array type mismatch"))?;
+        let expected = binary_value(&self.value)?;
+        Ok(BooleanArray::from_iter((0..array.len()).map(|row| {
+            Some(
+                !array.is_null(row)
+                    && ordering_matches(value_at(array, row).cmp(expected.as_slice()), &self.op),
+            )
+        })))
+    }
+
     fn evaluate_strings<T>(
         &self,
         array: &dyn Array,
@@ -933,6 +986,130 @@ fn unquote(value: &str) -> String {
         })
         .unwrap_or(value)
         .to_string()
+}
+
+/// Whether `ordering` (a value against the filter's) passes the comparison.
+fn ordering_matches(ordering: Ordering, op: &FilterOp) -> bool {
+    match op {
+        FilterOp::Eq => ordering == Ordering::Equal,
+        FilterOp::Ne => ordering != Ordering::Equal,
+        FilterOp::Gt => ordering == Ordering::Greater,
+        FilterOp::Ge => ordering != Ordering::Less,
+        FilterOp::Lt => ordering == Ordering::Less,
+        FilterOp::Le => ordering != Ordering::Greater,
+        _ => false,
+    }
+}
+
+/// The bytes a binary filter value stands for: hex digits, with or without
+/// `0x`, as the grid and CSV show binary values.
+fn binary_value(value: &str) -> Result<Vec<u8>> {
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    let bad = || anyhow!("'{value}' is not binary (expected hex digits, like 0x48656c6c6f)");
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|start| {
+            hex.get(start..start + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(bad)
+        })
+        .collect()
+}
+
+fn unit_name(unit: TimeUnit) -> &'static str {
+    match unit {
+        TimeUnit::Second => "seconds",
+        TimeUnit::Millisecond => "milliseconds",
+        TimeUnit::Microsecond => "microseconds",
+        TimeUnit::Nanosecond => "nanoseconds",
+    }
+}
+
+/// A duration filter value in ticks of `unit`: a number in that unit, or ISO
+/// 8601 as the grid shows durations (`PT90S`, `P1DT7200S`, `-PT0.5S`, with
+/// weeks, days, hours, minutes and seconds). A value between two ticks is
+/// kept as a fraction, so `==` matches nothing.
+fn duration_value(value: &str, unit: TimeUnit) -> Option<Number> {
+    if let Some(number) = Number::parse(value) {
+        return Some(number);
+    }
+    let nanos = iso_duration_nanos(value)?;
+    let per_tick: i128 = match unit {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
+    };
+    Some(if nanos % per_tick == 0 {
+        Number::Int(nanos / per_tick)
+    } else {
+        Number::Float(nanos as f64 / per_tick as f64)
+    })
+}
+
+/// Nanoseconds in an ISO 8601 duration without years or months.
+fn iso_duration_nanos(value: &str) -> Option<i128> {
+    const SECOND: i128 = 1_000_000_000;
+    let (negative, rest) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let rest = rest.strip_prefix(['P', 'p'])?;
+    let (date, time) = match rest.split_once(['T', 't']) {
+        Some((date, time)) => (date, Some(time)),
+        None => (rest, None),
+    };
+    let mut total: i128 = 0;
+    let mut parts = 0;
+    let mut add = |text: &str, units: &[(char, i128)]| -> Option<()> {
+        let mut number = String::new();
+        for c in text.chars() {
+            if c.is_ascii_digit() || c == '.' {
+                number.push(c);
+                continue;
+            }
+            let (_, size) = units
+                .iter()
+                .find(|(letter, _)| letter.eq_ignore_ascii_case(&c))?;
+            let (whole, fraction) = number.split_once('.').unwrap_or((&number, ""));
+            if whole.is_empty() && fraction.is_empty() {
+                return None;
+            }
+            // Only seconds take a fraction, as ISO 8601 writers use it.
+            if !fraction.is_empty() && *size != SECOND {
+                return None;
+            }
+            let whole = if whole.is_empty() {
+                0
+            } else {
+                whole.parse::<i128>().ok()?
+            };
+            let mut nanos = whole.checked_mul(*size)?;
+            if !fraction.is_empty() {
+                let digits = fraction.get(..fraction.len().min(9))?;
+                let scaled = digits.parse::<i128>().ok()? * 10_i128.pow(9 - digits.len() as u32);
+                nanos = nanos.checked_add(scaled)?;
+            }
+            total = total.checked_add(nanos)?;
+            parts += 1;
+            number.clear();
+        }
+        number.is_empty().then_some(())
+    };
+    add(date, &[('W', 7 * 86_400 * SECOND), ('D', 86_400 * SECOND)])?;
+    if let Some(time) = time {
+        add(
+            time,
+            &[('H', 3_600 * SECOND), ('M', 60 * SECOND), ('S', SECOND)],
+        )?;
+    }
+    (parts > 0).then_some(if negative { -total } else { total })
 }
 
 fn compare_bool(left: bool, right: bool, op: &FilterOp) -> bool {

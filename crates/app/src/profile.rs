@@ -617,7 +617,15 @@ mod tests {
             Some(4)
         );
 
-        assert!(ProfileAccumulator::new(0, "b".to_string(), DataType::Binary, None).is_err());
+        assert!(
+            ProfileAccumulator::new(
+                0,
+                "b".to_string(),
+                DataType::Interval(arrow_schema::IntervalUnit::DayTime),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]
