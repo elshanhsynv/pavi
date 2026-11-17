@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- SQL calculations: arithmetic (`price * qty`), `||`, comparisons and `AND`/`OR`/`NOT`, `CAST`/`TRY_CAST`, `CASE`, and the functions `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `SUBSTRING`, `CONCAT`, `ABS`, `ROUND`, `COALESCE`, `YEAR`, `QUARTER`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DAYOFWEEK` and `EXTRACT`. They work in SELECT, WHERE (`WHERE a > b`, `WHERE NOT (…)`), GROUP BY (`GROUP BY YEAR(day)`), ORDER BY, HAVING, inside aggregates (`SUM(price * qty)`) and on aggregates' results (`ROUND(AVG(delay), 2)`, `SUM(a) / COUNT(*)`). In a plain SELECT they cost nothing extra; used to filter, group or sort, the rows are prepared first, as for a join.
 - SQL: `ORDER BY` an aggregate's results (`ORDER BY COUNT(*) DESC`, an alias, or a position such as `ORDER BY 2`), `HAVING` (e.g. `HAVING COUNT(*) > 100`), `SELECT DISTINCT`, `COUNT(DISTINCT column)`, and `AS` aliases, which name the result's columns. `GROUP BY` without aggregates lists each value once.
 - Filter, SQL and sort results can be entered anywhere: "Go to row", Home, End, the arrow keys and a new scrollbar for the whole result reach any row, and scrolling up brings back rows scrolled past. A filter's matches are counted in the background ("rows 1–4,096 of 999,999,989"), after which a jump only reads the row group that holds the row, even in a billion-row file.
 - CLI: `--sql` shows the progress line too: how much of a join or subquery is prepared, then the rows scanned.
@@ -16,6 +17,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - CLI: `--format tsv` (and `-o out.tsv`) writes tab-separated text.
 
 ### Changed
+- SQL: SELECT may list GROUP BY columns in any order, or leave them out (`SELECT COUNT(*) FROM dataset GROUP BY carrier`).
 - CLI: with `--filter`, the table's `#` column shows each row's number in the file, not its place among the matches. With `--sort` or `--sql` it still counts the result.
 
 ### Fixed

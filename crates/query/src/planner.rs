@@ -30,7 +30,10 @@ impl PhysicalPlan {
     pub fn output_schema(&self) -> Result<SchemaRef> {
         let schema = self.unnamed_schema()?;
         match &self.output {
-            Some(output) => output.rename(&schema),
+            Some(output) => {
+                let schema = output.computed_schema(&schema)?.unwrap_or(schema);
+                output.rename(&schema)
+            }
             None => Ok(schema),
         }
     }
@@ -197,7 +200,10 @@ fn check_output(output: &Output, result: &Schema, aggregate: bool) -> Result<Sch
     if !aggregate && (output.having.is_some() || !output.sort.is_empty()) {
         bail!("HAVING and ORDER BY on result columns need GROUP BY or an aggregate");
     }
-    let renamed = output.rename(result)?;
+    let computed = output
+        .computed_schema(result)
+        .context("validate the calculations")?;
+    let renamed = output.rename(computed.as_deref().unwrap_or(result))?;
     if let Some(having) = &output.having {
         having
             .to_filter(&renamed)?

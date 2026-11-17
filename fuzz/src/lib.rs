@@ -300,6 +300,11 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT active, COUNT(DISTINCT name), SUM(score) FROM dataset GROUP BY active ORDER BY SUM(score) LIMIT 1",
     "SELECT DISTINCT category, active FROM dataset ORDER BY category DESC",
     "SELECT id AS key, name AS label FROM dataset ORDER BY key DESC LIMIT 4",
+    "SELECT id * 2 + small AS x, UPPER(name) || '!', CASE WHEN score > 2 THEN 'hi' ELSE 'lo' END FROM dataset",
+    "SELECT YEAR(day), COUNT(*), SUM(score * 2) FROM dataset WHERE id % 3 = 0 GROUP BY YEAR(day)",
+    "SELECT name FROM dataset WHERE LENGTH(name) > small AND NOT (active) ORDER BY ROUND(score / 3, 1) DESC",
+    "SELECT CAST(score AS DECIMAL(10, 2)), TRY_CAST(name AS INT), COALESCE(amount, 0) FROM dataset",
+    "SELECT ROUND(AVG(score), 2) AS mean, category, SUM(score) / COUNT(*) FROM dataset GROUP BY category HAVING mean > 1 ORDER BY 2",
 ];
 
 /// One runtime shared by fuzz inputs that need the query engine. It is kept in a

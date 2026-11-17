@@ -26,6 +26,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Clipboard copy | 16 MB of text; values are formatted only up to the space left | `MAX_CLIPBOARD_BYTES` |
 | Find, one step on the UI thread | 500,000 cells (only rows already loaded) | `find::MAX_FIND_CELLS` |
 | Cell value used as a filter | 1,024 bytes | `MAX_FILTER_VALUE_BYTES` |
+| SQL calculations (ADR 0013) | 256 parts per calculation, 32 calculations per query; evaluated one batch at a time; calculations used to filter, group or sort write a temporary table under the 32 GiB prepared limit | `expr::MAX_EXPR_NODES`, `sql::MAX_CALCULATIONS` |
 | Comparisons in one filter | 64 (each `IN` value counts), 16 levels deep | `filter::MAX_FILTER_TERMS`, `MAX_FILTER_DEPTH` |
 | `LIKE` pattern | 256 characters | `filter::MAX_LIKE_PATTERN_CHARS` |
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |

@@ -71,6 +71,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
+name = "arrow-arith"
+version = "60.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca16fdd1daeb1eccefb42df52ec65448ef33eec72488598675d46dfa9ce58923"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "chrono",
+ "num-traits",
+]
+
+[[package]]
 name = "arrow-array"
 version = "60.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -813,7 +827,9 @@ name = "pavi_query"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "arrow-arith",
  "arrow-array",
+ "arrow-cast",
  "arrow-ord",
  "arrow-schema",
  "arrow-select",

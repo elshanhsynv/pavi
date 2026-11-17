@@ -11,10 +11,35 @@ pub(crate) const MAX_SUGGESTIONS: usize = 8;
 const KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "LIMIT", "AND", "OR", "NOT", "IN",
     "BETWEEN", "LIKE", "IS", "NULL", "ASC", "DESC", "NULLS", "FIRST", "LAST", "TRUE", "FALSE",
-    "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS", "HAVING", "DISTINCT",
+    "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS", "HAVING", "DISTINCT", "CASE", "WHEN", "THEN",
+    "ELSE", "END", "CAST", "TRY_CAST", "EXTRACT",
 ];
 /// Aggregate functions, highlighted apart from keywords.
-const FUNCTIONS: &[&str] = &["COUNT", "SUM", "AVG", "MIN", "MAX"];
+const FUNCTIONS: &[&str] = &[
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "LOWER",
+    "UPPER",
+    "TRIM",
+    "LENGTH",
+    "SUBSTRING",
+    "SUBSTR",
+    "CONCAT",
+    "ABS",
+    "ROUND",
+    "COALESCE",
+    "YEAR",
+    "QUARTER",
+    "MONTH",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "DAYOFWEEK",
+];
 /// The tab running the query, always a table name.
 const TABLE: &str = "dataset";
 
@@ -178,9 +203,10 @@ pub(crate) fn word_before(text: &str, cursor: usize) -> Option<(usize, String)> 
     Some((text[..start].chars().count(), word.to_owned()))
 }
 
-/// Columns, keywords, functions and table names that start with `prefix`
-/// (ignoring case), columns first. Then columns that only contain it. A word
-/// already typed out in full is not offered.
+/// Columns, table names, keywords and functions that start with `prefix`
+/// (ignoring case), in that order: the data's own names before SQL's. Then
+/// columns that only contain it. A word already typed out in full is not
+/// offered.
 pub(crate) fn suggestions(prefix: &str, columns: &[String], tables: &[String]) -> Vec<Suggestion> {
     if prefix.is_empty() {
         return Vec::new();
@@ -194,10 +220,18 @@ pub(crate) fn suggestions(prefix: &str, columns: &[String], tables: &[String]) -
             kind: TokenKind::Column,
         });
     }
+    for table in std::iter::once(TABLE)
+        .chain(tables.iter().map(String::as_str))
+        .filter(|table| starts(table))
+    {
+        found.push(Suggestion {
+            insert: table.to_owned(),
+            kind: TokenKind::Table,
+        });
+    }
     for (words, kind) in [
         (KEYWORDS, TokenKind::Keyword),
         (FUNCTIONS, TokenKind::Function),
-        (&[TABLE][..], TokenKind::Table),
     ] {
         for word in words.iter().filter(|word| starts(word)) {
             found.push(Suggestion {
@@ -205,12 +239,6 @@ pub(crate) fn suggestions(prefix: &str, columns: &[String], tables: &[String]) -
                 kind,
             });
         }
-    }
-    for table in tables.iter().filter(|table| starts(table)) {
-        found.push(Suggestion {
-            insert: table.clone(),
-            kind: TokenKind::Table,
-        });
     }
     for column in columns.iter().filter(|column| {
         !starts(column)

@@ -46,6 +46,9 @@ pub struct Aggregate {
 /// `HAVING` and the sort apply to an aggregate's one bounded batch only.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Output {
+    /// The result's columns calculated from the input's (ADR 0013), when a
+    /// plain SELECT list calculates; they are made first, then named.
+    pub(crate) columns: Option<Vec<crate::expr::Expr<usize>>>,
     pub(crate) having: Option<OutputFilter>,
     /// Keys on result columns, most significant first.
     pub(crate) sort: Vec<SortSpec>,
@@ -103,15 +106,51 @@ impl Output {
         names: Vec<Option<String>>,
     ) -> Self {
         Self {
+            columns: None,
             having,
             sort,
             names,
         }
     }
 
-    /// Whether it renames any column.
+    /// The same step, calculating the result's columns from the input's.
+    pub fn computing(self, columns: Option<Vec<crate::expr::Expr<usize>>>) -> Self {
+        Self { columns, ..self }
+    }
+
+    /// The schema of the calculated columns over an input with `input`'s
+    /// columns, before naming: a column keeps its name, a calculation is
+    /// `column{n}` until named.
+    pub(crate) fn computed_schema(&self, input: &Schema) -> Result<Option<SchemaRef>> {
+        let Some(columns) = &self.columns else {
+            return Ok(None);
+        };
+        let fields = columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let name = match column {
+                    crate::expr::Expr::Column(position) => input
+                        .fields()
+                        .get(*position)
+                        .map(|field| field.name().clone())
+                        .ok_or_else(|| anyhow!("result column {position} is out of range"))?,
+                    _ => format!("column{}", index + 1),
+                };
+                Ok(arrow_schema::Field::new(
+                    name,
+                    column.data_type(input)?,
+                    true,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Arc::new(Schema::new(fields))))
+    }
+
+    /// Whether the result's columns are not the input's own: renamed or
+    /// calculated.
     pub fn renames(&self) -> bool {
-        self.names.iter().any(Option::is_some)
+        self.columns.is_some() || self.names.iter().any(Option::is_some)
     }
 
     /// `schema` with the new names.

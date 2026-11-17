@@ -1,6 +1,7 @@
 //! A bounded logical query layer over PAVI data sources.
 
 mod execution;
+pub mod expr;
 mod logical;
 mod planner;
 mod prep;

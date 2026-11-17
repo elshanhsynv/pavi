@@ -17,6 +17,7 @@ version = "0.4.0"
 [workspace.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+arrow-arith = "60"
 arrow-array = { version = "60", features = ["chrono-tz"] }
 arrow-cast = "60"
 # Opening CSV, JSON and Arrow IPC files (ADR 0007).

@@ -310,6 +310,24 @@ fn shape_output(output: Option<&Output>, batch: RecordBatch) -> Result<RecordBat
     let Some(output) = output else {
         return Ok(batch);
     };
+    // Calculated columns first, one batch at a time (ADR 0013).
+    let batch = match &output.columns {
+        Some(columns) => {
+            let schema = output
+                .computed_schema(batch.schema_ref())?
+                .context("calculated columns have no schema")?;
+            let arrays = columns
+                .iter()
+                .map(|column| column.evaluate(&batch))
+                .collect::<Result<Vec<_>>>()?;
+            RecordBatch::try_new_with_options(
+                schema,
+                arrays,
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+            )?
+        }
+        None => batch,
+    };
     let mut batch = if output.renames() {
         RecordBatch::try_new(output.rename(batch.schema_ref())?, batch.columns().to_vec())?
     } else {

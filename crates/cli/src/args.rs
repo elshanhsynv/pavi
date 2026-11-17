@@ -103,7 +103,8 @@ pub struct Args {
     /// its file name, e.g. `flights`); --table adds more. The same subset as
     /// the app's SQL editor: WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX and
     /// COUNT(DISTINCT …) with GROUP BY and HAVING, SELECT DISTINCT, AS aliases,
-    /// INNER/LEFT joins and subqueries. --head and --offset cut the
+    /// calculations (arithmetic, CASE, CAST, UPPER, YEAR, …), INNER/LEFT joins
+    /// and subqueries. --head and --offset cut the
     /// result
     #[arg(
         long,

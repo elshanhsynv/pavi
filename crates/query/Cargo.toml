@@ -6,7 +6,11 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+# Arithmetic, boolean logic and date parts for SQL calculations (ADR 0013):
+# the Arrow project's own kernels, the same version as the other arrow crates.
+arrow-arith.workspace = true
 arrow-array.workspace = true
+arrow-cast.workspace = true
 # Already in the tree through parquet_reader: sorting and filtering an
 # aggregate's result (ORDER BY, HAVING).
 arrow-ord.workspace = true

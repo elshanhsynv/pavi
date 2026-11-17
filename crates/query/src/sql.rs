@@ -18,6 +18,7 @@ use sqlparser::{
 
 use crate::{
     AggregateExpr, AggregateFunction, Filter, LogicalPlan, Planner,
+    expr::{self as calc},
     logical::{Output, OutputFilter, Prepared},
     prep::{MAX_JOINS, MAX_SUBQUERY_DEPTH, Prep, PrepFilter, PrepValue},
 };
@@ -146,6 +147,81 @@ impl std::fmt::Display for SqlColumn {
     }
 }
 
+/// Hidden column names for calculations start with this.
+const CALC_PREFIX: &str = "#calc";
+/// Distinct calculations in one query.
+pub const MAX_CALCULATIONS: usize = 32;
+
+/// The calculations a query makes (ADR 0013). Each is named by a hidden column
+/// (`#calc0` …) that the rest of the query uses like any column; the same
+/// calculation written twice is one column.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SqlCalcs {
+    items: Vec<SqlCalc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SqlCalc {
+    name: String,
+    expr: calc::Expr<SqlColumn>,
+    /// As written, for messages.
+    text: String,
+    /// Used by WHERE, GROUP BY, ORDER BY, HAVING or an aggregate, so it must
+    /// be calculated before rows are filtered, grouped or sorted.
+    outside_select: bool,
+}
+
+impl SqlCalcs {
+    /// The column `expression` stands for: itself when it is a column, else
+    /// the hidden column of its calculation.
+    fn column(&mut self, expression: &Expr, outside_select: bool) -> Result<SqlColumn> {
+        let parsed = calc::parse(expression)?;
+        if let calc::Expr::Column(column) = parsed {
+            return Ok(column);
+        }
+        if let Some(existing) = self.items.iter_mut().find(|item| item.expr == parsed) {
+            existing.outside_select |= outside_select;
+            return Ok(SqlColumn::new(existing.name.clone()));
+        }
+        if self.items.len() >= MAX_CALCULATIONS {
+            bail!("a query makes at most {MAX_CALCULATIONS} different calculations");
+        }
+        let name = format!("{CALC_PREFIX}{}", self.items.len());
+        self.items.push(SqlCalc {
+            name: name.clone(),
+            expr: parsed,
+            text: expression.to_string(),
+            outside_select,
+        });
+        Ok(SqlColumn::new(name))
+    }
+
+    /// Which calculation `column` names, if it is one.
+    fn position(&self, column: &SqlColumn) -> Option<usize> {
+        if column.table.is_some() {
+            return None;
+        }
+        self.items.iter().position(|item| item.name == column.name)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn outside_select(&self) -> bool {
+        self.items.iter().any(|item| item.outside_select)
+    }
+
+    /// Every column the calculations read.
+    fn columns(&self) -> Vec<&SqlColumn> {
+        let mut columns = Vec::new();
+        for item in &self.items {
+            item.expr.columns(&mut columns);
+        }
+        columns
+    }
+}
+
 /// The deliberately small SQL shape accepted by PAVI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlAst {
@@ -153,6 +229,9 @@ pub struct SqlAst {
     projection: SqlProjection,
     /// `AS` names of the SELECT items, in result order; `None` where there is none.
     aliases: Vec<Option<String>>,
+    /// The SQL text of SELECT items that calculate, as their default names.
+    labels: Vec<Option<String>>,
+    calcs: SqlCalcs,
     predicate: Option<SqlPredicate>,
     having: Option<SqlHaving>,
     /// ORDER BY keys, most significant first.
@@ -198,7 +277,36 @@ pub enum SqlProjection {
 pub struct SqlAggregate {
     /// GROUP BY columns, in order; empty for one overall group.
     pub group_by: Vec<SqlColumn>,
+    /// Every aggregate computed: the ones SELECT lists, and the ones only
+    /// used inside its calculations.
     pub expressions: Vec<SqlAggregateExpr>,
+    /// The result's columns, in SELECT order.
+    pub items: Vec<SqlItem>,
+}
+
+/// One result column of an aggregate query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlItem {
+    /// A GROUP BY column, by its place in GROUP BY.
+    Group(usize),
+    /// An aggregate, by its place in [`SqlAggregate::expressions`].
+    Aggregate(usize),
+    /// A calculation on the group's values and aggregates' results
+    /// (`ROUND(AVG(x), 2)`); an aggregate's result is the column `#agg{n}`.
+    Calc(calc::Expr<SqlColumn>),
+}
+
+/// Columns that hold an aggregate's result inside a SELECT calculation.
+const AGG_PREFIX: &str = "#agg";
+
+/// Which aggregate `column` names, when it is one's result inside a SELECT
+/// calculation.
+fn aggregate_result(column: &SqlColumn) -> Option<usize> {
+    column
+        .table
+        .is_none()
+        .then(|| column.name.strip_prefix(AGG_PREFIX)?.parse().ok())
+        .flatten()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -494,7 +602,8 @@ impl SqlAst {
         }
 
         let limit = parse_limit(query.limit_clause.as_ref())?;
-        let sort = parse_order_by(query.order_by.as_ref())?;
+        let mut calcs = SqlCalcs::default();
+        let sort = parse_order_by(query.order_by.as_ref(), &mut calcs)?;
         let SetExpr::Select(select) = query.body.as_ref() else {
             bail!("only a single SELECT is supported (no UNION)");
         };
@@ -504,21 +613,65 @@ impl SqlAst {
             Some(Distinct::Distinct) => true,
             Some(Distinct::On(_)) => bail!("DISTINCT ON is not supported; use SELECT DISTINCT"),
         };
-        let (projection, aliases) =
-            parse_projection(&select.projection, &select.group_by, distinct)?;
+        let (projection, aliases, labels) =
+            parse_projection(&select.projection, &select.group_by, distinct, &mut calcs)?;
+        let predicate = select
+            .selection
+            .as_ref()
+            .map(|selection| parse_predicate(selection, depth, &mut calcs))
+            .transpose()?;
+        let having = select
+            .having
+            .as_ref()
+            .map(|having| parse_having(having, &mut calcs))
+            .transpose()?;
         Ok(Self {
             from: parse_from(&select.from, depth)?,
             projection,
             aliases,
-            predicate: select
-                .selection
-                .as_ref()
-                .map(|selection| parse_predicate(selection, depth))
-                .transpose()?,
-            having: select.having.as_ref().map(parse_having).transpose()?,
+            labels,
+            calcs,
+            predicate,
+            having,
             sort,
             limit,
         })
+    }
+
+    /// Whether the query's calculations must be made before its rows are
+    /// filtered, grouped or sorted, so it runs on prepared rows (ADR 0013).
+    /// Calculations only in a plain SELECT list are made on the way out.
+    fn calculates_first(&self) -> bool {
+        if self.calcs.is_empty() {
+            return false;
+        }
+        if self.calcs.outside_select() || matches!(self.projection, SqlProjection::Aggregates(_)) {
+            return true;
+        }
+        // ORDER BY a calculated SELECT item, by its alias or position.
+        let SqlProjection::Columns(columns) = &self.projection else {
+            return false;
+        };
+        let item = |position: usize| {
+            columns
+                .get(position)
+                .is_some_and(|column| self.calcs.position(column).is_some())
+        };
+        self.sort.iter().any(|key| match &key.target {
+            SqlTarget::Column(column) => self.alias_position(column).is_some_and(item),
+            SqlTarget::Position(position) => item(position.saturating_sub(1)),
+            SqlTarget::Aggregate(_) => false,
+        })
+    }
+
+    /// The name each result column is shown with: its alias, else the SQL
+    /// text of a calculation; `None` keeps the column's own name.
+    fn result_names(&self) -> Vec<Option<String>> {
+        self.aliases
+            .iter()
+            .zip(self.labels.iter().chain(std::iter::repeat(&None)))
+            .map(|(alias, label)| alias.clone().or_else(|| label.clone()))
+            .collect()
     }
 
     pub fn projection(&self) -> &SqlProjection {
@@ -556,7 +709,8 @@ impl SqlAst {
             && !self
                 .predicate
                 .as_ref()
-                .is_some_and(SqlPredicate::has_subquery);
+                .is_some_and(SqlPredicate::has_subquery)
+            && !self.calculates_first();
         let plan = if direct {
             self.direct_plan(tables)?
         } else {
@@ -586,19 +740,71 @@ impl SqlAst {
             .as_ref()
             .map(|predicate| predicate.to_filter(&source, &resolve).map(Filter::new))
             .transpose()?;
-        self.shape(LogicalPlan::scan(Arc::clone(&source)), filter, &resolve)
+        self.shape(
+            LogicalPlan::scan(Arc::clone(&source)),
+            filter,
+            &resolve,
+            None,
+        )
     }
 
     /// Adds the filter, projection, aggregate, sort and limit above `plan`;
-    /// `resolve` maps a column to the input's column.
+    /// `resolve` maps a column to the input's column. `all` is how many input
+    /// columns `SELECT *` shows, when the input has hidden calculations after
+    /// them.
     fn shape(
         &self,
         mut plan: LogicalPlan,
         filter: Option<Filter>,
         resolve: &dyn Fn(&SqlColumn) -> Result<usize>,
+        all: Option<usize>,
     ) -> Result<LogicalPlan> {
+        // Calculations in a plain SELECT list of a direct query are made on
+        // the way out, over the columns they read (ADR 0013).
+        let mut computed = None;
         let (projection, aggregate) = match &self.projection {
-            SqlProjection::All => (None, None),
+            SqlProjection::All => (all.map(|count| (0..count).collect()), None),
+            SqlProjection::Columns(columns)
+                if !self.calcs.is_empty() && !self.calculates_first() =>
+            {
+                let items = columns
+                    .iter()
+                    .map(|column| match self.calcs.position(column) {
+                        Some(index) => self
+                            .calcs
+                            .items
+                            .get(index)
+                            .map(|item| item.expr.clone())
+                            .ok_or_else(|| anyhow!("calculation {index} is missing")),
+                        None => Ok(calc::Expr::Column(column.clone())),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut inputs = Vec::new();
+                for item in &items {
+                    let mut read = Vec::new();
+                    item.columns(&mut read);
+                    for column in read {
+                        let index = resolve(column)?;
+                        if !inputs.contains(&index) {
+                            inputs.push(index);
+                        }
+                    }
+                }
+                let position = |column: &SqlColumn| -> Result<usize> {
+                    let index = resolve(column)?;
+                    inputs
+                        .iter()
+                        .position(|input| *input == index)
+                        .ok_or_else(|| anyhow!("column {column} was not read"))
+                };
+                computed = Some(
+                    items
+                        .iter()
+                        .map(|item| item.map_columns(&position))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+                (Some(inputs), None)
+            }
             SqlProjection::Columns(columns) => (
                 Some(columns.iter().map(resolve).collect::<Result<Vec<_>>>()?),
                 None,
@@ -639,6 +845,49 @@ impl SqlAst {
         let mut having = None;
         let mut sort = Vec::new();
         if let SqlProjection::Aggregates(aggregate) = &self.projection {
+            // The result's columns, when SELECT doesn't list them as the
+            // aggregate makes them (GROUP BY columns, then aggregates): made
+            // from its one result batch (ADR 0013).
+            let groups = aggregate.group_by.len();
+            let natural = aggregate.items.len() == groups + aggregate.expressions.len()
+                && aggregate
+                    .items
+                    .iter()
+                    .enumerate()
+                    .all(|(index, item)| match item {
+                        SqlItem::Group(group) => *group == index,
+                        SqlItem::Aggregate(expression) => groups + expression == index,
+                        SqlItem::Calc(_) => false,
+                    });
+            if !natural {
+                let on_result = |column: &SqlColumn| -> Result<usize> {
+                    match aggregate_result(column) {
+                        Some(index) => Ok(groups + index),
+                        None => aggregate
+                            .group_by
+                            .iter()
+                            .position(|group| group.same(column))
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "{column} must be in GROUP BY or inside an aggregate to be calculated with"
+                                )
+                            }),
+                    }
+                };
+                computed = Some(
+                    aggregate
+                        .items
+                        .iter()
+                        .map(|item| match item {
+                            SqlItem::Group(group) => Ok(calc::Expr::Column(*group)),
+                            SqlItem::Aggregate(expression) => {
+                                Ok(calc::Expr::Column(groups + expression))
+                            }
+                            SqlItem::Calc(expression) => expression.map_columns(&on_result),
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
             let index_of = |target: &SqlTarget| self.result_index(aggregate, target);
             for key in &self.sort {
                 output_sort.push(SortSpec::new(
@@ -689,8 +938,13 @@ impl SqlAst {
         if !sort.is_empty() {
             plan = plan.sort_by(sort);
         }
-        if having.is_some() || !output_sort.is_empty() || self.aliases.iter().any(Option::is_some) {
-            plan = plan.output(Output::new(having, output_sort, self.aliases.clone()));
+        let names = self.result_names();
+        if having.is_some()
+            || !output_sort.is_empty()
+            || computed.is_some()
+            || names.iter().any(Option::is_some)
+        {
+            plan = plan.output(Output::new(having, output_sort, names).computing(computed));
         }
         if let Some(limit) = self.limit {
             plan = plan.limit(limit);
@@ -733,8 +987,7 @@ impl SqlAst {
     /// The result column an aggregate query's ORDER BY or HAVING names: a
     /// GROUP BY column, an aggregate in SELECT, an alias or a position.
     fn result_index(&self, aggregate: &SqlAggregate, target: &SqlTarget) -> Result<usize> {
-        let groups = aggregate.group_by.len();
-        let columns = groups + aggregate.expressions.len();
+        let columns = aggregate.items.len();
         match target {
             SqlTarget::Position(position) if (1..=columns).contains(position) => Ok(position - 1),
             SqlTarget::Position(position) => {
@@ -743,10 +996,10 @@ impl SqlAst {
             SqlTarget::Column(column) => self
                 .alias_position(column)
                 .or_else(|| {
-                    aggregate
-                        .group_by
-                        .iter()
-                        .position(|group| group.same(column))
+                    aggregate.items.iter().position(|item| {
+                        matches!(item, SqlItem::Group(group)
+                            if aggregate.group_by.get(*group).is_some_and(|group| group.same(column)))
+                    })
                 })
                 .ok_or_else(|| {
                     anyhow!(
@@ -754,10 +1007,12 @@ impl SqlAst {
                     )
                 }),
             SqlTarget::Aggregate(wanted) => aggregate
-                .expressions
+                .items
                 .iter()
-                .position(|expression| expression.same(wanted))
-                .map(|position| groups + position)
+                .position(|item| {
+                    matches!(item, SqlItem::Aggregate(index)
+                        if aggregate.expressions.get(*index).is_some_and(|expression| expression.same(wanted)))
+                })
                 .ok_or_else(|| anyhow!("{wanted} must also be in SELECT to sort or filter by it")),
         }
     }
@@ -804,6 +1059,9 @@ impl SqlAst {
                 columns.push(right);
             }
         }
+        // Hidden calculation columns are made later, from the columns they read.
+        columns.retain(|column| self.calcs.position(column).is_none());
+        columns.extend(self.calcs.columns());
         columns
     }
 
@@ -910,6 +1168,14 @@ impl SqlAst {
                 }
                 let mut columns = Vec::new();
                 conjunct.columns(&mut columns);
+                // A test on a calculation applies once it is made.
+                if columns
+                    .iter()
+                    .any(|column| self.calcs.position(column).is_some())
+                {
+                    after.push(conjunct);
+                    continue;
+                }
                 let mut sides = columns
                     .iter()
                     .map(|column| find(column).map(|(relation, _)| relation))
@@ -983,7 +1249,7 @@ impl SqlAst {
             };
         }
 
-        let schema: SchemaRef = Arc::new(Schema::new(
+        let mut schema: SchemaRef = Arc::new(Schema::new(
             output
                 .iter()
                 .zip(&names)
@@ -997,12 +1263,38 @@ impl SqlAst {
                 })
                 .collect::<Vec<Field>>(),
         ));
-        prepared = apply_where(prepared, &after, tables, &output_index, &schema)?;
+        // Calculations, over the joined rows, become columns after them (ADR 0013).
+        let base = output.len();
+        if !self.calcs.is_empty() {
+            let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+            let mut expressions = Vec::new();
+            for item in &self.calcs.items {
+                let expression = item.expr.map_columns(&output_index)?;
+                let data_type = expression
+                    .data_type(&schema)
+                    .with_context(|| format!("calculation {}", item.text))?;
+                fields.push(Arc::new(Field::new(&item.name, data_type, true)));
+                expressions.push((item.name.clone(), expression));
+            }
+            prepared = Prep::Compute {
+                input: Box::new(prepared),
+                expressions,
+            };
+            schema = Arc::new(Schema::new(fields));
+        }
+        let resolve = |column: &SqlColumn| -> Result<usize> {
+            match self.calcs.position(column) {
+                Some(index) => Ok(base + index),
+                None => output_index(column),
+            }
+        };
+        prepared = apply_where(prepared, &after, tables, &resolve, &schema)?;
         let plan = LogicalPlan::Prepared(Prepared {
             prep: Arc::new(prepared),
             schema,
         });
-        self.shape(plan, None, &output_index)
+        let all = (!self.calcs.is_empty()).then_some(base);
+        self.shape(plan, None, &resolve, all)
     }
 }
 
@@ -1173,7 +1465,7 @@ fn apply_where(
     })
 }
 
-fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<SqlSort>> {
+fn parse_order_by(order_by: Option<&OrderBy>, calcs: &mut SqlCalcs) -> Result<Vec<SqlSort>> {
     let Some(order_by) = order_by else {
         return Ok(Vec::new());
     };
@@ -1196,7 +1488,7 @@ fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<SqlSort>> {
                 bail!("ORDER BY WITH FILL is not supported");
             }
             Ok(SqlSort {
-                target: parse_target(&expression.expr, "ORDER BY")?,
+                target: parse_target(&expression.expr, "ORDER BY", calcs)?,
                 direction: if expression.options.asc == Some(false) {
                     SortDirection::Descending
                 } else {
@@ -1223,19 +1515,27 @@ fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<SqlSort>> {
 
 /// A result column named in `clause`: a column or alias, an aggregate, or a
 /// 1-based position in the SELECT list.
-fn parse_target(expression: &Expr, clause: &str) -> Result<SqlTarget> {
+fn parse_target(expression: &Expr, clause: &str, calcs: &mut SqlCalcs) -> Result<SqlTarget> {
     match expression {
-        Expr::Nested(inner) => parse_target(inner, clause),
-        Expr::Function(function) => Ok(SqlTarget::Aggregate(parse_aggregate(function)?)),
+        Expr::Nested(inner) => parse_target(inner, clause, calcs),
+        Expr::Function(function) if is_aggregate(function) => {
+            Ok(SqlTarget::Aggregate(parse_aggregate(function, calcs)?))
+        }
         Expr::Value(_) => match parse_literal(expression)?.parse::<usize>() {
             Ok(position) if position > 0 => Ok(SqlTarget::Position(position)),
-            _ => bail!("{clause} takes a column, an aggregate or a position from 1"),
+            _ => bail!("{clause} takes a column, an aggregate, a calculation or a position from 1"),
         },
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            Ok(SqlTarget::Column(parse_column(expression)?))
-        }
-        _ => bail!("{clause} takes a column, an aggregate or a position from 1"),
+        // A column, or a calculation (`ORDER BY price * qty`).
+        _ => Ok(SqlTarget::Column(calcs.column(expression, true)?)),
     }
+}
+
+/// Whether a function call is one of the aggregates.
+fn is_aggregate(function: &Function) -> bool {
+    matches!(
+        function.name.to_string().to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+    )
 }
 
 /// Fails when a column appears twice (names compare case-insensitively).
@@ -1384,11 +1684,13 @@ fn parse_on(condition: &Expr, on: &mut Vec<(SqlColumn, SqlColumn)>) -> Result<()
 
 /// The SELECT list, and the `AS` name of each item. `SELECT DISTINCT` and
 /// `GROUP BY` without aggregates list each distinct combination once.
+#[allow(clippy::type_complexity)]
 fn parse_projection(
     items: &[SelectItem],
     group_by: &GroupByExpr,
     distinct: bool,
-) -> Result<(SqlProjection, Vec<Option<String>>)> {
+    calcs: &mut SqlCalcs,
+) -> Result<(SqlProjection, Vec<Option<String>>, Vec<Option<String>>)> {
     if matches!(items, [SelectItem::Wildcard(_)]) {
         if !matches!(group_by, GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty())
         {
@@ -1397,15 +1699,17 @@ fn parse_projection(
         if distinct {
             bail!("SELECT DISTINCT needs the columns named, not *");
         }
-        return Ok((SqlProjection::All, Vec::new()));
+        return Ok((SqlProjection::All, Vec::new(), Vec::new()));
     }
     if items.is_empty() {
         bail!("SELECT needs at least one column");
     }
-    let group_by = parse_group_by(group_by)?;
+    let group_by = parse_group_by(group_by, calcs)?;
     let mut columns = Vec::new();
     let mut aggregates = Vec::new();
     let mut aliases: Vec<Option<String>> = Vec::new();
+    let mut labels: Vec<Option<String>> = Vec::new();
+    let mut result: Vec<SqlItem> = Vec::new();
     for item in items {
         let (expression, alias) = match item {
             SelectItem::UnnamedExpr(expression) => (expression, None),
@@ -1420,18 +1724,66 @@ fn parse_projection(
                 bail!("a SELECT item has one alias")
             }
         };
+        let calculated = calcs.items.len();
+        let mut on_result = false;
         match expression {
-            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                if !aggregates.is_empty() {
-                    bail!(
-                        "SELECT must list the GROUP BY columns first, in the same order, then aggregates"
-                    );
-                }
-                columns.push(parse_column(expression)?);
+            Expr::Function(function) if is_aggregate(function) => {
+                aggregates.push(parse_aggregate(function, calcs)?);
+                result.push(SqlItem::Aggregate(aggregates.len() - 1));
             }
-            Expr::Function(function) => aggregates.push(parse_aggregate(function)?),
-            _ => bail!("SELECT items must be column names or supported aggregates"),
+            // A column, a calculation (`price * qty AS total`), or a
+            // calculation on aggregates' results (`ROUND(AVG(x), 2)`).
+            _ => {
+                let mut inner: Vec<SqlAggregateExpr> = Vec::new();
+                let mut hook = |function: &Function| -> Result<SqlColumn> {
+                    inner.push(parse_aggregate(function, calcs)?);
+                    Ok(SqlColumn::new(format!("{AGG_PREFIX}{}", inner.len() - 1)))
+                };
+                let parsed = calc::parse_with(expression, &mut hook)?;
+                if inner.is_empty() {
+                    let column = calcs.column(expression, false)?;
+                    columns.push(column);
+                    // Its place among the columns for now; GROUP BY's below.
+                    result.push(SqlItem::Group(columns.len() - 1));
+                } else {
+                    // Each aggregate it uses is computed once, with the others.
+                    let global = inner
+                        .into_iter()
+                        .map(|aggregate| {
+                            match aggregates.iter().position(|other| other.same(&aggregate)) {
+                                Some(index) => index,
+                                None => {
+                                    aggregates.push(aggregate);
+                                    aggregates.len() - 1
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let mapped = parsed.map_columns(&|column: &SqlColumn| {
+                        Ok(
+                            match aggregate_result(column).and_then(|local| global.get(local)) {
+                                Some(index) => SqlColumn::new(format!("{AGG_PREFIX}{index}")),
+                                None => column.clone(),
+                            },
+                        )
+                    })?;
+                    result.push(SqlItem::Calc(mapped));
+                    on_result = true;
+                }
+            }
         }
+        // An item that calculates is shown by its SQL text unless it has an alias.
+        let calculates = calcs.items.len() > calculated
+            || columns
+                .last()
+                .is_some_and(|column| calcs.position(column).is_some())
+                && !matches!(expression, Expr::Function(function) if is_aggregate(function));
+        let aggregate_of_calc = matches!(expression, Expr::Function(function) if is_aggregate(function))
+            && aggregates
+                .last()
+                .and_then(|aggregate: &SqlAggregateExpr| aggregate.column.as_ref())
+                .is_some_and(|column| calcs.position(column).is_some());
+        labels.push((on_result || calculates || aggregate_of_calc).then(|| expression.to_string()));
         if let Some(name) = &alias
             && aliases
                 .iter()
@@ -1444,7 +1796,7 @@ fn parse_projection(
     }
     if aggregates.is_empty() {
         if !distinct && group_by.is_empty() {
-            return Ok((SqlProjection::Columns(columns), aliases));
+            return Ok((SqlProjection::Columns(columns), aliases, labels));
         }
         // Each distinct combination once: a grouping without aggregates.
         let same = group_by.is_empty()
@@ -1463,38 +1815,51 @@ fn parse_projection(
                 columns.len()
             );
         }
+        let items = (0..columns.len()).map(SqlItem::Group).collect();
         return Ok((
             SqlProjection::Aggregates(SqlAggregate {
                 group_by: columns,
                 expressions: Vec::new(),
+                items,
             }),
             aliases,
+            labels,
         ));
     }
     if group_by.is_empty() && !columns.is_empty() {
         bail!("aggregate SELECT cannot include ordinary columns without GROUP BY");
     }
-    // The result has the GROUP BY columns first, in GROUP BY order, so SELECT must
-    // list them the same way.
-    let same = columns.len() == group_by.len()
-        && columns
-            .iter()
-            .zip(&group_by)
-            .all(|(column, group)| column.same(group));
-    if !same {
-        bail!("SELECT must list the GROUP BY columns first, in the same order, then aggregates");
-    }
+    // A plain column of an aggregate query is one of its GROUP BY columns; SELECT
+    // may list them in any order, or leave some out.
+    let result = result
+        .into_iter()
+        .map(|item| match item {
+            SqlItem::Group(index) => {
+                let column = columns
+                    .get(index)
+                    .ok_or_else(|| anyhow!("SELECT column {index} is missing"))?;
+                group_by
+                    .iter()
+                    .position(|group| group.same(column))
+                    .map(SqlItem::Group)
+                    .ok_or_else(|| anyhow!("{column} must be in GROUP BY or inside an aggregate"))
+            }
+            other => Ok(other),
+        })
+        .collect::<Result<Vec<_>>>()?;
     // Grouped rows are distinct already, so DISTINCT changes nothing here.
     Ok((
         SqlProjection::Aggregates(SqlAggregate {
             group_by,
             expressions: aggregates,
+            items: result,
         }),
         aliases,
+        labels,
     ))
 }
 
-fn parse_group_by(group_by: &GroupByExpr) -> Result<Vec<SqlColumn>> {
+fn parse_group_by(group_by: &GroupByExpr, calcs: &mut SqlCalcs) -> Result<Vec<SqlColumn>> {
     match group_by {
         GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
             if expressions.len() > MAX_GROUP_COLUMNS {
@@ -1503,9 +1868,10 @@ fn parse_group_by(group_by: &GroupByExpr) -> Result<Vec<SqlColumn>> {
                     expressions.len()
                 );
             }
+            // Columns, or calculations (`GROUP BY YEAR(day)`).
             let columns = expressions
                 .iter()
-                .map(parse_column)
+                .map(|expression| calcs.column(expression, true))
                 .collect::<Result<Vec<_>>>()?;
             reject_repeats(columns.iter(), "GROUP BY")?;
             Ok(columns)
@@ -1514,7 +1880,7 @@ fn parse_group_by(group_by: &GroupByExpr) -> Result<Vec<SqlColumn>> {
     }
 }
 
-fn parse_aggregate(function: &Function) -> Result<SqlAggregateExpr> {
+fn parse_aggregate(function: &Function, calcs: &mut SqlCalcs) -> Result<SqlAggregateExpr> {
     if function.uses_odbc_syntax
         || !matches!(function.parameters, FunctionArguments::None)
         || function.filter.is_some()
@@ -1550,8 +1916,9 @@ fn parse_aggregate(function: &Function) -> Result<SqlAggregateExpr> {
         {
             None
         }
+        // A column, or a calculation (`SUM(price * qty)`).
         [FunctionArg::Unnamed(FunctionArgExpr::Expr(expression))] => {
-            Some(parse_column(expression)?)
+            Some(calcs.column(expression, true)?)
         }
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if distinct => {
             bail!("COUNT(DISTINCT …) needs a column, not *")
@@ -1574,17 +1941,17 @@ fn comparison_op(op: &BinaryOperator) -> Result<FilterOp> {
     })
 }
 
-fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
+fn parse_predicate(expression: &Expr, depth: usize, calcs: &mut SqlCalcs) -> Result<SqlPredicate> {
     match expression {
-        Expr::Nested(inner) => parse_predicate(inner, depth),
+        Expr::Nested(inner) => parse_predicate(inner, depth, calcs),
         Expr::BinaryOp {
             left,
             op: op @ (BinaryOperator::And | BinaryOperator::Or),
             right,
         } => {
             let parts = vec![
-                parse_predicate(left, depth)?,
-                parse_predicate(right, depth)?,
+                parse_predicate(left, depth, calcs)?,
+                parse_predicate(right, depth, calcs)?,
             ];
             Ok(if *op == BinaryOperator::And {
                 SqlPredicate::And(parts)
@@ -1594,22 +1961,31 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
         }
         Expr::BinaryOp { left, op, right } => match right.as_ref() {
             Expr::Subquery(query) => Ok(SqlPredicate::CompareSubquery {
-                column: parse_column(left)?,
+                column: calcs.column(left, true)?,
                 op: comparison_op(op)?,
                 query: Box::new(SqlAst::from_query(query, depth + 1)?),
             }),
-            right => Ok(SqlPredicate::compare(
-                parse_column(left)?,
-                comparison_op(op)?,
-                parse_literal(right)?,
-            )),
+            right => match parse_literal(right) {
+                Ok(value) => Ok(SqlPredicate::compare(
+                    calcs.column(left, true)?,
+                    comparison_op(op)?,
+                    value,
+                )),
+                // Two columns or calculations (`a > b`): the test itself is
+                // calculated, and must be true.
+                Err(_) => Ok(SqlPredicate::compare(
+                    calcs.column(expression, true)?,
+                    FilterOp::Eq,
+                    "true",
+                )),
+            },
         },
         Expr::InSubquery {
             expr,
             subquery,
             negated,
         } => Ok(SqlPredicate::InSubquery {
-            column: parse_column(expr)?,
+            column: calcs.column(expr, true)?,
             query: Box::new(SqlAst::from_query(subquery, depth + 1)?),
             negated: *negated,
         }),
@@ -1618,7 +1994,7 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
             list,
             negated,
         } => {
-            let column = parse_column(expr)?;
+            let column = calcs.column(expr, true)?;
             let op = if *negated { FilterOp::Ne } else { FilterOp::Eq };
             let mut tests = list
                 .iter()
@@ -1644,7 +2020,7 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
             low,
             high,
         } => {
-            let column = parse_column(expr)?;
+            let column = calcs.column(expr, true)?;
             let (low, high) = (parse_literal(low)?, parse_literal(high)?);
             Ok(if *negated {
                 SqlPredicate::Or(vec![
@@ -1659,12 +2035,12 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
             })
         }
         Expr::IsNull(expr) => Ok(SqlPredicate::compare(
-            parse_column(expr)?,
+            calcs.column(expr, true)?,
             FilterOp::IsNull,
             "",
         )),
         Expr::IsNotNull(expr) => Ok(SqlPredicate::compare(
-            parse_column(expr)?,
+            calcs.column(expr, true)?,
             FilterOp::IsNotNull,
             "",
         )),
@@ -1681,7 +2057,7 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
             if escape_char.is_some() {
                 bail!("LIKE ... ESCAPE is not supported");
             }
-            let column = parse_column(expr)?;
+            let column = calcs.column(expr, true)?;
             let pattern = parse_literal(pattern)?;
             // `LIKE '%text%'` stays the plain contains test it has always been.
             let contained = pattern
@@ -1695,10 +2071,15 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
             })
         }
         Expr::Exists { .. } => bail!("EXISTS is not supported; use IN (SELECT …)"),
+        // `NOT (…)` is calculated, and must be true.
         Expr::UnaryOp {
             op: UnaryOperator::Not,
             ..
-        } => bail!("NOT is supported only as NOT IN, NOT BETWEEN, NOT LIKE and IS NOT NULL"),
+        } => Ok(SqlPredicate::compare(
+            calcs.column(expression, true)?,
+            FilterOp::Eq,
+            "true",
+        )),
         _ => {
             bail!("WHERE supports comparisons, IN, BETWEEN, LIKE and IS NULL, joined by AND and OR")
         }
@@ -1707,16 +2088,15 @@ fn parse_predicate(expression: &Expr, depth: usize) -> Result<SqlPredicate> {
 
 /// `HAVING`: comparisons, `IN`, `BETWEEN` and `IS [NOT] NULL` on result
 /// columns (GROUP BY columns, aggregates, aliases), joined by `AND` and `OR`.
-fn parse_having(expression: &Expr) -> Result<SqlHaving> {
-    let target = |expression: &Expr| parse_target(expression, "HAVING");
+fn parse_having(expression: &Expr, calcs: &mut SqlCalcs) -> Result<SqlHaving> {
     match expression {
-        Expr::Nested(inner) => parse_having(inner),
+        Expr::Nested(inner) => parse_having(inner, calcs),
         Expr::BinaryOp {
             left,
             op: op @ (BinaryOperator::And | BinaryOperator::Or),
             right,
         } => {
-            let parts = vec![parse_having(left)?, parse_having(right)?];
+            let parts = vec![parse_having(left, calcs)?, parse_having(right, calcs)?];
             Ok(if *op == BinaryOperator::And {
                 SqlHaving::And(parts)
             } else {
@@ -1724,7 +2104,7 @@ fn parse_having(expression: &Expr) -> Result<SqlHaving> {
             })
         }
         Expr::BinaryOp { left, op, right } => Ok(SqlHaving::compare(
-            target(left)?,
+            parse_target(left, "HAVING", calcs)?,
             comparison_op(op)?,
             parse_literal(right)?,
         )),
@@ -1733,7 +2113,7 @@ fn parse_having(expression: &Expr) -> Result<SqlHaving> {
             list,
             negated,
         } => {
-            let target = target(expr)?;
+            let target = parse_target(expr, "HAVING", calcs)?;
             let op = if *negated { FilterOp::Ne } else { FilterOp::Eq };
             let mut tests = list
                 .iter()
@@ -1758,7 +2138,7 @@ fn parse_having(expression: &Expr) -> Result<SqlHaving> {
             low,
             high,
         } => {
-            let target = target(expr)?;
+            let target = parse_target(expr, "HAVING", calcs)?;
             let (low, high) = (parse_literal(low)?, parse_literal(high)?);
             Ok(if *negated {
                 SqlHaving::Or(vec![
@@ -1772,15 +2152,23 @@ fn parse_having(expression: &Expr) -> Result<SqlHaving> {
                 ])
             })
         }
-        Expr::IsNull(expr) => Ok(SqlHaving::compare(target(expr)?, FilterOp::IsNull, "")),
-        Expr::IsNotNull(expr) => Ok(SqlHaving::compare(target(expr)?, FilterOp::IsNotNull, "")),
+        Expr::IsNull(expr) => Ok(SqlHaving::compare(
+            parse_target(expr, "HAVING", calcs)?,
+            FilterOp::IsNull,
+            "",
+        )),
+        Expr::IsNotNull(expr) => Ok(SqlHaving::compare(
+            parse_target(expr, "HAVING", calcs)?,
+            FilterOp::IsNotNull,
+            "",
+        )),
         _ => bail!(
             "HAVING supports comparisons, IN, BETWEEN and IS NULL on result columns, joined by AND and OR"
         ),
     }
 }
 
-fn parse_column(expression: &Expr) -> Result<SqlColumn> {
+pub(crate) fn parse_column(expression: &Expr) -> Result<SqlColumn> {
     match expression {
         Expr::Identifier(identifier) => Ok(SqlColumn::new(identifier.value.clone())),
         Expr::CompoundIdentifier(parts) => match parts.as_slice() {
@@ -2077,6 +2465,146 @@ mod tests {
     }
 
     #[test]
+    fn calculates_in_select_where_group_by_and_order_by() {
+        let (_directory, source) = flights();
+        let run = |sql: &str| execute(sql, Arc::clone(&source));
+
+        // A plain SELECT calculates on the way out; items are named by their
+        // alias or their SQL text.
+        let select = run("SELECT carrier, delay * 2 AS double, delay + 1 FROM dataset LIMIT 3");
+        assert_eq!(names(&select), ["carrier", "double", "delay + 1"]);
+        assert_eq!(
+            rows(&select),
+            [["AA", "20", "11"], ["AA", "40", "21"], ["BB", "10", "6"]]
+        );
+        let plan = SqlAst::parse("SELECT UPPER(carrier) FROM dataset")
+            .unwrap()
+            .to_logical_plan(Arc::clone(&source))
+            .unwrap();
+        assert!(
+            !plan.is_prepared(),
+            "a SELECT-only calculation reads the file directly"
+        );
+        let case = run(
+            "SELECT CASE WHEN delay >= 20 THEN 'late' WHEN delay IS NULL THEN '?' ELSE 'ok' END AS status \
+             FROM dataset",
+        );
+        assert_eq!(
+            rows(&case).concat(),
+            ["ok", "late", "ok", "ok", "?", "late", "ok"]
+        );
+
+        // WHERE on a calculation, on two columns, and NOT: calculated first.
+        assert_eq!(
+            rows(&run("SELECT delay FROM dataset WHERE delay * 2 > 25")),
+            [["20"], ["30"]]
+        );
+        assert_eq!(
+            rows(&run(
+                "SELECT delay FROM dataset WHERE delay > LENGTH(carrier) * 5"
+            )),
+            [["20"], ["30"]]
+        );
+        assert_eq!(
+            rows(&run("SELECT delay FROM dataset WHERE NOT (delay > 5)")),
+            [["5"], ["5"]]
+        );
+        // SELECT * doesn't show the hidden calculation columns.
+        assert_eq!(
+            names(&run("SELECT * FROM dataset WHERE delay * 2 > 25")),
+            ["carrier", "delay"]
+        );
+
+        // GROUP BY a calculation, named by its text in SELECT.
+        let grouped =
+            run("SELECT delay > 10, COUNT(*) FROM dataset GROUP BY delay > 10 ORDER BY 1");
+        assert_eq!(names(&grouped), ["delay > 10", "COUNT(*)"]);
+        assert_eq!(
+            rows(&grouped),
+            [["false", "4"], ["true", "2"], ["null", "1"]]
+        );
+
+        // An aggregate of a calculation.
+        let sums = run(
+            "SELECT carrier, SUM(delay * 2) AS twice FROM dataset GROUP BY carrier ORDER BY twice DESC",
+        );
+        assert_eq!(rows(&sums), [["AA", "80"], ["CC", "60"], ["BB", "20"]]);
+
+        // SELECT lists GROUP BY columns in any order, or leaves them out.
+        assert_eq!(
+            rows(&run(
+                "SELECT COUNT(*), carrier FROM dataset GROUP BY carrier"
+            )),
+            [["3", "AA"], ["3", "BB"], ["1", "CC"]]
+        );
+        assert_eq!(
+            rows(&run("SELECT COUNT(*) FROM dataset GROUP BY carrier, delay")).len(),
+            5
+        );
+
+        // Calculations on aggregates' results, made from the aggregate's one
+        // result batch; HAVING and ORDER BY use their aliases.
+        let on_results = run(
+            "SELECT carrier, ROUND(AVG(delay), 1) AS mean, SUM(delay) / COUNT(*) FROM dataset \
+             GROUP BY carrier HAVING mean > 10 ORDER BY mean DESC",
+        );
+        assert_eq!(
+            names(&on_results),
+            ["carrier", "mean", "SUM(delay) / COUNT(*)"]
+        );
+        assert_eq!(
+            rows(&on_results),
+            [["CC", "30", "30"], ["AA", "13.3", "13.333333333333334"]]
+        );
+        assert_eq!(
+            rows(&run("SELECT COUNT(*) * 2 AS twice FROM dataset")),
+            [["14"]]
+        );
+        assert_eq!(
+            rows(&run(
+                "SELECT carrier || ':' || COUNT(*) FROM dataset GROUP BY carrier ORDER BY 1 DESC"
+            )),
+            [["CC:1"], ["BB:3"], ["AA:3"]]
+        );
+
+        // ORDER BY a calculation, and by the alias of one.
+        assert_eq!(
+            rows(&run(
+                "SELECT carrier, delay FROM dataset ORDER BY delay * -1 LIMIT 2"
+            )),
+            [["CC", "30"], ["AA", "20"]]
+        );
+        assert_eq!(
+            rows(&run(
+                "SELECT delay % 7 AS rest FROM dataset ORDER BY rest DESC LIMIT 2"
+            )),
+            [["6"], ["5"]]
+        );
+
+        for (sql, message) in [
+            (
+                "SELECT carrier FROM dataset WHERE SUM(delay) > 1",
+                "is an aggregate and can't be used here",
+            ),
+            (
+                "SELECT carrier, delay + SUM(delay) FROM dataset GROUP BY carrier",
+                "delay must be in GROUP BY or inside an aggregate",
+            ),
+            (
+                "SELECT delay FROM dataset WHERE carrier * 2 > 1",
+                "arithmetic needs numbers",
+            ),
+            ("SELECT NOW() FROM dataset", "unknown function NOW"),
+        ] {
+            let error = SqlAst::parse(sql)
+                .and_then(|parsed| parsed.to_logical_plan(Arc::clone(&source)))
+                .err()
+                .unwrap_or_else(|| panic!("{sql} should be refused"));
+            assert!(format!("{error:#}").contains(message), "{sql}: {error:#}");
+        }
+    }
+
+    #[test]
     fn explains_what_aggregate_ordering_and_having_cannot_do() {
         let (_directory, source) = flights();
         for (sql, message) in [
@@ -2103,10 +2631,6 @@ mod tests {
             (
                 "SELECT DISTINCT * FROM dataset",
                 "SELECT DISTINCT needs the columns named",
-            ),
-            (
-                "SELECT COUNT(*), carrier FROM dataset GROUP BY carrier",
-                "SELECT must list the GROUP BY columns first",
             ),
             (
                 "SELECT carrier AS x, COUNT(*) AS X FROM dataset GROUP BY carrier",
@@ -2412,7 +2936,6 @@ mod tests {
             "SELECT name, COUNT(*) FROM dataset GROUP BY id",
             "SELECT SUM(DISTINCT id) FROM dataset",
             "SELECT SUM(name) FROM dataset",
-            "SELECT COUNT(*) FROM dataset GROUP BY id, name",
         ] {
             assert!(
                 SqlAst::parse(sql)
@@ -2433,8 +2956,6 @@ mod tests {
     fn rejects_invalid_unsupported_and_invalid_source_queries() {
         for sql in [
             "SELECT FROM dataset",
-            "SELECT id FROM dataset WHERE NOT (id = 1)",
-            "SELECT id FROM dataset WHERE NOT enabled",
             "SELECT id FROM dataset a RIGHT JOIN dataset b ON a.id = b.id",
             "SELECT id FROM dataset a CROSS JOIN dataset b",
             "SELECT id FROM dataset a JOIN dataset b USING (id)",
@@ -2445,7 +2966,6 @@ mod tests {
             "SELECT id FROM dataset UNION SELECT id FROM dataset",
             "SELECT id FROM dataset WHERE name LIKE 'a!%' ESCAPE '!'",
             "SELECT id FROM dataset WHERE name ILIKE 'a%'",
-            "SELECT id FROM dataset WHERE id + 1 = 2",
             "SELECT id FROM dataset WHERE id BETWEEN name AND 3",
             "SELECT id FROM dataset ORDER BY id, id",
             "SELECT id, COUNT(*) FROM dataset GROUP BY enabled",
@@ -2453,6 +2973,26 @@ mod tests {
         ] {
             assert!(SqlAst::parse(sql).is_err(), "{sql}");
         }
+
+        // Calculated tests in WHERE run on prepared rows (ADR 0013).
+        let (_directory, calculated) = source();
+        for sql in [
+            "SELECT id FROM dataset WHERE NOT (id = 1)",
+            "SELECT id FROM dataset WHERE NOT enabled",
+            "SELECT id FROM dataset WHERE id + 1 = 2",
+        ] {
+            let plan = SqlAst::parse(sql)
+                .and_then(|parsed| parsed.to_logical_plan(Arc::clone(&calculated)))
+                .unwrap_or_else(|error| panic!("{sql}: {error:#}"));
+            assert!(plan.is_prepared(), "{sql}");
+        }
+        assert_eq!(
+            rows(&execute(
+                "SELECT id FROM dataset WHERE id + 1 = 2",
+                calculated
+            )),
+            [["1"]]
+        );
 
         let (_directory, source) = source();
         let error = SqlAst::parse("SELECT id FROM other")
