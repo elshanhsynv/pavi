@@ -2480,3 +2480,62 @@ fn runs_sql_with_having_order_by_aggregates_and_aliases() {
         app.sql_error
     );
 }
+
+#[test]
+fn runs_sql_with_calculations() {
+    let (_directory, source, path) = source(11);
+    let mut app = make_app(source, path);
+    let column_names = |app: &PaviApp| {
+        app.filtered.as_ref().unwrap().batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>()
+    };
+    let cells = |app: &PaviApp| {
+        (0..app.grid.rows)
+            .map(|row| {
+                (0..app.grid.columns)
+                    .map(|column| app.filtered_cell_text(row, column).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Calculated on the way out: the grid shows the result's own names.
+    app.sql_input = "SELECT id, id * 10 AS big, UPPER(name) FROM dataset LIMIT 2".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert!(app.filtered.as_ref().unwrap().aggregate);
+    assert_eq!(column_names(&app), ["id", "big", "UPPER(name)"]);
+    assert_eq!(cells(&app), [["0", "0", "ALPHA"], ["1", "10", "BETA"]]);
+
+    // Calculated first (WHERE and ORDER BY on calculations).
+    app.sql_input = "SELECT id, id % 3 AS rest FROM dataset WHERE id * 2 > 10 \
+                     ORDER BY rest DESC, id LIMIT 3"
+        .to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert_eq!(
+        cells(&app),
+        [["8", "2"], ["7", "1"], ["10", "1"]].map(|row| row.to_vec())
+    );
+
+    app.sql_input = "SELECT LOWER(id) FROM dataset".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    // Text functions take any value as its text.
+    assert_eq!(app.sql_error, None);
+    app.sql_input = "SELECT id FROM dataset WHERE name * 2 > 1".to_string();
+    app.run_sql();
+    assert!(
+        app.sql_error
+            .as_deref()
+            .is_some_and(|error| error.contains("arithmetic needs numbers")),
+        "{:?}",
+        app.sql_error
+    );
+}

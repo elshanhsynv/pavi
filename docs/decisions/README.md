@@ -38,3 +38,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0010](0010-light-theme.md) | A light theme beside the dark one, from one `Palette` type (amends DESIGN.md principle 5) |
 | [0011](0011-cli-sql.md) | The CLI runs `--sql` through `pavi_query` and the worker pool (amends "the CLI uses only `parquet_reader`") |
 | [0012](0012-result-navigation.md) | Results are entered anywhere: counted filters start at a row group, other results read on or again (amends 0003) |
+| [0013](0013-sql-calculations.md) | SQL calculations are made on the way out in a plain SELECT, otherwise on prepared rows first (amends 0009) |

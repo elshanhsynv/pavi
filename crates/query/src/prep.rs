@@ -46,6 +46,13 @@ pub(crate) enum Prep {
         input: Box<Prep>,
         filter: PrepFilter,
     },
+    /// The input's columns and, after them, the calculations' (ADR 0013),
+    /// written to a temporary table. The calculations' columns index the
+    /// input's columns.
+    Compute {
+        input: Box<Prep>,
+        expressions: Vec<(String, crate::expr::Expr<usize>)>,
+    },
     /// A join; `left_keys` and `right_keys` index the inputs' columns, and
     /// `names` name the output columns.
     Join {
@@ -178,6 +185,8 @@ fn count_joins(prep: &Prep) -> usize {
     match prep {
         Prep::Table { .. } | Prep::Query { .. } => 0,
         Prep::Filter { input, .. } => count_joins(input),
+        // Calculating reads every input row once, like a join: a step of progress.
+        Prep::Compute { input, .. } => 1 + count_joins(input),
         Prep::Join { left, right, .. } => 1 + count_joins(left) + count_joins(right),
     }
 }
@@ -209,6 +218,10 @@ fn run(prep: &Prep, context: &PrepContext) -> Result<Relation> {
                 None => expression,
             });
             Ok(relation)
+        }
+        Prep::Compute { input, expressions } => {
+            let relation = run(input, context)?;
+            compute_table(relation, expressions, context)
         }
         Prep::Join {
             left,
@@ -260,6 +273,70 @@ fn run(prep: &Prep, context: &PrepContext) -> Result<Relation> {
             })
         }
     }
+}
+
+/// Reads `relation`'s rows, adds the calculations' columns to each batch and
+/// writes them to a temporary table, whose columns are the relation's then
+/// the calculations'.
+fn compute_table(
+    relation: Relation,
+    expressions: &[(String, crate::expr::Expr<usize>)],
+    context: &PrepContext,
+) -> Result<Relation> {
+    let total = relation.source.row_count().max(1);
+    let mut plan = LogicalPlan::scan(Arc::clone(&relation.source));
+    if let Some(filter) = relation.filter.clone() {
+        plan = plan.filter(crate::Filter::new(filter));
+    }
+    let plan = plan.project(relation.columns.clone());
+    let engine = QueryEngine::from_handle(context.runtime.clone());
+    let input = engine.output_schema(&plan)?;
+    let mut fields = input.fields().iter().cloned().collect::<Vec<_>>();
+    for (name, expression) in expressions {
+        fields.push(Arc::new(arrow_schema::Field::new(
+            name,
+            expression.data_type(&input)?,
+            true,
+        )));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let mut writer = TempTableWriter::new(&schema)?;
+    let mut execution = engine.execute(&plan, GenerationId(0))?;
+    let done = context.joins_done.get();
+    loop {
+        if context.cancelled() {
+            execution.cancel();
+            return Err(Cancelled.into());
+        }
+        if let Some(scanned) = execution.scanned_rows() {
+            let fraction = (scanned as f64 / total as f64).min(1.0);
+            context.progress.store(
+                ((done as f64 + fraction) / context.joins.max(1) as f64 * PROGRESS_SCALE) as u64,
+                Ordering::Relaxed,
+            );
+        }
+        let Some(batch) = execution.next_batch()? else {
+            break;
+        };
+        let batch = batch.batch;
+        let mut columns = batch.columns().to_vec();
+        for (_, expression) in expressions {
+            columns.push(expression.evaluate(&batch)?);
+        }
+        writer.write(&arrow_array::RecordBatch::try_new_with_options(
+            Arc::clone(&schema),
+            columns,
+            &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )?)?;
+    }
+    context.joins_done.set(done + 1);
+    let source = writer.finish("calculation")?;
+    let columns = (0..source.column_count()).collect();
+    Ok(Relation {
+        source: Arc::new(source),
+        filter: None,
+        columns,
+    })
 }
 
 /// Runs `plan` to the end and writes its rows to a temporary table.
