@@ -147,6 +147,8 @@ pub(crate) struct PaviApp {
     show_shortcuts: bool,
     /// The filter and sort to restore once the open tab's file has opened.
     pending_view: Option<TabView>,
+    /// A message shown above the grid until dismissed (a crash last time).
+    notice: Option<String>,
 }
 
 /// Installs PAVI's fonts and style. Call once, before the first frame: fonts
@@ -263,10 +265,32 @@ struct RunningSql {
 
 impl PaviApp {
     pub(crate) fn new(initial_path: Option<PathBuf>) -> Self {
-        Self::new_with_store(
+        let mut app = Self::new_with_store(
             initial_path,
             SessionStore::new(SessionStore::default_path()),
-        )
+        );
+        app.report_previous_crash(&crate::logging::log_dir());
+        app
+    }
+
+    /// Says so once when the last run ended in a crash that left a report.
+    fn report_previous_crash(&mut self, log_dir: &std::path::Path) {
+        if let Some(newest) = crate::logging::crash_since(log_dir, self.session.last_crash_report) {
+            self.session.last_crash_report = newest;
+            self.persist_session();
+            self.notice = Some(
+                "PAVI closed unexpectedly last time. A crash report was saved in the log folder."
+                    .to_string(),
+            );
+        }
+    }
+
+    /// Opens the folder with the log and crash reports.
+    pub(super) fn open_log_folder(&mut self) {
+        let dir = crate::logging::log_dir();
+        if let Err(error) = crate::logging::open_folder(&dir) {
+            self.status = format!("{error:#}; the log folder is {}", dir.display());
+        }
     }
 
     fn new_with_store(initial_path: Option<PathBuf>, session_store: SessionStore) -> Self {
@@ -328,6 +352,7 @@ impl PaviApp {
             zoom_applied: None,
             show_shortcuts: false,
             pending_view: None,
+            notice: None,
         };
         if app.runtime.is_none() {
             app.grid.loading = LoadState::Error("start background runtime".to_string());
@@ -416,6 +441,7 @@ impl PaviApp {
         self.session.preferences.inspector_visible = self.show_inspector;
         self.session.preferences.chart_visible = self.chart.visible;
         if let Err(error) = self.session_store.save(&self.session) {
+            log::warn!("save session: {error}");
             self.status = format!("save session: {error}");
         }
     }
@@ -863,7 +889,7 @@ impl PaviApp {
                 });
                 self.restore_column_layout();
                 self.grid.ready(rows, self.column_layout.visible().len());
-                self.session.record_recent_file(path);
+                self.session.record_recent_file(path.clone());
                 self.persist_session();
                 if let Some(chart_columns) =
                     self.dataset.as_ref().map(|dataset| &dataset.column_names)
@@ -891,6 +917,10 @@ impl PaviApp {
                 } else {
                     format!("Ready: {rows} rows × {columns} columns{files}")
                 };
+                log::info!(
+                    "opened {}: {rows} rows × {columns} columns{files}",
+                    parquet_reader::display_path(&path).display()
+                );
                 if let Some(view) = self.pending_view.take() {
                     self.apply_tab_view(&view);
                 }
@@ -1106,6 +1136,10 @@ impl PaviApp {
 
     fn poll_export(&mut self) {
         if let Some(status) = self.export.poll() {
+            // The outcome, not every progress step.
+            if !status.starts_with("Exporting") {
+                log::info!("{status}");
+            }
             self.status = status;
         }
     }
@@ -1841,6 +1875,7 @@ impl PaviApp {
     }
 
     fn open_error(&mut self, error: String) {
+        log::warn!("{error}");
         self.grid.loading = LoadState::Error(error.clone());
         self.status = error;
     }

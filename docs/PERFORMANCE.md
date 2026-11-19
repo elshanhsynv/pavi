@@ -41,6 +41,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Bloom filter read for an `==` test (ADR 0014) | 16 MB per column chunk, only when the footer records its length; one at a time | `page_prune::MAX_BLOOM_FILTER_BYTES` |
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Restored tab views | one per open tab (≤16): filter ≤ 16 KB, ≤ 8 sort keys | `session::MAX_SAVED_FILTER_BYTES`, `MAX_SAVED_SORT_KEYS` |
+| Log file and crash reports | 1 MB, then it becomes `pavi.old.log` (2 MB in all); the newest 5 crash reports | `logging::MAX_LOG_BYTES`, `MAX_CRASH_REPORTS` |
+| Remote request in flight (ADR 0015) | one `pavi-http` helper thread per waiting worker; a cancel is noticed within 50 ms, and the abandoned request stops at its next 64 KB of body or its timeout | `remote::INTERRUPT_POLL`, `BODY_CHUNK_BYTES` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
 | Saved queries | 100, each ≤ 16 KB, names ≤ 80 characters | `session::MAX_SAVED_QUERIES`, `MAX_QUERY_BYTES`, `MAX_SAVED_NAME_CHARS` |
 | SQL completions shown | 8 | `sql_editor::MAX_SUGGESTIONS` |

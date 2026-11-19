@@ -3031,6 +3031,7 @@ dependencies = [
  "chrono",
  "eframe",
  "egui_extras",
+ "log",
  "parquet",
  "parquet_reader",
  "pavi_query",

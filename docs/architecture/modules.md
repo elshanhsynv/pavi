@@ -92,6 +92,7 @@ crates/app/src/                (pavi)
 ├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator (parquet_reader::profile statistics + distribution chart), ColumnProfile (derefs to ColumnStats)
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
 ├── compare.rs      CompareState, SchemaDiff, key_query (SQL for rows only in one tab)
+├── logging.rs      the log file (`log` facade → `pavi.log`, rotated at 1 MB), the panic hook and crash reports, Open log folder
 ├── copy.rs         CopyBuilder: "Copy as" Markdown, JSON or a SQL IN list, within the clipboard limit
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
 ├── session.rs      SessionState (serde: recent files, history, saved queries, layouts, zoom, tab views), SessionStore (JSON in the platform's folder, `session_dir`), ThemeChoice

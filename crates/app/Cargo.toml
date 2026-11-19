@@ -21,6 +21,9 @@ parquet_reader = { path = "../parquet" }
 pavi_runtime = { path = "../runtime" }
 pavi_query = { path = "../query" }
 parquet.workspace = true
+# The log file's facade; already in the tree through eframe, whose warnings
+# (graphics, window) then land in the same log.
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

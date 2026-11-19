@@ -2879,3 +2879,34 @@ fn a_restart_brings_back_filter_sort_and_number_formats() {
     assert_eq!(app.filter_input, "id > 70");
     assert_eq!(filtered_ids(&app)[0], "79");
 }
+
+#[test]
+fn tells_once_about_a_crash_in_the_last_run() {
+    let (directory, source, path) = source(4);
+    let mut app = make_app(source, path);
+    let logs = directory.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    app.report_previous_crash(&logs);
+    assert_eq!(app.notice, None, "no report, no notice");
+    std::fs::write(
+        logs.join("crash-20261119-120000.txt"),
+        crate::logging::crash_report_text("boom", "frames"),
+    )
+    .unwrap();
+    app.report_previous_crash(&logs);
+    assert!(
+        app.notice
+            .as_deref()
+            .unwrap()
+            .contains("closed unexpectedly")
+    );
+    assert!(app.session.last_crash_report > 0);
+    // The next start doesn't tell again about the same report.
+    app.notice = None;
+    app.report_previous_crash(&logs);
+    assert_eq!(app.notice, None);
+    assert_eq!(
+        app.session_store.load().last_crash_report,
+        app.session.last_crash_report
+    );
+}

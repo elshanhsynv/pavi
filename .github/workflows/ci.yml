@@ -45,8 +45,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is the primary desktop target; Linux keeps the crates portable.
-        os: [windows-latest, ubuntu-latest]
+        # Windows is the primary desktop target; Linux keeps the crates portable;
+        # macOS builds and tests the app there too.
+        os: [windows-latest, ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       # Installs the version and components pinned in rust-toolchain.toml.

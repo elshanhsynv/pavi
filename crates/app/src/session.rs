@@ -166,6 +166,9 @@ pub struct SessionState {
     pub preferences: Preferences,
     /// The filter and sort of open tabs that had one, by path.
     pub tab_views: Vec<TabView>,
+    /// When the newest crash report already told about was written (seconds
+    /// since 1970), so each crash is reported once.
+    pub last_crash_report: u64,
 }
 
 impl Default for SessionState {
@@ -184,6 +187,7 @@ impl Default for SessionState {
                 ..Preferences::default()
             },
             tab_views: Vec::new(),
+            last_crash_report: 0,
         }
     }
 }

@@ -50,7 +50,7 @@ Export writes CSV, Parquet, JSON Lines (`.jsonl`) and Arrow IPC file format (`.a
   - Session folder (`session::session_dir`): `%LOCALAPPDATA%\PAVI` on Windows, `~/Library/Application Support/PAVI` on macOS, `$XDG_STATE_HOME/pavi` or `~/.local/state/pavi` on Linux and the BSDs; the temp folder when none of these can be found.
   - Text font (`theme::font_files`): Segoe UI on Windows, Arial on macOS, Noto Sans or DejaVu Sans on Linux; egui's built-in font otherwise.
   - Window frame (`app::native_window_frame`): decorations are disabled except on macOS. Elsewhere the top bar is the drag area and draws its own minimize/maximize/close controls (`show_top_bar`, `window_controls` in `ui/toolbar.rs`), and `window_resize_handles` puts drag strips on the edges and corners that send `ViewportCommand::BeginResize`. winit doesn't support that command on macOS, so there the system title bar and border stay.
-- Builds and tests run on Windows and Ubuntu in CI. macOS is not built in CI; its branches above are unit-tested by name only.
+- Builds and tests run on Windows, Ubuntu and macOS in CI. The app's window has not been checked by hand on macOS.
 - Native dialogs: `rfd` (synchronous). Clipboard: egui/winit.
 
 ## unsafe / FFI

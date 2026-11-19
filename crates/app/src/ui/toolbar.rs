@@ -108,6 +108,30 @@ impl PaviApp {
                 });
             });
         self.show_tab_strip(ctx);
+        if let Some(notice) = self.notice.clone() {
+            let mut dismiss = false;
+            let mut open_logs = false;
+            egui::TopBottomPanel::top("notice")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::panel())
+                        .inner_margin(Spacing::Lg.symmetric(Spacing::Sm)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        widgets::error(ui, &notice);
+                        ui.add_space(Spacing::Md.px());
+                        open_logs = ui.small_button("Open log folder").clicked();
+                        dismiss = ui.small_button("Dismiss").clicked();
+                    });
+                });
+            if open_logs {
+                self.open_log_folder();
+            }
+            if dismiss || open_logs {
+                self.notice = None;
+            }
+        }
         if let Some(error) = &self.filter_error {
             egui::TopBottomPanel::top("filter_error")
                 .frame(
@@ -150,6 +174,7 @@ impl PaviApp {
         let mut zoom = None;
         let mut shortcuts = false;
         let mut clear_recent = false;
+        let mut open_logs = false;
         let response = widgets::menu(ui, "file", Some(Icon::Folder), &label, false, 420.0, |ui| {
             let path_box = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
@@ -225,6 +250,9 @@ impl PaviApp {
                 }
             });
             shortcuts = widgets::menu_item(ui, "Keyboard shortcuts", "F1").clicked();
+            open_logs = widgets::menu_item(ui, "Open log folder", "")
+                .on_hover_text("The log and any crash reports, to send with a bug report")
+                .clicked();
             if !self.session.recent_files.is_empty() {
                 ui.separator();
                 widgets::menu_caption(ui, "Recent");
@@ -253,6 +281,7 @@ impl PaviApp {
                 || compare
                 || shortcuts
                 || clear_recent
+                || open_logs
             {
                 widgets::close_menu(ui);
             }
@@ -290,6 +319,9 @@ impl PaviApp {
         }
         if clear_recent {
             self.clear_recent_files();
+        }
+        if open_logs {
+            self.open_log_folder();
         }
         if let Some(path) = open {
             self.open_path(path);

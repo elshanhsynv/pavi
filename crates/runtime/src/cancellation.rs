@@ -15,6 +15,11 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+
+    /// The flag itself, for `parquet_reader::interruptible`.
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.0)
+    }
 }
 
 /// How far a long scan has got, shared by a task and its worker. The worker
