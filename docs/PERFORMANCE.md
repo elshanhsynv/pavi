@@ -85,7 +85,7 @@ sub-frame operations aren't held to timer noise. A change that breaks a target n
 | Full scan: filter matching nothing on a text column | `pavi-cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
 | Lookup in a column sorted within row groups (page index, ADR 0014) | `pavi-cli --filter "user_id == 123" --count` | — | — | 2,126 ms (15,354 ms before) | < 3,200 ms |
 | Frame time while scrolling (UI thread: layout + tessellation, p95) | `cargo test --release -p pavi -- --ignored --nocapture frame_time` on a generated 1M-row, 12-column file, 20 rows a frame (the grid's work doesn't grow with the file): 5.5 ms | — | — | — | < 16 ms (60 fps) |
-| Cancel a running scan (cancel to return, all columns) | bench `cancel_scan_ms` | 0.6 ms | 0.1 ms | — | < 50 ms |
+| Cancel a running scan (cancel to return, all columns) | bench `cancel_scan_ms` | 1.3 ms | 0.1 ms | — | < 50 ms |
 
 Not yet enforced in CI: GitHub runners are too noisy for millisecond targets. Check them with the
 `perf-check` skill before merging changes to reading, the runtime, the query engine or the grid,
