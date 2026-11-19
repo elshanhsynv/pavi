@@ -35,7 +35,8 @@ use crate::profile::{
 };
 use crate::results::{FilteredGrid, JUMP_CONTEXT_ROWS, MatchCount, QueryKind};
 use crate::session::{
-    GridLayoutPreference, MAX_LAYOUT_COLUMNS, SessionState, SessionStore, ThemeChoice,
+    GridLayoutPreference, MAX_LAYOUT_COLUMNS, MAX_ZOOM, MIN_ZOOM, SavedNumberFormat, SavedSortKey,
+    SessionState, SessionStore, TabView, ThemeChoice,
 };
 use crate::state::{
     ColumnLayout, GridState, LoadState, ToolbarAvailability, ToolbarCommand, Workspace,
@@ -140,6 +141,12 @@ pub(crate) struct PaviApp {
     show_column_types: bool,
     freeze_header: bool,
     status: String,
+    /// The interface zoom last applied; `None` before the first frame.
+    zoom_applied: Option<f32>,
+    /// The keyboard shortcuts window (F1).
+    show_shortcuts: bool,
+    /// The filter and sort to restore once the open tab's file has opened.
+    pending_view: Option<TabView>,
 }
 
 /// Installs PAVI's fonts and style. Call once, before the first frame: fonts
@@ -175,6 +182,10 @@ enum HeaderAction {
     Profile(usize),
     /// Copy the column name.
     CopyName(String),
+    /// Show a source column's numbers in this format.
+    NumberFormat(usize, parquet_reader::NumberFormat),
+    /// Count each value of a source column, as a SQL query.
+    CountValues(usize),
     /// Add a source column as the next sort key.
     ThenSort(usize, SortDirection),
     /// Pin this many shown columns to the left (0 unpins).
@@ -228,6 +239,21 @@ enum CellAction {
     AndExclude,
     CopyCell,
     CopyRow,
+    /// Copy the selection in another format.
+    CopyAs(CopyFormat),
+}
+
+/// How a copied selection is written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CopyFormat {
+    /// Tab-separated, as spreadsheets paste it.
+    Tsv,
+    /// A Markdown table with the column names as its header.
+    Markdown,
+    /// A JSON array with one object per row, keyed by column name.
+    Json,
+    /// The distinct values as a SQL `IN (…)` list.
+    SqlList,
 }
 
 struct RunningSql {
@@ -299,6 +325,9 @@ impl PaviApp {
             show_column_types: true,
             freeze_header: true,
             status: "Choose a Parquet file to begin".to_string(),
+            zoom_applied: None,
+            show_shortcuts: false,
+            pending_view: None,
         };
         if app.runtime.is_none() {
             app.grid.loading = LoadState::Error("start background runtime".to_string());
@@ -310,7 +339,10 @@ impl PaviApp {
             let (paths, active) = (app.session.open_files.clone(), app.session.active_file);
             for (index, path) in paths.into_iter().enumerate() {
                 if index == 0 || app.new_tab() {
+                    // Its filter and sort come back once it has opened.
+                    let view = app.session.tab_view(&path).cloned();
                     app.begin_open(path);
+                    app.pending_view = view;
                 }
             }
             app.switch_tab(active);
@@ -338,9 +370,48 @@ impl PaviApp {
         }
     }
 
+    /// Applies the saved zoom on the first frame, and keeps a zoom changed with
+    /// the keyboard (egui's Ctrl+=, Ctrl+-, Ctrl+0) within bounds and saved.
+    fn apply_zoom(&mut self, ctx: &egui::Context) {
+        let Some(applied) = self.zoom_applied else {
+            ctx.set_zoom_factor(self.session.preferences.zoom);
+            self.zoom_applied = Some(self.session.preferences.zoom);
+            return;
+        };
+        let now = ctx.zoom_factor();
+        if (now - applied).abs() > 0.001 {
+            self.set_zoom(ctx, now);
+        }
+    }
+
+    /// Sets the interface zoom (1 is the normal size) and saves it.
+    pub(super) fn set_zoom(&mut self, ctx: &egui::Context, zoom: f32) {
+        let zoom = (zoom * 10.0).round() / 10.0;
+        let zoom = if zoom.is_finite() {
+            zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+        } else {
+            1.0
+        };
+        ctx.set_zoom_factor(zoom);
+        self.zoom_applied = Some(zoom);
+        self.status = format!("Zoom {}%", (zoom * 100.0).round());
+        if self.session.preferences.zoom != zoom {
+            self.session.preferences.zoom = zoom;
+            self.persist_session();
+        }
+    }
+
+    pub(super) fn clear_recent_files(&mut self) {
+        self.session.clear_recent_files();
+        self.persist_session();
+        self.status = "Recent files cleared".to_string();
+    }
+
     fn persist_session(&mut self) {
         let (open_files, active_file) = self.open_tab_paths();
         self.session.set_open_files(open_files, active_file);
+        let views = self.tab_views();
+        self.session.set_tab_views(views);
         self.session.sql_input = self.sql_input.clone();
         self.session.preferences.inspector_visible = self.show_inspector;
         self.session.preferences.chart_visible = self.chart.visible;
@@ -427,6 +498,11 @@ impl PaviApp {
         {
             self.open_find();
         }
+        if find_key(egui::Modifiers::NONE, egui::Key::F1)
+            || find_key(egui::Modifiers::COMMAND, egui::Key::Slash)
+        {
+            self.show_shortcuts = !self.show_shortcuts;
+        }
         if self.find.open {
             if find_key(egui::Modifiers::SHIFT, egui::Key::F3) {
                 self.find_next(true);
@@ -452,6 +528,19 @@ impl PaviApp {
         }
         if find_key(egui::Modifiers::COMMAND, egui::Key::W) {
             self.close_tab(self.tabs.active);
+        }
+        if find_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::PageUp,
+        ) && self.tabs.active > 0
+        {
+            self.move_tab(self.tabs.active, self.tabs.active - 1);
+        }
+        if find_key(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::PageDown,
+        ) {
+            self.move_tab(self.tabs.active, self.tabs.active + 1);
         }
         if self.tab_count() > 1 {
             let count = self.tab_count();
@@ -554,6 +643,17 @@ impl PaviApp {
             .collect();
         self.column_layout.restore(order, hidden, widths);
         self.column_layout.set_pinned(saved.pinned);
+        for (name, format) in &saved.number_formats {
+            if let Some(source) = index_for(name) {
+                self.column_layout.set_number_format(
+                    source,
+                    parquet_reader::NumberFormat {
+                        decimals: format.decimals,
+                        thousands: format.thousands,
+                    },
+                );
+            }
+        }
     }
 
     fn save_column_layout(&mut self) {
@@ -589,6 +689,20 @@ impl PaviApp {
                 .collect(),
             widths,
             pinned: self.column_layout.pinned(),
+            number_formats: self
+                .column_layout
+                .number_formats()
+                .iter()
+                .filter_map(|(source, format)| {
+                    Some((
+                        dataset.column_names.get(*source)?.clone(),
+                        SavedNumberFormat {
+                            decimals: format.decimals,
+                            thousands: format.thousands,
+                        },
+                    ))
+                })
+                .collect(),
         });
         self.persist_session();
     }
@@ -687,6 +801,7 @@ impl PaviApp {
             std::path::absolute(&path).unwrap_or(path)
         };
         self.cancel_tab_work();
+        self.pending_view = None;
         self.show_safe_full_selection = false;
         self.show_nested_selection = false;
         self.workspace = Workspace::Grid;
@@ -776,13 +891,57 @@ impl PaviApp {
                 } else {
                     format!("Ready: {rows} rows × {columns} columns{files}")
                 };
+                if let Some(view) = self.pending_view.take() {
+                    self.apply_tab_view(&view);
+                }
             }
-            OpenOutcome::Cancelled => self.status = "File open cancelled".to_string(),
+            OpenOutcome::Cancelled => {
+                self.pending_view = None;
+                self.status = "File open cancelled".to_string();
+            }
             OpenOutcome::OpenFailed(error) => {
+                self.pending_view = None;
                 self.session.remove_recent_file(&path);
                 self.persist_session();
                 self.open_error(format!("open file: {error:#}"));
             }
+        }
+    }
+
+    /// Applies a tab's saved filter and sort to the file just opened. A column
+    /// the file no longer has is left out of the sort; a filter that no longer
+    /// parses shows its error, as typed.
+    fn apply_tab_view(&mut self, view: &TabView) {
+        let Some(names) = self
+            .dataset
+            .as_ref()
+            .map(|dataset| dataset.column_names.clone())
+        else {
+            return;
+        };
+        if !view.filter.trim().is_empty() {
+            self.filter_input = view.filter.clone();
+            self.apply_filter();
+            if self.filter_error.is_some() {
+                return;
+            }
+        }
+        let keys = view
+            .sort
+            .iter()
+            .filter_map(|key| {
+                let column = names.iter().position(|name| *name == key.column)?;
+                let direction = if key.descending {
+                    SortDirection::Descending
+                } else {
+                    SortDirection::Ascending
+                };
+                Some(SortSpec::new(column, direction, NullOrder::Last))
+            })
+            .take(MAX_SORT_KEYS)
+            .collect::<Vec<_>>();
+        if !keys.is_empty() {
+            self.apply_sort(keys);
         }
     }
 
@@ -827,6 +986,11 @@ impl PaviApp {
                 ctx.copy_text(name);
                 self.status = "Copied the column name".to_string();
             }
+            Some(HeaderAction::NumberFormat(source, format)) => {
+                self.column_layout.set_number_format(source, format);
+                self.save_column_layout();
+            }
+            Some(HeaderAction::CountValues(source)) => self.count_values(source),
             Some(HeaderAction::Pin(count)) => {
                 self.column_layout.set_pinned(count);
                 self.save_column_layout();
@@ -1070,6 +1234,7 @@ impl PaviApp {
         match action {
             CellAction::CopyCell => self.copy_selection(ctx, false),
             CellAction::CopyRow => self.copy_selection(ctx, true),
+            CellAction::CopyAs(format) => self.copy_selection_as(ctx, false, format),
             CellAction::FilterTo
             | CellAction::Exclude
             | CellAction::AndFilterTo
@@ -1141,6 +1306,8 @@ impl PaviApp {
                 self.refresh_grid_columns();
                 self.filter_error = None;
                 self.status = format!("Filtering: {expression}");
+                // The tab's filter is reopened at the next start.
+                self.persist_session();
             }
             Err(error) => {
                 self.filter_error = Some(format!("Start filter: {error:#}"));
@@ -1174,6 +1341,7 @@ impl PaviApp {
         } else {
             self.grid.generation = generation;
         }
+        self.persist_session();
     }
 
     fn run_sql(&mut self) {
@@ -1395,6 +1563,7 @@ impl PaviApp {
                 self.filtered = Some(filtered);
                 self.refresh_grid_columns();
                 self.status = format!("Sorting by {description} (nulls last)");
+                self.persist_session();
             }
             Err(error) => self.status = format!("Start sort: {error:#}"),
         }
@@ -2052,6 +2221,10 @@ impl PaviApp {
     }
 
     fn copy_selection(&mut self, ctx: &egui::Context, row: bool) {
+        self.copy_selection_as(ctx, row, CopyFormat::Tsv);
+    }
+
+    fn copy_selection_as(&mut self, ctx: &egui::Context, row: bool, format: CopyFormat) {
         let Some((selected_grid_row, selected_display_column)) = self.grid.selection else {
             return;
         };
@@ -2073,6 +2246,36 @@ impl PaviApp {
         let last_row = range.anchor.0.max(range.focus.0);
         let first_column = range.anchor.1.min(range.focus.1);
         let last_column = range.anchor.1.max(range.focus.1);
+        if format != CopyFormat::Tsv {
+            let mut copy = crate::copy::CopyBuilder::new(format, MAX_CLIPBOARD_BYTES);
+            for row_index in first_row..=last_row {
+                let Some((batch, batch_row)) = self.batch_row_at(row_index) else {
+                    self.status =
+                        "Part of the selection is no longer loaded; select it again".to_string();
+                    return;
+                };
+                let mut cells = Vec::new();
+                for display_column in first_column..=last_column {
+                    let Some(column) = visible_columns.get(display_column).copied() else {
+                        self.status = "Selected column is unavailable".to_string();
+                        return;
+                    };
+                    if column >= batch.num_columns() {
+                        self.status = "Selected column is unavailable".to_string();
+                        return;
+                    }
+                    cells.push(column);
+                }
+                if let Err(error) = copy.add_row(&batch, batch_row, &cells) {
+                    self.status = format!("{error:#}");
+                    return;
+                }
+            }
+            let (text, status) = copy.finish();
+            ctx.copy_text(text);
+            self.status = status;
+            return;
+        }
         let mut text = String::new();
         for row_index in first_row..=last_row {
             let Some((batch, batch_row)) = self.batch_row_at(row_index) else {
@@ -2118,6 +2321,23 @@ impl PaviApp {
         } else {
             format!("{} cells copied to clipboard", ui::theme::number(cells))
         };
+    }
+
+    /// Counts each value of source column `source`: a SQL query grouped by the
+    /// column, most frequent first, run in the SQL workspace.
+    fn count_values(&mut self, source: usize) {
+        let Some(name) = self
+            .dataset
+            .as_ref()
+            .and_then(|dataset| dataset.column_names.get(source))
+            .cloned()
+        else {
+            return;
+        };
+        self.sql_input = count_values_sql(&name);
+        self.sql_completion = None;
+        self.workspace = Workspace::Sql;
+        self.run_sql();
     }
 
     /// Shows the find bar and puts the cursor in it.
@@ -2291,6 +2511,15 @@ impl PaviApp {
 /// The full display text of one cell for the clipboard, quoted as spreadsheets
 /// expect when it holds a tab, line break or quote. `None` when it does not fit in
 /// `room` bytes.
+/// The query "Count values" runs: each value of `column` and how many rows
+/// hold it, most frequent first.
+fn count_values_sql(column: &str) -> String {
+    let quoted = format!("\"{}\"", column.replace('"', "\"\""));
+    format!(
+        "SELECT {quoted}, COUNT(*) AS count\nFROM dataset\nGROUP BY {quoted}\nORDER BY count DESC"
+    )
+}
+
 fn clipboard_field(array: &dyn arrow_array::Array, row: usize, room: usize) -> Option<String> {
     // Formatting stops just past `room`, so a huge value is never built in full.
     let text = format_cell_with_limit(array, row, room.saturating_add(1));
@@ -2330,6 +2559,7 @@ impl eframe::App for PaviApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme_choice(ctx);
+        self.apply_zoom(ctx);
         self.pages.begin_frame();
         self.handle_global_shortcuts(ctx);
         self.open_dropped_files(ctx);
@@ -2349,6 +2579,7 @@ impl eframe::App for PaviApp {
         self.show_chart_window(ctx);
         self.show_file_profile_window(ctx);
         self.show_compare_window(ctx);
+        ui::shortcuts::window(ctx, &mut self.show_shortcuts);
         let compression = self
             .dataset
             .as_ref()

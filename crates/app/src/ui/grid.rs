@@ -17,7 +17,7 @@ const FIND_BOX_WIDTH: f32 = 240.0;
 /// Width of the menu a right-click on a cell opens.
 const CELL_MENU_WIDTH: f32 = 220.0;
 /// Width of the menu a right-click on a header opens.
-const HEADER_MENU_WIDTH: f32 = 180.0;
+const HEADER_MENU_WIDTH: f32 = 220.0;
 
 struct Header {
     source: Option<usize>,
@@ -253,6 +253,7 @@ impl PaviApp {
                                         let text = self
                                             .cell_text(row_index, column)
                                             .unwrap_or_else(|| "…".to_string());
+                                        let text = self.formatted(header, text);
                                         let (rect, _) = table_row.col(|ui| {
                                             self.data_cell(ui, row_index, column, &text, look);
                                         });
@@ -553,6 +554,7 @@ impl PaviApp {
                                         let text = self
                                             .filtered_cell_text(row_index, *batch_column)
                                             .unwrap_or_else(|| "…".to_string());
+                                        let text = self.formatted(&headers[column], text);
                                         let (rect, _) = table_row.col(|ui| {
                                             self.data_cell(ui, result_row, column, &text, look);
                                         });
@@ -595,6 +597,17 @@ impl PaviApp {
         self.apply_cell_action(ui.ctx());
     }
 
+    /// A cell's text in its column's number format, if it has one.
+    fn formatted(&self, header: &Header, text: String) -> String {
+        match header
+            .source
+            .and_then(|source| self.column_layout.number_format(source))
+        {
+            Some(format) if header.numeric => parquet_reader::value::format_number(&text, format),
+            _ => text,
+        }
+    }
+
     /// The right-click menu of a data cell. It acts on the selected cell, which a
     /// right-click has just made this one.
     fn cell_menu(&mut self, response: &egui::Response) {
@@ -627,6 +640,15 @@ impl PaviApp {
             }
             if widgets::menu_item(ui, "Copy row", "").clicked() {
                 chosen = Some(CellAction::CopyRow);
+            }
+            for (label, format) in [
+                ("Copy as Markdown table", CopyFormat::Markdown),
+                ("Copy as JSON", CopyFormat::Json),
+                ("Copy as SQL IN list", CopyFormat::SqlList),
+            ] {
+                if widgets::menu_item(ui, label, "").clicked() {
+                    chosen = Some(CellAction::CopyAs(format));
+                }
             }
             if chosen.is_some() {
                 self.cell_action = chosen;
@@ -953,6 +975,42 @@ impl PaviApp {
                 ui.separator();
                 if widgets::menu_item(ui, "Profile column", "").clicked() {
                     chosen = Some(HeaderAction::Profile(source));
+                }
+                if widgets::menu_item(ui, "Count values", "")
+                    .on_hover_text("Each value and how many rows hold it, as a SQL query")
+                    .clicked()
+                {
+                    chosen = Some(HeaderAction::CountValues(source));
+                }
+                if header.numeric {
+                    // Only what the grid shows; copy and export keep every digit.
+                    let current = self.column_layout.number_format(source).unwrap_or_default();
+                    ui.separator();
+                    widgets::menu_caption(ui, "Number format");
+                    let mut format = current;
+                    ui.horizontal(|ui| {
+                        ui.add_space(Spacing::Sm.px());
+                        if let Some(decimals) = widgets::segmented(
+                            ui,
+                            current.decimals,
+                            &[
+                                (None, "As is", true),
+                                (Some(0), "0", true),
+                                (Some(2), ".00", true),
+                                (Some(4), ".0000", true),
+                            ],
+                        ) {
+                            format.decimals = decimals;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(Spacing::Sm.px());
+                        ui.checkbox(&mut format.thousands, "1,000 separators");
+                    });
+                    if format != current {
+                        chosen = Some(HeaderAction::NumberFormat(source, format));
+                    }
+                    ui.separator();
                 }
                 if widgets::menu_item(ui, "Fit width", "").clicked() {
                     chosen = Some(HeaderAction::Fit(source));

@@ -85,19 +85,21 @@ crates/app/src/                (pavi)
 ├── pages.rs        SourcePages: source-grid page reads in flight, 8-page cache, off-screen cancellation
 ├── results.rs      FilteredGrid, QueryKind, MatchCount: the bounded filter/SQL/sort result window, its size and jumps (ADR 0012)
 ├── app_tests.rs    57 tests driving PaviApp without a window
-├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close tab, open_path (mounted inside app.rs)
-├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count), SelectionRange, LoadState, Workspace, ToolbarCommand
+├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close/move tab, tab_views (each tab's filter and sort for the session), open_path (mounted inside app.rs)
+├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count, number formats), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), progress, temp-file + rename; the writers are parquet_reader::export::BatchWriter
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
 ├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator (parquet_reader::profile statistics + distribution chart), ColumnProfile (derefs to ColumnStats)
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
 ├── compare.rs      CompareState, SchemaDiff, key_query (SQL for rows only in one tab)
+├── copy.rs         CopyBuilder: "Copy as" Markdown, JSON or a SQL IN list, within the clipboard limit
 ├── inspector.rs    CellDetails, column_summary, nested_schema_preview
-├── session.rs      SessionState (serde: recent files, history, saved queries, layouts), SessionStore (JSON in the platform's folder, `session_dir`), ThemeChoice
+├── session.rs      SessionState (serde: recent files, history, saved queries, layouts, zoom, tab views), SessionStore (JSON in the platform's folder, `session_dir`), ThemeChoice
 ├── sql_editor.rs   SQL tokens for highlighting, word-at-cursor completions, column quoting
 └── ui/             (mounted via #[path = "ui/mod.rs"] inside app.rs; every file is `impl PaviApp`)
     ├── toolbar.rs     top bar: file menu (path box, open file or folder, new tab, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls, window resize strips
-    ├── tabs.rs        tab strip under the top bar (from two tabs on)
+    ├── tabs.rs        tab strip under the top bar (from two tabs on); drag to reorder
+    ├── shortcuts.rs   the keyboard shortcuts window (F1) and the one list of shortcuts
     ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header and cell menus, pinned-column overlay, find bar
     ├── sql.rs         SQL workspace: highlighted editor with completions, History and Saved menus
     ├── inspector.rs   right panel: cell, whole row, column and profile, file info, schema, row-group stats
@@ -108,7 +110,7 @@ crates/app/src/                (pavi)
 
 ### Sharing between GUI and CLI
 
-- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `read_filtered_from`, `FilterExpr::parse`, `Projection`, the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling), the `export` module (`ExportFormat`, `BatchWriter`: CSV, JSON Lines, Parquet and Arrow IPC written batch by batch to any `Write`), and the `profile` module (`StatsAccumulator`, `FileProfiler`, `ColumnStats` and the distinct-value caps; the app adds the distribution chart and its threads).
+- **Shared:** `ParquetSource::open`, `read_window`, `read_filtered_window`, `read_filtered_from`, `FilterExpr::parse`, `Projection`, the `value` module (`format_cell*` for display, `scalar_text` for CSV and profiling, `format_number` for the grid's number formats, `sql_literal` for Copy as SQL), the `export` module (`ExportFormat`, `BatchWriter`: CSV, JSON Lines, Parquet and Arrow IPC written batch by batch to any `Write`), and the `profile` module (`StatsAccumulator`, `FileProfiler`, `ColumnStats` and the distinct-value caps; the app adds the distribution chart and its threads).
 - **Shared through `pavi_query` (CLI `--sql`, ADR 0011):** the runtime, the query engine and SQL subset, joins and subqueries, and `pavi_query::table_name`, which names the app's tabs and the CLI's `--table` files alike.
 - **GUI-only:** page cache use (`read_page`), the export task (thread, progress, temp file + rename), profiling, charts.
 - **Duplicated logic:** CLI has its own table printer and truncation (`crates/cli/src/output.rs`). Value → text conversion lives in one place, `value.rs`: display, CSV export, profiling and row-group statistics all use it. Aggregation keeps its own typed `Scalar` values (`source.rs::scalar_at`), which are turned back into Arrow arrays and displayed through `value.rs`. Type support is defined once in `types.rs` and used by sort, aggregates, filters and profiling; CSV export uses `value::is_scalar_type`. Charts keep their own checks.
@@ -156,7 +158,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | `FilteredGrid` | query kind, `LogicalPlan`, running `QueryExecution`, sliding `VecDeque<RecordBatch>` (≤8), `first_result`, `rows`, `target_result` | `results.rs` |
 | `ColumnLayout` | display order, hidden set, widths (72–480 px) | `state.rs:72-196` |
 | `ChartState`, `ProfileState`, `ExportState` | own generation, running execution/task, result, error. `ExportState` also drops events from replaced exports and turns events into status text | `chart.rs`, `profile.rs`, `export.rs` |
-| `SessionState` | recent files and folders (≤12), last file, files and folders open in tabs (≤16) and the shown one, SQL input, history (≤50 / 256 KB), inspector/chart visibility, per-schema grid layouts (≤8) | `session.rs:46-53` |
+| `SessionState` | recent files and folders (≤12), last file, files and folders open in tabs (≤16) and the shown one, SQL input, history (≤50 / 256 KB), inspector/chart visibility, zoom (0.5–2), per-schema grid layouts (≤8, with number formats), each open tab's filter (≤16 KB) and sort (≤8 keys) | `session.rs:46-53` |
 
 State changes happen by direct method calls. Every "restart" (open, filter, SQL, sort, clear) bumps `GridState.generation` via `GridState::reset()` (`state.rs:214-224`) so late responses are ignored.
 

@@ -147,6 +147,9 @@ impl PaviApp {
         let mut refresh = false;
         let mut compare = false;
         let mut theme_choice = None;
+        let mut zoom = None;
+        let mut shortcuts = false;
+        let mut clear_recent = false;
         let response = widgets::menu(ui, "file", Some(Icon::Folder), &label, false, 420.0, |ui| {
             let path_box = ui.add(
                 egui::TextEdit::singleline(&mut self.path_input)
@@ -194,6 +197,34 @@ impl PaviApp {
                     theme_choice = Some(choice);
                 }
             });
+            ui.horizontal(|ui| {
+                ui.add_space(Spacing::Md.px());
+                ui.label(RichText::new("Zoom").color(theme::muted()));
+                ui.add_space(Spacing::Sm.px());
+                let current = ui.ctx().zoom_factor();
+                if ui
+                    .small_button("−")
+                    .on_hover_text("Zoom out (Ctrl+-)")
+                    .clicked()
+                {
+                    zoom = Some(current - 0.1);
+                }
+                if ui
+                    .small_button(format!("{}%", (current * 100.0).round()))
+                    .on_hover_text("Normal size (Ctrl+0)")
+                    .clicked()
+                {
+                    zoom = Some(1.0);
+                }
+                if ui
+                    .small_button("+")
+                    .on_hover_text("Zoom in (Ctrl+=)")
+                    .clicked()
+                {
+                    zoom = Some(current + 0.1);
+                }
+            });
+            shortcuts = widgets::menu_item(ui, "Keyboard shortcuts", "F1").clicked();
             if !self.session.recent_files.is_empty() {
                 ui.separator();
                 widgets::menu_caption(ui, "Recent");
@@ -210,8 +241,19 @@ impl PaviApp {
                         open = Some(path.clone());
                     }
                 }
+                clear_recent = widgets::menu_item(ui, "Clear recent files", "")
+                    .on_hover_text("Forget this list; open tabs stay open")
+                    .clicked();
             }
-            if open.is_some() || browse || browse_folder || new_tab || refresh || compare {
+            if open.is_some()
+                || browse
+                || browse_folder
+                || new_tab
+                || refresh
+                || compare
+                || shortcuts
+                || clear_recent
+            {
                 widgets::close_menu(ui);
             }
         });
@@ -239,6 +281,15 @@ impl PaviApp {
         }
         if let Some(choice) = theme_choice {
             self.set_theme_choice(choice);
+        }
+        if let Some(zoom) = zoom {
+            self.set_zoom(ui.ctx(), zoom);
+        }
+        if shortcuts {
+            self.show_shortcuts = true;
+        }
+        if clear_recent {
+            self.clear_recent_files();
         }
         if let Some(path) = open {
             self.open_path(path);

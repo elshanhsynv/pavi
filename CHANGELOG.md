@@ -8,6 +8,14 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- Tabs reopen with the filter and sort they had when the app closed.
+- Number columns can show a fixed number of decimals and thousands separators (header right-click → Number format). Copy and export keep every digit.
+- "Copy as" in the cell menu: the selected cells as a Markdown table, as JSON, or as a SQL `IN (…)` list of their distinct values.
+- "Count values" in the header menu counts each value of a column, most frequent first.
+- Zoom the interface with Ctrl+= / Ctrl+- / Ctrl+0 or from the file menu; the zoom is remembered.
+- A list of keyboard shortcuts (F1, or the file menu).
+- Drag tabs to reorder them, or move the open tab with Ctrl+Shift+PgUp / PgDn.
+- "Clear recent files" in the file menu.
 - Filters skip data pages, not only row groups: a lookup in a sorted or clustered column reads one page of each row group (`user_id == 123` on a billion rows: 2 s instead of 15 s), using the page index most Parquet writers include. An `==` test also skips row groups whose bloom filter says the value is absent, in files that have bloom filters.
 - More column types can be filtered, sorted, grouped, profiled and used in MIN/MAX and SQL: dictionary-encoded columns (pandas categoricals), which now work like their values everywhere; durations, written as the grid shows them (`wait >= PT1M30S`) or as a number in the column's unit; binary, as hex (`hash == 0x6869`); and Decimal256 columns of up to 38 digits.
 - SQL calculations: arithmetic (`price * qty`), `||`, comparisons and `AND`/`OR`/`NOT`, `CAST`/`TRY_CAST`, `CASE`, and the functions `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `SUBSTRING`, `CONCAT`, `ABS`, `ROUND`, `COALESCE`, `YEAR`, `QUARTER`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DAYOFWEEK` and `EXTRACT`. They work in SELECT, WHERE (`WHERE a > b`, `WHERE NOT (…)`), GROUP BY (`GROUP BY YEAR(day)`), ORDER BY, HAVING, inside aggregates (`SUM(price * qty)`) and on aggregates' results (`ROUND(AVG(delay), 2)`, `SUM(a) / COUNT(*)`). In a plain SELECT they cost nothing extra; used to filter, group or sort, the rows are prepared first, as for a join.

@@ -20,6 +20,13 @@ pub const MAX_LAYOUT_COLUMNS: usize = 2_048;
 pub const MAX_SAVED_QUERIES: usize = 100;
 /// Characters of a saved query's name.
 pub const MAX_SAVED_NAME_CHARS: usize = 80;
+/// Bytes of a tab's filter kept to restore it at start.
+pub const MAX_SAVED_FILTER_BYTES: usize = 16 * 1024;
+/// Sort keys kept per tab (the app's own sort limit).
+pub const MAX_SAVED_SORT_KEYS: usize = 8;
+/// The interface zoom the app allows, as a factor of the normal size.
+pub const MIN_ZOOM: f32 = 0.5;
+pub const MAX_ZOOM: f32 = 2.0;
 
 /// The colour theme the user picked (ADR 0010).
 #[derive(Clone, Copy, Debug, Default, Serialize, Eq, PartialEq)]
@@ -74,15 +81,63 @@ pub struct GridLayoutPreference {
     pub widths: BTreeMap<String, u16>,
     /// Shown columns pinned to the left.
     pub pinned: usize,
+    /// Number formats of number columns, by column name.
+    pub number_formats: BTreeMap<String, SavedNumberFormat>,
 }
 
+/// A number column's format (`parquet_reader::NumberFormat`) as saved.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct SavedNumberFormat {
+    pub decimals: Option<u8>,
+    pub thousands: bool,
+}
+
+/// One sort key of a tab, by column name.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct SavedSortKey {
+    pub column: String,
+    pub descending: bool,
+}
+
+/// The filter and sort a tab showed, restored when the tab reopens at start.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct TabView {
+    pub path: PathBuf,
+    /// Filter text as the filter box takes it; empty for none.
+    pub filter: String,
+    pub sort: Vec<SavedSortKey>,
+}
+
+impl TabView {
+    pub fn is_empty(&self) -> bool {
+        self.filter.trim().is_empty() && self.sort.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Preferences {
     pub inspector_visible: bool,
     pub chart_visible: bool,
     pub grid_layouts: Vec<GridLayoutPreference>,
     pub theme: ThemeChoice,
+    /// Interface zoom, 1 for the normal size.
+    pub zoom: f32,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            inspector_visible: false,
+            chart_visible: false,
+            grid_layouts: Vec::new(),
+            theme: ThemeChoice::default(),
+            zoom: 1.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -94,7 +149,7 @@ pub struct QueryHistoryEntry {
     pub row_count: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SessionState {
     pub version: u32,
@@ -109,6 +164,8 @@ pub struct SessionState {
     /// Sorted by name, ignoring case.
     pub saved_queries: Vec<SavedQuery>,
     pub preferences: Preferences,
+    /// The filter and sort of open tabs that had one, by path.
+    pub tab_views: Vec<TabView>,
 }
 
 impl Default for SessionState {
@@ -126,6 +183,7 @@ impl Default for SessionState {
                 inspector_visible: true,
                 ..Preferences::default()
             },
+            tab_views: Vec::new(),
         }
     }
 }
@@ -258,6 +316,26 @@ impl SessionState {
             .unwrap_or(0);
     }
 
+    /// Forgets every recent file. Open tabs stay open.
+    pub fn clear_recent_files(&mut self) {
+        self.recent_files.clear();
+        self.last_opened_file = None;
+    }
+
+    /// The saved filter and sort of the tab showing `path`.
+    pub fn tab_view(&self, path: &Path) -> Option<&TabView> {
+        self.tab_views.iter().find(|view| view.path == path)
+    }
+
+    /// Keeps `views` (one per open tab that has a filter or sort) for the next
+    /// start. Like open files, a URL with a query string is never saved.
+    pub fn set_tab_views(&mut self, views: Vec<TabView>) {
+        self.tab_views = views
+            .into_iter()
+            .filter(|view| !view.is_empty() && !is_secret_url(&view.path))
+            .collect();
+    }
+
     pub fn remove_recent_file(&mut self, path: &Path) {
         self.recent_files.retain(|existing| existing != path);
         if self.last_opened_file.as_deref() == Some(path) {
@@ -320,6 +398,33 @@ impl SessionState {
             !layout.schema_key.is_empty() && layout.order.len() <= MAX_LAYOUT_COLUMNS
         });
         self.preferences.grid_layouts.truncate(MAX_GRID_LAYOUTS);
+        for layout in &mut self.preferences.grid_layouts {
+            layout
+                .number_formats
+                .retain(|name, _| layout.order.contains(name));
+            for format in layout.number_formats.values_mut() {
+                format.decimals = format
+                    .decimals
+                    .map(|decimals| decimals.min(parquet_reader::MAX_FORMAT_DECIMALS));
+            }
+        }
+        self.preferences.zoom = if self.preferences.zoom.is_finite() {
+            self.preferences.zoom.clamp(MIN_ZOOM, MAX_ZOOM)
+        } else {
+            1.0
+        };
+        // Only tabs that reopen keep a view.
+        let open_files = &self.open_files;
+        self.tab_views
+            .retain(|view| open_files.contains(&view.path));
+        for view in &mut self.tab_views {
+            if view.filter.len() > MAX_SAVED_FILTER_BYTES {
+                view.filter.clear();
+            }
+            view.sort.truncate(MAX_SAVED_SORT_KEYS);
+        }
+        self.tab_views.retain(|view| !view.is_empty());
+        self.tab_views.truncate(MAX_OPEN_FILES);
     }
 
     fn trim_history(&mut self) {
@@ -758,6 +863,93 @@ mod tests {
     }
 
     #[test]
+    fn keeps_zoom_tab_views_and_number_formats_within_bounds() {
+        // A session saved before zoom existed opens at the normal size.
+        let old: SessionState =
+            serde_json::from_str(r#"{"version":1,"preferences":{"inspector_visible":true}}"#)
+                .unwrap();
+        assert_eq!(old.preferences.zoom, 1.0);
+        let mut state = SessionState::default();
+        state.preferences.zoom = 9.0;
+        state.normalize();
+        assert_eq!(state.preferences.zoom, MAX_ZOOM);
+        state.preferences.zoom = f32::NAN;
+        state.normalize();
+        assert_eq!(state.preferences.zoom, 1.0);
+
+        // Views are kept only for tabs that reopen, and never for signed URLs.
+        let directory = tempfile::tempdir().unwrap();
+        let open = directory.path().join("open.parquet");
+        let closed = directory.path().join("closed.parquet");
+        fs::write(&open, b"").unwrap();
+        fs::write(&closed, b"").unwrap();
+        let signed = PathBuf::from("https://example.com/a.parquet?sig=secret");
+        state.set_open_files(vec![open.clone(), closed.clone()], 0);
+        let view = |path: &Path, filter: &str| TabView {
+            path: path.to_path_buf(),
+            filter: filter.to_string(),
+            sort: vec![SavedSortKey {
+                column: "id".to_string(),
+                descending: true,
+            }],
+        };
+        state.set_tab_views(vec![
+            view(&open, "id > 3"),
+            view(&closed, "id > 4"),
+            view(&signed, "id > 5"),
+            TabView {
+                path: open.clone(),
+                ..TabView::default()
+            },
+        ]);
+        assert_eq!(
+            state.tab_views.len(),
+            2,
+            "the signed URL and the empty view are dropped"
+        );
+        state.set_open_files(vec![open.clone()], 0);
+        state.normalize();
+        assert_eq!(state.tab_views, [view(&open, "id > 3")]);
+        assert_eq!(state.tab_view(&open).unwrap().sort[0].column, "id");
+
+        // A huge filter is dropped; the sort is kept, within bounds.
+        state.tab_views[0].filter = "x".repeat(MAX_SAVED_FILTER_BYTES + 1);
+        state.tab_views[0].sort = vec![SavedSortKey::default(); MAX_SAVED_SORT_KEYS + 3];
+        state.normalize();
+        assert!(state.tab_views[0].filter.is_empty());
+        assert_eq!(state.tab_views[0].sort.len(), MAX_SAVED_SORT_KEYS);
+
+        // Number formats of columns the layout no longer has are dropped.
+        state.save_grid_layout(GridLayoutPreference {
+            schema_key: "a|b".to_string(),
+            order: vec!["a".to_string(), "b".to_string()],
+            number_formats: BTreeMap::from([
+                (
+                    "a".to_string(),
+                    SavedNumberFormat {
+                        decimals: Some(200),
+                        thousands: true,
+                    },
+                ),
+                ("gone".to_string(), SavedNumberFormat::default()),
+            ]),
+            ..GridLayoutPreference::default()
+        });
+        state.normalize();
+        let formats = &state.grid_layout("a|b").unwrap().number_formats;
+        assert_eq!(formats.len(), 1);
+        assert_eq!(
+            formats["a"].decimals,
+            Some(parquet_reader::MAX_FORMAT_DECIMALS)
+        );
+
+        state.record_recent_file(open.clone());
+        state.clear_recent_files();
+        assert!(state.recent_files.is_empty());
+        assert_eq!(state.last_opened_file, None);
+    }
+
+    #[test]
     fn keeps_a_bounded_schema_keyed_grid_layout() {
         let mut state = SessionState::default();
         state.save_grid_layout(GridLayoutPreference {
@@ -766,6 +958,7 @@ mod tests {
             hidden: vec!["id".to_string()],
             widths: BTreeMap::from([("name".to_string(), 240)]),
             pinned: 1,
+            ..GridLayoutPreference::default()
         });
         assert_eq!(state.grid_layout("id|name").unwrap().order[0], "name");
         assert_eq!(state.grid_layout("id|name").unwrap().pinned, 1);

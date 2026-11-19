@@ -78,6 +78,9 @@ pub struct ColumnLayout {
     /// How many of the first shown columns stay in place when the grid scrolls
     /// sideways. The row numbers always do.
     pinned: usize,
+    /// Number formats of source columns; a column without one shows its values
+    /// as they are.
+    number_formats: std::collections::BTreeMap<usize, parquet_reader::NumberFormat>,
 }
 
 impl ColumnLayout {
@@ -88,6 +91,7 @@ impl ColumnLayout {
             widths: vec![width; columns],
             visible: Vec::new(),
             pinned: 0,
+            number_formats: std::collections::BTreeMap::new(),
         };
         layout.rebuild_visible();
         layout
@@ -161,6 +165,29 @@ impl ColumnLayout {
 
     pub fn order(&self) -> &[usize] {
         &self.order
+    }
+
+    /// The number format of source column `source`, if it has one.
+    pub fn number_format(&self, source: usize) -> Option<parquet_reader::NumberFormat> {
+        self.number_formats.get(&source).copied()
+    }
+
+    /// Sets (or, with the default format, clears) a source column's format.
+    pub fn set_number_format(&mut self, source: usize, format: parquet_reader::NumberFormat) {
+        if source >= self.order.len() {
+            return;
+        }
+        if format == parquet_reader::NumberFormat::default() {
+            self.number_formats.remove(&source);
+        } else {
+            self.number_formats.insert(source, format);
+        }
+    }
+
+    pub fn number_formats(
+        &self,
+    ) -> &std::collections::BTreeMap<usize, parquet_reader::NumberFormat> {
+        &self.number_formats
     }
 
     pub fn hidden(&self) -> &BTreeSet<usize> {

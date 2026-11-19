@@ -16,6 +16,8 @@ enum TabAction {
     Show(usize),
     Close(usize),
     New,
+    /// Move a dragged tab to another position.
+    Move(usize, usize),
 }
 
 impl PaviApp {
@@ -46,10 +48,27 @@ impl PaviApp {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                let mut rects = Vec::with_capacity(labels.len());
+                                let mut dragged = None;
                                 for (index, label) in labels.iter().enumerate() {
-                                    if let Some(chosen) = tab(ui, index, label) {
+                                    let (rect, chosen, dragging) = tab(ui, index, label);
+                                    rects.push(rect);
+                                    if dragging {
+                                        dragged = Some(index);
+                                    }
+                                    if let Some(chosen) = chosen {
                                         action = Some(chosen);
                                     }
+                                }
+                                // A dragged tab takes the place of the tab under the pointer.
+                                if let (Some(from), Some(pointer)) =
+                                    (dragged, ui.ctx().pointer_interact_pos())
+                                    && let Some(to) = rects
+                                        .iter()
+                                        .position(|rect| rect.x_range().contains(pointer.x))
+                                    && to != from
+                                {
+                                    action = Some(TabAction::Move(from, to));
                                 }
                                 ui.add_space(Spacing::Xs.px());
                                 if widgets::tool_button(ui, Some(Icon::Plus), "", false)
@@ -68,13 +87,15 @@ impl PaviApp {
             Some(TabAction::New) => {
                 self.new_tab();
             }
+            Some(TabAction::Move(from, to)) => self.move_tab(from, to),
             None => {}
         }
     }
 }
 
-/// Draws one tab: click shows it, middle-click or × closes it.
-fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
+/// Draws one tab: click shows it, middle-click or × closes it, dragging moves
+/// it. Returns its rectangle, what was chosen, and whether it is being dragged.
+fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> (egui::Rect, Option<TabAction>, bool) {
     let height = theme::TAB_BAR_HEIGHT;
     let icon_space = 22.0;
     let text_color = if label.active {
@@ -91,7 +112,14 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
     );
     let width = (icon_space + galley.size().x + CLOSE_SIZE + 3.0 * Spacing::Sm.px())
         .clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    // Keyed by the tab, not its position, so a tab being dragged stays the one
+    // dragged after it moves.
+    let response = ui.interact(
+        rect,
+        egui::Id::new(("tab", label.id)),
+        egui::Sense::click_and_drag(),
+    );
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,
@@ -168,12 +196,18 @@ fn tab(ui: &mut egui::Ui, index: usize, label: &TabLabel) -> Option<TabAction> {
         }
         widgets::icon(ui, close_rect.center(), Icon::Close, theme::muted());
     }
+    let dragging = response.dragged();
+    if dragging {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    }
     if close.clicked() || response.middle_clicked() {
-        return Some(TabAction::Close(index));
+        return (rect, Some(TabAction::Close(index)), dragging);
     }
     let response = match &label.path {
-        Some(path) => response.on_hover_text(path.display().to_string()),
+        Some(path) => response.on_hover_text(format!("{}\nDrag to move", path.display())),
         None => response,
     };
-    response.clicked().then_some(TabAction::Show(index))
+    // Pressing a tab shows it, so the tab being dragged is the one on screen.
+    let show = response.clicked() || response.drag_started();
+    (rect, show.then_some(TabAction::Show(index)), dragging)
 }
