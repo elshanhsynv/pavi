@@ -178,6 +178,11 @@ pub fn write_parquet(
     let properties = WriterProperties::builder()
         .set_compression(compression)
         .set_max_row_group_row_count(Some(row_group_rows))
+        // Several pages per row group, and bloom filters, so filtered reads
+        // exercise page and bloom filter pruning (ADR 0014).
+        .set_data_page_row_count_limit(4)
+        .set_write_batch_size(4)
+        .set_bloom_filter_enabled(true)
         .build();
     let file = File::create(path).expect("create parquet");
     let mut writer =

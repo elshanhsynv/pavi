@@ -176,7 +176,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 
 | Function | What it reads | Ref |
 |---|---|---|
-| `ParquetSource::open` | A file, a URL (read with range requests or downloaded, ADR 0008), or every `.parquet` file in a folder (`open_cancellable` stops between files). Bytes are read through `Handle` (a local `File` or a `RemoteReader`), the `ChunkReader` every read path uses. Footers only (`ArrowReaderMetadata::load`, default options → **no page index**); builds row-group index + statistics strings | `source.rs:125-159` |
+| `ParquetSource::open` | A file, a URL (read with range requests or downloaded, ADR 0008), or every `.parquet` file in a folder (`open_cancellable` stops between files). Bytes are read through `Handle` (a local `File` or a `RemoteReader`), the `ChunkReader` every read path uses. Footers only (`ArrowReaderMetadata::load`, default options → **no page index**; a filtered scan reads the page index and bloom filters of its columns per row group, ADR 0014); builds row-group index + statistics strings | `source.rs:125-159` |
 | `reader_for` | **Re-opens the row group's file** for every read (a window that crosses files uses one reader per file; partition columns are added by `reorder_batch`), builds a `ParquetRecordBatchReader` with `ProjectionMask::roots`, row groups, optional `RowSelection`, batch size 4096 | `source.rs:664-686` |
 | `read_window_batches` / `read_window` | Rows `[first, first+n)` → overlapping row groups + skip/select `RowSelection` | `source.rs:613-662` |
 | `read_page` | `read_window` for page `i` through the `Mutex<PageCache>` | `source.rs:223-242` |
