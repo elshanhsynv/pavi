@@ -36,7 +36,9 @@ pub use join::{
 pub use metadata::{ColumnInfo, ColumnStatistics, DatasetMetadata, RowGroupInfo};
 pub use page::{DataPage, PAGE_ROWS, PageKey, RowWindow};
 pub use projection::Projection;
-pub use remote::{MAX_DOWNLOAD_BYTES, REMOTE_CACHE_BYTES, display_path, is_remote};
+pub use remote::{
+    INTERRUPT_POLL, MAX_DOWNLOAD_BYTES, REMOTE_CACHE_BYTES, display_path, interruptible, is_remote,
+};
 pub use sort::{MAX_SORT_KEYS, NullOrder, SortBudget, SortDirection, SortSpec, validate_sort_keys};
 pub use source::{
     Cancelled, FileInfo, FilteredWindow, ParquetSource, SortOutput, aggregate_output_schema,

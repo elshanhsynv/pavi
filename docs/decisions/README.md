@@ -40,3 +40,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0012](0012-result-navigation.md) | Results are entered anywhere: counted filters start at a row group, other results read on or again (amends 0003) |
 | [0013](0013-sql-calculations.md) | SQL calculations are made on the way out in a plain SELECT, otherwise on prepared rows first (amends 0009) |
 | [0014](0014-page-index-and-bloom-filters.md) | Filtered scans read the page index and bloom filters of the columns they test, row group by row group |
+| [0015](0015-interruptible-remote-requests.md) | Remote requests wait on a helper thread, so cancelling a task ends the wait at once (amends 0008) |

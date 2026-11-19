@@ -509,9 +509,17 @@ fn worker_loop(receiver: Arc<Mutex<Receiver<Request>>>, shutdown: Arc<AtomicBool
         let Ok(request) = request else {
             return;
         };
+        // Remote requests made by the task stop when it is cancelled or the
+        // runtime shuts down, instead of after their HTTP timeouts.
         match request {
-            Request::Open(request) => execute_open(request, &shutdown),
-            Request::Read(request) => execute(request, &shutdown),
+            Request::Open(request) => {
+                let flags = [Arc::clone(&shutdown), request.cancellation.flag()];
+                parquet_reader::interruptible(&flags, || execute_open(request, &shutdown));
+            }
+            Request::Read(request) => {
+                let flags = [Arc::clone(&shutdown), request.cancellation.flag()];
+                parquet_reader::interruptible(&flags, || execute(request, &shutdown));
+            }
         }
     }
 }
@@ -815,6 +823,38 @@ mod tests {
             panic!("source open did not succeed")
         };
         assert_eq!(source.row_count(), 6);
+    }
+
+    #[test]
+    fn cancelling_an_open_stops_waiting_for_a_silent_server() {
+        // Accepts connections and never answers: a request waits for its
+        // 30 s response timeout unless the cancel reaches it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let runtime = runtime(1, 1);
+        let task = runtime
+            .submit_open(format!("http://{address}/data.parquet"), GenerationId(3))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let cancelled_at = std::time::Instant::now();
+        task.cancel();
+        let response = loop {
+            match task.try_recv() {
+                Ok(response) => break response,
+                Err(_) if cancelled_at.elapsed() < std::time::Duration::from_secs(5) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("no answer 5 s after the cancel: {error}"),
+            }
+        };
+        assert!(matches!(response.outcome, OpenOutcome::Cancelled));
+        assert!(cancelled_at.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

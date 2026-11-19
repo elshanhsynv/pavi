@@ -1,17 +1,27 @@
 //! Files read over HTTP: `https://`, `http://`, `s3://`, `gs://` and `az://`
 //! URLs (ADR 0008).
 //!
-//! Requests are blocking and run on the caller's thread (a runtime worker). A
-//! Parquet object is read with `Range` requests through [`RemoteReader`], which
-//! implements the `parquet` crate's `ChunkReader`; anything else is downloaded
-//! to a temporary file first.
+//! Requests are blocking. A Parquet object is read with `Range` requests
+//! through [`RemoteReader`], which implements the `parquet` crate's
+//! `ChunkReader`; anything else is downloaded to a temporary file first.
+//!
+//! Work run inside [`interruptible`] (the runtime's workers) makes each request
+//! on a helper thread and waits for it, checking its cancel flags every
+//! [`INTERRUPT_POLL`]: a cancelled task stops waiting at once instead of after
+//! the HTTP timeouts. The abandoned request stops at its next block of body,
+//! or when its own timeouts end it.
 
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -40,9 +50,100 @@ const ATTEMPTS: u32 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How often a thread waiting for a request checks whether it was cancelled.
+pub const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+/// Bytes of a response body read at a time; an abandoned request stops after
+/// at most one more.
+const BODY_CHUNK_BYTES: usize = 64 * 1024;
 /// SHA-256 of an empty body, the payload hash of a signed GET.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const AZURE_API_VERSION: &str = "2021-08-06";
+
+thread_local! {
+    /// The flags that cancel the work running on this thread (see [`interruptible`]).
+    static INTERRUPT: RefCell<Vec<Arc<AtomicBool>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `work` so that remote requests it makes stop when any of `flags` is
+/// set: the waiting thread returns [`Cancelled`] within [`INTERRUPT_POLL`].
+/// Without it (the CLI, tests), requests run on the calling thread.
+pub fn interruptible<T>(flags: &[Arc<AtomicBool>], work: impl FnOnce() -> T) -> T {
+    struct Restore(Vec<Arc<AtomicBool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            INTERRUPT.with(|flags| *flags.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(INTERRUPT.with(|current| current.replace(flags.to_vec())));
+    work()
+}
+
+fn interrupt_flags() -> Vec<Arc<AtomicBool>> {
+    INTERRUPT.with(|flags| flags.borrow().clone())
+}
+
+fn any_set(flags: &[Arc<AtomicBool>]) -> bool {
+    flags.iter().any(|flag| flag.load(Ordering::Acquire))
+}
+
+/// Runs a blocking request. `work` gets a test to call between steps (attempts,
+/// body chunks); when it says stop, `work` returns [`Cancelled`]. Inside
+/// [`interruptible`] `work` runs on a helper thread, and this thread gives up
+/// waiting as soon as a flag is set or `should_stop` says so.
+fn run_request<T: Send + 'static>(
+    work: impl FnOnce(&dyn Fn() -> bool) -> Result<T> + Send + 'static,
+    should_stop: &dyn Fn() -> bool,
+) -> Result<T> {
+    let flags = interrupt_flags();
+    if flags.is_empty() {
+        return work(should_stop);
+    }
+    if should_stop() || any_set(&flags) {
+        return Err(Cancelled.into());
+    }
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let helper_abandoned = Arc::clone(&abandoned);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("pavi-http".to_owned())
+        .spawn(move || {
+            let stop = || helper_abandoned.load(Ordering::Acquire);
+            let _ = sender.send(work(&stop));
+        })
+        .context("start a request thread")?;
+    loop {
+        match receiver.recv_timeout(INTERRUPT_POLL) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if should_stop() || any_set(&flags) {
+                    abandoned.store(true, Ordering::Release);
+                    return Err(Cancelled.into());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the request thread stopped"),
+        }
+    }
+}
+
+/// Reads `reader` to its end, at most `limit` bytes, a chunk at a time.
+fn read_body(mut reader: impl Read, limit: usize, stop: &dyn Fn() -> bool) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(limit.min(16 * 1024 * 1024));
+    let mut chunk = vec![0_u8; BODY_CHUNK_BYTES];
+    loop {
+        if stop() {
+            return Err(Cancelled.into());
+        }
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(body);
+        }
+        if body.len() + read > limit {
+            bail!("the server sent more than the {limit} bytes asked for");
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+}
 
 /// `true` for a path that is really a URL PAVI reads over HTTP.
 pub fn is_remote(path: &Path) -> bool {
@@ -125,8 +226,13 @@ impl std::fmt::Debug for RemoteObject {
 impl RemoteObject {
     /// Finds the object at `url` and its size with a one-byte range request.
     pub(crate) fn open(url: &str) -> Result<Self> {
+        let url = url.to_owned();
+        run_request(move |stop| Self::probe(&url, stop), &|| false)
+    }
+
+    fn probe(url: &str, stop: &dyn Fn() -> bool) -> Result<Self> {
         let mut target = resolve(url, &Environment::from_process())?;
-        let mut probe = request(&target, Some((0, 0)))?;
+        let mut probe = request(&target, Some((0, 0)), stop)?;
         // S3 answers a request to the wrong region with the bucket's region.
         if let Some(region) = probe
             .headers()
@@ -138,7 +244,7 @@ impl RemoteObject {
             let mut environment = Environment::from_process();
             environment.region = Some(region);
             target = resolve(url, &environment)?;
-            probe = request(&target, Some((0, 0)))?;
+            probe = request(&target, Some((0, 0)), stop)?;
         }
         let status = probe.status().as_u16();
         check_status(status, url, &target)?;
@@ -210,18 +316,24 @@ impl RemoteObject {
         {
             return Ok(bytes);
         }
-        let response = request(&self.target, Some((start, end - 1)))?;
-        let status = response.status().as_u16();
-        if status != 206 {
-            check_status(status, &self.target.url, &self.target)?;
-            bail!("the server stopped answering range requests (status {status})");
-        }
-        let body = response
-            .into_body()
-            .into_with_config()
-            .limit(length as u64 + 1)
-            .read_to_vec()
-            .context("read a remote byte range")?;
+        let target = self.target.clone();
+        let body = run_request(
+            move |stop| {
+                let response = request(&target, Some((start, end - 1)), stop)?;
+                let status = response.status().as_u16();
+                if status != 206 {
+                    check_status(status, &target.url, &target)?;
+                    bail!("the server stopped answering range requests (status {status})");
+                }
+                let reader = response
+                    .into_body()
+                    .into_with_config()
+                    .limit(length as u64 + 1)
+                    .reader();
+                read_body(reader, length, stop).context("read a remote byte range")
+            },
+            &|| false,
+        )?;
         if body.len() != length {
             bail!(
                 "the server sent {} bytes for a {length}-byte range",
@@ -241,40 +353,53 @@ impl RemoteObject {
     /// Downloads the whole object to `path`. `checkpoint` gets the share done
     /// (0 to 1) and cancels the download by returning `true`.
     pub(crate) fn download(&self, path: &Path, checkpoint: &dyn Fn(f64) -> bool) -> Result<()> {
-        let response = request(&self.target, None)?;
-        let status = response.status().as_u16();
-        check_status(status, &self.target.url, &self.target)?;
-        let mut reader = response
-            .into_body()
-            .into_with_config()
-            .limit(MAX_DOWNLOAD_BYTES)
-            .reader();
-        let mut file = std::io::BufWriter::new(
-            File::create(path).with_context(|| format!("create {}", path.display()))?,
-        );
-        let mut buffer = vec![0_u8; 256 * 1024];
-        let mut written = 0_u64;
-        loop {
-            if checkpoint(written as f64 / self.length.max(1) as f64) {
-                return Err(Cancelled.into());
-            }
-            let read = reader
-                .read(&mut buffer)
-                .context("download the remote file")?;
-            if read == 0 {
-                break;
-            }
-            written += read as u64;
-            if written > MAX_DOWNLOAD_BYTES {
-                bail!(
-                    "the remote file is larger than {} GB",
-                    MAX_DOWNLOAD_BYTES / (1024 * 1024 * 1024)
+        let target = self.target.clone();
+        let destination = path.to_path_buf();
+        // Bytes written so far, for `checkpoint`'s share while the download runs.
+        let written = Arc::new(AtomicU64::new(0));
+        let progress = Arc::clone(&written);
+        let total = self.length.max(1) as f64;
+        run_request(
+            move |stop| {
+                let response = request(&target, None, stop)?;
+                let status = response.status().as_u16();
+                check_status(status, &target.url, &target)?;
+                let mut reader = response
+                    .into_body()
+                    .into_with_config()
+                    .limit(MAX_DOWNLOAD_BYTES)
+                    .reader();
+                let mut file = std::io::BufWriter::new(
+                    File::create(&destination)
+                        .with_context(|| format!("create {}", destination.display()))?,
                 );
-            }
-            file.write_all(&buffer[..read])?;
-        }
-        file.flush()?;
-        Ok(())
+                let mut buffer = vec![0_u8; 256 * 1024];
+                let mut done = 0_u64;
+                loop {
+                    if stop() {
+                        return Err(Cancelled.into());
+                    }
+                    let read = reader
+                        .read(&mut buffer)
+                        .context("download the remote file")?;
+                    if read == 0 {
+                        break;
+                    }
+                    done += read as u64;
+                    if done > MAX_DOWNLOAD_BYTES {
+                        bail!(
+                            "the remote file is larger than {} GB",
+                            MAX_DOWNLOAD_BYTES / (1024 * 1024 * 1024)
+                        );
+                    }
+                    file.write_all(&buffer[..read])?;
+                    progress.store(done, Ordering::Relaxed);
+                }
+                file.flush()?;
+                Ok(())
+            },
+            &|| checkpoint(written.load(Ordering::Relaxed) as f64 / total),
+        )
     }
 }
 
@@ -602,11 +727,18 @@ fn agent() -> &'static ureq::Agent {
 
 /// Sends a GET for `range` (inclusive) or the whole object, retrying
 /// connection errors and 5xx answers.
-fn request(target: &Target, range: Option<(u64, u64)>) -> Result<ureq::http::Response<ureq::Body>> {
+fn request(
+    target: &Target,
+    range: Option<(u64, u64)>,
+    stop: &dyn Fn() -> bool,
+) -> Result<ureq::http::Response<ureq::Body>> {
     let mut last_error = None;
     for attempt in 0..ATTEMPTS {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(250 << attempt));
+        }
+        if stop() {
+            return Err(Cancelled.into());
         }
         let mut headers = target.headers.clone();
         if let Some((first, last)) = range {
@@ -1122,5 +1254,55 @@ mod tests {
                 .downcast_ref::<Cancelled>()
                 .is_some()
         );
+    }
+
+    /// A server that accepts connections and never answers.
+    fn silent_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        format!("http://{address}/data.parquet")
+    }
+
+    #[test]
+    fn a_cancelled_request_stops_waiting_for_the_server() {
+        let url = silent_server();
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            setter.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let error = interruptible(&[flag], || RemoteObject::open(&url)).unwrap_err();
+        assert!(error.downcast_ref::<Cancelled>().is_some(), "{error:#}");
+        // The server would keep it waiting for the 30 s response timeout.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // The flags apply only inside `interruptible`.
+        assert!(interrupt_flags().is_empty());
+    }
+
+    #[test]
+    fn interruptible_reads_return_the_same_bytes() {
+        let body = (0..=255_u8).cycle().take(300_000).collect::<Vec<_>>();
+        let url = serve(body.clone(), true);
+        let flag = Arc::new(AtomicBool::new(false));
+        let object = interruptible(&[Arc::clone(&flag)], || RemoteObject::open(&url)).unwrap();
+        let bytes =
+            interruptible(&[Arc::clone(&flag)], || object.read_range(1000, 200_000)).unwrap();
+        assert_eq!(bytes.as_ref(), &body[1000..201_000]);
+        // A flag already set stops a read before it starts.
+        flag.store(true, Ordering::Release);
+        let error = interruptible(&[flag], || object.read_range(250_000, 10)).unwrap_err();
+        assert!(error.downcast_ref::<Cancelled>().is_some());
     }
 }

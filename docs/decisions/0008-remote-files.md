@@ -1,6 +1,6 @@
 # 0008. Remote files over blocking HTTP range requests
 
-- Status: accepted
+- Status: accepted, amended by [0015](0015-interruptible-remote-requests.md)
 - Date: 2026-11-12
 
 ## Context
@@ -22,6 +22,6 @@ Much Parquet data lives in object storage (Amazon S3 and S3-compatible stores, G
 
 ## Consequences
 - Opening a large remote Parquet file costs a few requests for the footer; scrolling and filtering download only the column chunks they read, as a local read would read them from disk. Whole-file scans (sorts, aggregates) download the projected columns once per scan, so they are as slow as the network.
-- Each request has a 30-second timeout and is retried three times on connection errors and 5xx answers; a failure is a status-bar error like any read error. A read in flight can't be interrupted, only abandoned when it returns.
+- Each request has a 30-second timeout and is retried three times on connection errors and 5xx answers; a failure is a status-bar error like any read error. A read in flight can't be interrupted, only abandoned when it returns. (Since ADR 0015 a cancelled task stops waiting within 50 ms.)
 - New dependencies: `ureq`, `rustls`, `ring`, `rustls-native-certs` and their dependencies, all under the permitted licenses. `webpki-roots` (CDLA) is avoided by using the system certificate store.
 - Credential handling is limited to the cases above: no instance-metadata or SSO credentials for AWS, no service-account key files for Google, no Azure AD login. Those can be added later behind the same `Auth` type.

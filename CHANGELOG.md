@@ -8,6 +8,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- PAVI keeps a log of what it did and what failed (File menu → Open log folder). When the app crashes it writes a crash report, and the next start says so.
+- Cancelling the open or a read of a remote file stops at once, instead of waiting up to minutes for a slow or silent server.
+- macOS is built and tested in CI.
 - Tabs reopen with the filter and sort they had when the app closed.
 - Number columns can show a fixed number of decimals and thousands separators (header right-click → Number format). Copy and export keep every digit.
 - "Copy as" in the cell menu: the selected cells as a Markdown table, as JSON, or as a SQL `IN (…)` list of their distinct values.

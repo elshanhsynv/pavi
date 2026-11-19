@@ -41,7 +41,7 @@ A query that joins tables or uses subqueries (ADR 0009) is prepared on its own t
 
 ## Network reads
 
-Remote reads (ADR 0008) are blocking HTTP requests made on the worker that runs the read, through one shared `ureq` agent (connection pool). The range cache of a `RemoteObject` is behind a `Mutex` held only to look up or insert a range, never during a request. Cancellation is checked between batches as for local files; a request already sent runs until it answers or times out.
+Remote reads (ADR 0008) are blocking HTTP requests made on the worker that runs the read, through one shared `ureq` agent (connection pool). The range cache of a `RemoteObject` is behind a `Mutex` held only to look up or insert a range, never during a request. Cancellation is checked between batches as for local files, and also while a request is in flight (ADR 0015): the worker runs the task inside `parquet_reader::interruptible` with its cancellation and shutdown flags, each request runs on a short-lived `pavi-http` helper thread, and the worker stops waiting within `INTERRUPT_POLL` (50 ms) of a cancel. The abandoned request stops at its next 64 KB of body or at its own timeout.
 
 ## Tabs
 

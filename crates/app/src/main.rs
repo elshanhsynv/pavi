@@ -9,6 +9,7 @@ mod copy;
 mod export;
 mod find;
 mod inspector;
+mod logging;
 mod pages;
 mod profile;
 mod results;
@@ -21,6 +22,15 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
+    // Without a writable folder the app still runs, without a log.
+    if logging::init(&logging::log_dir()).is_ok() {
+        log::info!(
+            "PAVI {} started on {} {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+    }
     let options = eframe::NativeOptions {
         centered: true,
         viewport: egui::ViewportBuilder::default()
