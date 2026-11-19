@@ -537,6 +537,125 @@ fn format_binary(value: &[u8], limit: usize) -> String {
     out
 }
 
+/// How a number column shows its values in the grid: a fixed number of
+/// decimals and thousands separators. The default changes nothing. Copy and
+/// export always use the full value.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NumberFormat {
+    /// Digits after the decimal point, rounded half away from zero; `None`
+    /// keeps the value's own.
+    pub decimals: Option<u8>,
+    /// Groups the whole part's digits by three with `,`.
+    pub thousands: bool,
+}
+
+/// Most decimals a [`NumberFormat`] can ask for.
+pub const MAX_FORMAT_DECIMALS: u8 = 9;
+
+/// `text` (a cell's plain number text, as [`format_cell`] gives it) in
+/// `format`. Text that isn't a plain decimal number (`NaN`, `inf`, `…`) is
+/// returned as it is. Rounding works on the digits, so it is exact for
+/// decimals and for large integers.
+pub fn format_number(text: &str, format: NumberFormat) -> String {
+    if format == NumberFormat::default() {
+        return text.to_owned();
+    }
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return text.to_owned();
+    }
+    let mut digits = whole.bytes().chain(fraction.bytes()).collect::<Vec<u8>>();
+    let mut point = whole.len();
+    let decimals = match format.decimals {
+        Some(decimals) => usize::from(decimals.min(MAX_FORMAT_DECIMALS)),
+        None => fraction.len(),
+    };
+    let keep = point + decimals;
+    if digits.len() > keep {
+        let round_up = digits.get(keep).is_some_and(|digit| *digit >= b'5');
+        digits.truncate(keep);
+        if round_up {
+            let mut index = keep;
+            loop {
+                if index == 0 {
+                    digits.insert(0, b'1');
+                    point += 1;
+                    break;
+                }
+                index -= 1;
+                if let Some(digit) = digits.get_mut(index) {
+                    if *digit == b'9' {
+                        *digit = b'0';
+                    } else {
+                        *digit += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    digits.resize(point + decimals, b'0');
+    let (whole, fraction) = digits.split_at(point);
+    let whole = String::from_utf8_lossy(whole);
+    let mut out = String::with_capacity(text.len() + whole.len() / 3 + 2);
+    // `-0.00` reads as a different number from `0.00`.
+    if negative && digits.iter().any(|digit| *digit != b'0') {
+        out.push('-');
+    }
+    if format.thousands {
+        for (index, digit) in whole.chars().enumerate() {
+            if index > 0 && (whole.len() - index).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(digit);
+        }
+    } else {
+        out.push_str(&whole);
+    }
+    if !fraction.is_empty() {
+        out.push('.');
+        out.push_str(&String::from_utf8_lossy(fraction));
+    }
+    out
+}
+
+/// One value as a SQL literal, for an `IN (…)` list: numbers and booleans as
+/// they are, text in single quotes (a quote doubled), `NULL` for null.
+/// Nested values are refused.
+pub fn sql_literal(array: &dyn Array, row: usize) -> Result<String> {
+    let Some(text) = scalar_text(array, row)? else {
+        return Ok("NULL".to_owned());
+    };
+    let data_type = match array.data_type() {
+        DataType::Dictionary(_, values) => values.as_ref(),
+        data_type => data_type,
+    };
+    let bare = matches!(data_type, DataType::Boolean)
+        || (crate::types::is_numeric(data_type) && format_number_is_plain(&text));
+    Ok(if bare {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "''"))
+    })
+}
+
+/// `true` for `-?digits(.digits)?`, which SQL reads as a number.
+fn format_number_is_plain(text: &str) -> bool {
+    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, "0"));
+    !whole.is_empty()
+        && !fraction.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && fraction.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// A chart axis tick label for `value`: decimals to suit `step` (the distance
 /// between ticks), and k, M, G or T for large values.
 pub fn axis_number(value: f64, step: f64) -> String {
@@ -918,5 +1037,58 @@ mod tests {
             Some("1970-01-02T00:00:00")
         );
         assert_eq!(temporal_text(&DataType::Int32, 1.0), None);
+    }
+
+    #[test]
+    fn formats_numbers_with_decimals_and_thousands() {
+        let format = |decimals, thousands| NumberFormat {
+            decimals,
+            thousands,
+        };
+        assert_eq!(
+            format_number("0.013000000000000001", format(Some(2), false)),
+            "0.01"
+        );
+        assert_eq!(
+            format_number("1234567.891", format(Some(2), true)),
+            "1,234,567.89"
+        );
+        assert_eq!(format_number("999.995", format(Some(2), false)), "1000.00");
+        assert_eq!(
+            format_number("-999.995", format(Some(2), true)),
+            "-1,000.00"
+        );
+        assert_eq!(format_number("2.5", format(Some(0), false)), "3");
+        assert_eq!(format_number("-0.004", format(Some(2), false)), "0.00");
+        assert_eq!(format_number("12", format(Some(3), false)), "12.000");
+        assert_eq!(format_number("-1234", format(None, true)), "-1,234");
+        assert_eq!(format_number("123", format(None, true)), "123");
+        assert_eq!(
+            format_number(
+                "170141183460469231731687303715884105727",
+                format(None, true)
+            ),
+            "170,141,183,460,469,231,731,687,303,715,884,105,727"
+        );
+        for text in ["NaN", "inf", "-inf", "…", "", "1e5", "12.5.1"] {
+            assert_eq!(format_number(text, format(Some(2), true)), text);
+        }
+        assert_eq!(format_number("0.013", NumberFormat::default()), "0.013");
+    }
+
+    #[test]
+    fn writes_sql_literals() {
+        let numbers = Float64Array::from(vec![Some(1.5), None, Some(f64::NAN)]);
+        assert_eq!(sql_literal(&numbers, 0).unwrap(), "1.5");
+        assert_eq!(sql_literal(&numbers, 1).unwrap(), "NULL");
+        assert_eq!(sql_literal(&numbers, 2).unwrap(), "'NaN'");
+        let text = StringArray::from(vec!["O'Hare"]);
+        assert_eq!(sql_literal(&text, 0).unwrap(), "'O''Hare'");
+        let flags = BooleanArray::from(vec![true]);
+        assert_eq!(sql_literal(&flags, 0).unwrap(), "true");
+        let days = Date32Array::from(vec![19_000]);
+        assert_eq!(sql_literal(&days, 0).unwrap(), "'2022-01-08'");
+        let lists = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![Some(1)])]);
+        assert!(sql_literal(&lists, 0).is_err());
     }
 }

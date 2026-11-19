@@ -40,6 +40,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Page index read by a filtered scan (ADR 0014) | 4 MB per column chunk (column index + offset index each); larger ones aren't read and the chunk is scanned whole. The selected row ranges a scan reader keeps (`RowMap`) are at most one per page of its run | `page_prune::MAX_PAGE_INDEX_BYTES` |
 | Bloom filter read for an `==` test (ADR 0014) | 16 MB per column chunk, only when the footer records its length; one at a time | `page_prune::MAX_BLOOM_FILTER_BYTES` |
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
+| Restored tab views | one per open tab (≤16): filter ≤ 16 KB, ≤ 8 sort keys | `session::MAX_SAVED_FILTER_BYTES`, `MAX_SAVED_SORT_KEYS` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
 | Saved queries | 100, each ≤ 16 KB, names ≤ 80 characters | `session::MAX_SAVED_QUERIES`, `MAX_QUERY_BYTES`, `MAX_SAVED_NAME_CHARS` |
 | SQL completions shown | 8 | `sql_editor::MAX_SUGGESTIONS` |

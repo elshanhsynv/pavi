@@ -43,3 +43,4 @@ pub use source::{
     check_aggregate, check_sort,
 };
 pub use spill::{MAX_SPILL_BYTES, SortMerge};
+pub use value::{MAX_FORMAT_DECIMALS, NumberFormat};

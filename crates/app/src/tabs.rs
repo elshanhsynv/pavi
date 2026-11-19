@@ -48,6 +48,7 @@ pub(super) struct TabState {
     show_safe_full_selection: bool,
     show_nested_selection: bool,
     workspace: Workspace,
+    pending_view: Option<TabView>,
 }
 
 impl TabState {
@@ -86,6 +87,7 @@ impl TabState {
             show_safe_full_selection: false,
             show_nested_selection: false,
             workspace: Workspace::default(),
+            pending_view: None,
         }
     }
 
@@ -115,6 +117,8 @@ impl Default for Tabs {
 
 /// One tab as the tab strip shows it.
 pub(crate) struct TabLabel {
+    /// Stays with the tab when tabs move, so a drag keeps hold of it.
+    pub(crate) id: u64,
     pub(crate) title: String,
     /// The full path, for a tooltip.
     pub(crate) path: Option<PathBuf>,
@@ -177,6 +181,7 @@ impl PaviApp {
             &mut tab.show_nested_selection,
         );
         swap(&mut self.workspace, &mut tab.workspace);
+        swap(&mut self.pending_view, &mut tab.pending_view);
     }
 
     pub(super) fn tab_count(&self) -> usize {
@@ -208,7 +213,17 @@ impl PaviApp {
                         .and_then(|tab| tab.dataset.as_ref())
                         .is_some_and(|dataset| dataset.source.is_folder())
                 };
+                let id = if index == self.tabs.active {
+                    self.tab_id
+                } else {
+                    self.tabs
+                        .parked
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map_or(u64::MAX, |tab| tab.tab_id)
+                };
                 TabLabel {
+                    id,
                     title: tab_title(path),
                     path: path.map(parquet_reader::display_path),
                     folder,
@@ -231,6 +246,78 @@ impl PaviApp {
             }
         }
         (paths, active)
+    }
+
+    /// The filter and sort each open tab shows, for the session: from its result,
+    /// or, while it is still opening, the view waiting to be restored. SQL
+    /// results are not kept: their query is in the SQL history.
+    pub(super) fn tab_views(&self) -> Vec<TabView> {
+        (0..self.tab_count())
+            .filter_map(|index| {
+                let path = self.tab_path_at(index)?.to_path_buf();
+                let (dataset, filtered, pending) = if index == self.tabs.active {
+                    (
+                        self.dataset.as_ref(),
+                        self.filtered.as_ref(),
+                        self.pending_view.as_ref(),
+                    )
+                } else {
+                    let tab = self.tabs.parked.get(index)?.as_ref()?;
+                    (
+                        tab.dataset.as_ref(),
+                        tab.filtered.as_ref(),
+                        tab.pending_view.as_ref(),
+                    )
+                };
+                let view = match (dataset, filtered) {
+                    (Some(dataset), Some(filtered)) if filtered.kind != QueryKind::Sql => TabView {
+                        path,
+                        filter: filtered
+                            .filter
+                            .as_ref()
+                            .filter(|_| filtered.kind == QueryKind::Filter)
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                        sort: filtered
+                            .sort
+                            .iter()
+                            .filter_map(|key| {
+                                Some(SavedSortKey {
+                                    column: dataset.column_names.get(key.column)?.clone(),
+                                    descending: key.direction == SortDirection::Descending,
+                                })
+                            })
+                            .collect(),
+                    },
+                    (_, None) => pending.cloned()?,
+                    _ => return None,
+                };
+                (!view.is_empty()).then_some(view)
+            })
+            .collect()
+    }
+
+    /// Moves tab `from` to position `to` (both clamped to the tabs open); the
+    /// tab shown stays shown.
+    pub(super) fn move_tab(&mut self, from: usize, to: usize) {
+        let count = self.tab_count();
+        let to = to.min(count.saturating_sub(1));
+        if from >= count || from == to {
+            return;
+        }
+        let tab = self.tabs.parked.remove(from);
+        self.tabs.parked.insert(to, tab);
+        let active = self.tabs.active;
+        self.tabs.active = if active == from {
+            to
+        } else if from < active && to >= active {
+            active - 1
+        } else if from > active && to <= active {
+            active + 1
+        } else {
+            active
+        };
+        self.persist_session();
     }
 
     /// Shows tab `index`.

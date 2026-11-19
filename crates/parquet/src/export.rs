@@ -146,6 +146,14 @@ impl<W: Write> JsonWriter<W> {
     }
 }
 
+/// One value as JSON, as JSON Lines export writes it: numbers and booleans
+/// bare, text quoted, nested values as arrays and objects, `null` for null.
+pub fn json_value(array: &dyn Array, row: usize) -> Result<String> {
+    let mut output = Vec::new();
+    write_json_value(&mut output, array, row, 0)?;
+    Ok(String::from_utf8(output)?)
+}
+
 fn write_json_value(
     output: &mut impl Write,
     array: &dyn Array,

@@ -2619,3 +2619,263 @@ fn frame_time_while_scrolling() {
     );
     assert!(scrolled > 1_000, "the grid scrolled");
 }
+
+#[test]
+fn reopened_tabs_get_their_filter_and_sort_back() {
+    let (directory, _source, path) = source(80);
+    let store = SessionStore::new(directory.path().join("session.json"));
+    let mut saved = SessionState::default();
+    saved.set_open_files(vec![path.clone()], 0);
+    saved.set_tab_views(vec![TabView {
+        path: path.clone(),
+        filter: "id > 70".to_string(),
+        sort: vec![
+            SavedSortKey {
+                column: "id".to_string(),
+                descending: true,
+            },
+            // A column the file no longer has is left out.
+            SavedSortKey {
+                column: "gone".to_string(),
+                descending: false,
+            },
+        ],
+    }]);
+    store.save(&saved).unwrap();
+
+    let mut app = PaviApp::new_with_store(None, store.clone());
+    poll_until_opened(&mut app);
+    poll_until_idle(&mut app);
+    let filtered = app.filtered.as_ref().unwrap();
+    assert_eq!(filtered.kind, QueryKind::Filter);
+    assert_eq!(filtered.filter.as_ref().unwrap().to_string(), "id > 70");
+    assert_eq!(
+        app.sort_keys(),
+        [SortSpec::new(0, SortDirection::Descending, NullOrder::Last)]
+    );
+    assert_eq!(filtered_ids(&app)[..3], ["79", "78", "77"]);
+    assert_eq!(app.filter_input, "id > 70");
+
+    // What the tab shows now is what the next start restores.
+    app.persist_session();
+    let views = store.load().tab_views;
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].filter, "id > 70");
+    assert_eq!(views[0].sort.len(), 1);
+
+    // A SQL result is not kept as a view.
+    app.sql_input = "SELECT name FROM dataset".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    app.persist_session();
+    assert!(store.load().tab_views.is_empty());
+}
+
+#[test]
+fn moves_tabs_and_keeps_the_open_one_shown() {
+    let (_directory, source, path) = source(4);
+    let mut app = make_app(source, path.clone());
+    app.new_tab();
+    app.new_tab();
+    // Tabs: [file, empty, empty(shown)].
+    assert_eq!(app.tabs.active, 2);
+    let first = app.tab_labels()[0].id;
+    app.move_tab(0, 2);
+    assert_eq!(app.tab_labels()[2].id, first);
+    assert_eq!(app.tabs.active, 1, "the shown tab moved left by one");
+    assert_eq!(app.tab_labels()[2].path.as_deref(), Some(path.as_path()));
+    app.move_tab(1, 0);
+    assert_eq!(app.tabs.active, 0);
+    // Out of range moves are clamped or ignored.
+    app.move_tab(0, 99);
+    assert_eq!(app.tabs.active, 2);
+    app.move_tab(7, 0);
+    assert_eq!(app.tab_count(), 3);
+}
+
+#[test]
+fn number_formats_change_only_what_the_grid_shows() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    app.header_action = Some(HeaderAction::NumberFormat(
+        0,
+        parquet_reader::NumberFormat {
+            decimals: Some(2),
+            thousands: false,
+        },
+    ));
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    app.apply_header_action(&ctx);
+    // Text columns have no number format.
+    app.column_layout.set_number_format(
+        1,
+        parquet_reader::NumberFormat {
+            decimals: Some(2),
+            thousands: false,
+        },
+    );
+    let mut output = None;
+    for _ in 0..3 {
+        output = Some(ctx.run(grid_frame(0.0, vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        }));
+    }
+    let texts = output
+        .unwrap()
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(texts.iter().any(|text| text == "5.00"), "{texts:?}");
+    assert!(texts.iter().any(|text| text == "alpha"));
+    // The format is saved with the layout, and copying keeps the stored value.
+    let layout = app
+        .session
+        .grid_layout(&PaviApp::schema_key(&["id".to_string(), "name".to_string()]).unwrap())
+        .unwrap();
+    assert_eq!(layout.number_formats["id"].decimals, Some(2));
+    app.grid.select(5, 0);
+    app.copy_selection(&ctx, false);
+    assert_eq!(app.status, "Cell copied to clipboard");
+}
+
+#[test]
+fn counts_values_with_a_query() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    app.header_action = Some(HeaderAction::CountValues(1));
+    app.apply_header_action(&egui::Context::default());
+    assert_eq!(app.workspace, Workspace::Sql);
+    assert!(
+        app.sql_input.contains("GROUP BY \"name\""),
+        "{}",
+        app.sql_input
+    );
+    poll_until_idle(&mut app);
+    assert!(app.sql_error.is_none(), "{:?}", app.sql_error);
+    assert_eq!(app.grid.rows, 2);
+    assert_eq!(app.filtered_cell_text(0, 1).as_deref(), Some("40"));
+    assert_eq!(
+        count_values_sql("a\"b"),
+        "SELECT \"a\"\"b\", COUNT(*) AS count\nFROM dataset\nGROUP BY \"a\"\"b\"\nORDER BY count DESC"
+    );
+}
+
+#[test]
+fn copies_the_selection_as_markdown_json_or_a_sql_list() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    let ctx = egui::Context::default();
+    app.grid.select(0, 0);
+    app.grid.extend_selection(2, 1);
+    app.copy_selection_as(&ctx, false, CopyFormat::Markdown);
+    assert_eq!(app.status, "3 rows copied as a Markdown table");
+    app.copy_selection_as(&ctx, false, CopyFormat::Json);
+    assert_eq!(app.status, "3 rows copied as JSON");
+    app.copy_selection_as(&ctx, false, CopyFormat::SqlList);
+    assert_eq!(app.status, "5 values copied as a SQL IN list");
+}
+
+#[test]
+fn zoom_is_restored_bounded_and_saved() {
+    let (_directory, source, path) = source(4);
+    let mut app = make_app(source, path);
+    app.session.preferences.zoom = 1.5;
+    let ctx = egui::Context::default();
+    // A zoom set in one frame takes effect at the start of the next.
+    let frame = |app: &mut PaviApp| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.apply_zoom(ctx));
+    };
+    frame(&mut app);
+    frame(&mut app);
+    assert_eq!(ctx.zoom_factor(), 1.5);
+    app.set_zoom(&ctx, 7.0);
+    frame(&mut app);
+    assert_eq!(ctx.zoom_factor(), MAX_ZOOM);
+    assert_eq!(app.session.preferences.zoom, MAX_ZOOM);
+    // A zoom changed with egui's own keys is picked up and kept in bounds.
+    ctx.set_zoom_factor(0.2);
+    frame(&mut app);
+    frame(&mut app);
+    assert_eq!(ctx.zoom_factor(), MIN_ZOOM);
+    assert_eq!(app.session_store.load().preferences.zoom, MIN_ZOOM);
+}
+
+#[test]
+fn f1_opens_the_shortcuts_list() {
+    let (_directory, source, path) = source(4);
+    let mut app = make_app(source, path);
+    let ctx = egui::Context::default();
+    let press = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let _ = ctx.run(grid_frame(0.0, vec![press(egui::Key::F1)]), |ctx| {
+        app.handle_global_shortcuts(ctx);
+    });
+    assert!(app.show_shortcuts);
+    let mut output = None;
+    // A window lays itself out in its first frame and shows in the next.
+    for time in [0.1, 0.15] {
+        output = Some(ctx.run(grid_frame(time, vec![]), |ctx| {
+            ui::shortcuts::window(ctx, &mut app.show_shortcuts);
+        }));
+    }
+    let output = output.unwrap();
+    assert!(output.shapes.iter().any(|shape| matches!(
+        &shape.shape,
+        egui::Shape::Text(text) if text.galley.job.text == "Move the tab left / right"
+    )));
+    let _ = ctx.run(grid_frame(0.2, vec![press(egui::Key::Escape)]), |ctx| {
+        ui::shortcuts::window(ctx, &mut app.show_shortcuts);
+    });
+    assert!(!app.show_shortcuts);
+}
+
+#[test]
+fn a_restart_brings_back_filter_sort_and_number_formats() {
+    let (directory, _source, path) = source(80);
+    let store = SessionStore::new(directory.path().join("session.json"));
+    let mut app = PaviApp::new_with_store(Some(path.clone()), store.clone());
+    poll_until_opened(&mut app);
+    let ctx = egui::Context::default();
+    app.header_action = Some(HeaderAction::NumberFormat(
+        0,
+        parquet_reader::NumberFormat {
+            decimals: Some(2),
+            thousands: true,
+        },
+    ));
+    app.apply_header_action(&ctx);
+    app.filter_input = "id > 70".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    app.sort_column(0, SortDirection::Descending);
+    poll_until_idle(&mut app);
+    drop(app);
+
+    let saved = store.load();
+    assert_eq!(saved.tab_views.len(), 1, "{:?}", saved.tab_views);
+    let mut app = PaviApp::new_with_store(None, store);
+    poll_until_opened(&mut app);
+    poll_until_idle(&mut app);
+    assert_eq!(
+        app.column_layout
+            .number_format(0)
+            .map(|format| format.decimals),
+        Some(Some(2))
+    );
+    assert_eq!(app.filter_input, "id > 70");
+    assert_eq!(filtered_ids(&app)[0], "79");
+}

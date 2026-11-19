@@ -4,6 +4,7 @@ pub mod file_profile;
 pub mod grid;
 pub mod inspector;
 pub mod profile;
+pub mod shortcuts;
 pub mod spacing;
 pub mod sql;
 pub mod status;
