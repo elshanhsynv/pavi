@@ -654,6 +654,39 @@ impl Comparison {
         Ok(())
     }
 
+    /// What a Parquet bloom filter holds for an `==` test's value: the value as
+    /// the column stores it. `None` for other tests, and for types whose stored
+    /// form can differ from what is read (timestamps, decimals, floats).
+    pub(crate) fn bloom_key(&self, data_type: &DataType) -> Option<BloomKey> {
+        if self.op != FilterOp::Eq {
+            return None;
+        }
+        let int = || match self.ordered_value(data_type).ok()? {
+            Number::Int(value) => Some(value),
+            Number::Float(_) => None,
+        };
+        match data_type {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Date32 => {
+                i32::try_from(int()?).ok().map(BloomKey::Int32)
+            }
+            // Unsigned values are stored with the same bits as signed ones.
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => u32::try_from(int()?)
+                .ok()
+                .map(|value| BloomKey::Int32(value as i32)),
+            DataType::Int64 => i64::try_from(int()?).ok().map(BloomKey::Int64),
+            DataType::UInt64 => u64::try_from(int()?)
+                .ok()
+                .map(|value| BloomKey::Int64(value as i64)),
+            data_type if is_string(data_type) => {
+                Some(BloomKey::Bytes(self.value.as_bytes().to_vec()))
+            }
+            data_type if is_binary(data_type) => {
+                binary_value(&self.value).ok().map(BloomKey::Bytes)
+            }
+            _ => None,
+        }
+    }
+
     /// The comparison value for number, date and timestamp columns, in the column's
     /// own units: days for `Date32`, milliseconds for `Date64`, the column's unit
     /// for timestamps. A timestamp without an offset is read in the column's time
@@ -1121,6 +1154,14 @@ fn compare_bool(left: bool, right: bool, op: &FilterOp) -> bool {
 }
 
 /// A filter operand: integers stay exact, everything else is compared as `f64`.
+/// A value as a Parquet column stores it, for a bloom filter lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BloomKey {
+    Int32(i32),
+    Int64(i64),
+    Bytes(Vec<u8>),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Number {
     Int(i128),

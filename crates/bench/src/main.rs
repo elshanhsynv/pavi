@@ -2,12 +2,13 @@
 //!
 //! Usage: `cargo run -p pavi_bench -- <file.parquet> [sequential-pages]`.
 
-use std::{env, path::Path, sync::Arc, time::Instant};
+use std::{cell::Cell, env, path::Path, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use parquet_reader::{
-    DataPage, NullOrder, PAGE_ROWS, PageCacheLimits, ParquetSource, Projection, SortDirection,
+    DataPage, FilterExpr, FilterOp, NullOrder, PAGE_ROWS, PageCacheLimits, ParquetSource,
+    Projection, SortDirection,
 };
 use pavi_query::{LogicalPlan, QueryEngine};
 use pavi_runtime::{GenerationId, OpenOutcome, PageOutcome, Runtime, RuntimeConfig};
@@ -139,6 +140,26 @@ fn main() -> Result<()> {
     }
     println!("sort_all_ms,{}", millis(started.elapsed()));
     println!("sort_all_rows,{rows}");
+
+    // Cancel latency: a full scan of every column (a null test can't be
+    // pruned) is cancelled after a few batches; time from the cancel to the
+    // scan returning, which includes finishing the batch in hand.
+    let filter = FilterExpr::compare(source.schema().field(0).name(), FilterOp::IsNull, "");
+    let calls = Cell::new(0_u32);
+    let cancelled_at = Cell::new(None);
+    let ended = source.read_filtered_from(&filter, 0, 1, &Projection::all(columns), &|_| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 4 {
+            cancelled_at.set(Some(Instant::now()));
+        }
+        cancelled_at.get().is_some() && calls.get() > 4
+    });
+    let cancel_ms = match (ended, cancelled_at.get()) {
+        (Err(_), Some(at)) => at.elapsed().as_secs_f64() * 1000.0,
+        // A file of fewer than four batches finishes first.
+        _ => 0.0,
+    };
+    println!("cancel_scan_ms,{cancel_ms:.1}");
 
     runtime.shutdown();
     Ok(())

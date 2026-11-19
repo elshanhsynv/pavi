@@ -1,7 +1,8 @@
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::File,
+    ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -40,6 +41,7 @@ use crate::{
     filter::FilterExpr,
     metadata::ColumnStatistics,
     page::PAGE_ROWS,
+    page_prune,
     remote::{self, RemoteObject, RemoteReader, redact},
     sort::validate_sort_keys,
     spill::{RunWriter, SortKeys, SortMerge, TempFolder},
@@ -936,19 +938,20 @@ impl ParquetSource {
         let mut next_group = 0;
         let keep = |row_group: &RowGroupInfo| self.row_group_might_match(filter, row_group);
         while let Some(run) = self.next_scan_run(&mut next_group, start_row, &keep)? {
-            let (file, mut reader, mut batch_first_row) =
-                self.run_reader(&run, &read_projection, start_row)?;
+            let (file, mut reader, mut row_map) =
+                self.run_reader(&run, &read_projection, start_row, Some(filter))?;
             while let Some(batch) = reader.next().transpose()? {
-                if checkpoint(batch_first_row) {
+                if checkpoint(row_map.position()) {
                     return Err(Cancelled.into());
                 }
                 let batch = self.reorder_batch(batch, &read_projection, file)?;
-                let batch_rows = batch.num_rows() as u64;
+                // Pruned pages leave gaps: each stretch of the batch has its own
+                // first source row.
+                let stretches = row_map.take(batch.num_rows())?;
                 let mask = self.evaluate_filter(filter, &batch, &read_projection)?;
                 let matches = mask.true_count();
                 if matches as u64 <= skip_matches {
                     skip_matches -= matches as u64;
-                    batch_first_row += batch_rows;
                     continue;
                 }
                 let first = skip_matches as usize;
@@ -965,7 +968,7 @@ impl ParquetSource {
                         .set_indices()
                         .skip(first)
                         .take(take)
-                        .map(|index| batch_first_row + index as u64),
+                        .map(|index| source_row(&stretches, index)),
                 );
                 remaining -= take;
                 if remaining == 0 {
@@ -980,7 +983,6 @@ impl ParquetSource {
                         rows,
                     });
                 }
-                batch_first_row += batch_rows;
             }
         }
 
@@ -1014,38 +1016,39 @@ impl ParquetSource {
         // The row group of the row being counted; rows only move forward.
         let mut group = 0;
         while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
-            let (file, mut reader, mut batch_first_row) =
-                self.run_reader(&run, &read_projection, 0)?;
+            let (file, mut reader, mut row_map) =
+                self.run_reader(&run, &read_projection, 0, Some(filter))?;
             while let Some(batch) = reader.next().transpose()? {
-                if checkpoint(batch_first_row) {
+                if checkpoint(row_map.position()) {
                     return Err(Cancelled.into());
                 }
                 let batch = self.reorder_batch(batch, &read_projection, file)?;
                 let mask = self.evaluate_filter(filter, &batch, &read_projection)?;
-                let rows = batch.num_rows();
-                // A batch can cross into the next row group: split it there.
-                let mut offset = 0;
-                while offset < rows {
-                    let row = batch_first_row + offset as u64;
-                    while row_groups
-                        .get(group)
-                        .is_some_and(|info| row >= info.first_row + info.row_count)
-                    {
-                        group += 1;
+                // A batch can cross into the next row group, and pruned pages
+                // leave gaps: split it at both.
+                for (start, rows, first_row) in row_map.take(batch.num_rows())? {
+                    let mut offset = 0;
+                    while offset < rows {
+                        let row = first_row + offset as u64;
+                        while row_groups
+                            .get(group)
+                            .is_some_and(|info| row >= info.first_row + info.row_count)
+                        {
+                            group += 1;
+                        }
+                        let info = row_groups
+                            .get(group)
+                            .ok_or_else(|| anyhow!("row {row} is past the last row group"))?;
+                        let length = usize::try_from(info.first_row + info.row_count - row)
+                            .unwrap_or(usize::MAX)
+                            .min(rows - offset);
+                        let count = counts
+                            .get_mut(group)
+                            .ok_or_else(|| anyhow!("row group {group} has no count"))?;
+                        *count += mask.slice(start + offset, length).true_count() as u64;
+                        offset += length;
                     }
-                    let info = row_groups
-                        .get(group)
-                        .ok_or_else(|| anyhow!("row {row} is past the last row group"))?;
-                    let length = usize::try_from(info.first_row + info.row_count - row)
-                        .unwrap_or(usize::MAX)
-                        .min(rows - offset);
-                    let count = counts
-                        .get_mut(group)
-                        .ok_or_else(|| anyhow!("row group {group} has no count"))?;
-                    *count += mask.slice(offset, length).true_count() as u64;
-                    offset += length;
                 }
-                batch_first_row += rows as u64;
             }
         }
         Ok(counts)
@@ -1129,13 +1132,14 @@ impl ParquetSource {
             filter.is_none_or(|filter| self.row_group_might_match(filter, row_group))
         };
         while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
-            let (file, mut reader, mut scanned) = self.run_reader(&run, &read_projection, 0)?;
+            let (file, mut reader, mut row_map) =
+                self.run_reader(&run, &read_projection, 0, filter)?;
             while let Some(batch) = reader.next().transpose()? {
-                if checkpoint(scanned) {
+                if checkpoint(row_map.position()) {
                     return Err(Cancelled.into());
                 }
-                scanned += batch.num_rows() as u64;
-                scanned_total = scanned;
+                row_map.take(batch.num_rows())?;
+                scanned_total = row_map.position();
                 let batch = self.reorder_batch(batch, &read_projection, file)?;
                 let batch = match filter {
                     Some(filter) => filter_record_batch(
@@ -1279,12 +1283,13 @@ impl ParquetSource {
             filter.is_none_or(|filter| self.row_group_might_match(filter, row_group))
         };
         while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
-            let (file, mut reader, mut scanned) = self.run_reader(&run, &read_projection, 0)?;
+            let (file, mut reader, mut row_map) =
+                self.run_reader(&run, &read_projection, 0, filter)?;
             while let Some(batch) = reader.next().transpose()? {
-                if checkpoint(scanned) {
+                if checkpoint(row_map.position()) {
                     return Err(Cancelled.into());
                 }
-                scanned += batch.num_rows() as u64;
+                row_map.take(batch.num_rows())?;
                 let batch = self.reorder_batch(batch, &read_projection, file)?;
                 let batch = match filter {
                     Some(filter) => filter_record_batch(
@@ -1359,34 +1364,103 @@ impl ParquetSource {
         Ok(run)
     }
 
-    /// A reader over `run` from `start_row` on, with its file and the source row of
-    /// its first decoded row.
+    /// A reader over `run` from `start_row` on, with its file and the source rows
+    /// it decodes. With a `filter`, pages whose page-index statistics rule it out
+    /// are skipped (ADR 0014).
     fn run_reader(
         &self,
         run: &ScanRun,
         projection: &Projection,
         start_row: u64,
+        filter: Option<&FilterExpr>,
     ) -> Result<(
         &SourceFile,
         GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-        u64,
+        RowMap,
     )> {
         let file = self
             .files
             .get(run.file)
             .ok_or_else(|| anyhow!("file {} out of range", run.file))?;
+        let run_end = run.first_row + run.row_count;
         // Only the run containing `start_row` starts part-way through.
-        let skip = start_row.saturating_sub(run.first_row).min(run.row_count);
-        let selection = if skip > 0 {
-            Some(RowSelection::from(vec![
-                RowSelector::skip(usize::try_from(skip)?),
-                RowSelector::select(usize::try_from(run.row_count - skip)?),
-            ]))
+        let from = start_row.clamp(run.first_row, run_end);
+        let mut ranges: Vec<Range<u64>> = Vec::new();
+        let mut pruned = false;
+        let handle = match filter {
+            Some(_) => Some(file.location.open()?),
+            None => None,
+        };
+        let leaf_of = |column: usize| {
+            if column >= self.file_columns {
+                return None;
+            }
+            file.leaf_columns.get(column).copied().flatten()
+        };
+        let mut group_first = run.first_row;
+        for &local in &run.local_row_groups {
+            let row_group = file
+                .metadata
+                .row_groups()
+                .get(local)
+                .ok_or_else(|| anyhow!("row group {local} out of range"))?;
+            let group_rows = u64::try_from(row_group.num_rows())?;
+            let group_end = group_first + group_rows;
+            let allowed = match (filter, &handle) {
+                (Some(filter), Some(handle)) => page_prune::row_group_ranges(
+                    filter,
+                    &page_prune::PageContext {
+                        reader: handle,
+                        row_group,
+                        schema: &self.dataset_metadata.schema,
+                        leaf_of: &leaf_of,
+                    },
+                ),
+                _ => None,
+            };
+            pruned |= allowed.is_some();
+            let allowed = allowed.unwrap_or_else(|| std::iter::once(0..usize::MAX).collect());
+            for range in allowed {
+                let start = group_first.saturating_add(range.start as u64).max(from);
+                let end = group_first.saturating_add(range.end as u64).min(group_end);
+                if start >= end {
+                    continue;
+                }
+                match ranges.last_mut() {
+                    Some(last) if last.end == start => last.end = end,
+                    _ => ranges.push(start..end),
+                }
+            }
+            group_first = group_end;
+        }
+        let selection = if pruned || from > run.first_row {
+            let mut selectors = Vec::with_capacity(ranges.len() * 2 + 1);
+            let mut at = run.first_row;
+            for range in &ranges {
+                if range.start > at {
+                    selectors.push(RowSelector::skip(usize::try_from(range.start - at)?));
+                }
+                selectors.push(RowSelector::select(usize::try_from(
+                    range.end - range.start,
+                )?));
+                at = range.end;
+            }
+            if run_end > at {
+                selectors.push(RowSelector::skip(usize::try_from(run_end - at)?));
+            }
+            Some(RowSelection::from(selectors))
         } else {
             None
         };
         let reader = self.reader_for(file, projection, run.local_row_groups.clone(), selection)?;
-        Ok((file, reader, run.first_row + skip))
+        Ok((
+            file,
+            reader,
+            RowMap {
+                ranges: ranges.into(),
+                end: run_end,
+            },
+        ))
     }
 
     fn read_window_batches(
@@ -1578,14 +1652,18 @@ impl ParquetSource {
         })
     }
 
-    /// `false` only when the row group's statistics prove no row can pass `filter`.
+    /// `false` only when the row group's statistics, or its bloom filters,
+    /// prove no row can pass `filter`.
     fn row_group_might_match(&self, filter: &FilterExpr, row_group: &RowGroupInfo) -> bool {
         let schema = &self.dataset_metadata.schema;
         let Ok((file, local)) = self.locate(row_group.index) else {
             return true;
         };
-        let chunks = file.metadata.row_group(local).columns();
-        filter.might_match(schema, &|column| {
+        let Some(metadata) = file.metadata.row_groups().get(local) else {
+            return true;
+        };
+        let chunks = metadata.columns();
+        let by_statistics = filter.might_match(schema, &|column| {
             let data_type = schema.fields().get(column)?.data_type();
             if column >= self.file_columns {
                 // Every row of the file holds its folder's value.
@@ -1600,7 +1678,20 @@ impl ParquetSource {
             chunks
                 .get(leaf)
                 .map(|chunk| (chunk.statistics(), data_type))
-        })
+        });
+        if !by_statistics {
+            return false;
+        }
+        // The file is opened only when a bloom filter has to be read.
+        let handle = std::cell::OnceCell::new();
+        let reader = || handle.get_or_init(|| file.location.open().ok()).as_ref();
+        let leaf_of = |column: usize| {
+            if column >= self.file_columns {
+                return None;
+            }
+            file.leaf_columns.get(column).copied().flatten()
+        };
+        !page_prune::bloom_rules_out(filter, metadata, schema, &leaf_of, &reader)
     }
 
     fn concat_or_empty(
@@ -1690,6 +1781,52 @@ struct ScanRun {
     /// Source row of the run's first row.
     first_row: u64,
     row_count: u64,
+}
+
+/// The source rows a run's reader decodes, in order, so each decoded row maps
+/// back to its row in the source. Holds at most one range per page of the run.
+struct RowMap {
+    ranges: VecDeque<Range<u64>>,
+    /// The source row just past the run.
+    end: u64,
+}
+
+impl RowMap {
+    /// The source row of the next decoded row: how far the scan has come.
+    fn position(&self) -> u64 {
+        self.ranges.front().map_or(self.end, |range| range.start)
+    }
+
+    /// Consumes the next `rows` decoded rows, as stretches of consecutive
+    /// source rows: (offset in the batch, length, first source row).
+    fn take(&mut self, rows: usize) -> Result<Vec<(usize, usize, u64)>> {
+        let mut stretches = Vec::new();
+        let mut offset = 0;
+        while offset < rows {
+            let range = self
+                .ranges
+                .front_mut()
+                .ok_or_else(|| anyhow!("reader returned more rows than it selected"))?;
+            let length = usize::try_from(range.end - range.start)
+                .unwrap_or(usize::MAX)
+                .min(rows - offset);
+            stretches.push((offset, length, range.start));
+            range.start += length as u64;
+            offset += length;
+            if range.start == range.end {
+                self.ranges.pop_front();
+            }
+        }
+        Ok(stretches)
+    }
+}
+
+/// The source row of decoded row `index` of a batch split into `stretches`.
+fn source_row(stretches: &[(usize, usize, u64)], index: usize) -> u64 {
+    stretches
+        .iter()
+        .find(|(offset, length, _)| index < offset + length)
+        .map_or(0, |(offset, _, first)| first + (index - offset) as u64)
 }
 
 /// The error a long read returns when its `checkpoint` callback asks it to end early.
@@ -4942,5 +5079,197 @@ mod tests {
             panic!("a folder opened as CSV");
         };
         assert!(format!("{error:#}").contains("folder"), "{error:#}");
+    }
+
+    /// 3,000 rows in row groups of 1,000 and pages of 100: `id` counts up,
+    /// `scattered` holds the same numbers shuffled (so every row group's min
+    /// and max span them all) and `name` is `n<id>`. Bloom filters on all.
+    fn lookup_file() -> (TempDir, ParquetSource) {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("lookup.parquet");
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..3000)) as ArrayRef,
+            ),
+            (
+                "scattered",
+                Arc::new(Int32Array::from_iter_values((0..3000).map(scattered))),
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from_iter_values(
+                    (0..3000).map(|id| format!("n{id}")),
+                )),
+            ),
+        ])
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1000))
+            .set_data_page_row_count_limit(100)
+            .set_write_batch_size(100)
+            .set_bloom_filter_enabled(true)
+            .set_bloom_filter_fpp(0.0001)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (directory, ParquetSource::open(path).unwrap())
+    }
+
+    fn scattered(id: i64) -> i32 {
+        i32::try_from(id * 7919 % 3001).unwrap()
+    }
+
+    #[test]
+    fn filtered_reads_skip_pages_the_page_index_rules_out() {
+        use std::cell::RefCell;
+
+        let (_directory, source) = lookup_file();
+        let projection = Projection::all(3);
+        let filter = FilterExpr::parse("id >= 1450 AND id < 1460 OR id == 2990").unwrap();
+        let positions = RefCell::new(Vec::new());
+        let record = |row: u64| {
+            positions.borrow_mut().push(row);
+            false
+        };
+        let window = source
+            .read_filtered_from(&filter, 0, 100, &projection, &record)
+            .unwrap();
+        let expected = (1450..1460).chain([2990]).collect::<Vec<u64>>();
+        assert_eq!(window.rows, expected);
+        assert_eq!(
+            texts(&window.batch, 0),
+            expected.iter().map(u64::to_string).collect::<Vec<_>>()
+        );
+        // Only the page holding 1450..1460 and the one holding 2990 are read:
+        // their 200 rows come as one batch, which starts at the first page.
+        assert_eq!(*positions.borrow(), [1400]);
+
+        // Resuming part-way through a page keeps the source rows right.
+        let window = source
+            .read_filtered_from(&filter, 1455, 100, &projection, &|_| false)
+            .unwrap();
+        assert_eq!(window.rows, [1455, 1456, 1457, 1458, 1459, 2990]);
+        let window = source
+            .read_filtered_from(&filter, 0, 3, &projection, &|_| false)
+            .unwrap();
+        assert_eq!(
+            (window.rows, window.next_row),
+            (vec![1450, 1451, 1452], 1453)
+        );
+
+        assert_eq!(
+            source
+                .count_matches_by_row_group(&filter, &|_| false)
+                .unwrap(),
+            [0, 10, 1]
+        );
+    }
+
+    #[test]
+    fn pruned_reads_find_the_same_rows_as_full_scans() {
+        let (_directory, source) = lookup_file();
+        let projection = Projection::columns(vec![0], 3).unwrap();
+        type Case = (&'static str, fn(i64) -> bool);
+        let cases: Vec<Case> = vec![
+            ("id == 5", |id| id == 5),
+            ("id < 150", |id| id < 150),
+            ("id > 2950", |id| id > 2950),
+            ("id != 7", |id| id != 7),
+            ("scattered == 17", |id| scattered(id) == 17),
+            ("name == n2500", |id| id == 2500),
+            ("id >= 990 AND id <= 1010", |id| (990..=1010).contains(&id)),
+            ("id == 5 OR scattered == 5", |id| {
+                id == 5 || scattered(id) == 5
+            }),
+            ("id < 100 OR id > 2899", |id| !(100..=2899).contains(&id)),
+            ("id == 5 AND name IS NOT NULL", |id| id == 5),
+            ("id IS NULL OR id == 2999", |id| id == 2999),
+        ];
+        for (text, predicate) in cases {
+            let filter = FilterExpr::parse(text).unwrap();
+            let expected = (0..3000)
+                .filter(|id| predicate(*id))
+                .map(|id| id as u64)
+                .collect::<Vec<_>>();
+            let window = source
+                .read_filtered_from(&filter, 0, 3000, &projection, &|_| false)
+                .unwrap();
+            assert_eq!(window.rows, expected, "{text}");
+            let counts = source
+                .count_matches_by_row_group(&filter, &|_| false)
+                .unwrap();
+            assert_eq!(counts.iter().sum::<u64>(), expected.len() as u64, "{text}");
+            let sorted = source
+                .read_sorted_all(
+                    Some(&filter),
+                    &projection,
+                    &[SortSpec::new(0, SortDirection::Descending, NullOrder::Last)],
+                    SortBudget::default(),
+                    None,
+                    &|_| false,
+                )
+                .unwrap();
+            assert_eq!(
+                sorted.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected.len(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn bloom_filters_rule_out_row_groups_an_equal_value_is_missing_from() {
+        let (_directory, source) = lookup_file();
+        let groups = source.row_groups().to_vec();
+        let kept = |text: &str| {
+            let filter = FilterExpr::parse(text).unwrap();
+            groups
+                .iter()
+                .filter(|group| source.row_group_might_match(&filter, group))
+                .map(|group| group.index)
+                .collect::<Vec<_>>()
+        };
+        // Min and max can't rule these out: every row group spans them.
+        let in_last = scattered(2500);
+        assert_eq!(kept(&format!("scattered == {in_last}")), [2]);
+        assert_eq!(kept("name == n2500"), [2]);
+        let in_first = scattered(10);
+        assert_eq!(
+            kept(&format!(
+                "scattered == {in_last} OR scattered == {in_first}"
+            )),
+            [0, 2]
+        );
+        assert_eq!(kept(&format!("id < 3000 AND scattered == {in_last}")), [2]);
+        // Only `==` is looked up.
+        assert_eq!(kept(&format!("scattered != {in_last}")), [0, 1, 2]);
+        assert_eq!(kept(&format!("scattered >= {in_last}")), [0, 1, 2]);
+
+        let window = source
+            .read_filtered_from(
+                &FilterExpr::parse(&format!("scattered == {in_last}")).unwrap(),
+                0,
+                10,
+                &Projection::all(3),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(window.rows, [2500]);
+    }
+
+    #[test]
+    fn files_without_bloom_filters_keep_every_row_group() {
+        let (_directory, source) = numbered_file(30, 10);
+        let filter = FilterExpr::parse("bucket == 3").unwrap();
+        assert!(
+            source
+                .row_groups()
+                .iter()
+                .all(|group| source.row_group_might_match(&filter, group))
+        );
     }
 }

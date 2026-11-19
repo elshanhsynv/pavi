@@ -2539,3 +2539,83 @@ fn runs_sql_with_calculations() {
         app.sql_error
     );
 }
+
+/// Measures the UI thread's work per frame while wheel-scrolling a wide
+/// file: layout and tessellation, as the app does each frame (GPU drawing
+/// is not included). A measurement, not a check: run it on purpose with
+/// `cargo test --release -p pavi -- --ignored --nocapture frame_time`.
+#[test]
+#[ignore = "measurement; run with --release --ignored --nocapture"]
+fn frame_time_while_scrolling() {
+    use std::time::Instant;
+
+    const ROWS: usize = 1_000_000;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("wide.parquet");
+    let mut fields = Vec::new();
+    let mut columns: Vec<arrow_array::ArrayRef> = Vec::new();
+    for column in 0..6 {
+        fields.push(Field::new(
+            format!("number_{column}"),
+            DataType::Int32,
+            false,
+        ));
+        columns.push(Arc::new(Int32Array::from_iter_values(
+            (0..ROWS as i32).map(|row| row.wrapping_mul(column + 7)),
+        )));
+        fields.push(Field::new(format!("text_{column}"), DataType::Utf8, false));
+        columns.push(Arc::new(StringArray::from_iter_values(
+            (0..ROWS).map(|row| format!("value {row} of column {column}")),
+        )));
+    }
+    let batch = arrow_array::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let source = Arc::new(ParquetSource::open(&path).unwrap());
+    let mut app = make_app(source, path);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    let pointer = egui::pos2(600.0, 450.0);
+    let mut times = Vec::new();
+    for frame in 0..600 {
+        // About 20 rows a frame: a fast, steady wheel scroll.
+        let events = vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -20.0 * ROW_HEIGHT),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let started = Instant::now();
+        app.pages.begin_frame();
+        let _ = app.pages.poll(&mut app.grid);
+        let output = ctx.run(grid_frame(f64::from(frame) / 60.0, events), |ctx| {
+            app.show_top_bar(ctx);
+            app.show_inspector_panel(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        });
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        times.push(started.elapsed().as_secs_f64() * 1000.0);
+        // Pages arrive between frames, as they do at 60 fps.
+        thread::sleep(Duration::from_millis(16));
+    }
+    let scrolled = app.drawn_rows.map(|(first, _)| first).unwrap_or_default();
+    // The first frames lay out fonts and the panels once.
+    let mut steady = times.split_off(30);
+    steady.sort_by(f64::total_cmp);
+    let at = |share: f64| steady[((steady.len() - 1) as f64 * share) as usize];
+    println!(
+        "frame_time_ms p50 {:.2} p95 {:.2} max {:.2} over {} frames, scrolled to row {scrolled}",
+        at(0.5),
+        at(0.95),
+        at(1.0),
+        steady.len()
+    );
+    assert!(scrolled > 1_000, "the grid scrolled");
+}

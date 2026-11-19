@@ -13,6 +13,9 @@ ignore = [
     # D-Bus introspection XML from the system, never user files. Remove when eframe is upgraded.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml via eframe/zbus_xml; no user-controlled XML" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml via eframe/zbus_xml; no user-controlled XML" },
+    # chrono is marked unmaintained (not a vulnerability). Every arrow crate depends on it for
+    # dates and times, so it can't be dropped; remove this when arrow moves off it.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; required by arrow, no replacement" },
 ]
 
 [licenses]

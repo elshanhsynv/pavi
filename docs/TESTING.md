@@ -36,4 +36,6 @@ Write Parquet fixtures at test time with `parquet::arrow::ArrowWriter` into a `t
 
 Changes to the reader, filter parser or SQL should also get a local fuzz run; see `docs/FUZZING.md`.
 
+Measurements that aren't checks are `#[ignore]`d tests (for example `frame_time_while_scrolling` in `app_tests.rs`); run them with `cargo test --release -p pavi -- --ignored --nocapture <name>` and record the numbers in `docs/PERFORMANCE.md`.
+
 `unwrap`, `expect` and `panic!` are fine in tests (`clippy.toml`).

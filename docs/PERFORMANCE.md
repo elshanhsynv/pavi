@@ -37,6 +37,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | CLI standard input (`-`) | copied to a temporary file, at most 32 GiB (as a remote download); CSV, JSON and Arrow input is then converted as for any file | `cli::files::MAX_STDIN_BYTES`, `MAX_CONVERTED_BYTES` |
 | CLI `--stats` table | 1,000 rows (row group × column) unless `--head` is lower; streamed formats print every row. The rows come from the footer, which is bounded at open | `cli::MAX_HEAD_ROWS`, `MAX_DATASET_METADATA_BYTES` |
 | Rows per scan reader (filter, sort and aggregate scans read consecutive row groups of one file with one reader; its dictionary pages are checked when it opens) | 1,048,576 rows | `SCAN_RUN_ROWS` in `crates/parquet/src/source.rs` |
+| Page index read by a filtered scan (ADR 0014) | 4 MB per column chunk (column index + offset index each); larger ones aren't read and the chunk is scanned whole. The selected row ranges a scan reader keeps (`RowMap`) are at most one per page of its run | `page_prune::MAX_PAGE_INDEX_BYTES` |
+| Bloom filter read for an `==` test (ADR 0014) | 16 MB per column chunk, only when the footer records its length; one at a time | `page_prune::MAX_BLOOM_FILTER_BYTES` |
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Query history | 50 entries / 256 KB | `session::MAX_HISTORY_*` |
 | Saved queries | 100, each ≤ 16 KB, names ≤ 80 characters | `session::MAX_SAVED_QUERIES`, `MAX_QUERY_BYTES`, `MAX_SAVED_NAME_CHARS` |
@@ -63,7 +65,7 @@ Each budget is a named constant. Change it in one place and update this table.
 
 ## Targets
 
-Measured 2026-11-09 on the reference machine: Intel i5-11400H (12 threads), 16 GB RAM, SSD,
+Measured 2026-11-09 (lookup, frame time and cancel rows: 2026-11-19) on the reference machine: Intel i5-11400H (12 threads), 16 GB RAM, SSD,
 Windows 11, release build (thin LTO), warm OS file cache, median of 3 runs.
 Files: `flights` (1M rows, 7 cols), `dummy_5m` (5M rows, 4 cols), `dummy_1b` (1B rows, 10 cols).
 
@@ -81,8 +83,9 @@ sub-frame operations aren't held to timer noise. A change that breaks a target n
 | App memory after loading a file | working set 5 s after start | 96 MB | — | 114 MB | < 200 MB |
 | CLI open + 1,000-row preview (includes process start) | wall time | 167 ms | 167 ms | 237 ms | < 400 ms |
 | Full scan: filter matching nothing on a text column | `pavi-cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
-| Frame time while scrolling | not yet measured | | | | < 16 ms (60 fps) |
-| Cancel a running scan | not yet measured | | | | < 50 ms |
+| Lookup in a column sorted within row groups (page index, ADR 0014) | `pavi-cli --filter "user_id == 123" --count` | — | — | 2,126 ms (15,354 ms before) | < 3,200 ms |
+| Frame time while scrolling (UI thread: layout + tessellation, p95) | `cargo test --release -p pavi -- --ignored --nocapture frame_time` on a generated 1M-row, 12-column file, 20 rows a frame (the grid's work doesn't grow with the file): 5.5 ms | — | — | — | < 16 ms (60 fps) |
+| Cancel a running scan (cancel to return, all columns) | bench `cancel_scan_ms` | 1.3 ms | 0.1 ms | — | < 50 ms |
 
 Not yet enforced in CI: GitHub runners are too noisy for millisecond targets. Check them with the
 `perf-check` skill before merging changes to reading, the runtime, the query engine or the grid,
