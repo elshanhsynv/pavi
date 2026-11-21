@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-21
+
 ### Added
 - PAVI keeps a log of what it did and what failed (File menu → Open log folder). When the app crashes it writes a crash report, and the next start says so.
 - Cancelling the open or a read of a remote file stops at once, instead of waiting up to minutes for a slow or silent server.
@@ -161,7 +163,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/elshanhsynv/pavi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/elshanhsynv/pavi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/elshanhsynv/pavi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/elshanhsynv/pavi/releases/tag/v0.2.0
