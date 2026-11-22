@@ -1,144 +1,250 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::builder::styling::{AnsiColor, Effects, Style, Styles};
+use clap::{ArgAction, Parser, ValueEnum};
 
-const EXIT_CODES: &str = "\
-Exit codes:
-  0  success, also when the reader of standard output stops early (`| head`)
-  1  the file, a column, the filter or the output failed
-  2  invalid arguments";
+/// Help colours, in cargo's style. They are dropped when the output is not a
+/// terminal, and follow `NO_COLOR` and `CLICOLOR_FORCE`.
+pub const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default())
+    .valid(AnsiColor::Cyan.on_default().effects(Effects::BOLD))
+    .invalid(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .error(AnsiColor::Red.on_default().effects(Effects::BOLD));
 
-/// Preview or stream the rows of a Parquet file, a folder of Parquet files,
-/// a CSV, JSON or Arrow file, or an https/s3/gs/az URL.
+/// Help is wrapped to the terminal, but no wider than this, so lines stay
+/// easy to read on a wide screen.
+const MAX_HELP_WIDTH: usize = 100;
+
+/// Preview, convert, query and profile Parquet, CSV, JSON and Arrow files.
 ///
-/// By default prints a summary (row count, schema, row groups) and the first
-/// rows as a table. With --format csv, jsonl, parquet or arrow it writes only
-/// the rows, all of them unless --head is given, to standard output or to
-/// --output. --count, --schema and --stats print facts about the file instead
-/// of rows. Converting is `cli in.csv -o out.parquet`.
+/// By default pavi-cli prints a short summary of FILE (rows, columns, schema,
+/// row groups) and its first 10 rows as a table. Choose rows with --columns,
+/// --filter, --sort, --head and --offset; send them anywhere with --format and
+/// --output; ask for facts about the file instead with --count, --schema,
+/// --stats or --profile; or run SQL with --sql.
+///
+/// Large files are fine: rows are read a batch at a time, and only the table
+/// keeps its rows (at most 1,000) in memory.
 #[derive(Parser)]
-#[command(name = "pavi-cli", version, about, after_help = EXIT_CODES)]
+#[command(
+    name = "pavi-cli",
+    bin_name = "pavi-cli",
+    version,
+    about,
+    long_about,
+    styles = STYLES,
+    max_term_width = MAX_HELP_WIDTH,
+    disable_help_flag = true,
+    disable_version_flag = true,
+    after_help = short_footer(),
+    after_long_help = long_footer(),
+)]
 pub struct Args {
-    /// File, folder or URL to read, or - for standard input (Parquet, Arrow,
-    /// JSON or CSV, told apart by their first bytes)
+    /// File, folder or URL to read, or - for standard input
+    ///
+    /// A Parquet, CSV, TSV, JSON or Arrow file; a folder of Parquet files, read
+    /// as one table (folders named key=value become columns); an https://,
+    /// s3://, gs:// or az:// URL; or - for standard input, which is saved to a
+    /// temporary file and told apart by its first bytes.
+    #[arg(value_name = "FILE")]
     pub file: String,
 
-    /// Read FILE as this format whatever its extension says (e.g. a CSV file
-    /// named .txt), or standard input whatever its first bytes suggest
-    #[arg(long, value_enum, value_name = "FORMAT")]
-    pub input_format: Option<InputFormat>,
-
-    /// Number of rows to output [default: 10 for the table, at most 1,000;
-    /// every row for the other formats]
-    #[arg(long, value_name = "N")]
-    pub head: Option<u64>,
-
-    /// Skip this many rows first (with --filter: this many matching rows)
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    pub offset: u64,
-
-    /// Columns to output, comma-separated, by name or 0-based index
-    /// (e.g. "id,name" or "0,3"); a name wins over an index
-    #[arg(long, value_name = "LIST")]
-    pub columns: Option<String>,
-
-    /// Only rows that match, e.g. "DEP_DELAY > 60 AND ORIGIN IN ('JFK', 'LGA')"
-    #[arg(long, value_name = "EXPR")]
-    pub filter: Option<String>,
-
-    /// Output format [default: from --output's extension, otherwise table]
-    #[arg(long, value_enum)]
-    pub format: Option<Format>,
-
-    /// Write to this file instead of standard output. The file appears only
-    /// once it is complete (a temporary file next to it is renamed), and an
-    /// existing file is replaced. The format comes from the extension
-    /// (.csv, .tsv, .jsonl, .json, .ndjson, .parquet, .arrow, .feather) unless
-    /// --format is given
-    #[arg(long, short, value_name = "PATH")]
-    pub output: Option<PathBuf>,
-
-    /// Print only the table, without the summary and schema
-    #[arg(long, short)]
-    pub quiet: bool,
-
-    /// Never show the progress line. It appears on standard error, only when
-    /// that is a terminal, once a scan, sort or open takes over a second
-    #[arg(long)]
-    pub no_progress: bool,
-
-    /// Draw the table with ASCII (+ - |) instead of box-drawing characters,
-    /// for consoles and code pages that can't show them
-    #[arg(long)]
-    pub ascii: bool,
-
-    /// Sort by these columns, comma-separated, each by name or index and
-    /// optionally followed by :asc or :desc (e.g. "DEP_DELAY:desc,FL_DATE").
-    /// Nulls sort last. Works with --filter; sorts larger than memory spill
-    /// to temporary files
-    #[arg(long, value_name = "KEYS")]
-    pub sort: Option<String>,
-
-    /// Print only the number of rows (that match --filter, if given)
-    #[arg(long, conflicts_with_all = ["head", "offset", "columns", "format", "quiet", "sort"])]
-    pub count: bool,
-
-    /// Print the schema instead of rows: index, name, type and nullability of
-    /// each column (or of --columns), in any --format
+    /// Read FILE as parquet, csv, json or arrow, whatever its name says
+    ///
+    /// For a CSV saved as .txt, say, or standard input that starts like another format.
+    ///   parquet  a Parquet file
+    ///   csv      comma, tab, semicolon or pipe separated, with a header line
+    ///   json     JSON Lines, or one array of objects
+    ///   arrow    an Arrow IPC file or stream
     #[arg(
         long,
+        value_enum,
+        value_name = "FORMAT",
+        hide_possible_values = true,
+        help_heading = "Input",
+        verbatim_doc_comment
+    )]
+    pub input_format: Option<InputFormat>,
+
+    /// Only these columns, by name or 0-based number: -c id,name
+    ///
+    /// Comma-separated, in the order to output. A name is tried before a
+    /// number, so a column called 7 is found by its name.
+    #[arg(short, long, value_name = "COLUMNS", help_heading = "Choosing rows")]
+    pub columns: Option<String>,
+
+    /// Only rows that match: -f "DEP_DELAY > 60 AND ORIGIN = 'JFK'"
+    ///
+    /// Tests joined by AND / OR, with brackets: = != < <= > >= contains,
+    /// [NOT] IN (a, b), [NOT] BETWEEN a AND b, [NOT] LIKE 'a%', IS [NOT] NULL.
+    /// Quote a value that holds spaces, commas, brackets or keywords.
+    #[arg(short, long, value_name = "EXPR", help_heading = "Choosing rows")]
+    pub filter: Option<String>,
+
+    /// Sort by columns, each :asc or :desc: -s DEP_DELAY:desc,FL_DATE
+    ///
+    /// Up to 8 columns, by name or number; ascending unless :desc; nulls last.
+    /// Works with --filter. Sorts larger than memory spill to temporary files.
+    #[arg(short, long, value_name = "KEYS", help_heading = "Choosing rows")]
+    pub sort: Option<String>,
+
+    /// How many rows to output [default: 10 in the table, every row otherwise]
+    ///
+    /// The table shows at most 1,000 rows; the other formats stream any number.
+    #[arg(short = 'n', long, value_name = "N", help_heading = "Choosing rows")]
+    pub head: Option<u64>,
+
+    /// Skip this many rows first (matching rows, with --filter)
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        hide_default_value = true,
+        help_heading = "Choosing rows"
+    )]
+    pub offset: u64,
+
+    /// table, csv, tsv, jsonl, parquet or arrow [default: table]
+    ///
+    /// With -o, the default is the format its extension names.
+    /// Every format but the table writes only the rows (all of them unless --head is given).
+    ///   table    a summary and a table, for reading
+    ///   csv      comma-separated, with a header line; nulls are empty
+    ///   tsv      tab-separated, with a header line; nulls are empty
+    ///   jsonl    one JSON object per line (also: json)
+    ///   parquet  a Parquet file
+    ///   arrow    an Arrow IPC file (Feather v2)
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        hide_possible_values = true,
+        help_heading = "Output",
+        verbatim_doc_comment
+    )]
+    pub format: Option<Format>,
+
+    /// Write to a file instead of standard output: -o flights.parquet
+    ///
+    /// The file appears only once it is complete (it is written next to the
+    /// target, then renamed). An existing file is replaced, but never the file
+    /// being read. The format comes from the extension (.csv .tsv .jsonl .json
+    /// .parquet .arrow .feather) unless --format is given.
+    #[arg(short, long, value_name = "PATH", help_heading = "Output")]
+    pub output: Option<PathBuf>,
+
+    /// Show only the table, without the file summary above it
+    #[arg(short, long, help_heading = "Output")]
+    pub quiet: bool,
+
+    /// Draw tables with + - | instead of box-drawing lines
+    ///
+    /// For consoles and code pages that can't show box-drawing characters.
+    /// Null cells then read NULL instead of ∅.
+    #[arg(long, help_heading = "Output")]
+    pub ascii: bool,
+
+    /// Never show the progress line
+    ///
+    /// It appears on standard error, only on a terminal, once opening,
+    /// scanning, sorting or a query has taken over a second, and is erased
+    /// before any output.
+    #[arg(long, help_heading = "Output")]
+    pub no_progress: bool,
+
+    /// Print only the number of rows (that match --filter)
+    ///
+    /// Without --filter the count comes from the footer, without reading data.
+    #[arg(
+        long,
+        help_heading = "Facts instead of rows",
+        conflicts_with_all = ["head", "offset", "columns", "format", "quiet", "sort"]
+    )]
+    pub count: bool,
+
+    /// Print each column's number, name, type and nullability
+    #[arg(
+        long,
+        help_heading = "Facts instead of rows",
         conflicts_with_all = ["stats", "count", "sort", "filter", "offset", "head", "quiet"]
     )]
     pub schema: bool,
 
-    /// Print the footer's statistics instead of rows, without reading any
-    /// data: rows, nulls, min, max and distinct count per row group and column
-    /// (or per --columns), in any --format. The table shows at most 1,000
-    /// rows; --head limits them
-    #[arg(long, conflicts_with_all = ["count", "sort", "filter", "offset", "quiet"])]
+    /// Print each row group's statistics, without reading any data
+    ///
+    /// Rows, nulls, min, max and distinct count per row group and column (or
+    /// per --columns), from the file's footer. The table shows the first
+    /// 1,000; --head shows fewer, the other formats show all.
+    #[arg(
+        long,
+        help_heading = "Facts instead of rows",
+        conflicts_with_all = ["count", "sort", "filter", "offset", "quiet"]
+    )]
     pub stats: bool,
 
-    /// Run a SQL query and output its rows, e.g. "SELECT ORIGIN, COUNT(*)
-    /// FROM dataset GROUP BY ORIGIN". FILE is the table `dataset` (and also
-    /// its file name, e.g. `flights`); --table adds more. The same subset as
-    /// the app's SQL editor: WHERE, ORDER BY, LIMIT, COUNT/SUM/AVG/MIN/MAX and
-    /// COUNT(DISTINCT …) with GROUP BY and HAVING, SELECT DISTINCT, AS aliases,
-    /// calculations (arithmetic, CASE, CAST, UPPER, YEAR, …), INNER/LEFT joins
-    /// and subqueries. --head and --offset cut the
-    /// result
+    /// Profile each column: nulls, distinct values, min, max, mean, …
+    ///
+    /// One scan of every column (or of --columns, at most 256), as the app's
+    /// Profile window does: rows, nulls, distinct values (exact up to 1,000),
+    /// min, max, mean, text lengths, and the most frequent value when every
+    /// distinct value was counted. With --filter, only matching rows.
     #[arg(
         long,
-        value_name = "QUERY",
-        conflicts_with_all = ["filter", "sort", "columns", "count", "schema", "stats", "quiet"]
-    )]
-    pub sql: Option<String>,
-
-    /// Another file for --sql, as NAME=PATH or just PATH (then named after
-    /// the file, e.g. airports.csv → airports). Repeat for more tables
-    #[arg(long = "table", value_name = "[NAME=]PATH", requires = "sql")]
-    pub tables: Vec<String>,
-
-    /// Profile each column (or each of --columns, at most 256) in one scan,
-    /// as the app's Profile window does: rows, nulls, distinct values (exact
-    /// up to 1,000), min, max, mean, text lengths and, when every distinct value was counted,
-    /// the most frequent value. With
-    /// --filter, only matching rows. Lists, structs and maps show the footer's
-    /// counts only
-    #[arg(
-        long,
+        help_heading = "Facts instead of rows",
         conflicts_with_all = [
             "count", "schema", "stats", "sql", "sort", "offset", "head", "quiet"
         ]
     )]
     pub profile: bool,
+
+    /// Run a SQL query; FILE is the table `dataset`
+    ///
+    /// The same SQL as the app's editor: WHERE, ORDER BY, LIMIT, GROUP BY with
+    /// HAVING, COUNT / SUM / AVG / MIN / MAX and COUNT(DISTINCT …), SELECT
+    /// DISTINCT, AS aliases, calculations (arithmetic, CASE, CAST, UPPER, YEAR,
+    /// …), INNER and LEFT joins, and subqueries. FILE can also be named by its
+    /// file name (flights.parquet → flights). --head and --offset cut the
+    /// result.
+    #[arg(
+        long,
+        value_name = "QUERY",
+        help_heading = "SQL",
+        conflicts_with_all = ["filter", "sort", "columns", "count", "schema", "stats", "quiet"]
+    )]
+    pub sql: Option<String>,
+
+    /// Another file for --sql to query or join; repeat for more
+    ///
+    /// NAME=PATH names it; a bare PATH is named after the file, as the app
+    /// names its tabs (airports.csv → airports).
+    #[arg(
+        long = "table",
+        value_name = "[NAME=]PATH",
+        help_heading = "SQL",
+        requires = "sql"
+    )]
+    pub tables: Vec<String>,
+
+    /// Print help (--help shows more, with examples)
+    #[arg(short, long, action = ArgAction::Help, help_heading = "Help")]
+    help: Option<bool>,
+
+    /// Print the version
+    #[arg(short = 'V', long, action = ArgAction::Version, help_heading = "Help")]
+    version: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Format {
-    /// Summary and a box-drawn table (for people)
+    /// A summary and a table, for reading
     Table,
-    /// CSV with a header line; nulls are empty fields
+    /// Comma-separated, with a header line; nulls are empty
     Csv,
+    /// Tab-separated, with a header line; nulls are empty
+    Tsv,
     /// One JSON object per line
     #[value(alias = "json")]
     Jsonl,
@@ -146,14 +252,13 @@ pub enum Format {
     Parquet,
     /// An Arrow IPC file (Feather v2)
     Arrow,
-    /// Tab-separated text with a header line; nulls are empty fields
-    Tsv,
 }
 
 /// How to read FILE when its extension (or, for -, its first bytes) would
 /// mislead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum InputFormat {
+    /// A Parquet file
     Parquet,
     /// Comma, tab, semicolon or pipe separated, with a header line
     Csv,
@@ -174,6 +279,108 @@ impl InputFormat {
     }
 }
 
+/// A few examples under `-h`.
+fn short_footer() -> String {
+    let mut text = heading("Examples:");
+    for (command, what) in &EXAMPLES[..3] {
+        text.push_str(&example(command, what));
+    }
+    text.push_str(&format!(
+        "\n\nRun {} for details, more examples, exit codes and colours.",
+        literal("pavi-cli --help")
+    ));
+    text
+}
+
+/// Every example, the exit codes and colours under `--help`.
+fn long_footer() -> String {
+    let mut text = heading("Examples:");
+    for (command, what) in EXAMPLES {
+        text.push_str(&example(command, what));
+    }
+    text.push_str("\n\n");
+    text.push_str(&heading("Exit codes:"));
+    for (code, meaning) in [
+        (
+            "0",
+            "success, also when the reader of the output stops early (| head)",
+        ),
+        (
+            "1",
+            "the file, a column, the filter, the query or the output failed",
+        ),
+        ("2", "invalid arguments"),
+    ] {
+        text.push_str(&format!("\n  {}  {meaning}", literal(code)));
+    }
+    text.push('\n');
+    text.push('\n');
+    text.push_str(&heading("Colours:"));
+    text.push_str(
+        "\n  Used only on a terminal. NO_COLOR=1 turns them off; CLICOLOR_FORCE=1 keeps them\n  \
+         in pipes.",
+    );
+    text
+}
+
+/// What each example does, shortest first; the first three show under `-h`.
+const EXAMPLES: [(&str, &str); 10] = [
+    ("pavi-cli flights.parquet", "summary and the first 10 rows"),
+    (
+        "pavi-cli flights.parquet -f \"DEP_DELAY > 60\" -s DEP_DELAY:desc -n 20",
+        "the 20 worst delays",
+    ),
+    (
+        "pavi-cli flights.csv -o flights.parquet",
+        "convert CSV to Parquet",
+    ),
+    (
+        "pavi-cli flights.parquet -c FL_DATE,DEP_DELAY --format csv | head",
+        "two columns as CSV, into a pipe",
+    ),
+    (
+        "pavi-cli flights.parquet --count -f \"DISTANCE > 1000\"",
+        "how many rows match",
+    ),
+    (
+        "pavi-cli flights.parquet --schema",
+        "columns and their types",
+    ),
+    (
+        "pavi-cli flights.parquet --profile",
+        "nulls, distinct values, min, max …",
+    ),
+    (
+        "pavi-cli flights.parquet --sql \"SELECT ORIGIN, COUNT(*) FROM flights GROUP BY ORIGIN\"",
+        "SQL",
+    ),
+    (
+        "pavi-cli flights.parquet --table airports.csv --sql \"SELECT … JOIN airports …\"",
+        "join two files",
+    ),
+    (
+        "curl -s https://…/data.parquet | pavi-cli - --count",
+        "read standard input",
+    ),
+];
+
+fn example(command: &str, what: &str) -> String {
+    format!("\n  {}\n      {what}", literal(command))
+}
+
+fn heading(text: &str) -> String {
+    styled(STYLES.get_header(), text)
+}
+
+fn literal(text: &str) -> String {
+    styled(STYLES.get_literal(), text)
+}
+
+/// `text` with `style`'s escape codes; clap strips them where colour is off.
+fn styled(style: &Style, text: &str) -> String {
+    format!("{}{text}{}", style.render(), style.render_reset())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -186,6 +393,56 @@ mod tests {
         for argument in Args::command().get_arguments() {
             assert!(argument.get_help().is_some(), "{}", argument.get_id());
         }
+    }
+
+    #[test]
+    fn groups_every_option_under_a_heading() {
+        for argument in Args::command()
+            .get_arguments()
+            .filter(|argument| !argument.is_positional())
+        {
+            assert!(
+                argument.get_help_heading().is_some(),
+                "{} has no heading",
+                argument.get_id()
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_short_help_to_one_line_per_option() {
+        let help = Args::command().render_help().to_string();
+        for line in help.lines() {
+            assert!(
+                line.chars().count() <= MAX_HELP_WIDTH,
+                "line wider than the help: {line:?}"
+            );
+        }
+        for heading in [
+            "Input:",
+            "Choosing rows:",
+            "Output:",
+            "Facts instead of rows:",
+            "SQL:",
+        ] {
+            assert!(help.contains(heading), "{heading} missing in\n{help}");
+        }
+        assert!(help.contains("Examples:"), "{help}");
+        let long = Args::command().render_long_help().to_string();
+        assert!(long.contains("Exit codes:"), "{long}");
+        assert!(long.contains("--table airports.csv"), "{long}");
+    }
+
+    #[test]
+    fn takes_short_flags() {
+        let args = Args::try_parse_from([
+            "pavi-cli", "f", "-c", "a,b", "-f", "a > 1", "-s", "a:desc", "-n", "5",
+        ])
+        .unwrap();
+        assert_eq!(args.columns.as_deref(), Some("a,b"));
+        assert_eq!(args.filter.as_deref(), Some("a > 1"));
+        assert_eq!(args.sort.as_deref(), Some("a:desc"));
+        assert_eq!(args.head, Some(5));
     }
 
     #[test]

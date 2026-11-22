@@ -193,7 +193,7 @@ Caching: two independent LRU layers of 8 pages each — `PageCache` inside `Parq
 
 ### CLI
 
-One implicit command. Arguments (`crates/cli/src/args.rs`):
+One implicit command. Arguments (`crates/cli/src/args.rs`), shown by `-h` under the headings Arguments, Input, Choosing rows, Output, Facts instead of rows, SQL and Help (`help_heading`). Each doc comment's first paragraph is the one-line `-h` text; the rest shows under `--help`, which also lists examples, exit codes and colours (`after_long_help`). Help wraps to the terminal up to 100 columns (clap's `wrap_help`, `MAX_HELP_WIDTH`) and is coloured in cargo's style (`args::STYLES`), as is the `Error:` label (through `anstream`); colour is dropped off a terminal and follows `NO_COLOR` / `CLICOLOR_FORCE`. Short flags: `-c` columns, `-f` filter, `-s` sort, `-n` head, `-o` output, `-q` quiet, `-h` help, `-V` version.
 
 | Arg | Meaning |
 |---|---|

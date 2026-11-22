@@ -39,7 +39,7 @@ crates/
 
 ```bash
 pavi-cli flights.parquet                                    # summary + first 10 rows
-pavi-cli flights.parquet -q --head 50 --columns FL_DATE,DEP_DELAY
+pavi-cli flights.parquet -q -n 50 -c FL_DATE,DEP_DELAY
 pavi-cli flights.parquet --count --filter "DEP_DELAY > 60"
 pavi-cli flights.parquet --format csv --filter "DEP_DELAY > 60" > late.csv
 pavi-cli data/ --format jsonl --offset 1000 --head 100 | jq .
@@ -54,7 +54,7 @@ pavi-cli flights.parquet --table airports.csv --format csv \
     --sql "SELECT f.FL_DATE, a.name FROM flights AS f JOIN airports AS a ON f.ORIGIN = a.code"
 ```
 
-`--format` is `table`, `csv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `pavi-cli --help` lists every option and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
+`--format` is `table`, `csv`, `tsv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `pavi-cli -h` shows the options by group with a few examples; `pavi-cli --help` adds the details, more examples and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
 
 ## Current limits
 

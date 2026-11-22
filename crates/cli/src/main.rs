@@ -50,8 +50,16 @@ fn main() -> ExitCode {
         // The reader went away (`cli … | head`): stop quietly, as `cat` does.
         Err(error) if is_broken_pipe(&error) => ExitCode::SUCCESS,
         Err(error) => {
-            // Same text Rust prints for an error returned from `main`.
-            let _ = writeln!(io::stderr(), "Error: {error:?}");
+            // Same text Rust prints for an error returned from `main`, with
+            // "Error:" in clap's error colour on a terminal (anstream drops the
+            // colour elsewhere and honours NO_COLOR).
+            let label = args::STYLES.get_error();
+            let _ = writeln!(
+                anstream::stderr(),
+                "{}Error:{} {error:?}",
+                label.render(),
+                label.render_reset()
+            );
             ExitCode::FAILURE
         }
     }

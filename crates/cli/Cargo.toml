@@ -12,12 +12,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# Colour that turns itself off when stderr isn't a terminal, for the error
+# message; both are already in the tree through clap.
+anstream = "1"
+anstyle = "1"
 arrow-array.workspace = true
 # Schema and statistics rows, and joining a sorted table's batches; both
 # already in the tree through parquet_reader.
 arrow-schema.workspace = true
 arrow-select.workspace = true
-clap.workspace = true
+# `wrap_help` wraps --help to the terminal's width (adds `terminal_size`).
+clap = { workspace = true, features = ["wrap_help"] }
 parquet_reader = { path = "../parquet" }
 # `--sql` runs on the app's query engine and worker pool (ADR 0011).
 pavi_query = { path = "../query" }
