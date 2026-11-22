@@ -141,6 +141,20 @@ fn main() -> Result<()> {
     println!("sort_all_ms,{}", millis(started.elapsed()));
     println!("sort_all_rows,{rows}");
 
+    // Every row and column through the query engine, as the app's export of an
+    // unfiltered file reads them.
+    let started = Instant::now();
+    let mut execution = QueryEngine::new(&runtime).execute(
+        &LogicalPlan::scan(Arc::clone(&source)).project((0..columns).collect::<Vec<_>>()),
+        GenerationId(3),
+    )?;
+    let mut rows = 0_u64;
+    while let Some(batch) = execution.next_batch()? {
+        rows += batch.batch.num_rows() as u64;
+    }
+    println!("scan_all_ms,{}", millis(started.elapsed()));
+    println!("scan_all_rows,{rows}");
+
     // Cancel latency: a full scan of every column (a null test can't be
     // pruned) is cancelled after a few batches; time from the cancel to the
     // scan returning, which includes finishing the batch in hand.

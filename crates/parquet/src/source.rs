@@ -855,6 +855,51 @@ impl ParquetSource {
         Ok(page)
     }
 
+    /// A scan from `start_row` to the end of the source, of every row or only
+    /// those matching `filter`, that keeps its reader open between reads.
+    /// Reading a whole file with [`Self::read_window`] or
+    /// [`Self::read_filtered_from`] opens a reader per call; the cursor opens one
+    /// per run of row groups, so exports and other long streams decode each
+    /// page once. Read it with [`ScanCursor::next_window`].
+    pub fn scan_cursor(
+        &self,
+        filter: Option<FilterExpr>,
+        start_row: u64,
+        projection: &Projection,
+    ) -> Result<ScanCursor> {
+        let total_rows = self.row_count();
+        if start_row > total_rows {
+            bail!("scan start row {start_row} is past row count {total_rows}");
+        }
+        let mut read_columns = projection.as_slice().to_vec();
+        if let Some(filter) = &filter {
+            for column in filter.columns(&self.dataset_metadata.schema)? {
+                if !read_columns.contains(&column) {
+                    read_columns.push(column);
+                }
+            }
+        }
+        let read_projection = Projection::columns(read_columns, self.column_count())?;
+        let output_positions = projection
+            .as_slice()
+            .iter()
+            .map(|column| projected_position(&read_projection, *column, "output"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ScanCursor {
+            filter,
+            projection: projection.clone(),
+            read_projection,
+            output_positions,
+            start_row,
+            total_rows,
+            next_group: 0,
+            run: None,
+            leftover: None,
+            next_row: start_row,
+            done: start_row == total_rows,
+        })
+    }
+
     /// Reads up to `row_count` rows matching `filter`, after skipping the first
     /// `first_match_offset` matches. This always scans from the start of the file;
     /// to page through results, use [`Self::read_filtered_from`].
@@ -1849,6 +1894,177 @@ pub struct FilteredWindow {
     pub next_row: u64,
     /// The 0-based source row of each row of `batch`, in order.
     pub rows: Vec<u64>,
+}
+
+/// A scan that keeps one reader open per run of row groups between reads; see
+/// [`ParquetSource::scan_cursor`]. Besides the reader it holds at most one
+/// decoded batch (≤ 4,096 rows) that the last read did not hand out.
+pub struct ScanCursor {
+    filter: Option<FilterExpr>,
+    projection: Projection,
+    /// `projection` plus the filter's columns.
+    read_projection: Projection,
+    /// Where each output column sits in a batch read with `read_projection`.
+    output_positions: Vec<usize>,
+    start_row: u64,
+    total_rows: u64,
+    /// The next row group [`ParquetSource::next_scan_run`] looks at.
+    next_group: usize,
+    run: Option<OpenRun>,
+    /// Rows decoded (and filtered, projected) but not yet handed out, with the
+    /// source row of each.
+    leftover: Option<(RecordBatch, Vec<u64>)>,
+    /// The source row the next read resumes from.
+    next_row: u64,
+    done: bool,
+}
+
+struct OpenRun {
+    /// Index into [`ParquetSource::files`].
+    file: usize,
+    reader: GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
+    row_map: RowMap,
+}
+
+impl ScanCursor {
+    /// The source row the next read resumes from; the row count at the end.
+    pub fn position(&self) -> u64 {
+        self.next_row
+    }
+
+    /// Whether the scan has handed out every row.
+    pub fn is_finished(&self) -> bool {
+        self.done && self.leftover.is_none()
+    }
+
+    /// The next up to `row_count` rows (matching ones, with a filter). Fewer
+    /// rows come only at the end of the scan, where `next_row` is the row count
+    /// (as from [`ParquetSource::read_filtered_from`]). `source` must be the source the
+    /// cursor was made from. `checkpoint` works as in
+    /// [`ParquetSource::read_filtered_from`]: it gets the scan's position before
+    /// each decoded batch and ends the read with [`Cancelled`] when it returns
+    /// `true`. A cancelled cursor can be read again; it resumes where it stopped.
+    pub fn next_window(
+        &mut self,
+        source: &ParquetSource,
+        row_count: usize,
+        checkpoint: &dyn Fn(u64) -> bool,
+    ) -> Result<FilteredWindow> {
+        if source.row_count() != self.total_rows {
+            bail!("scan cursor read with a different source");
+        }
+        let mut batches = Vec::new();
+        let mut rows: Vec<u64> = Vec::new();
+        let mut remaining = row_count;
+        while remaining > 0 {
+            if let Some((batch, positions)) = self.leftover.take() {
+                let take = remaining.min(batch.num_rows());
+                batches.push(batch.slice(0, take));
+                rows.extend(positions.iter().take(take));
+                if take < batch.num_rows() {
+                    self.leftover = Some((
+                        batch.slice(take, batch.num_rows() - take),
+                        positions.get(take..).unwrap_or_default().to_vec(),
+                    ));
+                }
+                remaining -= take;
+                continue;
+            }
+            if self.done {
+                break;
+            }
+            if let Err(error) = self.decode_next(source, checkpoint) {
+                // Rows taken before a cancel stay with the cursor.
+                if !batches.is_empty() {
+                    let batch = source.concat_or_empty(&self.projection, batches)?;
+                    self.leftover = Some((batch, rows));
+                }
+                return Err(error);
+            }
+        }
+        // A read is short only at the end; the rows a full read leaves decoded
+        // come after its last row.
+        if self.done {
+            self.next_row = self.total_rows;
+        } else if let Some(last) = rows.last() {
+            self.next_row = last + 1;
+        }
+        Ok(FilteredWindow {
+            batch: source.concat_or_empty(&self.projection, batches)?,
+            next_row: self.next_row,
+            rows,
+        })
+    }
+
+    /// Decodes the next batch into `leftover`, opening the next run's reader
+    /// when needed, or marks the scan done. A batch with no matches leaves
+    /// `leftover` empty.
+    fn decode_next(
+        &mut self,
+        source: &ParquetSource,
+        checkpoint: &dyn Fn(u64) -> bool,
+    ) -> Result<()> {
+        let open = match &mut self.run {
+            Some(open) => open,
+            None => {
+                let filter = self.filter.as_ref();
+                let keep = |row_group: &RowGroupInfo| {
+                    filter.is_none_or(|filter| source.row_group_might_match(filter, row_group))
+                };
+                let Some(run) =
+                    source.next_scan_run(&mut self.next_group, self.start_row, &keep)?
+                else {
+                    self.done = true;
+                    return Ok(());
+                };
+                let (_, reader, row_map) =
+                    source.run_reader(&run, &self.read_projection, self.start_row, filter)?;
+                self.run.insert(OpenRun {
+                    file: run.file,
+                    reader,
+                    row_map,
+                })
+            }
+        };
+        if checkpoint(open.row_map.position()) {
+            return Err(Cancelled.into());
+        }
+        let Some(batch) = open.reader.next().transpose()? else {
+            self.run = None;
+            return Ok(());
+        };
+        let file = source
+            .files
+            .get(open.file)
+            .ok_or_else(|| anyhow!("file {} out of range", open.file))?;
+        let batch = source.reorder_batch(batch, &self.read_projection, file)?;
+        // Pruned pages leave gaps: each stretch of the batch has its own first
+        // source row.
+        let stretches = open.row_map.take(batch.num_rows())?;
+        let (batch, positions) = match &self.filter {
+            Some(filter) => {
+                let mask = source.evaluate_filter(filter, &batch, &self.read_projection)?;
+                let positions = mask
+                    .values()
+                    .set_indices()
+                    .map(|index| source_row(&stretches, index))
+                    .collect::<Vec<_>>();
+                (filter_record_batch(&batch, &mask)?, positions)
+            }
+            None => {
+                let positions = stretches
+                    .iter()
+                    .flat_map(|(_, length, first)| *first..first + *length as u64)
+                    .collect::<Vec<_>>();
+                (batch, positions)
+            }
+        };
+        if batch.num_rows() > 0 {
+            let batch = project_batch(&batch, &self.projection, &self.output_positions)?;
+            self.leftover = Some((batch, positions));
+        }
+        Ok(())
+    }
 }
 
 /// Column positions and direction for sorting buffered rows. `sequence` holds each
@@ -4290,6 +4506,137 @@ mod tests {
             .unwrap();
         assert_eq!(ids(&resumed.batch), [26_000, 26_001]);
         assert_eq!(resumed.next_row, 26_002);
+    }
+
+    /// Reads `cursor` to the end in windows of `rows`, checking each window's
+    /// rows and resume row; returns the ids and the reads it took.
+    fn drain_cursor(source: &ParquetSource, cursor: &mut ScanCursor, rows: usize) -> Vec<i32> {
+        let mut seen = Vec::new();
+        while !cursor.is_finished() {
+            let window = cursor.next_window(source, rows, &|_| false).unwrap();
+            let page = ids(&window.batch);
+            assert!(page.len() <= rows);
+            assert_eq!(
+                window.rows,
+                page.iter().map(|id| *id as u64).collect::<Vec<_>>(),
+                "source rows match the ids"
+            );
+            if page.len() < rows {
+                assert_eq!(window.next_row, source.row_count(), "only the end is short");
+            } else if let Some(last) = page.last() {
+                assert_eq!(window.next_row, *last as u64 + 1);
+            }
+            assert_eq!(cursor.position(), window.next_row);
+            seen.extend(page);
+        }
+        seen
+    }
+
+    #[test]
+    fn scan_cursor_streams_every_row_once_across_runs_and_files() {
+        // Thirty 1,000-row groups; reads of 333 rows end inside batches and row groups.
+        let (_directory, source) = numbered_file(30_000, 1_000);
+        let projection = Projection::columns(vec![0], 2).unwrap();
+        let mut cursor = source.scan_cursor(None, 0, &projection).unwrap();
+        assert_eq!(
+            drain_cursor(&source, &mut cursor, 333),
+            (0..30_000).collect::<Vec<_>>()
+        );
+        // Reading past the end hands out nothing.
+        let end = cursor.next_window(&source, 10, &|_| false).unwrap();
+        assert_eq!((end.batch.num_rows(), end.next_row), (0, 30_000));
+
+        // Starting part-way, with windows larger than a decoded batch.
+        let mut cursor = source.scan_cursor(None, 12_345, &projection).unwrap();
+        assert_eq!(
+            drain_cursor(&source, &mut cursor, 10_000),
+            (12_345..30_000).collect::<Vec<_>>()
+        );
+        let mut at_end = source.scan_cursor(None, 30_000, &projection).unwrap();
+        assert!(at_end.is_finished());
+        assert_eq!(
+            at_end.next_window(&source, 5, &|_| false).unwrap().next_row,
+            30_000
+        );
+        assert!(source.scan_cursor(None, 30_001, &projection).is_err());
+
+        // Each file of a folder is its own run.
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "a.parquet", 0..5_000, false);
+        write_ids(directory.path(), "b.parquet", 5_000..9_000, false);
+        let folder = ParquetSource::open(directory.path()).unwrap();
+        let mut cursor = folder.scan_cursor(None, 0, &Projection::all(1)).unwrap();
+        assert_eq!(
+            drain_cursor(&folder, &mut cursor, 4_096),
+            (0..9_000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scan_cursor_filters_like_resumed_filtered_reads() {
+        let (_directory, source) = numbered_file(30_000, 1_000);
+        let projection = Projection::columns(vec![0], 2).unwrap();
+        for (filter, expected) in [
+            // A filter column that is not in the output.
+            (
+                "bucket == 3",
+                (0..30_000).filter(|id| id % 7 == 3).collect::<Vec<_>>(),
+            ),
+            // Pruned row groups leave a gap between runs.
+            (
+                "id < 3000 OR id >= 25500",
+                (0..3_000).chain(25_500..30_000).collect(),
+            ),
+            ("id < 0", Vec::new()),
+        ] {
+            let parsed = FilterExpr::parse(filter).unwrap();
+            for rows in [1, 333, 4_096, 50_000] {
+                let mut cursor = source
+                    .scan_cursor(Some(parsed.clone()), 0, &projection)
+                    .unwrap();
+                assert_eq!(
+                    drain_cursor(&source, &mut cursor, rows),
+                    expected,
+                    "{filter} in reads of {rows}"
+                );
+            }
+        }
+
+        // Starting inside a row group, as `read_filtered_from` does.
+        let mut cursor = source
+            .scan_cursor(
+                Some(FilterExpr::parse("bucket == 3").unwrap()),
+                15_001,
+                &projection,
+            )
+            .unwrap();
+        let first = cursor.next_window(&source, 2, &|_| false).unwrap();
+        assert_eq!(ids(&first.batch), [15_004, 15_011]);
+        assert_eq!(first.next_row, 15_012);
+    }
+
+    #[test]
+    fn scan_cursor_resumes_after_a_cancelled_read_without_losing_rows() {
+        use std::cell::Cell;
+
+        let (_directory, source) = numbered_file(30_000, 1_000);
+        let projection = Projection::columns(vec![0], 2).unwrap();
+        let mut cursor = source.scan_cursor(None, 0, &projection).unwrap();
+        let mut seen = ids(&cursor.next_window(&source, 100, &|_| false).unwrap().batch);
+
+        // The read is cancelled after it has taken rows from two decoded batches.
+        let calls = Cell::new(0);
+        let cancel_third = |_| {
+            calls.set(calls.get() + 1);
+            calls.get() == 3
+        };
+        let error = cursor
+            .next_window(&source, 20_000, &cancel_third)
+            .unwrap_err();
+        assert!(error.downcast_ref::<Cancelled>().is_some());
+
+        seen.extend(drain_cursor(&source, &mut cursor, 4_096));
+        assert_eq!(seen, (0..30_000).collect::<Vec<_>>());
     }
 
     #[test]
