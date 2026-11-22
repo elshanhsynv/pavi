@@ -1,4 +1,7 @@
-use std::sync::mpsc::{Receiver, RecvError, TryRecvError};
+use std::{
+    sync::mpsc::{Receiver, RecvError, RecvTimeoutError, TryRecvError},
+    time::Duration,
+};
 
 use crate::{CancellationToken, OpenResponse, PageResponse, ScanProgress};
 
@@ -56,6 +59,11 @@ impl PageTask {
 
     pub fn try_recv(&self) -> Result<PageResponse, TryRecvError> {
         self.response.try_recv()
+    }
+
+    /// Waits for the response at most `timeout`.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<PageResponse, RecvTimeoutError> {
+        self.response.recv_timeout(timeout)
     }
 }
 

@@ -101,7 +101,7 @@ flowchart LR
 There are almost no traits. The boundaries are concrete types:
 - `Arc<ParquetSource>` is the only "data source"; `LogicalPlan::Scan` hard-codes it (`logical.rs`); there is no data-source trait.
 - `RuntimeHandle` (cloneable) is the boundary between query/app and threads.
-- `QueryPoll` / `QueryExecution::poll_next_batch` is the boundary between event-loop consumers and the engine.
+- `QueryPoll` / `QueryExecution::poll_next_batch` is the boundary between event-loop consumers and the engine. Background loops (export, profiles, the CLI's `--sql`) call `wait_next_batch(timeout)` instead: it blocks on the runtime's response channel (`PageTask::recv_timeout`) until a batch arrives or the timeout passes, so they never sleep while a batch is ready. The UI thread only polls.
 - The only trait is private: `export.rs::BatchSource` (one-batch vs query-backed input).
 
 ```mermaid

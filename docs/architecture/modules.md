@@ -77,7 +77,7 @@ crates/query/src/              (pavi_query)
 ├── prep.rs         Prep tree (tables, subqueries, filters, joins) and PrepTask, the thread that runs it (ADR 0009)
 ├── logical.rs      LogicalPlan tree (Scan/Prepared/Projection/Filter/Limit/Sort/Aggregate), replace_sort, bind
 ├── planner.rs      Planner::validate (schema only, also for prepared plans) and Planner::plan → PhysicalPlan
-└── execution.rs    QueryEngine, QueryExecution (a preparing stage, then Running: next_batch / poll_next_batch), QueryPoll
+└── execution.rs    QueryEngine, QueryExecution (a preparing stage, then Running: next_batch / poll_next_batch / wait_next_batch), QueryPoll
 
 crates/app/src/                (pavi)
 ├── main.rs         NativeOptions + eframe::run_native
