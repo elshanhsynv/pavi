@@ -181,7 +181,7 @@ const LOCK_FILE: &str = ".pavi-lock";
 const TEMP_FOLDER_PREFIX: &str = "pavi-";
 /// An unlocked folder younger than this may be one another PAVI is just
 /// creating (between making the folder and locking it), so it is kept.
-const UNLOCKED_GRACE: Duration = Duration::from_secs(60);
+pub(crate) const UNLOCKED_GRACE: Duration = Duration::from_secs(60);
 
 /// Removes the temporary folders other PAVI processes left behind: folders
 /// whose lock is free (their process has ended) and that are more than a

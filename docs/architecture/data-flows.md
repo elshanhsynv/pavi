@@ -224,7 +224,7 @@ sequenceDiagram
 
 ## 4.7 Export and clipboard
 
-- **Export** (`app.rs:842-886`, `export.rs:76-206`): save dialog (blocks UI), build `ExportInput` = the current filter/SQL/sort `LogicalPlan`, or a full-scan plan, or one selected row; spawn `pavi-export` thread. It writes to `<file>.pavi-<gen>.tmp`, waiting on `wait_next_batch(5 ms)` (it returns as soon as a batch arrives; the 5 ms only bounds how long a cancel waits to be seen), writing each batch as CSV, Parquet (`ArrowWriter`), JSON Lines (`parquet_reader::export::BatchWriter`, shared with the CLI; `JsonWriter`: one object per row; scalars are `value::ScalarTexts` text (as `value::scalar_text`), each field name escaped once, numbers and booleans unquoted, NaN and infinity as strings, binary as `0x` hex; lists as arrays, structs and maps as objects, ≤64 levels) or Arrow IPC (`arrow_ipc::writer::FileWriter`), sending best-effort progress (`try_send`, capacity 1), then `fs::rename` to the target. Cancel/failure deletes the temp file. CSV accepts every non-nested type and writes each field with `value::ScalarTexts` (prepared once per column and batch, the same text as `value::scalar_text`), the same text the grid shows, untruncated; nulls are empty fields and binary is `0x`-prefixed hex.
+- **Export** (`app.rs:842-886`, `export.rs:76-206`): save dialog (blocks UI), build `ExportInput` = the current filter/SQL/sort `LogicalPlan`, or a full-scan plan, or one selected row; spawn `pavi-export` thread. It first removes partial files a killed PAVI left for the same target (ADR 0017), then writes to `<file>.pavi-<gen>.tmp`, locked while written, waiting on `wait_next_batch(5 ms)` (it returns as soon as a batch arrives; the 5 ms only bounds how long a cancel waits to be seen), writing each batch as CSV, Parquet (`ArrowWriter`), JSON Lines (`parquet_reader::export::BatchWriter`, shared with the CLI; `JsonWriter`: one object per row; scalars are `value::ScalarTexts` text (as `value::scalar_text`), each field name escaped once, numbers and booleans unquoted, NaN and infinity as strings, binary as `0x` hex; lists as arrays, structs and maps as objects, ≤64 levels) or Arrow IPC (`arrow_ipc::writer::FileWriter`), sending best-effort progress (`try_send`, capacity 1), then `fs::rename` to the target. Cancel/failure deletes the temp file. CSV accepts every non-nested type and writes each field with `value::ScalarTexts` (prepared once per column and batch, the same text as `value::scalar_text`), the same text the grid shows, untruncated; nulls are empty fields and binary is `0x`-prefixed hex.
 - **Copy:** Ctrl+C copies the selected cell range (TSV) from in-memory batches (`app.rs:1659-1751`) using the same 256-char display formatting, capped at 64 KB; fails if any selected row has been evicted from the window.
 
 ```mermaid
@@ -275,7 +275,7 @@ sequenceDiagram
         M->>M: copy stdin to a temporary stdin.<ext> (format from the first bytes, ≤32 GiB)
     end
     opt -o PATH
-        M->>M: refuse PATH = FILE; format from PATH's extension unless --format; write into PATH.pavi-cli-<pid>.tmp
+        M->>M: refuse PATH = FILE; format from PATH's extension unless --format; remove PATH's left-over partial files (ADR 0017); write into PATH.pavi-cli-<pid>.tmp, locked
     end
     M->>PS: open(FILE)
     M->>M: parse_columns (names first, then 0-based indexes)

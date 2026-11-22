@@ -13,6 +13,65 @@ use parquet::arrow::ArrowWriter;
 
 use crate::value::{ScalarTexts, is_scalar_type, scalar_text};
 
+/// Locks a partial output file (an export or `pavi-cli -o` written next to its
+/// target, then renamed) for as long as `file` is open, so a later write to
+/// the same target can tell one left by a killed process from one being
+/// written (ADR 0017). Where the file system can't lock, nothing changes.
+pub fn lock_partial_output(file: &std::fs::File) {
+    let _ = file.try_lock();
+}
+
+/// Removes the partial output files a stopped export or `pavi-cli -o` left
+/// next to `target`: `<name>.pavi-<n>.tmp` (the app) and
+/// `<name>.pavi-cli-<n>.tmp` (the CLI) whose lock is free and that haven't
+/// changed for a minute. Called before a new write to `target`.
+pub fn remove_left_over_partial_outputs(target: &std::path::Path) {
+    let Some(name) = target.file_name() else {
+        return;
+    };
+    let prefix = format!("{}.pavi-", name.to_string_lossy());
+    let folder = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(middle) = file_name
+            .strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let number = middle.strip_prefix("cli-").unwrap_or(middle);
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= crate::spill::UNLOCKED_GRACE);
+        if !old_enough {
+            continue;
+        }
+        let path = entry.path();
+        let unlocked = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .is_ok_and(|file| file.try_lock().is_ok());
+        if unlocked {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Deepest nesting of lists, structs and maps written to JSON.
 const MAX_JSON_DEPTH: usize = 64;
 
@@ -583,6 +642,45 @@ mod tests {
             String::from_utf8(json).unwrap(),
             String::from_utf8(expected).unwrap()
         );
+    }
+
+    #[test]
+    fn removes_only_unlocked_old_partial_outputs_of_the_same_target() {
+        use std::fs::File;
+        use std::time::{Duration, SystemTime};
+
+        let folder = tempfile::tempdir().unwrap();
+        let make = |name: &str, age_secs: u64| {
+            let path = folder.path().join(name);
+            let file = File::create(&path).unwrap();
+            file.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+                .unwrap();
+            (path, file)
+        };
+        let (stopped_cli, file) = make("out.csv.pavi-cli-123.tmp", 120);
+        drop(file);
+        let (stopped_app, file) = make("out.csv.pavi-7.tmp", 120);
+        drop(file);
+        // A run still writing holds its lock, however old the file looks.
+        let (writing, held) = make("out.csv.pavi-cli-456.tmp", 120);
+        lock_partial_output(&held);
+        // Under a minute old: may be a run that hasn't locked it yet.
+        let (fresh, file) = make("out.csv.pavi-cli-789.tmp", 0);
+        drop(file);
+        // Not PAVI's partial output, or another target's.
+        let (notes, file) = make("out.csv.pavi-notes.tmp", 120);
+        drop(file);
+        let (other, file) = make("other.csv.pavi-cli-1.tmp", 120);
+        drop(file);
+        let (target, file) = make("out.csv", 120);
+        drop(file);
+
+        remove_left_over_partial_outputs(&folder.path().join("out.csv"));
+        assert!(!stopped_cli.exists(), "a killed CLI run's file is removed");
+        assert!(!stopped_app.exists(), "a killed export's file is removed");
+        assert!(writing.exists() && fresh.exists());
+        assert!(notes.exists() && other.exists() && target.exists());
+        drop(held);
     }
 
     #[test]

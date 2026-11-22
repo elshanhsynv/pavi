@@ -201,6 +201,9 @@ fn export(
     cancellation: &CancellationToken,
     sender: &SyncSender<ExportEvent>,
 ) -> Result<u64> {
+    // Partial files a killed PAVI left for this target go first; ours is
+    // locked while it is written (ADR 0017).
+    parquet_reader::export::remove_left_over_partial_outputs(path);
     let temporary = temporary_path(path, generation);
     let result = export_temporary(
         input,
@@ -244,6 +247,7 @@ fn export_temporary(
     };
     let file = File::create(temporary)
         .with_context(|| format!("create export {}", temporary.display()))?;
+    parquet_reader::export::lock_partial_output(&file);
     let mut writer = BatchWriter::new(format, BufWriter::new(file), schema)?;
     let mut rows = 0_u64;
     while let Some(batch) = batches.next(cancellation)? {

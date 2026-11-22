@@ -16,6 +16,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 - Exports, conversions and other whole-file reads are faster: a file is read with one open reader instead of reopening it every 4,096 rows. In the app this speeds up exporting, scrolling through filter and SQL results, and joins; in the CLI, `--format csv/jsonl/parquet/arrow`, `--count` with a filter, `--profile` and `--sql`.
 
 ### Fixed
+- An export or `pavi-cli -o` that was stopped part-way no longer leaves its unfinished `<name>.pavi-….tmp` file next to the target for good: the next export to the same file removes it.
 - A large sort stopped with Ctrl+C (or a crash) no longer leaves its temporary files, up to 32 GB, on disk for a day: they are removed the next time `pavi-cli` runs or the app starts.
 
 ### Security
