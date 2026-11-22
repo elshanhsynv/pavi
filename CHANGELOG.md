@@ -7,6 +7,11 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Added
+- CLI: shell completions. `pavi-cli --completions bash` (or `zsh`, `fish`, `powershell`, `elvish`) prints a script that completes options and their values; `pavi-cli --help` says where to save it.
+- CLI: a manual page. `pavi-cli --man > pavi-cli.1` writes it; the Linux release includes it as `man/man1/pavi-cli.1`.
+- Releases include the completion scripts: PowerShell in the Windows zip, bash, zsh and fish in the Linux archive.
+
 ## [0.6.0] - 2026-11-22
 
 ### Added

@@ -76,6 +76,11 @@ jobs:
           $name = "pavi-$version-windows-x64"
           New-Item -ItemType Directory -Force dist\$name | Out-Null
           Copy-Item target\release\pavi.exe, target\release\pavi-cli.exe, README.md, CHANGELOG.md dist\$name
+          # PowerShell completions, written by the binary itself (pavi-cli --completions).
+          New-Item -ItemType Directory -Force dist\$name\completions | Out-Null
+          & target\release\pavi-cli.exe --completions powershell |
+            Out-File -Encoding utf8 dist\$name\completions\pavi-cli.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Path dist\$name\* -DestinationPath dist\$name.zip -Force
           $hash = (Get-FileHash dist\$name.zip -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii dist\$name.zip.sha256
@@ -121,6 +126,12 @@ jobs:
           name="pavi-$version-linux-x64"
           mkdir -p "dist/$name"
           cp target/release/pavi target/release/pavi-cli README.md CHANGELOG.md "dist/$name/"
+          # The manual page and shell completions, written by the binary itself.
+          mkdir -p "dist/$name/man/man1" "dist/$name/completions"
+          target/release/pavi-cli --man > "dist/$name/man/man1/pavi-cli.1"
+          target/release/pavi-cli --completions bash > "dist/$name/completions/pavi-cli.bash"
+          target/release/pavi-cli --completions zsh > "dist/$name/completions/_pavi-cli"
+          target/release/pavi-cli --completions fish > "dist/$name/completions/pavi-cli.fish"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"

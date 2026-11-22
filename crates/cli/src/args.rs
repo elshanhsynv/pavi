@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::builder::styling::{AnsiColor, Effects, Style, Styles};
-use clap::{ArgAction, Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum, ValueHint};
 
 /// Help colours, in cargo's style. They are dropped when the output is not a
 /// terminal, and follow `NO_COLOR` and `CLICOLOR_FORCE`.
@@ -37,6 +37,8 @@ const MAX_HELP_WIDTH: usize = 100;
     long_about,
     styles = STYLES,
     max_term_width = MAX_HELP_WIDTH,
+    // FILE is optional to clap only so --completions and --man run alone.
+    override_usage = "pavi-cli [OPTIONS] <FILE>\n       pavi-cli --completions <SHELL> | --man",
     disable_help_flag = true,
     disable_version_flag = true,
     after_help = short_footer(),
@@ -49,8 +51,12 @@ pub struct Args {
     /// as one table (folders named key=value become columns); an https://,
     /// s3://, gs:// or az:// URL; or - for standard input, which is saved to a
     /// temporary file and told apart by its first bytes.
-    #[arg(value_name = "FILE")]
-    pub file: String,
+    #[arg(
+        value_name = "FILE",
+        value_hint = ValueHint::AnyPath,
+        required_unless_present_any = ["completions", "man"]
+    )]
+    pub file: Option<String>,
 
     /// Read FILE as parquet, csv, json or arrow, whatever its name says
     ///
@@ -133,7 +139,13 @@ pub struct Args {
     /// target, then renamed). An existing file is replaced, but never the file
     /// being read. The format comes from the extension (.csv .tsv .jsonl .json
     /// .parquet .arrow .feather) unless --format is given.
-    #[arg(short, long, value_name = "PATH", help_heading = "Output")]
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        value_hint = ValueHint::FilePath,
+        help_heading = "Output"
+    )]
     pub output: Option<PathBuf>,
 
     /// Show only the table, without the file summary above it
@@ -235,6 +247,30 @@ pub struct Args {
     /// Print the version
     #[arg(short = 'V', long, action = ArgAction::Version, help_heading = "Help")]
     version: Option<bool>,
+
+    /// Print a completion script for bash, zsh, fish, powershell or elvish
+    ///
+    /// Save it where your shell looks for completions, e.g.:
+    ///   bash        pavi-cli --completions bash > ~/.local/share/bash-completion/completions/pavi-cli
+    ///   zsh         pavi-cli --completions zsh > ~/.zfunc/_pavi-cli   (with fpath+=~/.zfunc)
+    ///   fish        pavi-cli --completions fish > ~/.config/fish/completions/pavi-cli.fish
+    ///   PowerShell  pavi-cli --completions powershell >> $PROFILE
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SHELL",
+        hide_possible_values = true,
+        exclusive = true,
+        help_heading = "Help",
+        verbatim_doc_comment
+    )]
+    pub completions: Option<clap_complete::Shell>,
+
+    /// Print the manual page (roff), e.g. pavi-cli --man > pavi-cli.1
+    ///
+    /// Read it with man ./pavi-cli.1, or install it in a man1 folder on MANPATH.
+    #[arg(long, exclusive = true, help_heading = "Help")]
+    pub man: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -281,25 +317,31 @@ impl InputFormat {
 
 /// A few examples under `-h`.
 fn short_footer() -> String {
-    let mut text = heading("Examples:");
+    let colour = true;
+    let mut text = heading("Examples:", colour);
     for (command, what) in &EXAMPLES[..3] {
-        text.push_str(&example(command, what));
+        text.push_str(&example(command, what, colour));
     }
     text.push_str(&format!(
         "\n\nRun {} for details, more examples, exit codes and colours.",
-        literal("pavi-cli --help")
+        literal("pavi-cli --help", colour)
     ));
     text
 }
 
 /// Every example, the exit codes and colours under `--help`.
 fn long_footer() -> String {
-    let mut text = heading("Examples:");
+    long_footer_text(true)
+}
+
+/// The `--help` footer, with or without colour codes (a man page has none).
+pub fn long_footer_text(colour: bool) -> String {
+    let mut text = heading("Examples:", colour);
     for (command, what) in EXAMPLES {
-        text.push_str(&example(command, what));
+        text.push_str(&example(command, what, colour));
     }
     text.push_str("\n\n");
-    text.push_str(&heading("Exit codes:"));
+    text.push_str(&heading("Exit codes:", colour));
     for (code, meaning) in [
         (
             "0",
@@ -311,11 +353,11 @@ fn long_footer() -> String {
         ),
         ("2", "invalid arguments"),
     ] {
-        text.push_str(&format!("\n  {}  {meaning}", literal(code)));
+        text.push_str(&format!("\n  {}  {meaning}", literal(code, colour)));
     }
     text.push('\n');
     text.push('\n');
-    text.push_str(&heading("Colours:"));
+    text.push_str(&heading("Colours:", colour));
     text.push_str(
         "\n  Used only on a terminal. NO_COLOR=1 turns them off; CLICOLOR_FORCE=1 keeps them\n  \
          in pipes.",
@@ -364,21 +406,26 @@ const EXAMPLES: [(&str, &str); 10] = [
     ),
 ];
 
-fn example(command: &str, what: &str) -> String {
-    format!("\n  {}\n      {what}", literal(command))
+fn example(command: &str, what: &str, colour: bool) -> String {
+    format!("\n  {}\n      {what}", literal(command, colour))
 }
 
-fn heading(text: &str) -> String {
-    styled(STYLES.get_header(), text)
+fn heading(text: &str, colour: bool) -> String {
+    styled(STYLES.get_header(), text, colour)
 }
 
-fn literal(text: &str) -> String {
-    styled(STYLES.get_literal(), text)
+fn literal(text: &str, colour: bool) -> String {
+    styled(STYLES.get_literal(), text, colour)
 }
 
-/// `text` with `style`'s escape codes; clap strips them where colour is off.
-fn styled(style: &Style, text: &str) -> String {
-    format!("{}{text}{}", style.render(), style.render_reset())
+/// `text` with `style`'s escape codes when `colour`; clap strips them where
+/// the terminal has no colour, but a man page must not get them at all.
+fn styled(style: &Style, text: &str, colour: bool) -> String {
+    if colour {
+        format!("{}{text}{}", style.render(), style.render_reset())
+    } else {
+        text.to_owned()
+    }
 }
 
 #[cfg(test)]
