@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Display, Write as _};
 
 use anyhow::{Result, anyhow, bail};
 use arrow_array::{
@@ -215,13 +215,10 @@ pub fn scalar_text(array: &dyn Array, row: usize) -> Result<Option<String>> {
     if let Some((values, index)) = dictionary_value(array, row) {
         return scalar_text(values, index);
     }
-    if !is_scalar_type(array.data_type()) {
-        bail!(
-            "{:?} values are nested and have no scalar text",
-            array.data_type()
-        );
-    }
-    leaf_text(array, row).map(Some)
+    let mut text = String::new();
+    Ok(ScalarTexts::new(array)?
+        .write(row, &mut text)?
+        .then_some(text))
 }
 
 /// Whether [`scalar_text`] supports values of this type (everything except nested types).
@@ -302,32 +299,171 @@ fn format_value(array: &dyn Array, row: usize, limit: usize, depth: usize) -> St
 
 /// Text for one non-null, non-nested, non-dictionary value.
 fn leaf_text(array: &dyn Array, row: usize) -> Result<String> {
-    let text = match array.data_type() {
-        DataType::Boolean => downcast::<BooleanArray>(array)?.value(row).to_string(),
-        DataType::Int8 => primitive_text::<Int8Type>(array, row)?,
-        DataType::Int16 => primitive_text::<Int16Type>(array, row)?,
-        DataType::Int32 => primitive_text::<Int32Type>(array, row)?,
-        DataType::Int64 => primitive_text::<Int64Type>(array, row)?,
-        DataType::UInt8 => primitive_text::<UInt8Type>(array, row)?,
-        DataType::UInt16 => primitive_text::<UInt16Type>(array, row)?,
-        DataType::UInt32 => primitive_text::<UInt32Type>(array, row)?,
-        DataType::UInt64 => primitive_text::<UInt64Type>(array, row)?,
-        DataType::Float32 => primitive_text::<Float32Type>(array, row)?,
-        DataType::Float64 => primitive_text::<Float64Type>(array, row)?,
-        DataType::Utf8 => downcast::<StringArray>(array)?.value(row).to_owned(),
-        DataType::LargeUtf8 => downcast::<LargeStringArray>(array)?.value(row).to_owned(),
-        DataType::Utf8View => downcast::<StringViewArray>(array)?.value(row).to_owned(),
-        DataType::Binary => hex(downcast::<BinaryArray>(array)?.value(row)),
-        DataType::LargeBinary => hex(downcast::<LargeBinaryArray>(array)?.value(row)),
-        DataType::BinaryView => hex(downcast::<BinaryViewArray>(array)?.value(row)),
-        DataType::FixedSizeBinary(_) => hex(downcast::<FixedSizeBinaryArray>(array)?.value(row)),
-        // Dates, timestamps, times, durations, intervals, decimals, Float16, run-end
-        // encoded values and anything else: arrow-rs's own display rules.
-        _ => ArrayFormatter::try_new(array, &FormatOptions::new())?
-            .value(row)
-            .try_to_string()?,
-    };
+    let mut text = String::new();
+    leaf_writer(array)?(row, &mut text)?;
     Ok(text)
+}
+
+/// Appends a value's text to a buffer; `false` (and nothing appended) for null.
+type WriteText<'a> = Box<dyn Fn(usize, &mut String) -> Result<bool> + 'a>;
+
+/// The [`scalar_text`] of every row of one array, prepared once: the type is
+/// looked at, and the formatter for dates, timestamps, decimals and the like
+/// built, when the column is, not for every value. Export writes whole columns
+/// through it; `scalar_text` is the same code for one value.
+pub struct ScalarTexts<'a> {
+    len: usize,
+    write: WriteText<'a>,
+}
+
+impl<'a> ScalarTexts<'a> {
+    /// Fails for nested types; see [`is_scalar_type`].
+    pub fn new(array: &'a dyn Array) -> Result<Self> {
+        if !is_scalar_type(array.data_type()) {
+            bail!(
+                "{:?} values are nested and have no scalar text",
+                array.data_type()
+            );
+        }
+        Ok(Self {
+            len: array.len(),
+            write: text_writer(array)?,
+        })
+    }
+
+    /// Appends the text of `row` to `out` and returns `true`, or returns
+    /// `false` and appends nothing for null.
+    pub fn write(&self, row: usize, out: &mut String) -> Result<bool> {
+        if row >= self.len {
+            bail!(
+                "row {row} is out of range for an array of {} values",
+                self.len
+            );
+        }
+        (self.write)(row, out)
+    }
+}
+
+/// Text of any scalar array: dictionaries through their values.
+fn text_writer(array: &dyn Array) -> Result<WriteText<'_>> {
+    fn dictionary<K: ArrowDictionaryKeyType>(array: &dyn Array) -> Result<WriteText<'_>> {
+        let dictionary = downcast::<DictionaryArray<K>>(array)?;
+        let values = dictionary.values().as_ref();
+        let len = values.len();
+        let write = text_writer(values)?;
+        Ok(Box::new(move |row, out| match dictionary.key(row) {
+            None => Ok(false),
+            Some(index) if index >= len => {
+                bail!("row {index} is out of range for an array of {len} values")
+            }
+            Some(index) => write(index, out),
+        }))
+    }
+    fn plain(array: &dyn Array) -> Result<WriteText<'_>> {
+        let write = leaf_writer(array)?;
+        Ok(Box::new(move |row, out| {
+            if array.is_null(row) {
+                return Ok(false);
+            }
+            write(row, out)?;
+            Ok(true)
+        }))
+    }
+
+    let DataType::Dictionary(key, _) = array.data_type() else {
+        return plain(array);
+    };
+    match key.as_ref() {
+        DataType::Int8 => dictionary::<Int8Type>(array),
+        DataType::Int16 => dictionary::<Int16Type>(array),
+        DataType::Int32 => dictionary::<Int32Type>(array),
+        DataType::Int64 => dictionary::<Int64Type>(array),
+        DataType::UInt8 => dictionary::<UInt8Type>(array),
+        DataType::UInt16 => dictionary::<UInt16Type>(array),
+        DataType::UInt32 => dictionary::<UInt32Type>(array),
+        DataType::UInt64 => dictionary::<UInt64Type>(array),
+        _ => plain(array),
+    }
+}
+
+/// Appends a non-null value's text.
+type WriteLeaf<'a> = Box<dyn Fn(usize, &mut String) -> Result<()> + 'a>;
+
+/// The one place a scalar value becomes text, for the grid, export and profiles.
+fn leaf_writer(array: &dyn Array) -> Result<WriteLeaf<'_>> {
+    fn display<T>(array: &dyn Array) -> Result<WriteLeaf<'_>>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: Display,
+    {
+        let array = downcast::<PrimitiveArray<T>>(array)?;
+        Ok(Box::new(move |row, out| {
+            write!(out, "{}", array.value(row))?;
+            Ok(())
+        }))
+    }
+    fn text<'a, T: 'static>(
+        array: &'a dyn Array,
+        value: impl Fn(&'a T, usize) -> &'a str + 'a,
+    ) -> Result<WriteLeaf<'a>> {
+        let array = downcast::<T>(array)?;
+        Ok(Box::new(move |row, out| {
+            out.push_str(value(array, row));
+            Ok(())
+        }))
+    }
+    fn bytes<'a, T: 'static>(
+        array: &'a dyn Array,
+        value: impl Fn(&'a T, usize) -> &'a [u8] + 'a,
+    ) -> Result<WriteLeaf<'a>> {
+        let array = downcast::<T>(array)?;
+        Ok(Box::new(move |row, out| {
+            push_hex(value(array, row), out);
+            Ok(())
+        }))
+    }
+
+    Ok(match array.data_type() {
+        DataType::Boolean => {
+            let array = downcast::<BooleanArray>(array)?;
+            Box::new(move |row, out| {
+                out.push_str(if array.value(row) { "true" } else { "false" });
+                Ok(())
+            })
+        }
+        DataType::Int8 => display::<Int8Type>(array)?,
+        DataType::Int16 => display::<Int16Type>(array)?,
+        DataType::Int32 => display::<Int32Type>(array)?,
+        DataType::Int64 => display::<Int64Type>(array)?,
+        DataType::UInt8 => display::<UInt8Type>(array)?,
+        DataType::UInt16 => display::<UInt16Type>(array)?,
+        DataType::UInt32 => display::<UInt32Type>(array)?,
+        DataType::UInt64 => display::<UInt64Type>(array)?,
+        DataType::Float32 => display::<Float32Type>(array)?,
+        DataType::Float64 => display::<Float64Type>(array)?,
+        DataType::Utf8 => text(array, |array: &StringArray, row| array.value(row))?,
+        DataType::LargeUtf8 => text(array, |array: &LargeStringArray, row| array.value(row))?,
+        DataType::Utf8View => text(array, |array: &StringViewArray, row| array.value(row))?,
+        DataType::Binary => bytes(array, |array: &BinaryArray, row| array.value(row))?,
+        DataType::LargeBinary => bytes(array, |array: &LargeBinaryArray, row| array.value(row))?,
+        DataType::BinaryView => bytes(array, |array: &BinaryViewArray, row| array.value(row))?,
+        DataType::FixedSizeBinary(_) => {
+            bytes(array, |array: &FixedSizeBinaryArray, row| array.value(row))?
+        }
+        // Dates, timestamps, times, durations, intervals, decimals, Float16, run-end
+        // encoded values and anything else: arrow-rs's own display rules. A type
+        // it can't show fails at its first non-null value, as before.
+        _ => match ArrayFormatter::try_new(array, &FormatOptions::new()) {
+            Ok(formatter) => Box::new(move |row, out| {
+                formatter.value(row).write(out)?;
+                Ok(())
+            }),
+            Err(error) => {
+                let message = error.to_string();
+                Box::new(move |_, _| Err(anyhow!("{message}")))
+            }
+        },
+    })
 }
 
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> {
@@ -337,20 +473,13 @@ fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> {
         .ok_or_else(|| anyhow!("{:?} array type mismatch", array.data_type()))
 }
 
-fn primitive_text<T>(array: &dyn Array, row: usize) -> Result<String>
-where
-    T: ArrowPrimitiveType,
-    T::Native: Display,
-{
-    Ok(downcast::<PrimitiveArray<T>>(array)?.value(row).to_string())
-}
-
-fn hex(value: &[u8]) -> String {
-    let mut out = String::with_capacity(value.len() * 2);
+fn push_hex(value: &[u8], out: &mut String) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(value.len() * 2);
     for byte in value {
-        out.push_str(&format!("{byte:02x}"));
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
-    out
 }
 
 /// For a dictionary-encoded cell, the values array and the index it references.
@@ -749,7 +878,7 @@ pub fn temporal_text(data_type: &DataType, value: f64) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
         DurationSecondArray, Float64Array, Int32Array, LargeListArray, ListArray, StringArray,
@@ -923,6 +1052,160 @@ mod tests {
             2,
         );
         assert_eq!(format_cell(&list, 0), "[1, 2]");
+    }
+
+    /// Arrays of every scalar kind, each with a null.
+    pub(crate) fn scalar_arrays() -> Vec<arrow_array::ArrayRef> {
+        use arrow_array::{
+            Date32Array, Date64Array, Decimal128Array, DurationSecondArray, Float32Array,
+            Float64Array, Int8Array, Int16Array, Int64Array, LargeBinaryArray, LargeStringArray,
+            Time64MicrosecondArray, TimestampMillisecondArray, UInt8Array, UInt64Array,
+        };
+        let strings = StringArray::from(vec![Some("a,\"b\"\n"), None, Some("")]);
+        vec![
+            Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])),
+            Arc::new(Int8Array::from(vec![Some(-128), None, Some(7)])),
+            Arc::new(Int16Array::from(vec![Some(i16::MAX), None, Some(0)])),
+            Arc::new(Int32Array::from(vec![Some(-1), None, Some(42)])),
+            Arc::new(Int64Array::from(vec![Some(i64::MIN), None, Some(1)])),
+            Arc::new(UInt8Array::from(vec![Some(255), None, Some(0)])),
+            Arc::new(UInt64Array::from(vec![Some(u64::MAX), None, Some(3)])),
+            arrow_cast::cast(
+                &Float32Array::from(vec![Some(1.5), None, Some(-0.25)]),
+                &DataType::Float16,
+            )
+            .unwrap(),
+            Arc::new(Float32Array::from(vec![Some(0.1), None, Some(f32::NAN)])),
+            Arc::new(Float64Array::from(vec![
+                Some(1e21),
+                None,
+                Some(f64::NEG_INFINITY),
+            ])),
+            Arc::new(strings),
+            Arc::new(LargeStringArray::from(vec![Some("large"), None, Some("x")])),
+            Arc::new(StringViewArray::from(vec![
+                Some("a view longer than twelve"),
+                None,
+                Some("v"),
+            ])),
+            Arc::new(BinaryArray::from(vec![
+                Some(&[0x00_u8, 0xab][..]),
+                None,
+                Some(&[][..]),
+            ])),
+            Arc::new(LargeBinaryArray::from(vec![
+                Some(&[0xff_u8][..]),
+                None,
+                Some(&[1, 2][..]),
+            ])),
+            Arc::new(Date32Array::from(vec![Some(19_000), None, Some(-1)])),
+            Arc::new(Date64Array::from(vec![
+                Some(1_600_000_000_000),
+                None,
+                Some(0),
+            ])),
+            Arc::new(
+                TimestampMillisecondArray::from(vec![Some(1_600_000_000_123), None, Some(0)])
+                    .with_timezone("+02:00"),
+            ),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(1),
+                None,
+                Some(-1),
+            ])),
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(3_723_000_001),
+                None,
+                Some(0),
+            ])),
+            Arc::new(DurationSecondArray::from(vec![Some(90), None, Some(-5)])),
+            Arc::new(
+                Decimal128Array::from(vec![Some(12_345), None, Some(-5)])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+            Arc::new(
+                vec![Some("red"), None, Some("red")]
+                    .into_iter()
+                    .collect::<DictionaryArray<Int8Type>>(),
+            ),
+            Arc::new(
+                vec![Some("x"), Some("y"), None]
+                    .into_iter()
+                    .collect::<DictionaryArray<UInt32Type>>(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn column_texts_match_the_per_value_rules() {
+        // The rules before columns were prepared once: Display for numbers and
+        // booleans, the text itself, lowercase hex, else a fresh ArrayFormatter.
+        fn reference(array: &dyn Array, row: usize) -> Option<String> {
+            if array.is_null(row) {
+                return None;
+            }
+            if let Some((values, index)) = dictionary_value(array, row) {
+                return reference(values, index);
+            }
+            Some(match array.data_type() {
+                DataType::Boolean => array.as_boolean().value(row).to_string(),
+                DataType::Int8 => array.as_primitive::<Int8Type>().value(row).to_string(),
+                DataType::Int16 => array.as_primitive::<Int16Type>().value(row).to_string(),
+                DataType::Int32 => array.as_primitive::<Int32Type>().value(row).to_string(),
+                DataType::Int64 => array.as_primitive::<Int64Type>().value(row).to_string(),
+                DataType::UInt8 => array.as_primitive::<UInt8Type>().value(row).to_string(),
+                DataType::UInt64 => array.as_primitive::<UInt64Type>().value(row).to_string(),
+                DataType::Float32 => array.as_primitive::<Float32Type>().value(row).to_string(),
+                DataType::Float64 => array.as_primitive::<Float64Type>().value(row).to_string(),
+                DataType::Utf8 => array.as_string::<i32>().value(row).to_owned(),
+                DataType::LargeUtf8 => array.as_string::<i64>().value(row).to_owned(),
+                DataType::Utf8View => array.as_string_view().value(row).to_owned(),
+                DataType::Binary => array
+                    .as_binary::<i32>()
+                    .value(row)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                DataType::LargeBinary => array
+                    .as_binary::<i64>()
+                    .value(row)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                _ => ArrayFormatter::try_new(array, &FormatOptions::new())
+                    .unwrap()
+                    .value(row)
+                    .try_to_string()
+                    .unwrap(),
+            })
+        }
+        use arrow_array::cast::AsArray;
+
+        for array in scalar_arrays() {
+            let texts = ScalarTexts::new(array.as_ref()).unwrap();
+            // One buffer for the whole column: each write appends.
+            let mut buffer = String::from(">");
+            for row in 0..array.len() {
+                let expected = reference(array.as_ref(), row);
+                let start = buffer.len();
+                let written = texts.write(row, &mut buffer).unwrap();
+                assert_eq!(
+                    written.then(|| buffer[start..].to_string()),
+                    expected,
+                    "{:?} row {row}",
+                    array.data_type()
+                );
+                assert_eq!(scalar_text(array.as_ref(), row).unwrap(), expected);
+            }
+            assert!(buffer.starts_with('>'), "writes append");
+            assert!(texts.write(array.len(), &mut buffer).is_err());
+        }
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1)])]);
+        assert!(
+            ScalarTexts::new(&list).is_err(),
+            "nested values have no scalar text"
+        );
     }
 
     #[test]
