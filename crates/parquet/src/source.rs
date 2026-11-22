@@ -1247,20 +1247,15 @@ impl ParquetSource {
                         .saturating_add(rows.saturating_mul(8))
                         > budget.max_bytes();
                 if over_budget {
-                    if top.is_some() && rows <= budget.max_rows() {
-                        // A top-N whose kept rows alone are too large: no spill helps.
-                        bail!(
-                            "the rows kept for this LIMIT exceed the in-memory sort budget of \
-                             {} bytes; select fewer columns or a smaller LIMIT",
-                            budget.max_bytes()
-                        );
-                    }
-                    // Too many rows to sort in memory: write them out as a sorted run.
+                    // Too many rows to sort in memory: write them out as a sorted
+                    // run. Under a LIMIT a run needs only its best `top` rows: a
+                    // row with `top` better rows in its own run can't be in the
+                    // result. The merge applies the LIMIT.
                     let writer = match &mut runs {
                         Some(writer) => writer,
                         None => runs.insert(RunWriter::new()?),
                     };
-                    writer.write(&order.sort(&retained, None)?)?;
+                    writer.write(&order.sort(&retained, top)?)?;
                     retained.clear();
                     rows = 0;
                     bytes = 0;
@@ -4372,6 +4367,24 @@ mod tests {
         assert_eq!(
             limited.iter().flat_map(ids).collect::<Vec<_>>(),
             expected[..101]
+        );
+
+        // A LIMIT within the row budget whose rows don't fit its bytes spills
+        // too, each run trimmed to its best rows, instead of failing.
+        let narrow = SortBudget::new(10_000, 200_000).unwrap();
+        let spilled_top = source
+            .read_sorted_all(
+                None,
+                &projection,
+                &[by_bucket],
+                narrow,
+                Some(5_000),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(
+            spilled_top.iter().flat_map(ids).collect::<Vec<_>>(),
+            expected[..5_000]
         );
 
         // The budget counts rows that pass the filter, not the whole file.

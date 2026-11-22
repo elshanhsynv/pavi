@@ -18,6 +18,8 @@ Memory stays bounded by the same sort budget. Disk use is bounded by a new named
 
 `ORDER BY … LIMIT n` with `n` within the budget keeps the in-memory top-N path: it never touches disk.
 
+*Note, 2026-11-22:* the budget is now 1,048,576 rows / 128 MB (from 100,000 rows), so the bytes, not the row count, usually decide when a sort spills. A top-N whose kept rows don't fit the bytes now spills (each run trimmed to its best `n` rows) instead of failing. The decision above is unchanged.
+
 ## Consequences
 - Sorting works on files of any size, with memory still predictable.
 - A large sort writes roughly its projected input to disk, in up to log₁₆(runs) passes, so it is slow and needs free disk space; progress shows while the scan runs.

@@ -14,7 +14,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Page size | 4,096 rows | `parquet_reader::page::PAGE_ROWS` |
 | Filter/SQL/sort result window | 8 batches (~32k rows); a jump keeps 2,048 rows above its target | `pavi::results::MAX_FILTERED_BATCHES`, `JUMP_CONTEXT_ROWS` |
 | Filter match count (ADR 0012, 0016) | One `u64` per row group of the file (the footer's list), no other buffer; row groups the statistics settle are not read | `ParquetSource::count_matches_by_row_group` |
-| Sort rows in memory (larger sorts spill, ADR 0005) | 100,000 rows / 128 MB | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
+| Sort rows in memory (larger sorts spill, ADR 0005); also the size of one spilled run | 1,048,576 rows / 128 MB (the bytes counted three times: the rows, their sorted copy and the concatenation) | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
 | Sort spill files | 32 GiB per sort | `spill::MAX_SPILL_BYTES` |
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
 | Sort keys / GROUP BY columns | 8 / 8 | `sort::MAX_SORT_KEYS`, `aggregate::MAX_GROUP_COLUMNS` |
@@ -34,7 +34,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | CLI streamed output (`--format csv/jsonl/parquet/arrow`) | one 4,096-row batch of the projected columns; Parquet also buffers its open row group, as in the app's export. No row limit | `cli::STREAM_BATCH_ROWS` |
 | CLI `--count` with a filter (ADR 0016) | up to 16 threads, each with one reader and one 4,096-row batch of the filter's columns, reading chunks of about 1,048,576 rows; one `u64` per row group per chunk | `cli::MAX_COUNT_THREADS`, `COUNT_CHUNK_ROWS` |
 | CLI `--sql` | the query engine's own budgets, as in the app: sort, `GroupBudget`, the join build side (`MAX_JOIN_BUILD_ROWS` / `_BYTES`) and the prepared table (`MAX_PREPARED_BYTES`); one worker pool of `available_parallelism` threads with a 32-task queue. The table holds ≤1,000 result rows | `RuntimeConfig::default()`, ADR 0009, 0011 |
-| CLI `--sort` | the app's sort budget in memory (100,000 rows / 128 MB, or the best `offset + head` rows with `--head`), then spill files up to 32 GiB in the temporary folder, deleted when the run ends | `SortBudget::DEFAULT_MAX_*`, `spill::MAX_SPILL_BYTES` |
+| CLI `--sort` | the app's sort budget in memory (1,048,576 rows / 128 MB, or the best `offset + head` rows with `--head`), then spill files up to 32 GiB in the temporary folder, deleted when the run ends | `SortBudget::DEFAULT_MAX_*`, `spill::MAX_SPILL_BYTES` |
 | CLI standard input (`-`) | copied to a temporary file, at most 32 GiB (as a remote download); CSV, JSON and Arrow input is then converted as for any file | `cli::files::MAX_STDIN_BYTES`, `MAX_CONVERTED_BYTES` |
 | CLI `--stats` table | 1,000 rows (row group × column) unless `--head` is lower; streamed formats print every row. The rows come from the footer, which is bounded at open | `cli::MAX_HEAD_ROWS`, `MAX_DATASET_METADATA_BYTES` |
 | Rows per scan reader (filter, sort and aggregate scans, query results, exports, the CLI's streamed output and join scans read consecutive row groups of one file with one reader; its dictionary pages are checked when it opens). A query result or stream keeps its reader open between reads (`ScanCursor`), with at most one decoded batch it has not handed out | 1,048,576 rows | `SCAN_RUN_ROWS` in `crates/parquet/src/source.rs` |
@@ -64,7 +64,7 @@ Each budget is a named constant. Change it in one place and update this table.
 
 - The UI thread only polls (`try_recv`). Nothing on it may scale with file size.
 - Per-frame work is limited to visible rows × visible columns.
-- Cancelled or replaced work stops within one 4,096-row batch.
+- Cancelled or replaced work stops within one 4,096-row batch. The one longer step is a sort sorting the rows it holds in memory (one run, ≤ 1,048,576 rows / 128 MB; about 0.1 s for flights' million rows), which finishes before the cancel is seen.
 - Repaint every 16 ms only while something is pending; idle means no repaint.
 
 ## Targets

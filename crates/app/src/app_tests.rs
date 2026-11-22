@@ -1416,8 +1416,9 @@ fn header_actions_sort_select_and_hide_columns() {
 
 #[test]
 fn sorts_the_whole_file_and_by_several_columns() {
-    // More rows than the in-memory sort budget: the sort spills to disk.
-    let rows = pavi_query::SortBudget::DEFAULT_MAX_ROWS + 500;
+    // Far more rows than the result window holds (spilling past the sort
+    // budget is tested in `pavi_query` and `parquet_reader` with small budgets).
+    let rows = 150_000;
     let (_directory, source, path) = source(rows);
     let mut app = make_app(source, path);
 
@@ -1427,7 +1428,7 @@ fn sorts_the_whole_file_and_by_several_columns() {
     let filtered = app.filtered.as_ref().unwrap();
     assert!(filtered.error.is_none(), "{:?}", filtered.error);
     assert_eq!(filtered_ids(&app)[0], (rows - 1).to_string());
-    // Rows past the old 100,000-row cap are reachable: read on to the end.
+    // Rows past the 100,000-row cap sorts once had are reachable: read on to the end.
     for _ in 0..40 {
         app.request_more_filtered();
         poll_until_idle(&mut app);

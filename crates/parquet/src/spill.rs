@@ -17,7 +17,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use arrow_array::{RecordBatch, UInt32Array};
-use arrow_ord::sort::{SortColumn, lexsort_to_indices};
+use arrow_ord::{
+    ord::make_comparator,
+    sort::{SortColumn, lexsort_to_indices},
+};
 use arrow_schema::{SchemaRef, SortOptions};
 use arrow_select::{concat::concat_batches, take::take_record_batch};
 use parquet::{
@@ -68,6 +71,35 @@ impl SortKeys {
                 }),
             }])
             .collect()
+    }
+
+    /// Compares rows of `left` with rows of `right` in sort order, the sequence
+    /// number last, so no two rows compare equal.
+    fn comparator(
+        &self,
+        left: &RecordBatch,
+        right: &RecordBatch,
+    ) -> Result<impl Fn(usize, usize) -> std::cmp::Ordering + use<>> {
+        let columns = self
+            .columns(left)
+            .into_iter()
+            .zip(self.columns(right))
+            .map(|(left, right)| {
+                make_comparator(
+                    left.values.as_ref(),
+                    right.values.as_ref(),
+                    left.options.unwrap_or_default(),
+                )
+                .context("compare supported Arrow values")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(move |left: usize, right: usize| {
+            columns
+                .iter()
+                .map(|compare| compare(left, right))
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Row order of `batch`, keeping only the first `limit` rows if given.
@@ -298,7 +330,8 @@ impl Cursor {
 
 /// Merges sorted runs. Each round emits every buffered row that is no greater
 /// than the smallest "last buffered row" of any run: no unread row can come
-/// before those.
+/// before those. Only the rows a round emits are sorted, so each row is sorted
+/// once.
 struct Merger {
     cursors: Vec<Cursor>,
     keys: SortKeys,
@@ -340,44 +373,50 @@ impl Merger {
         if active.is_empty() {
             return Ok(None);
         }
-        let batches = active
+        // The boundary: the first, in sort order, of the runs' last buffered rows.
+        let lasts = active
             .iter()
-            .map(|(_, batch)| batch.clone())
+            .map(|(_, batch)| batch.slice(batch.num_rows() - 1, 1))
             .collect::<Vec<_>>();
-        let combined = concat(&batches)?;
-        let order = self.keys.indices(&combined, None)?;
-        // Where each run's rows start in `combined`, and its last row there.
-        let mut starts = Vec::with_capacity(active.len());
-        let mut start = 0_usize;
-        for (_, batch) in &active {
-            starts.push(start);
-            start += batch.num_rows();
-        }
-        let last_rows = active
-            .iter()
-            .zip(&starts)
-            .map(|((_, batch), start)| start + batch.num_rows() - 1)
-            .collect::<Vec<_>>();
-        // The first "last row" in sort order is the boundary: everything up to it
-        // is final.
-        let boundary = order
+        let lasts = concat(&lasts)?;
+        let first_last = self.keys.indices(&lasts, Some(1))?;
+        let boundary_run = first_last
             .values()
-            .iter()
-            .position(|row| last_rows.contains(&(*row as usize)))
+            .first()
+            .map(|row| *row as usize)
             .context("merge lost its boundary row")?;
-        let taken = UInt32Array::from(order.values()[..=boundary].to_vec());
-        let mut used = vec![0_usize; active.len()];
-        for row in taken.values() {
-            let row = *row as usize;
-            let run = starts.partition_point(|start| *start <= row) - 1;
-            used[run] += 1;
-        }
-        for ((index, batch), used) in active.iter().zip(used) {
-            // Each run's buffer is sorted, so the rows it gave are a prefix.
+        let boundary = lasts.slice(boundary_run, 1);
+        // Each run's buffer is sorted, so the rows up to the boundary are a prefix.
+        let mut prefixes = Vec::with_capacity(active.len());
+        for (position, (index, batch)) in active.iter().enumerate() {
+            let used = if position == boundary_run {
+                batch.num_rows()
+            } else {
+                let compare = self.keys.comparator(batch, &boundary)?;
+                partition_point(batch.num_rows(), |row| compare(row, 0).is_lt())
+            };
+            if used > 0 {
+                prefixes.push(batch.slice(0, used));
+            }
             self.cursors[*index].buffer = Some(batch.slice(used, batch.num_rows() - used));
         }
-        Ok(Some(take_record_batch(&combined, &taken)?))
+        Ok(Some(self.keys.sort(&prefixes, None)?))
     }
+}
+
+/// The number of leading rows of `0..rows` for which `before` holds, when it
+/// holds for a prefix and not after.
+fn partition_point(rows: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, rows);
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if before(middle) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low
 }
 
 /// The final merge of a spilled sort, handing out rows as they are asked for.
@@ -561,6 +600,75 @@ mod tests {
                 .sum::<usize>(),
             10_000
         );
+    }
+
+    #[test]
+    fn merges_long_runs_over_many_rounds_by_two_keys() {
+        // Runs of 10,000 rows, longer than a merge round's 4,096-row buffers,
+        // with ranges that overlap only partly, so some runs give nothing for
+        // several rounds.
+        let keys = SortKeys {
+            keys: vec![
+                (
+                    0,
+                    SortSpec::new(0, SortDirection::Descending, NullOrder::First),
+                ),
+                (
+                    1,
+                    SortSpec::new(1, SortDirection::Ascending, NullOrder::Last),
+                ),
+            ],
+            sequence: 2,
+        };
+        let mut writer = RunWriter::new().unwrap();
+        let mut all = Vec::new();
+        let mut sequence = 0_u64;
+        for run in 0..5_i32 {
+            let rows = 10_000_i32;
+            let first = (0..rows)
+                .map(|row| (row % 997 != 3).then_some(run * 4_000 + (row * 7) % 6_000))
+                .collect::<Vec<_>>();
+            let second = (0..rows)
+                .map(|row| (row % 13 != 0).then_some((row * 31 + run) % 5))
+                .collect::<Vec<_>>();
+            let run_batch = RecordBatch::try_from_iter(vec![
+                ("a", Arc::new(Int32Array::from(first)) as ArrayRef),
+                ("b", Arc::new(Int32Array::from(second))),
+                (
+                    "__pavi_sequence",
+                    Arc::new(UInt64Array::from_iter_values(
+                        sequence..sequence + rows as u64,
+                    )),
+                ),
+            ])
+            .unwrap();
+            sequence += rows as u64;
+            all.push(run_batch.clone());
+            writer
+                .write(&keys.sort(&[run_batch], None).unwrap())
+                .unwrap();
+        }
+        let mut merge = writer
+            .into_merge(keys.clone(), vec![0, 1, 2], None, &|| false)
+            .unwrap();
+        let mut merged = Vec::new();
+        loop {
+            let (batches, finished) = merge.next_rows(PAGE_ROWS as usize, &|| false).unwrap();
+            merged.extend(batches);
+            if finished {
+                break;
+            }
+        }
+        let merged = concat_batches(&merged[0].schema(), &merged).unwrap();
+        let expected = keys.sort(&all, None).unwrap();
+        assert_eq!(merged.num_rows(), 50_000);
+        for column in 0..3 {
+            assert_eq!(
+                merged.column(column).as_ref(),
+                expected.column(column).as_ref(),
+                "column {column}"
+            );
+        }
     }
 
     #[test]
