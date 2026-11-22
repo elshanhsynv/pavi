@@ -188,6 +188,36 @@ pub fn format_cell(array: &dyn Array, row: usize) -> String {
     format_cell_with_limit(array, row, DEFAULT_CELL_LIMIT)
 }
 
+/// Significant digits a 64-bit float holds reliably; [`format_cell_readable`]
+/// rounds to this many.
+pub const READABLE_FLOAT_DIGITS: usize = 15;
+
+/// Like [`format_cell`], but a `Float64` value reads as a person would write
+/// it: at most [`READABLE_FLOAT_DIGITS`] significant digits, so binary noise
+/// such as `0.009000000000000001` (from `9.0 * 0.001`) reads `0.009`; and, as
+/// Python prints floats, in scientific notation below 1e-4 or from 1e16 up
+/// (`1e-20`, `1e300`) rather than with dozens of zeros. For tables people
+/// read (the CLI's); copy and export keep the full value.
+pub fn format_cell_readable(array: &dyn Array, row: usize) -> String {
+    let Some(values) = array.as_any().downcast_ref::<PrimitiveArray<Float64Type>>() else {
+        return format_cell(array, row);
+    };
+    if row >= values.len() || values.is_null(row) || !values.value(row).is_finite() {
+        return format_cell(array, row);
+    }
+    let value = values.value(row);
+    let digits = READABLE_FLOAT_DIGITS - 1;
+    let Ok(rounded) = format!("{value:.digits$e}").parse::<f64>() else {
+        return format_cell(array, row);
+    };
+    let magnitude = rounded.abs();
+    if rounded != 0.0 && !(1e-4..1e16).contains(&magnitude) {
+        format!("{rounded:e}")
+    } else {
+        rounded.to_string()
+    }
+}
+
 /// Bounded display text for one cell, truncated to about `limit` bytes.
 ///
 /// Scalars use the same text as [`scalar_text`]; nested values are capped by
@@ -981,6 +1011,40 @@ pub(crate) mod tests {
             decimal_f64(&arrow_array::Int32Array::from(vec![1]), 0),
             None
         );
+    }
+
+    #[test]
+    fn rounds_float_noise_away_for_reading_only() {
+        let values = Float64Array::from(vec![
+            Some(9.0 * 0.001),
+            Some(0.1 + 0.2),
+            Some(1.5),
+            Some(1e-20),
+            Some(1e300),
+            Some(123_456_789.123_456_78),
+            Some(f64::NAN),
+            None,
+        ]);
+        let readable = (0..values.len())
+            .map(|row| format_cell_readable(&values, row))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readable,
+            [
+                "0.009",
+                "0.3",
+                "1.5",
+                "1e-20",
+                "1e300",
+                "123456789.123457",
+                "NaN",
+                "null"
+            ]
+        );
+        // The plain text keeps every digit, for copy and export.
+        assert_eq!(format_cell(&values, 0), "0.009000000000000001");
+        // Other types are left alone.
+        assert_eq!(format_cell_readable(&Int32Array::from(vec![7]), 0), "7");
     }
 
     #[test]

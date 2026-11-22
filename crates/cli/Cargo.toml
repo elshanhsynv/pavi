@@ -35,6 +35,9 @@ pavi_runtime = { path = "../runtime" }
 # Terminal column widths for the preview table (CJK and most emoji take two
 # columns). Already in the tree through egui's dependencies.
 unicode-width = "0.1"
+# The terminal's width, which the table fits; already in the tree through
+# clap's `wrap_help`.
+terminal_size = "0.4"
 # Grapheme clusters, so an emoji with a skin tone or a flag is measured and
 # cut as one character. Already in the tree through egui's dependencies.
 unicode-segmentation = "1"
