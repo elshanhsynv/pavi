@@ -19,5 +19,5 @@ The CLI was a synchronous tool over `parquet_reader` alone. It now streams rows,
 ## Consequences
 - One SQL dialect for the app and the CLI; a change to the subset or its limits reaches both.
 - The CLI binary links the runtime and query crates and the SQL parser (already in the workspace; no new third-party crate).
-- A process killed mid-query (Ctrl+C) can leave a spill or prepared-table folder in the temporary directory, as a crashed app would; the next run that creates a folder of the same kind removes those older than a day (`TempFolder::create`, ADR 0005).
+- A process killed mid-query (Ctrl+C) can leave a spill or prepared-table folder in the temporary directory, as a crashed app would; the next `pavi-cli` run or app start removes it (its lock is free; ADR 0017).
 - Long queries show a progress line on a terminal (the share of joins and subqueries prepared, then rows scanned); before that was added, they printed nothing until rows arrived.

@@ -11,7 +11,7 @@ When `ParquetSource::open` gets a `.csv`/`.tsv`, `.json`/`.jsonl`/`.ndjson` or `
 
 - The conversion streams: 8,192 rows at a time are read with `arrow-csv`, `arrow-json` or `arrow-ipc` and written with `ArrowWriter` (Snappy, row groups of at most 262,144 rows or 64 MB buffered). Memory stays bounded whatever the file size. The temporary file is capped at 32 GiB (`MAX_CONVERTED_BYTES`).
 - CSV and JSON have no schema, so column types are inferred from the first 10,000 records (`MAX_INFER_ROWS`). A later value that doesn't fit stops the open with an error that says so. CSV must have a header row; the delimiter is a tab for `.tsv`, otherwise the most frequent of `,` `;` tab `|` in the first line. JSON can be one object per line or a single array of objects.
-- The file lives in `<temp>/pavi-open-<pid>-<n>/` and is deleted when the source is dropped (its tab closed or reloaded). Folders a crash left behind are removed by a later conversion once they are a day old, as for sort spills (ADR 0005).
+- The file lives in `<temp>/pavi-open-<pid>-<n>/` and is deleted when the source is dropped (its tab closed or reloaded). Folders a crash left behind are removed when PAVI next starts (ADR 0017).
 - The open reports how far it has read and can be cancelled between batches.
 - The readers are untrusted-input parsers like the Parquet decoder: their panics become errors, and an Arrow file's block, message and decompressed buffer sizes are checked against the file before `arrow-ipc` allocates for them (both found by the `other_formats` fuzz target).
 - Folders (ADR 0006) still hold Parquet files only.

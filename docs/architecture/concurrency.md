@@ -20,6 +20,7 @@
 | Open, page, window, filtered read, sort, aggregate | `pavi-page-N` pool (N = CPU count) | `CancellationToken` and the runtime's shutdown flag, combined into a `stop` check (`scheduler.rs::execute`). Checked before and after every read. Filtered/sorted/aggregated scans call the runtime's `checkpoint(scanned_rows)` before each 4,096-row batch: it stores the scan position in the task's `ScanProgress` (an `Arc<AtomicU64>`, written by the worker and read by the UI with relaxed ordering; it is a display value and guards nothing) and returns the `stop` check. A stopped scan returns `parquet_reader::Cancelled`, reported as `PageOutcome::Cancelled` | Yes; a running scan stops within one batch (sub-millisecond on the sample files) |
 | Export | `pavi-export` (one per export) | token checked between batches | Yes, at batch granularity |
 | Profile | `pavi-profile` | token checked between polls; cancels its query's pool task | Yes, at batch granularity |
+| Left-over temp folders (ADR 0017) | `pavi-cleanup` (one, at app and CLI start) | none needed: it removes only folders whose `.pavi-lock` it can lock, so never one in use; the CLI joins it after its output | — |
 | Panics in a read or open | worker thread | `guarded` (`catch_unwind`) turns the panic into `ReadFailed` / `OpenFailed` | Yes; the worker survives and the pool keeps its size |
 | Stale results | — | `GenerationId` per grid / chart / profile / export | Yes; late responses are dropped |
 

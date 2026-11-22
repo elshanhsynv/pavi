@@ -15,7 +15,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Filter/SQL/sort result window | 8 batches (~32k rows); a jump keeps 2,048 rows above its target | `pavi::results::MAX_FILTERED_BATCHES`, `JUMP_CONTEXT_ROWS` |
 | Filter match count (ADR 0012, 0016) | One `u64` per row group of the file (the footer's list), no other buffer; row groups the statistics settle are not read | `ParquetSource::count_matches_by_row_group` |
 | Sort rows in memory (larger sorts spill, ADR 0005); also the size of one spilled run | 1,048,576 rows / 128 MB (the bytes counted three times: the rows, their sorted copy and the concatenation) | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
-| Sort spill files | 32 GiB per sort | `spill::MAX_SPILL_BYTES` |
+| Sort spill files | 32 GiB per sort; a killed process's folder is removed at the next app or CLI start (ADR 0017) | `spill::MAX_SPILL_BYTES` |
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
 | Sort keys / GROUP BY columns | 8 / 8 | `sort::MAX_SORT_KEYS`, `aggregate::MAX_GROUP_COLUMNS` |
 | GROUP BY, SELECT DISTINCT (and the values `COUNT(DISTINCT …)` keeps, which count against the bytes, as does each group's encoded key); HAVING and ORDER BY on an aggregate work on this one result | 10,000 groups / 8 MB | `GroupBudget::DEFAULT_MAX_GROUPS`, `DEFAULT_MAX_BYTES` |

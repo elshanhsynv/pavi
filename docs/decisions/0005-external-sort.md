@@ -14,7 +14,7 @@ A sort whose input does not fit the in-memory sort budget is done as an external
 2. When there are more than 16 runs, groups of 16 are merged into longer runs until at most 16 remain.
 3. The remaining runs are merged a page at a time, only as the grid or an export asks for rows. One merge step holds at most one 4,096-row batch per run.
 
-Memory stays bounded by the same sort budget. Disk use is bounded by a new named cap, `MAX_SPILL_BYTES` (32 GiB); a sort that needs more fails with a clear error naming the cap and the way out (filter or LIMIT). The spill directory is deleted when the sort is finished, replaced or cancelled. Directories a crash left behind are removed by the next sort that spills, once they are more than a day old.
+Memory stays bounded by the same sort budget. Disk use is bounded by a new named cap, `MAX_SPILL_BYTES` (32 GiB); a sort that needs more fails with a clear error naming the cap and the way out (filter or LIMIT). The spill directory is deleted when the sort is finished, replaced or cancelled. Directories a crash left behind are removed by the next sort that spills, once they are more than a day old (amended by [0017](0017-locked-temp-folders.md): folders are locked while in use, and left-over ones are removed when PAVI next starts).
 
 `ORDER BY … LIMIT n` with `n` within the budget keeps the in-memory top-N path: it never touches disk.
 
