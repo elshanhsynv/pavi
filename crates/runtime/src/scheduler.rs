@@ -12,8 +12,8 @@ use std::{
 };
 
 use parquet_reader::{
-    AggregateSpec, Cancelled, FilterExpr, GroupBudget, ParquetSource, Projection, SortBudget,
-    SortMerge, SortOutput, SortSpec,
+    AggregateSpec, Cancelled, FilterExpr, GroupBudget, ParquetSource, Projection, ScanCursor,
+    SortBudget, SortMerge, SortOutput, SortSpec,
 };
 
 use crate::{
@@ -107,6 +107,10 @@ enum ReadOperation {
     },
     SortMerge {
         merge: Arc<Mutex<SortMerge>>,
+        rows: usize,
+    },
+    Cursor {
+        cursor: Arc<Mutex<ScanCursor>>,
         rows: usize,
     },
     Aggregated {
@@ -386,6 +390,27 @@ impl RuntimeHandle {
             projection,
             generation_id,
             ReadOperation::SortMerge { merge, rows },
+            None,
+        )
+    }
+
+    /// Reads the next up to `rows` rows of a scan cursor (see
+    /// `ParquetSource::scan_cursor`), which keeps its reader open between
+    /// reads; the outcome is [`PageOutcome::Filtered`] with the row to resume
+    /// from, the row count at the end.
+    pub fn submit_cursor(
+        &self,
+        source: Arc<ParquetSource>,
+        cursor: Arc<Mutex<ScanCursor>>,
+        rows: usize,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::Cursor { cursor, rows },
             None,
         )
     }
@@ -675,6 +700,11 @@ fn read_source(
                 .next_rows(rows, &|| checkpoint(0))
                 .map(|(batches, finished)| PageOutcome::Merged { batches, finished })
         }
+        ReadOperation::Cursor { cursor, rows } => cursor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("scan cursor lock poisoned"))?
+            .next_window(source, rows, checkpoint)
+            .map(PageOutcome::Filtered),
         ReadOperation::Aggregated {
             filter,
             aggregate,

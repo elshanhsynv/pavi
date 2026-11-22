@@ -31,6 +31,7 @@ Opening a new file cancels all of the above (`app.rs:643-660`). If the user acts
 
 - `ParquetSource.cache: Mutex<PageCache>` — locked only around `get`/`insert`, never across decoding or UI rendering. Two workers can decode the same missing page concurrently (no in-flight dedupe); harmless.
 - `Runtime.submissions: Arc<Mutex<Option<SyncSender>>>` — locked briefly to clone the sender.
+- A query's `Arc<Mutex<ScanCursor>>` (and a spilled sort's `Arc<Mutex<SortMerge>>`) — held by the one worker running that query's read, across its decoding; a query has at most one read in flight, so no one else waits on it. A cancelled read leaves the cursor where it stopped.
 - Worker receiver `Arc<Mutex<Receiver>>` — the standard shared-receiver pattern; a worker holds the lock while blocked in `recv()`, which serializes dequeueing but not execution.
 - Atomics: task ID counter, shutdown flag, cancellation flags.
 - No `RwLock`, no locks touched by the UI thread except via `ParquetSource::cache_stats` (Inspector). No lock is held across rendering.

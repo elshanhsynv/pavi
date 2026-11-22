@@ -7,6 +7,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Changed
+- Exports, conversions and other whole-file reads are faster: a file is read with one open reader instead of reopening it every 4,096 rows. In the app this speeds up exporting, scrolling through filter and SQL results, and joins; in the CLI, `--format csv/jsonl/parquet/arrow`, `--count` with a filter, `--profile` and `--sql`.
+
 ## [0.7.0] - 2026-11-22
 
 ### Added

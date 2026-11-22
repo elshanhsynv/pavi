@@ -86,15 +86,15 @@ sequenceDiagram
    - a cell's right-click menu ("Filter to this value" / "Exclude this value"): `cell_menu` in `ui/grid.rs` stores a `CellAction`; `apply_cell_action` runs it after the table is drawn. `selected_cell_filter` builds the test directly from the selected cell (the column's name `==` or `!=` the cell's `value::scalar_text`, or `IS NULL` / `IS NOT NULL` for a null cell), so no text is re-parsed. "Add to filter" joins it with `AND` to the filter the result was made with (`FilteredGrid.filter`, kept across a sort). The filter box gets the text `FilterExpr`'s `Display` writes. A cell is refused, with the reason shown in the menu, for types that are not comparable, aggregate results, values over `MAX_FILTER_VALUE_BYTES` (1,024), and any value whose `==` filter does not match its own cell.
 
    `start_filter`: `LogicalPlan::scan().filter().project(all)` → `Planner::plan` validates column/type → cancel pages & previous filter → `grid.reset()` → `QueryEngine::execute`.
-2. `execute` (`execution.rs:91-120`) schedules the first read: `submit_filtered_from(filter, start_row 0, 4096 rows)`.
-3. Worker: `read_filtered_from` starts at `start_row`, reports its position in the file before each batch (`checkpoint`, see concurrency.md), skips row groups whose statistics can't match (`row_group_might_match`: an `AND` is skipped when any part cannot match, an `OR` only when no part can; `LIKE` and null tests never skip; an `==` test also asks the chunk's bloom filter, when there is one, ADR 0014), skips pages whose page-index min/max can't match (`page_prune::row_group_ranges`, read per row group for the filter's columns; the surviving rows become the reader's `RowSelection`, and `RowMap` maps each decoded row back to its row in the file), decodes `projection ∪ filter columns` (consecutive kept row groups of one file share one reader, up to `SCAN_RUN_ROWS` = 1,048,576 rows, so files with many small row groups aren't reopened per group; sorts and aggregates scan the same way), evaluates a `BooleanArray` mask (`FilterExpr::evaluate`: one mask per comparison, combined bitwise), and returns up to 4,096 matches as `PageOutcome::Filtered` with `next_row`.
+2. `execute` (`execution.rs:91-120`) makes a `ScanCursor` (`ParquetSource::scan_cursor(filter, start_row 0, projection)`) and schedules the first read: `submit_cursor(cursor, 4096 rows)`. A query without filter, sort or aggregate (a plain SQL `SELECT`, the export of an unfiltered file) runs the same way with no filter.
+3. Worker: `ScanCursor::next_window` (the scan `read_filtered_from` also does, but keeping its reader open between reads) starts at `start_row`, reports its position in the file before each batch (`checkpoint`, see concurrency.md), skips row groups whose statistics can't match (`row_group_might_match`: an `AND` is skipped when any part cannot match, an `OR` only when no part can; `LIKE` and null tests never skip; an `==` test also asks the chunk's bloom filter, when there is one, ADR 0014), skips pages whose page-index min/max can't match (`page_prune::row_group_ranges`, read per row group for the filter's columns; the surviving rows become the reader's `RowSelection`, and `RowMap` maps each decoded row back to its row in the file), decodes `projection ∪ filter columns` (consecutive kept row groups of one file share one reader, up to `SCAN_RUN_ROWS` = 1,048,576 rows, so files with many small row groups aren't reopened per group; sorts and aggregates scan the same way), evaluates a `BooleanArray` mask (`FilterExpr::evaluate`: one mask per comparison, combined bitwise), and returns up to 4,096 matches as `PageOutcome::Filtered` with `next_row`. The cursor keeps the run's reader and at most one decoded batch it has not handed out, so the next read continues where this one stopped instead of opening a reader again.
 4. UI `poll_filtered` (`app.rs:1219-1278`) calls `poll_next_batch()` while `needs_more()`; batches go into `FilteredGrid.push`, which keeps only the last 8 batches and advances `first_result`. `grid.rows` is set to the **window size**, not the total.
-5. When the last window row is rendered, `request_more_filtered` raises `target_result` by 4,096 (`ui/grid.rs:347-349`), causing the next `submit_filtered_from` at `next_filter_row`, the cursor returned by the previous read.
+5. When the last window row is rendered, `request_more_filtered` raises `target_result` by 4,096 (`ui/grid.rs:347-349`), causing the next `submit_cursor` on the same cursor, which resumes at `next_filter_row`.
 6. `Finished` when `next_row` reaches the file's row count.
 7. **Counting** (ADR 0012): `start_filter` (and a sort of a filtered result) also submits `submit_match_counts(filter)`. A worker runs `count_matches_by_row_group`: it reads only the filter's columns, skips the row groups the statistics or bloom filters rule out and the pages the page index rules out, reports its position and stops between batches when cancelled, and returns one count per row group (`PageOutcome::Counted`). `MatchCount` (`results.rs`) keeps the running totals; `poll_filtered` polls it, and the grid redraws every 250 ms (`COUNT_REPAINT`) while only the count runs. The totals give the result's size (the strip above the grid, the status bar) and, for any result row, the row group that holds it (`MatchCount::entry_for`).
 8. **Jumping** (`jump_to_result`, from "Go to row", the arrow keys, Home/End, the result scrollbar, or scrolling up past the first row held): a row held is scrolled to. Otherwise the target minus `JUMP_CONTEXT_ROWS` (2,048) becomes the first row to keep, and: a counted, unsorted filter starts a new execution at the first row of the row group holding it (`QueryEngine::execute_from_row`, which sets the scan's `next_filter_row`); ahead of the rows read so far the current execution reads on (`FilteredGrid::skip_forward`); anything else runs the plan again (`FilteredGrid::restart`). Either way `FilteredGrid.push` drops rows before `skip_until`, the grid gets a new generation (`GridState::next_generation`) so the old reads' batches are dropped, and `pending_jump` selects the row (in the column that was selected) once it has arrived. A SQL rerun records no second history entry (`completed_once`).
 
-**Memory:** ≤8 batches (≈32k rows) in the UI, plus the count's one number per row group. Each worker request decodes only from the cursor onward, so reading a whole filtered result (scrolling to the end, export) touches each row once; a jump reads at most one row group before its first kept row once the count is in.
+**Memory:** ≤8 batches (≈32k rows) in the UI, plus the count's one number per row group. Each worker request continues the cursor's open reader, so reading a whole result (scrolling to the end, export) decodes each page once; a jump reads at most one row group before its first kept row once the count is in.
 **Errors:** parse/validation errors → red text under the filter box (`filter_error`); execution errors → `FilteredGrid.error` shown in the grid + status.
 
 ```mermaid
@@ -105,8 +105,8 @@ sequenceDiagram
     participant W as Worker
     UI->>UI: apply_filter(): parse, plan, grid.reset()
     UI->>Q: QueryEngine.execute(plan, gen)
-    Q->>RT: submit_filtered_from(start_row=0, 4096)
-    RT->>W: read_filtered_from
+    Q->>RT: submit_cursor(scan_cursor(filter, start_row=0), 4096)
+    RT->>W: ScanCursor::next_window
     W->>W: from start_row: prune row groups by stats, decode, mask
     W-->>Q: PageOutcome::Filtered(batch ≤4096, next_row)
     loop each frame while needs_more
@@ -115,7 +115,7 @@ sequenceDiagram
         UI->>UI: FilteredGrid.push (keep last 8 batches)
     end
     UI->>UI: last row rendered → request_more()
-    Q->>RT: submit_filtered_from(start_row=next_row, 4096)
+    Q->>RT: submit_cursor(same cursor, 4096)
 ```
 
 ## 4.4 Sort (Sort menu, header right-click, SQL ORDER BY)
@@ -282,13 +282,13 @@ sequenceDiagram
     M->>PS: parse_filter → FilterExpr::parse + validate_filter
     M->>PS: parse_sort → validate_sort (≤8 keys, sortable types)
     alt --count
-        M->>PS: row_count, or read_filtered_from over the filter's columns, 4,096 rows a step
+        M->>PS: row_count, or a ScanCursor over the filter's columns, 4,096 rows a step
         M->>Shell: the number
     else --schema / --stats
         M->>PS: schema / metadata().columns() row-group statistics (footer only)
         M->>Shell: one batch → table (stats: first --head rows, ≤1000) or BatchWriter
     else --profile
-        M->>PS: FileProfiler over --columns (≤256); Rows::for_each (filtered or window reads, 4,096 rows a step) → push_batch
+        M->>PS: FileProfiler over --columns (≤256); Rows::for_each (one ScanCursor, 4,096 rows a step) → push_batch
         M->>Shell: one row per column → table or BatchWriter
     else --sql
         M->>PS: open each --table; Tables = dataset + table_name(FILE) + --table names
@@ -300,9 +300,9 @@ sequenceDiagram
             M->>PS: read_sorted(filter, proj, keys, SortBudget, top = offset + head)
             Note over M,PS: InMemory batches, or a SortMerge read 4,096 rows a step after spilling (ADR 0005)
         else --filter
-            M->>PS: read_filtered_from(next_row, 4,096)
+            M->>PS: scan_cursor(filter, 0) → next_window(4,096)
         else
-            M->>PS: read_window(row, 4,096) from row = offset
+            M->>PS: scan_cursor(None, offset) → next_window(4,096)
         end
         alt --format csv / jsonl / parquet / arrow
             M->>W: write(batch) → stdout, then finish (Parquet/Arrow footer)

@@ -454,16 +454,20 @@ impl Rows<'_> {
         match (self.sort, self.filter) {
             (Some(sort), filter) => self.sorted(sort, filter, limit, emit),
             (None, None) => {
-                // The offset is where the reads start.
-                let mut row = self.offset.min(total);
-                let end = row.saturating_add(limit).min(total);
+                // The offset is where the scan starts; one reader per run of
+                // row groups, not one per batch.
+                let start = self.offset.min(total);
+                let end = start.saturating_add(limit).min(total);
+                let mut cursor = self.parquet.scan_cursor(None, start, self.projection)?;
+                let mut row = start;
                 while row < end {
                     let count = (end - row).min(self.batch_rows);
-                    let batch = self
-                        .parquet
-                        .read_window(row, to_usize(count)?, self.projection)?;
-                    self.deliver(batch, emit)?;
-                    row += count;
+                    let read = cursor.next_window(self.parquet, to_usize(count)?, &|_| false)?;
+                    if read.batch.num_rows() == 0 {
+                        bail!("scan returned no rows at row {row}");
+                    }
+                    row += read.batch.num_rows() as u64;
+                    self.deliver(read.batch, emit)?;
                     self.progress.rows("Reading", row, total);
                 }
                 Ok(())
@@ -473,22 +477,18 @@ impl Rows<'_> {
                     skip: self.offset,
                     left: limit,
                 };
-                let mut next_row = 0;
-                while !window.is_done() && next_row < total {
-                    let read = self.parquet.read_filtered_from(
-                        filter,
-                        next_row,
+                let mut cursor =
+                    self.parquet
+                        .scan_cursor(Some(filter.clone()), 0, self.projection)?;
+                while !window.is_done() && !cursor.is_finished() {
+                    let read = cursor.next_window(
+                        self.parquet,
                         to_usize(self.batch_rows)?,
-                        self.projection,
                         &|scanned| {
                             self.progress.rows("Scanning", scanned, total);
                             false
                         },
                     )?;
-                    if read.next_row <= next_row {
-                        bail!("filtered read did not move past row {next_row}");
-                    }
-                    next_row = read.next_row;
                     if let Some((start, length)) = window.take_range(read.batch.num_rows()) {
                         if let Some(positions) = self.positions {
                             positions
@@ -587,22 +587,12 @@ fn count_rows(
     let projection =
         Projection::columns(filter.columns(&parquet.schema())?, parquet.column_count())?;
     let mut matches = 0_u64;
-    let mut next_row = 0;
-    while next_row < total {
-        let window = parquet.read_filtered_from(
-            filter,
-            next_row,
-            to_usize(batch_rows)?,
-            &projection,
-            &|scanned| {
-                progress.rows("Counting", scanned, total);
-                false
-            },
-        )?;
-        if window.next_row <= next_row {
-            bail!("filtered read did not move past row {next_row}");
-        }
-        next_row = window.next_row;
+    let mut cursor = parquet.scan_cursor(Some(filter.clone()), 0, &projection)?;
+    while !cursor.is_finished() {
+        let window = cursor.next_window(parquet, to_usize(batch_rows)?, &|scanned| {
+            progress.rows("Counting", scanned, total);
+            false
+        })?;
         matches += window.batch.num_rows() as u64;
     }
     Ok(matches)
