@@ -7,6 +7,13 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Added
+- CLI: short flags `-c` (`--columns`), `-f` (`--filter`), `-s` (`--sort`) and `-n` (`--head`).
+
+### Changed
+- CLI: `pavi-cli -h` groups its options (Input, Choosing rows, Output, Facts instead of rows, SQL), gives each a one-line description with an example, wraps to the terminal and shows a few examples; `pavi-cli --help` adds the details, more examples, the exit codes and how colours work.
+- CLI: help and the "Error:" label are coloured on a terminal. Colours are left out in pipes and files, and `NO_COLOR=1` turns them off.
+
 ## [0.5.0] - 2026-11-21
 
 ### Added
