@@ -13,7 +13,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | UI loaded pages | 8 pages | `pavi::pages::MAX_LOADED_PAGES` |
 | Page size | 4,096 rows | `parquet_reader::page::PAGE_ROWS` |
 | Filter/SQL/sort result window | 8 batches (~32k rows); a jump keeps 2,048 rows above its target | `pavi::results::MAX_FILTERED_BATCHES`, `JUMP_CONTEXT_ROWS` |
-| Filter match count (ADR 0012) | One `u64` per row group of the file (the footer's list), no other buffer | `ParquetSource::count_matches_by_row_group` |
+| Filter match count (ADR 0012, 0016) | One `u64` per row group of the file (the footer's list), no other buffer; row groups the statistics settle are not read | `ParquetSource::count_matches_by_row_group` |
 | Sort rows in memory (larger sorts spill, ADR 0005) | 100,000 rows / 128 MB | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
 | Sort spill files | 32 GiB per sort | `spill::MAX_SPILL_BYTES` |
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
@@ -31,7 +31,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | `LIKE` pattern | 256 characters | `filter::MAX_LIKE_PATTERN_CHARS` |
 | Grid row window | 500,000 rows | `state::GRID_WINDOW_ROWS` |
 | CLI table preview | 1,000 rows (`--head`), each cell ≤ 1,024 bytes, plus one row number per row under `--filter` | `cli::MAX_HEAD_ROWS`, `value::DEFAULT_CELL_LIMIT` |
-| CLI streamed output (`--format csv/jsonl/parquet/arrow`) and `--count` | one 4,096-row batch of the projected (for `--count`, the filter's) columns; Parquet also buffers its open row group, as in the app's export. No row limit | `cli::STREAM_BATCH_ROWS` |
+| CLI streamed output (`--format csv/jsonl/parquet/arrow`) | one 4,096-row batch of the projected columns; Parquet also buffers its open row group, as in the app's export. No row limit | `cli::STREAM_BATCH_ROWS` |
+| CLI `--count` with a filter (ADR 0016) | up to 16 threads, each with one reader and one 4,096-row batch of the filter's columns, reading chunks of about 1,048,576 rows; one `u64` per row group per chunk | `cli::MAX_COUNT_THREADS`, `COUNT_CHUNK_ROWS` |
 | CLI `--sql` | the query engine's own budgets, as in the app: sort, `GroupBudget`, the join build side (`MAX_JOIN_BUILD_ROWS` / `_BYTES`) and the prepared table (`MAX_PREPARED_BYTES`); one worker pool of `available_parallelism` threads with a 32-task queue. The table holds ≤1,000 result rows | `RuntimeConfig::default()`, ADR 0009, 0011 |
 | CLI `--sort` | the app's sort budget in memory (100,000 rows / 128 MB, or the best `offset + head` rows with `--head`), then spill files up to 32 GiB in the temporary folder, deleted when the run ends | `SortBudget::DEFAULT_MAX_*`, `spill::MAX_SPILL_BYTES` |
 | CLI standard input (`-`) | copied to a temporary file, at most 32 GiB (as a remote download); CSV, JSON and Arrow input is then converted as for any file | `cli::files::MAX_STDIN_BYTES`, `MAX_CONVERTED_BYTES` |
@@ -86,7 +87,7 @@ sub-frame operations aren't held to timer noise. A change that breaks a target n
 | App memory after loading a file | working set 5 s after start | 96 MB | — | 114 MB | < 200 MB |
 | CLI open + 1,000-row preview (includes process start) | wall time | 167 ms | 167 ms | 237 ms | < 400 ms |
 | Full scan: filter matching nothing on a text column | `pavi-cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
-| Lookup in a column sorted within row groups (page index, ADR 0014) | `pavi-cli --filter "user_id == 123" --count` | — | — | 2,126 ms (15,354 ms before) | < 3,200 ms |
+| Lookup in a column sorted within row groups (page index, ADR 0014) | `pavi-cli --filter "user_id == 123" --count` | — | — | 393 ms (2,126 ms before ADR 0016, 15,354 ms before ADR 0014) | < 3,200 ms |
 | Frame time while scrolling (UI thread: layout + tessellation, p95) | `cargo test --release -p pavi -- --ignored --nocapture frame_time` on a generated 1M-row, 12-column file, 20 rows a frame (the grid's work doesn't grow with the file): 5.5 ms | — | — | — | < 16 ms (60 fps) |
 | Cancel a running scan (cancel to return, all columns) | bench `cancel_scan_ms` | 1.3 ms | 0.1 ms | — | < 50 ms |
 
