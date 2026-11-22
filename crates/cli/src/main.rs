@@ -140,6 +140,12 @@ fn run(
     } else {
         Borders::Unicode
     };
+    // A table shown on a terminal fits its width; written to a pipe or a file
+    // it keeps every column at its full width.
+    let table_width = (args.output.is_none() && io::stdout().is_terminal())
+        .then(terminal_size::terminal_size)
+        .flatten()
+        .map(|(width, _)| usize::from(width.0));
     // Rows the table holds: --head, or every statistics row up to the cap.
     let table_rows = if format == Format::Table && !args.count && !args.schema {
         let default = args.stats.then_some(MAX_HEAD_ROWS);
@@ -192,12 +198,20 @@ fn run(
     }
     if args.schema {
         let batch = inspect::schema_batch(&parquet, &projection)?;
-        return write_facts(&batch, "Schema", None, format, borders, out);
+        return write_facts(&batch, "Schema", None, format, borders, table_width, out);
     }
     if args.stats {
         let batch = inspect::stats_batch(&parquet, &projection)?;
         let limit = table_rows.map_or(args.head, |rows| Some(rows as u64));
-        return write_facts(&batch, "Statistics", limit, format, borders, out);
+        return write_facts(
+            &batch,
+            "Statistics",
+            limit,
+            format,
+            borders,
+            table_width,
+            out,
+        );
     }
     if args.profile {
         let profiles = profile_columns(
@@ -209,7 +223,7 @@ fn run(
         )?;
         progress.clear();
         let batch = inspect::profile_batch(&profiles)?;
-        return write_facts(&batch, "Profile", None, format, borders, out);
+        return write_facts(&batch, "Profile", None, format, borders, table_width, out);
     }
 
     let output = RowOutput {
@@ -219,6 +233,7 @@ fn run(
         offset: args.offset,
         progress: &progress,
         borders,
+        table_width,
     };
 
     if let Some(sql) = &args.sql {
@@ -272,6 +287,8 @@ struct RowOutput<'a> {
     /// Blanked before the table is printed.
     progress: &'a Progress,
     borders: Borders,
+    /// The terminal's width, which the table fits, when it goes to one.
+    table_width: Option<usize>,
 }
 
 impl RowOutput<'_> {
@@ -326,7 +343,7 @@ impl RowOutput<'_> {
             Some(numbers) if numbers.len() == batch.num_rows() => RowNumbers::Listed(numbers),
             _ => RowNumbers::From(self.offset.saturating_add(1)),
         };
-        print_batch(&batch, title, numbers, self.borders, out)?;
+        print_batch(&batch, title, numbers, self.borders, self.table_width, out)?;
         Ok(())
     }
 }
@@ -377,6 +394,7 @@ fn write_facts(
     limit: Option<u64>,
     format: Format,
     borders: Borders,
+    table_width: Option<usize>,
     out: &mut (impl Write + Send),
 ) -> anyhow::Result<()> {
     let total = batch.num_rows();
@@ -386,7 +404,14 @@ fn write_facts(
     let batch = batch.slice(0, shown);
 
     if format == Format::Table {
-        print_batch(&batch, title, RowNumbers::From(1), borders, out)?;
+        print_batch(
+            &batch,
+            title,
+            RowNumbers::From(1),
+            borders,
+            table_width,
+            out,
+        )?;
         if shown < total {
             writeln!(
                 out,

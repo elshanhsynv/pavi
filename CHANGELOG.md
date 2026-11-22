@@ -7,6 +7,10 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Fixed
+- CLI: a table wider than the terminal no longer wraps into an unreadable mess. Its widest columns are narrowed (down to 10 characters) until it fits; if that isn't enough, middle columns are left out and shown as one `…` column, and the title says how many columns are shown. Tables written to a pipe or a file keep every column.
+- CLI: floating-point numbers in the table read as people write them: `0.009` instead of `0.009000000000000001`, and `1e-20` instead of twenty zeros. CSV, JSON and the other formats keep the full value.
+
 ## [0.7.1] - 2026-11-22
 
 ### Changed
