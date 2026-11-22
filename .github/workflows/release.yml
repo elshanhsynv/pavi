@@ -1,6 +1,6 @@
 name: Release
 
-# Pushing a tag vX.Y.Z builds PAVI for Windows and publishes a GitHub Release.
+# Pushing a tag vX.Y.Z builds PAVI for Windows and Linux and publishes a GitHub Release.
 # See docs/RELEASING.md.
 on:
   push:
@@ -101,3 +101,31 @@ jobs:
         run: |
           gh release create $env:GITHUB_REF_NAME $env:ASSET "$env:ASSET.sha256" `
             --title "PAVI $env:GITHUB_REF_NAME" --notes-file dist\notes.md --verify-tag
+
+  linux:
+    name: Build and attach (Linux x64)
+    # The Windows job creates the release; this one adds its assets to it.
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p pavi -p cli
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="pavi-$version-linux-x64"
+          mkdir -p "dist/$name"
+          cp target/release/pavi target/release/pavi-cli README.md CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Attach to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256"

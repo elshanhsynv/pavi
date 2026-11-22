@@ -2,7 +2,8 @@
 
 A release is a tag `vX.Y.Z` on `main`. Pushing the tag runs `.github/workflows/release.yml`,
 which re-runs every check, builds `pavi.exe` and `pavi-cli.exe` for Windows x64, and publishes a
-GitHub Release with a zip, its SHA-256 checksum, and the CHANGELOG section as notes.
+GitHub Release with a zip, its SHA-256 checksum, and the CHANGELOG section as notes. A second job
+then builds the Linux x64 binaries and attaches a `.tar.gz` and its checksum to that release.
 
 ## Steps
 
@@ -31,6 +32,13 @@ and `git tag -d vX.Y.Z`) and the draft release if one was created, then tag agai
 
 `pavi-X.Y.Z-windows-x64.zip` with `pavi.exe` (the app; no console window), `pavi-cli.exe`,
 `README.md` and `CHANGELOG.md`, plus `pavi-X.Y.Z-windows-x64.zip.sha256`.
+
+`pavi-X.Y.Z-linux-x64.tar.gz` with `pavi`, `pavi-cli`, `README.md` and `CHANGELOG.md`, plus
+`pavi-X.Y.Z-linux-x64.tar.gz.sha256`. It is built on `ubuntu-latest`, so it needs a glibc at
+least as new as that image's, and a desktop with X11 or Wayland. There is no macOS build yet.
+
+If the Linux job fails after the Windows job published, the release exists without the Linux
+files: re-run the failed job from the Actions page (it only uploads assets).
 Release builds use `[profile.release]` (thin LTO, one codegen unit).
 
 ## Code signing (off until configured)

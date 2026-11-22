@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- Releases include a Linux x64 build (`pavi-X.Y.Z-linux-x64.tar.gz`) besides the Windows zip.
 - CLI: short flags `-c` (`--columns`), `-f` (`--filter`), `-s` (`--sort`) and `-n` (`--head`).
 
 ### Changed
