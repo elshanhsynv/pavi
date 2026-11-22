@@ -134,10 +134,14 @@ pub fn write_atomically(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
 ) -> Result<()> {
+    // Partial files a killed run left for this target go first; ours is
+    // locked while it is written (ADR 0017).
+    parquet_reader::export::remove_left_over_partial_outputs(path);
     let temporary = temporary_path(path);
     let result = File::create(&temporary)
         .with_context(|| format!("create {}", temporary.display()))
         .and_then(|file| {
+            parquet_reader::export::lock_partial_output(&file);
             let mut out = BufWriter::new(file);
             write(&mut out)?;
             let file = out.into_inner().map_err(io::IntoInnerError::into_error)?;
