@@ -46,6 +46,12 @@ const STREAM_BATCH_ROWS: u64 = PAGE_ROWS;
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    // Temporary folders a stopped run left behind (a sort ended with Ctrl+C
+    // can leave many GB) are removed beside the work; folders in use are
+    // locked. The run waits for it only once its output is written.
+    let cleanup = std::thread::Builder::new()
+        .name("pavi-cleanup".into())
+        .spawn(parquet_reader::remove_leftover_temp_folders);
     let mut input = io::stdin().lock();
     let result = match &args.output {
         Some(path) => run_to_file(&args, path, &mut input, STREAM_BATCH_ROWS),
@@ -57,6 +63,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let code = report(result);
+    if let Ok(cleanup) = cleanup {
+        let _ = cleanup.join();
+    }
+    code
+}
+
+/// The exit code for `result`, with an error written to standard error.
+fn report(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         // The reader went away (`cli … | head`): stop quietly, as `cat` does.

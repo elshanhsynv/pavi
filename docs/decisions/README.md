@@ -42,3 +42,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0014](0014-page-index-and-bloom-filters.md) | Filtered scans read the page index and bloom filters of the columns they test, row group by row group |
 | [0015](0015-interruptible-remote-requests.md) | Remote requests wait on a helper thread, so cancelling a task ends the wait at once (amends 0008) |
 | [0016](0016-counts-from-statistics.md) | Counts take whole row groups from statistics that prove every row matches; the CLI counts on threads (amends 0011) |
+| [0017](0017-locked-temp-folders.md) | Temporary folders are locked while in use; left-over ones are removed when the app or CLI starts (amends 0005, 0007, 0011) |

@@ -128,19 +128,24 @@ fn concat(batches: &[RecordBatch]) -> Result<RecordBatch> {
 }
 
 /// A folder in the temp directory for one sort's runs or one converted file,
-/// removed when dropped.
+/// removed when dropped. It holds [`LOCK_FILE`], locked for as long as the
+/// folder is in use: the operating system releases the lock when the process
+/// ends, however it ends (Ctrl+C, a crash, a kill), so another PAVI can tell a
+/// left-over folder from one in use and remove it.
 #[derive(Debug)]
 pub(crate) struct TempFolder {
     pub(crate) path: PathBuf,
+    /// The locked [`LOCK_FILE`]; `None` where the file system can't lock.
+    lock: Option<File>,
 }
 
 impl TempFolder {
-    /// Creates `<temp>/<prefix><pid>-<n>/`, first removing folders with the same
-    /// prefix that a crashed PAVI left behind.
+    /// Creates `<temp>/<prefix><pid>-<n>/` and locks it, first removing
+    /// folders a stopped PAVI left behind ([`remove_leftover_temp_folders`]).
     pub(crate) fn create(prefix: &str) -> Result<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir();
-        remove_stale_dirs(&temp, prefix);
+        remove_leftovers(&temp, prefix, UNLOCKED_GRACE);
         let path = temp.join(format!(
             "{prefix}{}-{}",
             std::process::id(),
@@ -148,34 +153,104 @@ impl TempFolder {
         ));
         std::fs::create_dir_all(&path)
             .with_context(|| format!("create temporary folder {}", path.display()))?;
-        Ok(Self { path })
+        let lock_path = path.join(LOCK_FILE);
+        let lock = File::create(&lock_path)
+            .ok()
+            .filter(|file| file.try_lock().is_ok());
+        if lock.is_none() {
+            // No lock: the folder is told apart by its age, as before.
+            let _ = std::fs::remove_file(&lock_path);
+        }
+        Ok(Self { path, lock })
     }
 }
 
 impl Drop for TempFolder {
     fn drop(&mut self) {
+        // Unlock and close first: Windows can't delete an open file.
+        drop(self.lock.take());
         // Best effort: a file still open elsewhere is cleaned up by a later run.
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
-/// Removes `prefix` folders a crashed PAVI left behind (older than a day).
-fn remove_stale_dirs(temp: &Path, prefix: &str) {
+/// The file in every temporary folder that its PAVI keeps locked.
+const LOCK_FILE: &str = ".pavi-lock";
+/// Name start of every temporary folder PAVI makes (sorts, opened CSV/JSON/Arrow
+/// files, downloads, prepared query tables).
+const TEMP_FOLDER_PREFIX: &str = "pavi-";
+/// An unlocked folder younger than this may be one another PAVI is just
+/// creating (between making the folder and locking it), so it is kept.
+const UNLOCKED_GRACE: Duration = Duration::from_secs(60);
+
+/// Removes the temporary folders other PAVI processes left behind: folders
+/// whose lock is free (their process has ended) and that are more than a
+/// minute old. Folders in use are kept. Run when the app or the CLI starts,
+/// on a background thread, and before each new temporary folder is made.
+pub fn remove_leftover_temp_folders() {
+    remove_leftovers(&std::env::temp_dir(), "", UNLOCKED_GRACE);
+}
+
+/// [`remove_leftover_temp_folders`] in `temp`; folders with `legacy_prefix`
+/// and no lock file (made by an older PAVI, or where locks don't work) are
+/// removed once they are more than a day old, as before. Unlocked folders
+/// younger than `grace` are kept.
+fn remove_leftovers(temp: &Path, legacy_prefix: &str, grace: Duration) {
     let Ok(entries) = std::fs::read_dir(temp) else {
         return;
     };
     for entry in entries.flatten() {
-        let stale = entry.file_name().to_string_lossy().starts_with(prefix)
-            && entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                .is_some_and(|age| age > STALE_SPILL_AGE);
-        if stale {
-            let _ = std::fs::remove_dir_all(entry.path());
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(TEMP_FOLDER_PREFIX) {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+        let path = entry.path();
+        let lock_path = path.join(LOCK_FILE);
+        if lock_path.is_file() {
+            if age.is_none_or(|age| age < grace) {
+                continue;
+            }
+            let unlocked = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .is_ok_and(|file| file.try_lock().is_ok());
+            if unlocked {
+                remove_folder(&path, &lock_path);
+            }
+        } else if !legacy_prefix.is_empty()
+            && name.starts_with(legacy_prefix)
+            && age.is_some_and(|age| age > STALE_SPILL_AGE)
+        {
+            let _ = std::fs::remove_dir_all(&path);
         }
     }
+}
+
+/// Removes a left-over folder, its lock file last, so a removal cut short
+/// (the process ends) is finished by the next one.
+fn remove_folder(path: &Path, lock_path: &Path) {
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path == lock_path {
+                continue;
+            }
+            let _ = if entry_path.is_dir() {
+                std::fs::remove_dir_all(&entry_path)
+            } else {
+                std::fs::remove_file(&entry_path)
+            };
+        }
+    }
+    let _ = std::fs::remove_file(lock_path);
+    let _ = std::fs::remove_dir(path);
 }
 
 /// One sorted run on disk.
@@ -707,13 +782,77 @@ mod tests {
     }
 
     #[test]
+    fn removes_unlocked_leftover_folders_and_keeps_those_in_use() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let folder = |name: &str, locked: bool| {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(path.join("nested")).unwrap();
+            std::fs::write(path.join("run-0.parquet"), b"rows").unwrap();
+            std::fs::write(path.join("nested").join("part"), b"rows").unwrap();
+            let lock = File::create(path.join(LOCK_FILE)).unwrap();
+            if locked {
+                lock.try_lock().unwrap();
+            }
+            (path, lock)
+        };
+        // A sort still running holds its lock; one stopped by Ctrl+C doesn't.
+        let (in_use, _held) = folder(&format!("{SPILL_PREFIX}1-0"), true);
+        let (stopped, released) = folder(&format!("{SPILL_PREFIX}2-0"), false);
+        drop(released);
+        let (other_kind, released) = folder("pavi-open-3-0", false);
+        drop(released);
+        // Not PAVI's, even with a lock file.
+        let (foreign, released) = folder("someone-else-4-0", false);
+        drop(released);
+
+        // Within the grace time nothing unlocked is touched: it may be a
+        // folder another PAVI is just creating.
+        remove_leftovers(temp.path(), SPILL_PREFIX, UNLOCKED_GRACE);
+        assert!(in_use.exists() && stopped.exists() && other_kind.exists());
+
+        remove_leftovers(temp.path(), SPILL_PREFIX, Duration::ZERO);
+        assert!(
+            in_use.join("run-0.parquet").exists(),
+            "a locked folder is in use"
+        );
+        assert!(!stopped.exists(), "a stopped sort's folder is removed");
+        assert!(!other_kind.exists(), "every kind of PAVI folder is cleaned");
+        assert!(foreign.exists());
+
+        // A removal cut short keeps the lock file, so it is finished later.
+        let (half, released) = folder(&format!("{SPILL_PREFIX}5-0"), false);
+        drop(released);
+        std::fs::remove_file(half.join("run-0.parquet")).unwrap();
+        remove_leftovers(temp.path(), SPILL_PREFIX, Duration::ZERO);
+        assert!(!half.exists());
+    }
+
+    #[test]
+    fn temp_folders_are_locked_while_in_use_and_removed_when_dropped() {
+        let folder = TempFolder::create("pavi-test-").unwrap();
+        let lock_path = folder.path.join(LOCK_FILE);
+        assert!(lock_path.is_file());
+        // Another handle can't take the lock while the folder is in use.
+        let other = File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(other.try_lock().is_err());
+        drop(other);
+        let path = folder.path.clone();
+        drop(folder);
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn removes_only_old_leftover_spill_folders() {
         let temp = tempfile::TempDir::new().unwrap();
         let fresh = temp.path().join(format!("{SPILL_PREFIX}1-1"));
         let other = temp.path().join("not-pavi");
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::create_dir_all(&other).unwrap();
-        remove_stale_dirs(temp.path(), SPILL_PREFIX);
+        remove_leftovers(temp.path(), SPILL_PREFIX, UNLOCKED_GRACE);
         assert!(
             fresh.exists() && other.exists(),
             "a fresh folder may belong to a running sort"

@@ -44,5 +44,5 @@ pub use source::{
     Cancelled, FileInfo, FilteredWindow, ParquetSource, ScanCursor, SortOutput,
     aggregate_output_schema, check_aggregate, check_sort,
 };
-pub use spill::{MAX_SPILL_BYTES, SortMerge};
+pub use spill::{MAX_SPILL_BYTES, SortMerge, remove_leftover_temp_folders};
 pub use value::{MAX_FORMAT_DECIMALS, NumberFormat};

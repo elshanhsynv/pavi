@@ -31,6 +31,11 @@ fn main() -> eframe::Result {
             std::env::consts::ARCH
         );
     }
+    // Temporary folders a stopped PAVI left behind (a sort's spill files can
+    // be many GB) are removed in the background; folders in use are locked.
+    let _ = std::thread::Builder::new()
+        .name("pavi-cleanup".into())
+        .spawn(parquet_reader::remove_leftover_temp_folders);
     let options = eframe::NativeOptions {
         centered: true,
         viewport: egui::ViewportBuilder::default()
