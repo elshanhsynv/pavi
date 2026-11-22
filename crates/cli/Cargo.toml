@@ -23,6 +23,11 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 # `wrap_help` wraps --help to the terminal's width (adds `terminal_size`).
 clap = { workspace = true, features = ["wrap_help"] }
+# `--completions` and `--man`: shell completion scripts and a roff manual page,
+# generated from the same argument definitions as --help (clap's own crates;
+# clap_mangen adds `roff`).
+clap_complete = "4"
+clap_mangen = "0.3"
 parquet_reader = { path = "../parquet" }
 # `--sql` runs on the app's query engine and worker pool (ADR 0011).
 pavi_query = { path = "../query" }

@@ -56,6 +56,14 @@ pavi-cli flights.parquet --table airports.csv --format csv \
 
 `--format` is `table`, `csv`, `tsv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `pavi-cli -h` shows the options by group with a few examples; `pavi-cli --help` adds the details, more examples and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
 
+Tab completion and a manual page come from the program itself (the release archives include them):
+
+```bash
+pavi-cli --completions bash > ~/.local/share/bash-completion/completions/pavi-cli
+pavi-cli --completions powershell >> $PROFILE         # or zsh, fish, elvish
+pavi-cli --man > ~/.local/share/man/man1/pavi-cli.1   # then: man pavi-cli
+```
+
 ## Current limits
 
 The desktop entry point is in `crates/app/src/main.rs`; application state and background work live in `app.rs`. The `ui/` directory separates the top bar, right-side inspector, virtualized grid, SQL editor, charts, status bar, theme, and shared icon widgets. `ui/spacing.rs` defines the shared `Spacing` scale (0, 2, 4, 8, 12 px) used for gaps and padding. Rows are 24 px high; column type labels and frozen headers can be toggled without disabling virtualization. File properties and cache metrics come from the loaded source.

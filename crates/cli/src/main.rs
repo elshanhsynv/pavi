@@ -1,5 +1,6 @@
 mod args;
 mod files;
+mod generate;
 mod inspect;
 mod output;
 mod progress;
@@ -72,7 +73,7 @@ fn run_to_file(
     input: &mut dyn Read,
     batch_rows: u64,
 ) -> anyhow::Result<()> {
-    files::check_not_input(&args.file, path)?;
+    files::check_not_input(args.file.as_deref().unwrap_or_default(), path)?;
     files::write_atomically(path, |out| run(args, input, out, batch_rows))
 }
 
@@ -95,6 +96,18 @@ fn run(
     out: &mut (impl Write + Send),
     batch_rows: u64,
 ) -> anyhow::Result<()> {
+    // These print a script or a page about pavi-cli itself and read no file.
+    if let Some(shell) = args.completions {
+        return generate::completions(shell, out);
+    }
+    if args.man {
+        return generate::man(out);
+    }
+    let file = args
+        .file
+        .as_deref()
+        .context("give a FILE to read (see pavi-cli -h)")?;
+
     let format = output_format(args)?;
     let borders = if args.ascii {
         Borders::Ascii
@@ -116,7 +129,7 @@ fn run(
     let progress = Progress::new(args.no_progress || streams_to_terminal);
 
     // Declared before the source so it is deleted after the source closes it.
-    let stdin = (args.file == "-")
+    let stdin = (file == "-")
         .then(|| files::copy_stdin(input))
         .transpose()?;
     let opening = |share| {
@@ -130,7 +143,7 @@ fn run(
     };
     let parquet = match &stdin {
         Some(copy) => open(&copy.path).context("read standard input")?,
-        None => open(Path::new(&args.file))?,
+        None => open(Path::new(file))?,
     };
     progress.clear();
     let projection = parse_columns(args.columns.as_deref(), &parquet)?;
@@ -186,7 +199,7 @@ fn run(
         let dataset_path = if stdin.is_some() {
             Path::new("stdin")
         } else {
-            Path::new(&args.file)
+            Path::new(file)
         };
         let tables = query::tables(Arc::new(parquet), dataset_path, &args.tables)?;
         let query = query::plan(sql, &tables)?;

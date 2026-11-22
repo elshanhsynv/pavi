@@ -31,10 +31,14 @@ and `git tag -d vX.Y.Z`) and the draft release if one was created, then tag agai
 ## What users get
 
 `pavi-X.Y.Z-windows-x64.zip` with `pavi.exe` (the app; no console window), `pavi-cli.exe`,
-`README.md` and `CHANGELOG.md`, plus `pavi-X.Y.Z-windows-x64.zip.sha256`.
+`completions/pavi-cli.ps1` (PowerShell), `README.md` and `CHANGELOG.md`, plus
+`pavi-X.Y.Z-windows-x64.zip.sha256`.
 
-`pavi-X.Y.Z-linux-x64.tar.gz` with `pavi`, `pavi-cli`, `README.md` and `CHANGELOG.md`, plus
-`pavi-X.Y.Z-linux-x64.tar.gz.sha256`. It is built on `ubuntu-latest`, so it needs a glibc at
+`pavi-X.Y.Z-linux-x64.tar.gz` with `pavi`, `pavi-cli`, `man/man1/pavi-cli.1`,
+`completions/` (`pavi-cli.bash`, `_pavi-cli` for zsh, `pavi-cli.fish`), `README.md` and
+`CHANGELOG.md`, plus `pavi-X.Y.Z-linux-x64.tar.gz.sha256`. The man page and completion scripts
+are written at packaging time by the release binary itself (`pavi-cli --man`,
+`pavi-cli --completions <shell>`), so they always match its options. It is built on `ubuntu-latest`, so it needs a glibc at
 least as new as that image's, and a desktop with X11 or Wayland. There is no macOS build yet.
 
 If the Linux job fails after the Windows job published, the release exists without the Linux
