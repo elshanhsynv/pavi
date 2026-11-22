@@ -64,7 +64,7 @@ impl SortSpec {
 }
 
 impl SortBudget {
-    pub const DEFAULT_MAX_ROWS: usize = 100_000;
+    pub const DEFAULT_MAX_ROWS: usize = 1 << 20;
     pub const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024;
 
     pub fn new(max_rows: usize, max_bytes: usize) -> Result<Self> {

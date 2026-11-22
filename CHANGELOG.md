@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Changed
+- Sorting large files is about 4× faster. A sort keeps up to about a million rows in memory (still within 128 MB) before it writes to disk, so a sort of a few million rows needs no extra merge pass, and the final merge sorts each row once. A sort by a column of a 5-million-row file now shows its first rows in about 1 second instead of 4. A large `LIMIT` whose rows don't fit in memory now spills to disk instead of failing.
 - Counting the rows that match a filter is faster. Row groups whose footer statistics show that every row matches are counted without being read (on a sorted or clustered column, most of the file). In the CLI, `--count` with a filter also reads the rest on all CPU cores. The app's match count uses the statistics too.
 - Exports, conversions and other whole-file reads are faster: a file is read with one open reader instead of reopening it every 4,096 rows. In the app this speeds up exporting, scrolling through filter and SQL results, and joins; in the CLI, `--format csv/jsonl/parquet/arrow`, `--count` with a filter, `--profile` and `--sql`.
 
