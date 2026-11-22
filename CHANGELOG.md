@@ -7,6 +7,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Security
+- Updated the `url` dependency to 2.5.9 for RUSTSEC-2026-0592 (a stack overflow on deeply nested `blob:` URLs).
+
 ## [0.7.0] - 2026-11-22
 
 ### Added
