@@ -18,6 +18,7 @@ use arrow_array::{
 use arrow_schema::{DataType, TimeUnit};
 
 use crate::types::{is_comparable, is_decimal, is_string};
+use crate::value::ScalarTexts;
 use crate::{ColumnInfo, ParquetSource};
 
 /// Distinct values counted exactly for one column's profile; past it the
@@ -205,20 +206,33 @@ impl StatsAccumulator {
         if array.data_type() != &self.data_type {
             bail!("profile batch type changed");
         }
+        // The column's text is prepared once per batch; profiling accepts the
+        // comparable types (`types::is_comparable`), checked at the first value.
+        let texts = is_comparable(array.data_type())
+            .then(|| ScalarTexts::new(array.as_ref()))
+            .transpose()?;
+        let mut value = String::new();
         for row in 0..batch.num_rows() {
             self.row_count = self.row_count.saturating_add(1);
             if array.is_null(row) {
                 self.null_count = self.null_count.saturating_add(1);
                 continue;
             }
-            let value = profile_text(array.as_ref(), row)?;
-            self.record_distinct(&value)?;
+            let Some(texts) = &texts else {
+                bail!("profiling does not support {:?}", array.data_type());
+            };
+            value.clear();
+            if !texts.write(row, &mut value)? {
+                bail!("profile value is unexpectedly null");
+            }
+            let value = value.as_str();
+            self.record_distinct(value)?;
             if let Some(number) = numeric(array.as_ref(), row)? {
-                self.record_numeric(number, &value)?;
+                self.record_numeric(number, value)?;
             } else if let Some(key) = temporal_key(array.as_ref(), row)? {
-                self.record_temporal(key, &value);
+                self.record_temporal(key, value);
             } else {
-                self.record_text(&value, is_string(&self.data_type));
+                self.record_text(value, is_string(&self.data_type));
             }
         }
         Ok(())
@@ -434,15 +448,6 @@ impl FileProfiler {
     }
 }
 
-/// Profile text for one non-null value, from the shared scalar formatter.
-/// Profiling accepts the comparable types (`types::is_comparable`).
-fn profile_text(array: &dyn Array, row: usize) -> Result<String> {
-    if !is_comparable(array.data_type()) {
-        bail!("profiling does not support {:?}", array.data_type());
-    }
-    crate::value::scalar_text(array, row)?.context("profile value is unexpectedly null")
-}
-
 /// The stored value of a date, timestamp or time of day, for ordering; `None` for
 /// other types.
 fn temporal_key(array: &dyn Array, row: usize) -> Result<Option<i64>> {
@@ -640,7 +645,18 @@ mod tests {
         assert!(accumulator.record_distinct("one-too-many").is_err());
         // Binary values are profiled as their hex, as the grid shows them.
         let binary = BinaryArray::from(vec![Some(b"x".as_slice())]);
-        assert_eq!(profile_text(&binary, 0).unwrap(), "78");
+        let mut accumulator =
+            StatsAccumulator::new(0, "bytes".to_string(), DataType::Binary, None).unwrap();
+        accumulator
+            .push_batch(
+                &RecordBatch::try_from_iter(vec![(
+                    "bytes",
+                    Arc::new(binary) as arrow_array::ArrayRef,
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(accumulator.finish().min.as_deref(), Some("78"));
     }
 
     #[test]

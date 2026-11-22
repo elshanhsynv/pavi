@@ -11,7 +11,7 @@ use arrow_array::{Array, RecordBatch, cast::AsArray};
 use arrow_schema::{DataType, SchemaRef};
 use parquet::arrow::ArrowWriter;
 
-use crate::value::{is_scalar_type, scalar_text};
+use crate::value::{ScalarTexts, is_scalar_type, scalar_text};
 
 /// Deepest nesting of lists, structs and maps written to JSON.
 const MAX_JSON_DEPTH: usize = 64;
@@ -114,26 +114,82 @@ impl<W: Write + Send> BatchWriter<W> {
 pub struct JsonWriter<W> {
     output: W,
     schema: SchemaRef,
+    /// Each column's `"name":` (with the comma before it after the first),
+    /// escaped once.
+    keys: Vec<Vec<u8>>,
 }
 
 impl<W: Write> JsonWriter<W> {
     pub fn new(output: W, schema: SchemaRef) -> Self {
-        Self { output, schema }
+        let keys = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(column, field)| {
+                let mut key = Vec::new();
+                if column > 0 {
+                    key.push(b',');
+                }
+                // Writing a string to a Vec can't fail.
+                let _ = serde_json::to_writer(&mut key, field.name());
+                key.push(b':');
+                key
+            })
+            .collect();
+        Self {
+            output,
+            schema,
+            keys,
+        }
     }
 
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if batch.schema() != self.schema {
             bail!("export batch schema changed");
         }
+        // Scalar columns are prepared once per batch; nested ones are walked
+        // value by value.
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|array| {
+                let array = array.as_ref();
+                Ok(if is_scalar_type(array.data_type()) {
+                    JsonColumn::Scalar {
+                        texts: ScalarTexts::new(array)?,
+                        kind: json_kind(array.data_type()),
+                        binary: is_binary(array.data_type()),
+                    }
+                } else {
+                    JsonColumn::Nested(array)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut text = String::new();
         for row in 0..batch.num_rows() {
             self.output.write_all(b"{")?;
-            for (column, field) in self.schema.fields().iter().enumerate() {
-                if column > 0 {
-                    self.output.write_all(b",")?;
+            for (column, key) in columns.iter().zip(&self.keys) {
+                self.output.write_all(key)?;
+                match column {
+                    JsonColumn::Scalar {
+                        texts,
+                        kind,
+                        binary,
+                    } => {
+                        text.clear();
+                        if *binary {
+                            text.push_str("0x");
+                        }
+                        if texts.write(row, &mut text)? {
+                            write_json_scalar(&mut self.output, kind, &text)?;
+                        } else {
+                            self.output.write_all(b"null")?;
+                        }
+                    }
+                    JsonColumn::Nested(array) => {
+                        write_json_value(&mut self.output, *array, row, 0)?;
+                    }
                 }
-                serde_json::to_writer(&mut self.output, field.name())?;
-                self.output.write_all(b":")?;
-                write_json_value(&mut self.output, batch.column(column).as_ref(), row, 0)?;
             }
             self.output.write_all(b"}\n")?;
         }
@@ -144,6 +200,28 @@ impl<W: Write> JsonWriter<W> {
         self.output.flush()?;
         Ok(())
     }
+}
+
+/// A batch column as [`JsonWriter`] writes it.
+enum JsonColumn<'a> {
+    Scalar {
+        texts: ScalarTexts<'a>,
+        kind: JsonKind,
+        /// Binary text gets a `0x` before its hex digits.
+        binary: bool,
+    },
+    Nested(&'a dyn Array),
+}
+
+/// A scalar's text as JSON: numbers that are JSON numbers and booleans bare,
+/// everything else (NaN and infinity too) as a string.
+fn write_json_scalar(output: &mut impl Write, kind: &JsonKind, text: &str) -> Result<()> {
+    match kind {
+        JsonKind::Number if is_json_number(text) => output.write_all(text.as_bytes())?,
+        JsonKind::Boolean => output.write_all(text.as_bytes())?,
+        JsonKind::Number | JsonKind::Text => serde_json::to_writer(&mut *output, text)?,
+    }
+    Ok(())
 }
 
 /// One value as JSON, as JSON Lines export writes it: numbers and booleans
@@ -214,20 +292,12 @@ fn write_json_value(
                 output.write_all(b"null")?;
                 return Ok(());
             };
-            match json_kind(data_type) {
-                JsonKind::Number if is_json_number(&text) => output.write_all(text.as_bytes())?,
-                JsonKind::Boolean => output.write_all(text.as_bytes())?,
-                // NaN and infinity are not JSON numbers; they are written as text.
-                JsonKind::Number | JsonKind::Text => {
-                    let text = if is_binary(data_type) {
-                        format!("0x{text}")
-                    } else {
-                        text
-                    };
-                    serde_json::to_writer(&mut *output, &text)?;
-                }
-            }
-            Ok(())
+            let text = if is_binary(data_type) {
+                format!("0x{text}")
+            } else {
+                text
+            };
+            write_json_scalar(output, &json_kind(data_type), &text)
         }
     }
 }
@@ -349,17 +419,35 @@ impl<W: Write> CsvWriter<W> {
         if batch.schema() != self.schema {
             bail!("export batch schema changed");
         }
+        // Each column is prepared once per batch; one buffer takes every value.
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|array| {
+                Ok((
+                    ScalarTexts::new(array.as_ref())?,
+                    is_binary(array.data_type()),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut text = String::new();
         for row in 0..batch.num_rows() {
-            for column in 0..batch.num_columns() {
+            for (column, (texts, binary)) in columns.iter().enumerate() {
                 if column > 0 {
                     self.output.write_all(&[self.delimiter])?;
                 }
-                write_csv_value(
-                    &mut self.output,
-                    batch.column(column).as_ref(),
-                    row,
-                    self.delimiter,
-                )?;
+                text.clear();
+                // Nulls are empty fields.
+                if !texts.write(row, &mut text)? {
+                    continue;
+                }
+                if *binary {
+                    // `0x` and hex digits never need quotes.
+                    self.output.write_all(b"0x")?;
+                    self.output.write_all(text.as_bytes())?;
+                } else {
+                    write_csv_text(&mut self.output, &text, self.delimiter)?;
+                }
             }
             self.output.write_all(b"\n")?;
         }
@@ -378,25 +466,6 @@ fn ensure_csv_type(data_type: &DataType) -> Result<()> {
     } else {
         bail!("CSV export does not support nested {data_type:?} values")
     }
-}
-
-/// Writes one CSV field using the shared scalar text; nulls are empty fields and
-/// binary values keep the `0x`-prefixed hex form.
-fn write_csv_value(
-    output: &mut impl Write,
-    array: &dyn Array,
-    row: usize,
-    delimiter: u8,
-) -> Result<()> {
-    let Some(text) = scalar_text(array, row)? else {
-        return Ok(());
-    };
-    if is_binary(array.data_type()) {
-        output.write_all(b"0x")?;
-        output.write_all(text.as_bytes())?;
-        return Ok(());
-    }
-    write_csv_text(output, &text, delimiter)
 }
 
 fn is_binary(data_type: &DataType) -> bool {
@@ -442,6 +511,79 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn csv_and_json_lines_match_cell_by_cell_text_for_every_scalar_type() {
+        let arrays = crate::value::tests::scalar_arrays();
+        let schema = Arc::new(Schema::new(
+            arrays
+                .iter()
+                .enumerate()
+                .map(|(index, array)| {
+                    Field::new(format!("c{index} \"q\""), array.data_type().clone(), true)
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+
+        // CSV, as it was written one `scalar_text` at a time.
+        let mut expected = String::new();
+        let header = schema
+            .fields()
+            .iter()
+            .map(|field| format!("\"{}\"", field.name().replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        expected.push_str(&header.join(","));
+        expected.push('\n');
+        // Two batches: the second is the first again.
+        for _ in 0..2 {
+            for row in 0..batch.num_rows() {
+                let fields = batch
+                    .columns()
+                    .iter()
+                    .map(|array| match scalar_text(array.as_ref(), row).unwrap() {
+                        None => String::new(),
+                        Some(text) if is_binary(array.data_type()) => format!("0x{text}"),
+                        Some(text) if text.contains([',', '"', '\n', '\r']) => {
+                            format!("\"{}\"", text.replace('"', "\"\""))
+                        }
+                        Some(text) => text,
+                    })
+                    .collect::<Vec<_>>();
+                expected.push_str(&fields.join(","));
+                expected.push('\n');
+            }
+        }
+        let mut csv = Vec::new();
+        let mut writer = CsvWriter::new(&mut csv, schema.clone()).unwrap();
+        writer.write(&batch).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(String::from_utf8(csv).unwrap(), expected);
+
+        // JSON Lines, against the per-value writer nested values still use.
+        let mut expected = Vec::new();
+        for row in 0..batch.num_rows() {
+            expected.push(b'{');
+            for (column, field) in schema.fields().iter().enumerate() {
+                if column > 0 {
+                    expected.push(b',');
+                }
+                serde_json::to_writer(&mut expected, field.name()).unwrap();
+                expected.push(b':');
+                write_json_value(&mut expected, batch.column(column).as_ref(), row, 0).unwrap();
+            }
+            expected.extend_from_slice(b"}\n");
+        }
+        let mut json = Vec::new();
+        let mut writer = JsonWriter::new(&mut json, schema);
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(
+            String::from_utf8(json).unwrap(),
+            String::from_utf8(expected).unwrap()
+        );
+    }
 
     #[test]
     fn writes_json_lines_with_the_grid_text_and_nested_values() {
