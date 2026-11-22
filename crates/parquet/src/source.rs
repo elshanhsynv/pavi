@@ -2188,7 +2188,34 @@ pub(crate) enum Scalar {
     Bytes(Vec<u8>),
 }
 
+/// Variant tags of [`Scalar::encode`].
+const KEY_NULL: u8 = 0;
+const KEY_UTF8: u8 = 5;
+const KEY_BYTES: u8 = 12;
+
 impl Scalar {
+    /// Appends bytes that tell values apart exactly as `==` does: a tag for
+    /// the variant, then a fixed-width payload, or a length and the bytes.
+    /// Group keys are looked up by this encoding, so no `Scalar` (and no copy
+    /// of a text value) is built for a row whose group exists.
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.push(KEY_NULL),
+            Self::Bool(value) => out.extend([1, u8::from(*value)]),
+            Self::I64(value) => encode_fixed(2, &value.to_le_bytes(), out),
+            Self::U64(value) => encode_fixed(3, &value.to_le_bytes(), out),
+            Self::F64(value) => encode_fixed(4, &value.to_le_bytes(), out),
+            Self::Utf8(value) => encode_bytes(KEY_UTF8, value.as_bytes(), out),
+            Self::Date32(value) => encode_fixed(6, &value.to_le_bytes(), out),
+            Self::Date64(value) => encode_fixed(7, &value.to_le_bytes(), out),
+            Self::Timestamp(value) => encode_fixed(8, &value.to_le_bytes(), out),
+            Self::Time(value) => encode_fixed(9, &value.to_le_bytes(), out),
+            Self::Decimal(value) => encode_fixed(10, &value.to_le_bytes(), out),
+            Self::Duration(value) => encode_fixed(11, &value.to_le_bytes(), out),
+            Self::Bytes(value) => encode_bytes(KEY_BYTES, value, out),
+        }
+    }
+
     fn bytes(&self) -> usize {
         match self {
             Self::Utf8(value) => 16 + value.len(),
@@ -2431,9 +2458,13 @@ struct GroupCollector {
     /// Name and type of each GROUP BY column.
     group_by: Vec<(String, DataType)>,
     groups: Vec<GroupState>,
-    indexes: HashMap<Vec<Scalar>, usize>,
+    /// Group index by the encoded key (`Scalar::encode` of each key value).
+    indexes: HashMap<Vec<u8>, usize>,
     bytes: usize,
     budget: GroupBudget,
+    /// Whether a group's size can change as rows arrive: `COUNT(DISTINCT …)`,
+    /// or `MIN`/`MAX` of text or binary. Otherwise it is counted once.
+    sizes_vary: bool,
 }
 
 impl GroupCollector {
@@ -2485,6 +2516,25 @@ impl GroupCollector {
                     .ok_or_else(|| anyhow!("group column {column} out of range"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let sizes_vary = expressions
+            .iter()
+            .zip(&input_types)
+            .any(|(expression, input)| match expression.function() {
+                AggregateFunction::CountDistinct => true,
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    input.as_ref().is_some_and(|data_type| {
+                        crate::types::is_string(data_type)
+                            || matches!(
+                                data_type,
+                                DataType::Binary
+                                    | DataType::LargeBinary
+                                    | DataType::BinaryView
+                                    | DataType::FixedSizeBinary(_)
+                            )
+                    })
+                }
+                _ => false,
+            });
         let mut collector = Self {
             expressions,
             input_types,
@@ -2495,9 +2545,10 @@ impl GroupCollector {
             indexes: HashMap::new(),
             bytes: 0,
             budget,
+            sizes_vary,
         };
         if collector.group_by.is_empty() {
-            collector.ensure_group(Vec::new())?;
+            collector.add_group(Vec::new(), Vec::new())?;
         }
         Ok(collector)
     }
@@ -2511,17 +2562,38 @@ impl GroupCollector {
         if group_positions.len() != self.group_by.len() {
             bail!("aggregate group projection was inconsistent");
         }
+        let key_columns = self
+            .group_by
+            .iter()
+            .zip(group_positions)
+            .map(|((_, data_type), position)| (batch.column(*position).as_ref(), data_type.clone()))
+            .collect::<Vec<_>>();
+        let mut encoded = Vec::new();
         for row in 0..batch.num_rows() {
-            let key = self
-                .group_by
-                .iter()
-                .zip(group_positions)
-                .map(|((_, data_type), position)| {
-                    scalar_at(batch.column(*position).as_ref(), row, data_type)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let index = self.ensure_group(key)?;
-            let before = self.groups[index].bytes();
+            // Without GROUP BY every row is in the one group.
+            let index = if key_columns.is_empty() {
+                0
+            } else {
+                encoded.clear();
+                for (array, data_type) in &key_columns {
+                    encode_key_at(*array, row, data_type, &mut encoded)?;
+                }
+                match self.indexes.get(encoded.as_slice()) {
+                    Some(index) => *index,
+                    None => {
+                        let key = key_columns
+                            .iter()
+                            .map(|(array, data_type)| scalar_at(*array, row, data_type))
+                            .collect::<Result<Vec<_>>>()?;
+                        self.add_group(encoded.clone(), key)?
+                    }
+                }
+            };
+            let before = if self.sizes_vary {
+                self.groups[index].bytes()
+            } else {
+                0
+            };
             for (expression_index, ((expression, input_type), position)) in self
                 .expressions
                 .iter()
@@ -2551,13 +2623,15 @@ impl GroupCollector {
                     .ok_or_else(|| anyhow!("aggregate accumulator was lost"))?;
                 accumulator.update(*expression, value)?;
             }
-            let after = self.groups[index].bytes();
-            self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
-            if self.bytes > self.budget.max_bytes() {
-                bail!(
-                    "grouped aggregate exceeds the in-memory group budget of {} bytes",
-                    self.budget.max_bytes()
-                );
+            if self.sizes_vary {
+                let after = self.groups[index].bytes();
+                self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+                if self.bytes > self.budget.max_bytes() {
+                    bail!(
+                        "grouped aggregate exceeds the in-memory group budget of {} bytes",
+                        self.budget.max_bytes()
+                    );
+                }
             }
         }
         Ok(())
@@ -2573,18 +2647,21 @@ impl GroupCollector {
         Ok(())
     }
 
-    fn ensure_group(&mut self, key: Vec<Scalar>) -> Result<usize> {
-        if let Some(index) = self.indexes.get(&key) {
-            return Ok(*index);
-        }
+    /// Adds the group whose key is `key` (encoded as `encoded`); the caller
+    /// has looked it up and not found it.
+    fn add_group(&mut self, encoded: Vec<u8>, key: Vec<Scalar>) -> Result<usize> {
         if self.groups.len() >= self.budget.max_groups() {
             bail!(
                 "grouped aggregate exceeds the in-memory group budget of {} groups",
                 self.budget.max_groups()
             );
         }
-        let state = GroupState::new(key.clone(), &self.expressions, &self.input_types)?;
-        let next_bytes = self.bytes.saturating_add(state.bytes());
+        let state = GroupState::new(key, &self.expressions, &self.input_types)?;
+        // The encoded key is kept too, as the index's key.
+        let next_bytes = self
+            .bytes
+            .saturating_add(state.bytes())
+            .saturating_add(encoded.len());
         if next_bytes > self.budget.max_bytes() {
             bail!(
                 "grouped aggregate exceeds the in-memory group budget of {} bytes",
@@ -2593,7 +2670,7 @@ impl GroupCollector {
         }
         let index = self.groups.len();
         self.bytes = next_bytes;
-        self.indexes.insert(key, index);
+        self.indexes.insert(encoded, index);
         self.groups.push(state);
         Ok(index)
     }
@@ -2686,6 +2763,73 @@ fn aggregate_name(expression: AggregateExpr, input: &Option<String>) -> String {
         (_, Some(_), Some(column)) => format!("{function}({column})"),
         _ => function.to_string(),
     }
+}
+
+fn encode_fixed(tag: u8, payload: &[u8], out: &mut Vec<u8>) {
+    out.push(tag);
+    out.extend_from_slice(payload);
+}
+
+fn encode_bytes(tag: u8, value: &[u8], out: &mut Vec<u8>) {
+    out.push(tag);
+    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    out.extend_from_slice(value);
+}
+
+/// Appends `scalar_at(array, row, data_type)?.encode(..)`, reading text and
+/// binary values in place instead of copying them into a `Scalar`.
+fn encode_key_at(
+    array: &dyn Array,
+    row: usize,
+    data_type: &DataType,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if array.is_null(row) {
+        out.push(KEY_NULL);
+        return Ok(());
+    }
+    fn value<'a, T: 'static>(
+        array: &'a dyn Array,
+        read: impl Fn(&'a T) -> &'a [u8],
+    ) -> Result<&'a [u8]> {
+        array
+            .as_any()
+            .downcast_ref::<T>()
+            .map(read)
+            .context("read group key value")
+    }
+    let borrowed = match data_type {
+        DataType::Utf8 => Some((
+            KEY_UTF8,
+            value(array, |a: &StringArray| a.value(row).as_bytes())?,
+        )),
+        DataType::LargeUtf8 => Some((
+            KEY_UTF8,
+            value(array, |a: &LargeStringArray| a.value(row).as_bytes())?,
+        )),
+        DataType::Utf8View => Some((
+            KEY_UTF8,
+            value(array, |a: &StringViewArray| a.value(row).as_bytes())?,
+        )),
+        DataType::Binary => Some((KEY_BYTES, value(array, |a: &BinaryArray| a.value(row))?)),
+        DataType::LargeBinary => Some((
+            KEY_BYTES,
+            value(array, |a: &LargeBinaryArray| a.value(row))?,
+        )),
+        DataType::BinaryView => {
+            Some((KEY_BYTES, value(array, |a: &BinaryViewArray| a.value(row))?))
+        }
+        DataType::FixedSizeBinary(_) => Some((
+            KEY_BYTES,
+            value(array, |a: &FixedSizeBinaryArray| a.value(row))?,
+        )),
+        _ => None,
+    };
+    match borrowed {
+        Some((tag, bytes)) => encode_bytes(tag, bytes, out),
+        None => scalar_at(array, row, data_type)?.encode(out),
+    }
+    Ok(())
 }
 
 pub(crate) fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> Result<Scalar> {
@@ -5487,6 +5631,134 @@ mod tests {
         assert_eq!(
             crate::value::format_cell(result.column(1).as_ref(), 0),
             "10"
+        );
+    }
+
+    #[test]
+    fn group_keys_are_encoded_as_their_scalars_and_never_collide() {
+        // Every key type: the in-place encoding is the encoding of `scalar_at`.
+        for array in crate::value::tests::scalar_arrays() {
+            let data_type = crate::types::read_type(array.data_type());
+            let array = arrow_cast::cast(array.as_ref(), &data_type).unwrap();
+            for row in 0..array.len() {
+                let Ok(scalar) = scalar_at(array.as_ref(), row, &data_type) else {
+                    continue;
+                };
+                let mut expected = Vec::new();
+                scalar.encode(&mut expected);
+                let mut encoded = Vec::new();
+                encode_key_at(array.as_ref(), row, &data_type, &mut encoded).unwrap();
+                assert_eq!(encoded, expected, "{data_type:?} row {row}");
+            }
+        }
+
+        // Keys that a plain concatenation would mix up stay apart.
+        let key = |values: &[Scalar]| {
+            let mut out = Vec::new();
+            for value in values {
+                value.encode(&mut out);
+            }
+            out
+        };
+        let text = |value: &str| Scalar::Utf8(value.to_string());
+        let distinct = [
+            key(&[text("a"), text("bc")]),
+            key(&[text("ab"), text("c")]),
+            key(&[text(""), Scalar::Null]),
+            key(&[Scalar::Null, text("")]),
+            key(&[Scalar::I64(1)]),
+            key(&[Scalar::U64(1)]),
+            key(&[text("1")]),
+            key(&[Scalar::Bytes(b"1".to_vec())]),
+            key(&[Scalar::Date32(1)]),
+            key(&[Scalar::F64(0.0_f64.to_bits())]),
+            key(&[Scalar::F64((-0.0_f64).to_bits())]),
+        ];
+        for (index, left) in distinct.iter().enumerate() {
+            for right in &distinct[index + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn groups_text_keys_and_aggregates_like_before() {
+        // Two text columns whose values would collide if simply joined, with
+        // nulls and empty text, and every aggregate.
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("text-groups.parquet");
+        let first = [
+            Some("a"),
+            Some("ab"),
+            Some(""),
+            None,
+            Some("a"),
+            Some("ab"),
+            None,
+            Some(""),
+        ];
+        let second = [
+            Some("bc"),
+            Some("c"),
+            None,
+            Some(""),
+            Some("bc"),
+            Some("c"),
+            Some(""),
+            None,
+        ];
+        let batch = RecordBatch::try_from_iter(vec![
+            ("x", Arc::new(StringArray::from(first.to_vec())) as ArrayRef),
+            ("y", Arc::new(StringArray::from(second.to_vec()))),
+            ("n", Arc::new(Int32Array::from((0..8).collect::<Vec<_>>()))),
+        ])
+        .unwrap();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let source = ParquetSource::open(path).unwrap();
+        let aggregate = AggregateSpec::grouped_by(
+            vec![0, 1],
+            vec![
+                AggregateExpr::count_all(),
+                AggregateExpr::sum(2),
+                AggregateExpr::min(2),
+                AggregateExpr::max(1),
+                AggregateExpr::count_distinct(2),
+            ],
+        )
+        .unwrap();
+        let result = source
+            .read_aggregated(None, &aggregate, GroupBudget::default(), &|_| false)
+            .unwrap();
+        let rows = (0..result.num_rows())
+            .map(|row| {
+                (0..result.num_columns())
+                    .map(|column| crate::value::format_cell(result.column(column).as_ref(), row))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>();
+        // Groups in order of first appearance: x, y, COUNT(*), SUM(n), MIN(n), MAX(y), COUNT(DISTINCT n).
+        assert_eq!(
+            rows,
+            [
+                "a|bc|2|4|0|bc|2",
+                "ab|c|2|6|1|c|2",
+                "|null|2|9|2|null|2",
+                "null||2|9|3||2",
+            ]
+        );
+
+        // The budget still counts every group, text keys included.
+        let tiny = GroupBudget::new(3, GroupBudget::DEFAULT_MAX_BYTES).unwrap();
+        assert!(
+            source
+                .read_aggregated(None, &aggregate, tiny, &|_| false)
+                .unwrap_err()
+                .to_string()
+                .contains("3 groups")
         );
     }
 
