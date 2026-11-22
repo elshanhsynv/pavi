@@ -308,10 +308,12 @@ impl BatchSource for QueryBatches {
                 self.0.cancel();
                 bail!("export cancelled");
             }
-            match self.0.poll_next_batch()? {
+            // Woken by each batch; the timeout only bounds how long a cancel
+            // waits to be seen.
+            match self.0.wait_next_batch(Duration::from_millis(5))? {
                 QueryPoll::Batch(batch) => return Ok(Some(batch.batch)),
                 QueryPoll::Finished => return Ok(None),
-                QueryPoll::Pending => thread::sleep(Duration::from_millis(5)),
+                QueryPoll::Pending => {}
             }
         }
     }

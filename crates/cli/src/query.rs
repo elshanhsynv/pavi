@@ -4,7 +4,6 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -17,8 +16,8 @@ use pavi_runtime::{GenerationId, Runtime, RuntimeConfig};
 use crate::Window;
 use crate::progress::Progress;
 
-/// Wait between polls while the workers have no batch ready (the app's
-/// export waits the same).
+/// Longest wait for the next batch before the progress line is updated; a
+/// batch that is ready sooner is taken at once (the app's export waits the same).
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The tables a query can name: `dataset` and `dataset_path`'s own name for
@@ -94,9 +93,10 @@ impl Query {
         let engine = QueryEngine::new(&runtime);
         let mut execution = engine.execute(&self.plan, GenerationId(1))?;
         while !window.is_done() {
-            // Polled rather than waited on, so the progress line can follow
-            // the preparation of joins and subqueries and the scan.
-            let batch = match execution.poll_next_batch()? {
+            // Waited on for at most `POLL_INTERVAL` at a time, so the progress
+            // line can follow the preparation of joins and subqueries and the
+            // scan, while each batch is taken as soon as it is ready.
+            let batch = match execution.wait_next_batch(POLL_INTERVAL)? {
                 QueryPoll::Batch(batch) => batch,
                 QueryPoll::Finished => return Ok(()),
                 QueryPoll::Pending => {
@@ -107,7 +107,6 @@ impl Query {
                         // tables, or the prepared one, so no total is shown.
                         progress.count("Scanning", scanned);
                     }
-                    thread::sleep(POLL_INTERVAL);
                     continue;
                 }
             };

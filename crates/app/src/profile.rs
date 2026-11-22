@@ -143,10 +143,10 @@ fn profile_column(
             execution.cancel();
             bail!("profile cancelled");
         }
-        match execution.poll_next_batch()? {
+        match execution.wait_next_batch(Duration::from_millis(5))? {
             QueryPoll::Batch(batch) => accumulator.push_batch(&batch.batch)?,
             QueryPoll::Finished => return Ok(accumulator.finish()),
-            QueryPoll::Pending => thread::sleep(Duration::from_millis(5)),
+            QueryPoll::Pending => {}
         }
     }
 }
@@ -312,7 +312,7 @@ fn profile_file(
                 execution.cancel();
                 bail!("profile cancelled");
             }
-            match execution.poll_next_batch()? {
+            match execution.wait_next_batch(Duration::from_millis(5))? {
                 QueryPoll::Batch(batch) => {
                     scanned.fetch_add(
                         batch.batch.num_rows() as u64,
@@ -321,7 +321,7 @@ fn profile_file(
                     profiler.push_batch(&batch.batch)?;
                 }
                 QueryPoll::Finished => break,
-                QueryPoll::Pending => thread::sleep(Duration::from_millis(5)),
+                QueryPoll::Pending => {}
             }
         }
     }

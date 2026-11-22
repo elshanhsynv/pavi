@@ -443,6 +443,17 @@ impl PrepTask {
         }
     }
 
+    /// The prepared rows if they arrive within `timeout`, else `None`.
+    pub(crate) fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Option<Relation>> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(result) => result.map(Some),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("the query preparation stopped without a result")
+            }
+        }
+    }
+
     pub(crate) fn recv(&self) -> Result<Relation> {
         self.receiver
             .recv()

@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Changed
+- Exports from the app are much faster (about 20× for Arrow and 4–5× for CSV on the sample files), and so are column profiles and the CLI's `--sql` output: they no longer pause 5 ms each time they ask for the next 4,096 rows.
 - CSV, TSV and JSON Lines export is about twice as fast, and column profiles are about 40% faster: each column's values are turned into text with one prepared formatter per batch instead of one per value. The text written is unchanged.
 - Sorting large files is about 4× faster. A sort keeps up to about a million rows in memory (still within 128 MB) before it writes to disk, so a sort of a few million rows needs no extra merge pass, and the final merge sorts each row once. A sort by a column of a 5-million-row file now shows its first rows in about 1 second instead of 4. A large `LIMIT` whose rows don't fit in memory now spills to disk instead of failing.
 - Counting the rows that match a filter is faster. Row groups whose footer statistics show that every row matches are counted without being read (on a sorted or clustered column, most of the file). In the CLI, `--count` with a filter also reads the rest on all CPU cores. The app's match count uses the statistics too.

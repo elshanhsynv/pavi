@@ -1,6 +1,10 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{RecvTimeoutError, TryRecvError},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -256,16 +260,35 @@ impl QueryExecution {
 
     /// Polls for one next batch without waiting for a runtime response.
     pub fn poll_next_batch(&mut self) -> Result<QueryPoll> {
+        self.next_batch_within(None)
+    }
+
+    /// The next batch as soon as it arrives, or [`QueryPoll::Pending`] after at
+    /// most about `timeout`. For a background loop that also shows progress or
+    /// checks for a cancel: it wakes for each batch instead of sleeping a fixed
+    /// time between polls. Never call it on the UI thread.
+    pub fn wait_next_batch(&mut self, timeout: Duration) -> Result<QueryPoll> {
+        self.next_batch_within(Some(Instant::now() + timeout))
+    }
+
+    /// `poll_next_batch` without a deadline, `wait_next_batch` with one.
+    fn next_batch_within(&mut self, deadline: Option<Instant>) -> Result<QueryPoll> {
         loop {
             if self.cancelled {
                 bail!("query execution was cancelled");
             }
             match &mut self.stage {
-                Stage::Running(running) => return running.poll_next_batch(),
-                Stage::Preparing { task, .. } => match task.try_recv()? {
-                    Some(relation) => self.start(relation)?,
-                    None => return Ok(QueryPoll::Pending),
-                },
+                Stage::Running(running) => return running.next_batch_within(deadline),
+                Stage::Preparing { task, .. } => {
+                    let prepared = match deadline {
+                        None => task.try_recv()?,
+                        Some(deadline) => task.recv_timeout(time_left(deadline))?,
+                    };
+                    match prepared {
+                        Some(relation) => self.start(relation)?,
+                        None => return Ok(QueryPoll::Pending),
+                    }
+                }
             }
         }
     }
@@ -501,8 +524,9 @@ impl Running {
         }
     }
 
-    /// Polls for one next batch without waiting for a runtime response.
-    pub fn poll_next_batch(&mut self) -> Result<QueryPoll> {
+    /// The next batch, waiting for a runtime response until `deadline` (not
+    /// at all without one).
+    fn next_batch_within(&mut self, deadline: Option<Instant>) -> Result<QueryPoll> {
         loop {
             if self.cancelled {
                 bail!("query execution was cancelled");
@@ -519,6 +543,11 @@ impl Running {
 
             if let Err(error) = self.schedule_next() {
                 if is_queue_full(&error) {
+                    // The workers are busy with other reads; a waiting caller
+                    // waits here rather than asking again at once.
+                    if let Some(deadline) = deadline {
+                        std::thread::sleep(time_left(deadline));
+                    }
                     return Ok(QueryPoll::Pending);
                 }
                 return Err(error);
@@ -526,15 +555,27 @@ impl Running {
             if self.finished {
                 return Ok(QueryPoll::Finished);
             }
-            let response = match self
+            let task = self
                 .pending
                 .as_ref()
-                .context("query execution has no pending runtime task")?
-                .try_recv()
-            {
+                .context("query execution has no pending runtime task")?;
+            let received = match deadline {
+                None => task.try_recv().map_err(|error| match error {
+                    TryRecvError::Empty => None,
+                    TryRecvError::Disconnected => Some(()),
+                }),
+                Some(deadline) => {
+                    task.recv_timeout(time_left(deadline))
+                        .map_err(|error| match error {
+                            RecvTimeoutError::Timeout => None,
+                            RecvTimeoutError::Disconnected => Some(()),
+                        })
+                }
+            };
+            let response = match received {
                 Ok(response) => response,
-                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(QueryPoll::Pending),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(None) => return Ok(QueryPoll::Pending),
+                Err(Some(())) => {
                     self.pending = None;
                     self.in_flight = None;
                     bail!("query runtime response channel disconnected");
@@ -777,6 +818,11 @@ impl Running {
         self.scheduled_reads += 1;
         Ok(())
     }
+}
+
+/// Time from now until `deadline`, zero once it has passed.
+fn time_left(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
 }
 
 fn is_queue_full(error: &anyhow::Error) -> bool {
@@ -1092,6 +1138,57 @@ mod tests {
         );
         assert!(execution.next_batch().unwrap().is_none());
         assert_eq!(execution.scheduled_reads(), 1);
+    }
+
+    #[test]
+    fn waits_for_each_batch_instead_of_polling() {
+        let (_dir, source, _) = source();
+        let runtime = runtime();
+        let plan = LogicalPlan::scan(Arc::clone(&source))
+            .filter(Filter::parse("id >= 3").unwrap())
+            .project(vec![0]);
+        let mut expected = Vec::new();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(1))
+            .unwrap();
+        while let Some(batch) = execution.next_batch().unwrap() {
+            expected.extend(ids(&batch.batch));
+        }
+
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(2))
+            .unwrap();
+        let mut waited = Vec::new();
+        let mut calls = 0;
+        loop {
+            calls += 1;
+            match execution
+                .wait_next_batch(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                QueryPoll::Batch(batch) => waited.extend(ids(&batch.batch)),
+                QueryPoll::Finished => break,
+                QueryPoll::Pending => {}
+            }
+        }
+        assert_eq!(waited, expected);
+        // With a long timeout every call returns a batch or the end: none comes
+        // back empty-handed, as a poll would while the read is in flight.
+        assert!(
+            calls <= expected.len().div_ceil(PAGE_ROWS as usize) + 2,
+            "{calls} calls"
+        );
+
+        // A cancelled query fails at once instead of waiting.
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(3))
+            .unwrap();
+        execution.cancel();
+        assert!(
+            execution
+                .wait_next_batch(std::time::Duration::from_secs(5))
+                .is_err()
+        );
     }
 
     #[test]

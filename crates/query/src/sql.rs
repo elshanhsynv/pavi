@@ -3142,6 +3142,55 @@ mod tests {
     }
 
     #[test]
+    fn waiting_for_batches_gives_the_rows_of_a_blocking_read() {
+        // A join is prepared on its own thread first; waiting covers that too.
+        let (_directory, tables) = tables();
+        for sql in [
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer = c.id ORDER BY o.id",
+            "SELECT id, amount FROM orders WHERE amount > 6",
+        ] {
+            let plan = SqlAst::parse(sql)
+                .unwrap()
+                .to_logical_plan_with(&tables)
+                .unwrap();
+            let runtime = runtime();
+            let mut execution = QueryEngine::new(&runtime)
+                .execute(&plan, GenerationId(3))
+                .unwrap();
+            let mut waited = Vec::new();
+            loop {
+                match execution
+                    .wait_next_batch(std::time::Duration::from_millis(5))
+                    .unwrap()
+                {
+                    crate::QueryPoll::Batch(batch) => waited.push(batch.batch),
+                    crate::QueryPoll::Finished => break,
+                    crate::QueryPoll::Pending => {}
+                }
+            }
+            let rows = waited
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).map(|row| {
+                        (0..batch.num_columns())
+                            .map(|column| {
+                                parquet_reader::value::scalar_text(
+                                    batch.column(column).as_ref(),
+                                    row,
+                                )
+                                .unwrap()
+                                .unwrap_or_else(|| "null".into())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows, run(sql, &tables).unwrap().1, "{sql}");
+        }
+    }
+
+    #[test]
     fn joins_open_tables() {
         let (_directory, tables) = tables();
         let rows = |sql: &str| run(sql, &tables).unwrap().1;
