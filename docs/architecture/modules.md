@@ -209,7 +209,7 @@ One implicit command. Arguments (`crates/cli/src/args.rs`), shown by `-h` under 
 | `--columns a,b` | Column names or 0-based indexes; a name is tried first, so a column called `7` is found by name |
 | `--filter "…"` | Same `FilterExpr` grammar as the GUI filter box |
 | `--sort "a:desc,b"` | Up to 8 keys by name or index, `:asc` (default) or `:desc`, nulls last; through `read_sorted` with `SortBudget::default()` (`sort.rs`) |
-| `--count` | Print only the row count (footer), or the matching rows (a scan of the filter's columns). Excludes `--head`, `--offset`, `--columns`, `--format`, `--quiet`, `--sort` |
+| `--count` | Print only the row count (footer), or the matching rows: row groups the statistics settle are not read, the rest are counted in ~1M-row chunks on up to 16 threads (`count_rows`, ADR 0016). Excludes `--head`, `--offset`, `--columns`, `--format`, `--quiet`, `--sort` |
 | `--schema` | One row per column (index, name, Arrow type text, nullable), in any `--format` (`inspect.rs`). Excludes every row option except `--columns` and `--format` |
 | `--stats` | One row per row group × column from the footer's statistics (rows, nulls, min, max, distinct), in any `--format`; the table shows ≤1,000 rows (`inspect.rs`). Allows `--columns`, `--head`, `--format` |
 | `-q`, `--quiet` | Table without the summary |

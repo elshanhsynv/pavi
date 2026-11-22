@@ -1040,13 +1040,26 @@ impl ParquetSource {
 
     /// Counts the rows that pass `filter` in each row group, in row-group order:
     /// one entry per row group, so as long as the footer's row-group list. Only
-    /// the filter's columns are read, and row groups the footer statistics rule
-    /// out count 0 without being read. With the counts, a filtered result can be
+    /// the filter's columns are read; row groups the footer statistics rule out
+    /// count 0, and row groups they prove match in full count all their rows,
+    /// both without being read. With the counts, a filtered result can be
     /// entered anywhere: its match `n` is in the first row group whose running
     /// total passes `n`. `checkpoint` works as in [`Self::read_filtered_from`].
     pub fn count_matches_by_row_group(
         &self,
         filter: &FilterExpr,
+        checkpoint: &dyn Fn(u64) -> bool,
+    ) -> Result<Vec<u64>> {
+        self.count_matches_in_row_groups(filter, 0..self.row_groups().len(), checkpoint)
+    }
+
+    /// [`Self::count_matches_by_row_group`] for the row groups in `range` only:
+    /// the other entries are 0. Disjoint ranges can be counted on separate
+    /// threads and the counts added up.
+    pub fn count_matches_in_row_groups(
+        &self,
+        filter: &FilterExpr,
+        range: Range<usize>,
         checkpoint: &dyn Fn(u64) -> bool,
     ) -> Result<Vec<u64>> {
         let row_groups = self.row_groups();
@@ -1056,11 +1069,28 @@ impl ParquetSource {
             .into_iter()
             .collect::<Vec<_>>();
         let read_projection = Projection::columns(columns, self.column_count())?;
-        let keep = |row_group: &RowGroupInfo| self.row_group_might_match(filter, row_group);
-        let mut next_group = 0;
+        let mut proven = vec![false; row_groups.len()];
+        for index in range.clone() {
+            if let (Some(info), Some(count), Some(proven)) = (
+                row_groups.get(index),
+                counts.get_mut(index),
+                proven.get_mut(index),
+            ) && self.row_group_must_match(filter, info)
+            {
+                *count = info.row_count;
+                *proven = true;
+            }
+        }
+        let keep = |row_group: &RowGroupInfo| {
+            range.contains(&row_group.index)
+                && !proven.get(row_group.index).copied().unwrap_or(false)
+                && self.row_group_might_match(filter, row_group)
+        };
+        let first_row = row_groups.get(range.start).map_or(0, |info| info.first_row);
+        let mut next_group = range.start;
         // The row group of the row being counted; rows only move forward.
-        let mut group = 0;
-        while let Some(run) = self.next_scan_run(&mut next_group, 0, &keep)? {
+        let mut group = range.start;
+        while let Some(run) = self.next_scan_run(&mut next_group, first_row, &keep)? {
             let (file, mut reader, mut row_map) =
                 self.run_reader(&run, &read_projection, 0, Some(filter))?;
             while let Some(batch) = reader.next().transpose()? {
@@ -1737,6 +1767,33 @@ impl ParquetSource {
             file.leaf_columns.get(column).copied().flatten()
         };
         !page_prune::bloom_rules_out(filter, metadata, schema, &leaf_of, &reader)
+    }
+
+    /// `true` only when the row group's statistics prove every row passes
+    /// `filter` (see [`FilterExpr::must_match`]).
+    fn row_group_must_match(&self, filter: &FilterExpr, row_group: &RowGroupInfo) -> bool {
+        let schema = &self.dataset_metadata.schema;
+        let Ok((file, local)) = self.locate(row_group.index) else {
+            return false;
+        };
+        let Some(metadata) = file.metadata.row_groups().get(local) else {
+            return false;
+        };
+        let chunks = metadata.columns();
+        filter.must_match(schema, &|column| {
+            let data_type = schema.fields().get(column)?.data_type();
+            if column >= self.file_columns {
+                let statistics = file
+                    .partition_statistics
+                    .get(local)?
+                    .get(column - self.file_columns)?;
+                return Some((Some(statistics), data_type));
+            }
+            let leaf = file.leaf_columns.get(column).copied().flatten()?;
+            chunks
+                .get(leaf)
+                .map(|chunk| (chunk.statistics(), data_type))
+        })
     }
 
     fn concat_or_empty(
@@ -4209,9 +4266,10 @@ mod tests {
         );
         assert!(seen.lock().unwrap().iter().all(|row| *row >= 20_000));
 
-        // Uneven groups: a batch that crosses a boundary is split there.
+        // Uneven groups: a batch that crosses a boundary is split there. (No
+        // single `==` can prove a whole group, so every group is read.)
         let (_directory, uneven) = numbered_file(10_000, 3_333);
-        let all = FilterExpr::parse("id >= 0").unwrap();
+        let all = FilterExpr::parse("bucket IN (0, 1, 2, 3, 4, 5, 6)").unwrap();
         assert_eq!(
             uneven.count_matches_by_row_group(&all, &|_| false).unwrap(),
             [3_333, 3_333, 3_333, 1]
@@ -4225,6 +4283,64 @@ mod tests {
                 .downcast_ref::<Cancelled>()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn counts_row_groups_the_statistics_prove_without_reading_them() {
+        let (_directory, source) = numbered_file(30_000, 1_000);
+        let every_group = |filter: &FilterExpr| {
+            let matches = source
+                .read_filtered_from(filter, 0, 30_000, &Projection::all(2), &|_| false)
+                .unwrap();
+            let mut counts = vec![0_u64; 30];
+            for id in ids(&matches.batch) {
+                counts[id as usize / 1_000] += 1;
+            }
+            counts
+        };
+        let positions = std::sync::Mutex::new(Vec::new());
+        let record = |row| {
+            positions.lock().unwrap().push(row);
+            false
+        };
+        for (filter, read_from) in [
+            // Groups 0-4 ruled out, 5-29 proven: nothing is read.
+            ("id >= 5000", None),
+            ("id IS NOT NULL", None),
+            ("id != 30000 AND id >= 5000", None),
+            // Group 5 is cut by the bound and read; the rest are settled.
+            ("id >= 5500", Some(5_000)),
+            ("id < 5500 OR id >= 29000", Some(5_000)),
+            // Every group holds matches and non-matches: all are read.
+            ("bucket == 3", Some(0)),
+        ] {
+            let parsed = FilterExpr::parse(filter).unwrap();
+            positions.lock().unwrap().clear();
+            let counts = source.count_matches_by_row_group(&parsed, &record).unwrap();
+            assert_eq!(counts, every_group(&parsed), "{filter}");
+            let read = positions.lock().unwrap().first().copied();
+            assert_eq!(read, read_from, "{filter}: first row read");
+        }
+
+        // Disjoint ranges add up to the whole count; outside its range a count is 0.
+        let filter = FilterExpr::parse("id >= 5500 AND bucket != 2").unwrap();
+        let whole = source
+            .count_matches_by_row_group(&filter, &|_| false)
+            .unwrap();
+        let mut sum = vec![0_u64; 30];
+        for range in [0..7, 7..19, 19..30] {
+            let part = source
+                .count_matches_in_row_groups(&filter, range.clone(), &|_| false)
+                .unwrap();
+            for (index, count) in part.iter().enumerate() {
+                if !range.contains(&index) {
+                    assert_eq!(*count, 0, "group {index} outside {range:?}");
+                }
+                sum[index] += count;
+            }
+        }
+        assert_eq!(sum, whole);
+        assert_eq!(whole, every_group(&filter));
     }
 
     #[test]

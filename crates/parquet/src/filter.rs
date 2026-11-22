@@ -240,6 +240,31 @@ impl FilterExpr {
                 .any(|part| part.might_match(schema, column_statistics)),
         }
     }
+
+    /// Returns `true` only when statistics prove that every row of a row group
+    /// passes, so its rows can be counted without reading them.
+    /// `column_statistics` is as for [`Self::might_match`].
+    pub fn must_match<'a>(
+        &self,
+        schema: &Schema,
+        column_statistics: &dyn Fn(usize) -> Option<(Option<&'a Statistics>, &'a DataType)>,
+    ) -> bool {
+        match self {
+            Self::Compare(comparison) => comparison
+                .column_index(schema)
+                .ok()
+                .and_then(column_statistics)
+                .is_some_and(|(statistics, data_type)| {
+                    comparison.must_match_statistics(statistics, data_type)
+                }),
+            Self::And(parts) => parts
+                .iter()
+                .all(|part| part.must_match(schema, column_statistics)),
+            Self::Or(parts) => parts
+                .iter()
+                .any(|part| part.must_match(schema, column_statistics)),
+        }
+    }
 }
 
 /// Writes the filter in the filter-box grammar. Text made here parses back to the
@@ -926,6 +951,110 @@ impl Comparison {
         }
     }
 
+    /// Returns `true` only when row-group statistics prove that every row
+    /// matches. A null never passes a comparison, so this needs a recorded null
+    /// count of zero; it also needs exact min and max values (text may be
+    /// truncated), statistics in the current format (the deprecated fields used
+    /// signed order), and for floats a recorded NaN count of zero, as min and
+    /// max leave NaN out. Patterns and `contains` are never proven.
+    pub fn must_match_statistics(
+        &self,
+        statistics: Option<&Statistics>,
+        data_type: &DataType,
+    ) -> bool {
+        let Some(statistics) = statistics else {
+            return false;
+        };
+        if statistics.null_count_opt() != Some(0) {
+            return false;
+        }
+        match self.op {
+            FilterOp::IsNotNull => return true,
+            FilterOp::Eq
+            | FilterOp::Ne
+            | FilterOp::Gt
+            | FilterOp::Ge
+            | FilterOp::Lt
+            | FilterOp::Le => {}
+            FilterOp::IsNull | FilterOp::Contains | FilterOp::Like | FilterOp::NotLike => {
+                return false;
+            }
+        }
+        if statistics.is_min_max_deprecated()
+            || !statistics.min_is_exact()
+            || !statistics.max_is_exact()
+        {
+            return false;
+        }
+        let expected = || self.ordered_value(data_type).ok();
+        let no_nan = statistics.nan_count_opt() == Some(0);
+
+        match statistics {
+            Statistics::Boolean(stats) => {
+                let Ok(value) = self.value.parse::<bool>() else {
+                    return false;
+                };
+                match (stats.min_opt(), stats.max_opt()) {
+                    (Some(min), Some(max)) => {
+                        compare_bool(*min, value, &self.op) && compare_bool(*max, value, &self.op)
+                    }
+                    _ => false,
+                }
+            }
+            Statistics::Int32(stats) => number_range_must_match(
+                stats
+                    .min_opt()
+                    .map(|value| int32_statistic(*value, data_type)),
+                stats
+                    .max_opt()
+                    .map(|value| int32_statistic(*value, data_type)),
+                expected(),
+                &self.op,
+            ),
+            Statistics::Int64(stats) => number_range_must_match(
+                stats
+                    .min_opt()
+                    .map(|value| int64_statistic(*value, data_type)),
+                stats
+                    .max_opt()
+                    .map(|value| int64_statistic(*value, data_type)),
+                expected(),
+                &self.op,
+            ),
+            Statistics::Float(stats) if no_nan => number_range_must_match(
+                stats.min_opt().map(|value| Number::Float((*value).into())),
+                stats.max_opt().map(|value| Number::Float((*value).into())),
+                expected(),
+                &self.op,
+            ),
+            Statistics::Double(stats) if no_nan => number_range_must_match(
+                stats.min_opt().map(|value| Number::Float(*value)),
+                stats.max_opt().map(|value| Number::Float(*value)),
+                expected(),
+                &self.op,
+            ),
+            Statistics::ByteArray(stats) if is_string(data_type) => {
+                let min = stats
+                    .min_bytes_opt()
+                    .and_then(|value| std::str::from_utf8(value).ok());
+                let max = stats
+                    .max_bytes_opt()
+                    .and_then(|value| std::str::from_utf8(value).ok());
+                match (min, max) {
+                    (Some(min), Some(max)) if min <= max => match self.op {
+                        FilterOp::Ne => self.value.as_str() < min || self.value.as_str() > max,
+                        _ => {
+                            compare_str(min, &self.value, &self.op)
+                                && compare_str(max, &self.value, &self.op)
+                        }
+                    },
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn evaluate_bool(&self, array: &dyn Array) -> Result<BooleanArray> {
         let expected = self
             .value
@@ -1414,6 +1543,35 @@ fn number_range_might_match(
     }
 }
 
+/// Whether every value in `[min, max]` passes the comparison with `value`.
+/// Unknown or unordered bounds, or NaN, prove nothing.
+fn number_range_must_match(
+    min: Option<Number>,
+    max: Option<Number>,
+    value: Option<Number>,
+    op: &FilterOp,
+) -> bool {
+    let (Some(min), Some(max), Some(value)) = (min, max, value) else {
+        return false;
+    };
+    if min
+        .compare(max)
+        .is_none_or(|ordering| ordering == Ordering::Greater)
+    {
+        return false;
+    }
+    match op {
+        // The value lies outside the range.
+        FilterOp::Ne => {
+            compare_number(value, min, &FilterOp::Lt) || compare_number(value, max, &FilterOp::Gt)
+        }
+        FilterOp::Eq | FilterOp::Gt | FilterOp::Ge | FilterOp::Lt | FilterOp::Le => {
+            compare_number(min, value, op) && compare_number(max, value, op)
+        }
+        _ => false,
+    }
+}
+
 fn string_range_might_match(
     min: Option<&str>,
     max: Option<&str>,
@@ -1870,6 +2028,148 @@ mod tests {
         // Null tests and patterns never prune: a zero null count may mean "unknown".
         assert!(might("x IS NULL"));
         assert!(might("x IS NOT NULL AND y == 150"));
+    }
+
+    #[test]
+    fn proves_full_matches_only_from_exact_null_free_statistics() {
+        use parquet::data_type::ByteArray;
+        use parquet::file::statistics::ValueStatistics;
+
+        let schema = Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("u", DataType::UInt32, true),
+        ]);
+        let x = Statistics::int32(Some(10), Some(20), None, Some(0), false);
+        let text = |min: &str, max: &str| {
+            Statistics::byte_array(
+                Some(ByteArray::from(min)),
+                Some(ByteArray::from(max)),
+                None,
+                Some(0),
+                false,
+            )
+        };
+        let name = text("bob", "dan");
+        let float = |nan_count: Option<u64>| {
+            Statistics::Double(
+                ValueStatistics::new(Some(1.0), Some(2.0), None, Some(0), false)
+                    .with_nan_count(nan_count),
+            )
+        };
+        let f = float(Some(0));
+        // 4,000,000,000 as an unsigned 32-bit value, stored as a negative i32.
+        let u = Statistics::int32(Some(-294_967_296), Some(-294_967_296), None, Some(0), false);
+        let types = [
+            DataType::Int32,
+            DataType::Utf8,
+            DataType::Float64,
+            DataType::UInt32,
+        ];
+        let must_with = |filter: &str, x: &Statistics, name: &Statistics, f: &Statistics| {
+            FilterExpr::parse(filter)
+                .unwrap()
+                .must_match(&schema, &|column| match column {
+                    0 => Some((Some(x), &types[0])),
+                    1 => Some((Some(name), &types[1])),
+                    2 => Some((Some(f), &types[2])),
+                    3 => Some((Some(&u), &types[3])),
+                    _ => None,
+                })
+        };
+        let must = |filter: &str| must_with(filter, &x, &name, &f);
+
+        // Every value of [10, 20] passes.
+        for filter in [
+            "x >= 10",
+            "x > 9",
+            "x <= 20",
+            "x < 21",
+            "x != 9",
+            "x != 21",
+            "x BETWEEN 5 AND 25",
+            "x IS NOT NULL",
+        ] {
+            assert!(must(filter), "{filter}");
+        }
+        // Some value of [10, 20] may fail.
+        for filter in [
+            "x > 10",
+            "x < 20",
+            "x == 15",
+            "x != 15",
+            "x >= 11",
+            "x > abc",
+            "x IS NULL",
+            "x BETWEEN 12 AND 25",
+        ] {
+            assert!(!must(filter), "{filter}");
+        }
+        assert!(must_with(
+            "x == 7",
+            &Statistics::int32(Some(7), Some(7), None, Some(0), false),
+            &name,
+            &f
+        ));
+        assert!(
+            must("u == 4000000000"),
+            "unsigned statistics read as unsigned"
+        );
+
+        // Text, compared byte by byte; patterns and contains are never proven.
+        for filter in ["name >= bob", "name < dz", "name != alice", "name != eve"] {
+            assert!(must(filter), "{filter}");
+        }
+        for filter in [
+            "name > bob",
+            "name != carl",
+            "name contains b",
+            "name LIKE '%'",
+        ] {
+            assert!(!must(filter), "{filter}");
+        }
+
+        // AND needs every part proven, OR one.
+        assert!(must("x >= 10 AND name >= bob"));
+        assert!(!must("x >= 10 AND name > bob"));
+        assert!(must("x > 15 OR name >= bob"));
+        assert!(!must("x > 15 OR name > bob"));
+
+        // A null count that is missing or not zero proves nothing: nulls fail.
+        let unknown_nulls = Statistics::int32(Some(10), Some(20), None, None, false);
+        let some_nulls = Statistics::int32(Some(10), Some(20), None, Some(1), false);
+        assert!(!must_with("x >= 10", &unknown_nulls, &name, &f));
+        assert!(!must_with("x IS NOT NULL", &some_nulls, &name, &f));
+        // Deprecated (signed-order) or inexact (truncated) bounds prove nothing.
+        let deprecated = Statistics::int32(Some(10), Some(20), None, Some(0), true);
+        assert!(!must_with("x >= 10", &deprecated, &name, &f));
+        let truncated = Statistics::ByteArray(
+            ValueStatistics::new(
+                Some(ByteArray::from("bob")),
+                Some(ByteArray::from("dan")),
+                None,
+                Some(0),
+                false,
+            )
+            .with_max_is_exact(false),
+        );
+        assert!(!must_with("name >= bob", &x, &truncated, &f));
+        // Floats need a recorded NaN count of zero: min and max leave NaN out.
+        assert!(must("f >= 1"));
+        assert!(!must_with("f >= 1", &x, &name, &float(None)));
+        assert!(!must_with("f >= 1", &x, &name, &float(Some(3))));
+        // No statistics, or a column the callback doesn't know, prove nothing.
+        assert!(
+            !FilterExpr::parse("x >= 10")
+                .unwrap()
+                .must_match(&schema, &|_| None)
+        );
+        assert!(
+            !FilterExpr::parse("x >= 10")
+                .unwrap()
+                .must_match(&schema, &|_| Some((None, &types[0])))
+        );
     }
 
     #[test]

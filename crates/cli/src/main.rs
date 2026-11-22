@@ -9,9 +9,14 @@ mod sort;
 
 use std::cell::RefCell;
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use args::{Args, Format};
@@ -21,16 +26,22 @@ use clap::Parser;
 use output::{Borders, RowNumbers, print_batch};
 use parquet_reader::export::{BatchWriter, ExportFormat};
 use parquet_reader::{
-    FilterExpr, PAGE_ROWS, ParquetSource, Projection, SortBudget, SortOutput, SortSpec,
+    Cancelled, FilterExpr, PAGE_ROWS, ParquetSource, Projection, SortBudget, SortOutput, SortSpec,
 };
 use progress::Progress;
 
 /// Most rows the table format prints; it holds them all in memory to size columns.
 const MAX_HEAD_ROWS: u64 = 1_000;
+/// Most threads `--count` with a filter reads on.
+const MAX_COUNT_THREADS: usize = 16;
+/// Rows of consecutive row groups one counting thread reads at a time.
+const COUNT_CHUNK_ROWS: u64 = 1 << 20;
+/// Longest the main thread waits between progress updates while threads count.
+const COUNT_PROGRESS_INTERVAL: Duration = Duration::from_millis(20);
 /// Rows shown in the table when `--head` is not given.
 const DEFAULT_HEAD_ROWS: u64 = 10;
-/// Rows read per step when streaming rows or counting matches: memory stays at
-/// one batch of the projected (or, for `--count`, the filter's) columns.
+/// Rows read per step when streaming rows: memory stays at one batch of the
+/// projected columns.
 const STREAM_BATCH_ROWS: u64 = PAGE_ROWS;
 
 fn main() -> ExitCode {
@@ -159,7 +170,7 @@ fn run(
         .transpose()?;
 
     if args.count {
-        let rows = count_rows(&parquet, filter.as_ref(), batch_rows, &progress)?;
+        let rows = count_rows(&parquet, filter.as_ref(), COUNT_CHUNK_ROWS, &progress)?;
         progress.clear();
         writeln!(out, "{rows}")?;
         return Ok(());
@@ -573,29 +584,162 @@ impl Rows<'_> {
     }
 }
 
-/// The row count from the footer, or a scan that reads only the filter's columns.
+/// The row count from the footer, or a count of the filter's matches. Row
+/// groups whose statistics settle the count are not read; the rest are read in
+/// chunks of consecutive row groups (about `chunk_rows` rows each),
+/// handed out one at a time to up to [`MAX_COUNT_THREADS`] threads. Each thread
+/// holds one reader and one 4,096-row batch of the filter's columns.
 fn count_rows(
     parquet: &ParquetSource,
     filter: Option<&FilterExpr>,
-    batch_rows: u64,
+    chunk_rows: u64,
     progress: &Progress,
 ) -> anyhow::Result<u64> {
     let Some(filter) = filter else {
         return Ok(parquet.row_count());
     };
     let total = parquet.row_count();
-    let projection =
-        Projection::columns(filter.columns(&parquet.schema())?, parquet.column_count())?;
-    let mut matches = 0_u64;
-    let mut cursor = parquet.scan_cursor(Some(filter.clone()), 0, &projection)?;
-    while !cursor.is_finished() {
-        let window = cursor.next_window(parquet, to_usize(batch_rows)?, &|scanned| {
-            progress.rows("Counting", scanned, total);
-            false
-        })?;
-        matches += window.batch.num_rows() as u64;
+    let chunks = count_chunks(parquet, chunk_rows);
+    let threads = thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .clamp(1, MAX_COUNT_THREADS)
+        .min(chunks.len())
+        .max(1);
+    let next_chunk = AtomicUsize::new(0);
+    // Rows counted in finished chunks, and where each thread's chunk has got to.
+    let finished_rows = AtomicU64::new(0);
+    let positions = (0..threads).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
+    let stop = AtomicBool::new(false);
+    let row_groups = parquet.row_groups();
+    let chunk_first_row =
+        |chunk: &Range<usize>| row_groups.get(chunk.start).map_or(0, |info| info.first_row);
+    // Each thread wakes the main thread when it ends, so the count is printed
+    // at once, not at the next progress update.
+    let main_thread = thread::current();
+    let ended = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let workers = positions
+            .iter()
+            .map(|position| {
+                let (chunks, next_chunk, finished_rows, stop) =
+                    (&chunks, &next_chunk, &finished_rows, &stop);
+                let wake = WakeOnDrop {
+                    thread: &main_thread,
+                    ended: &ended,
+                };
+                thread::Builder::new()
+                    .name("pavi-count".into())
+                    .spawn_scoped(scope, move || -> anyhow::Result<u64> {
+                        let _wake = wake;
+                        let mut matches = 0_u64;
+                        while let Some(chunk) =
+                            chunks.get(next_chunk.fetch_add(1, Ordering::Relaxed))
+                        {
+                            let first = chunk_first_row(chunk);
+                            position.store(0, Ordering::Relaxed);
+                            let counted = parquet.count_matches_in_row_groups(
+                                filter,
+                                chunk.clone(),
+                                &|row| {
+                                    position.store(row.saturating_sub(first), Ordering::Relaxed);
+                                    stop.load(Ordering::Relaxed)
+                                },
+                            );
+                            let counts = match counted {
+                                Ok(counts) => counts,
+                                Err(error) => {
+                                    stop.store(true, Ordering::Relaxed);
+                                    return Err(error);
+                                }
+                            };
+                            matches += counts.iter().sum::<u64>();
+                            let rows = chunk
+                                .clone()
+                                .filter_map(|index| row_groups.get(index))
+                                .map(|info| info.row_count)
+                                .sum::<u64>();
+                            position.store(0, Ordering::Relaxed);
+                            finished_rows.fetch_add(rows, Ordering::Relaxed);
+                        }
+                        Ok(matches)
+                    })
+                    .context("start a counting thread")
+            })
+            .collect::<anyhow::Result<Vec<_>>>();
+        let workers = match workers {
+            Ok(workers) => workers,
+            Err(error) => {
+                stop.store(true, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        while ended.load(Ordering::Acquire) < workers.len() {
+            let done = finished_rows.load(Ordering::Relaxed)
+                + positions
+                    .iter()
+                    .map(|position| position.load(Ordering::Relaxed))
+                    .sum::<u64>();
+            progress.rows("Counting", done.min(total), total);
+            thread::park_timeout(COUNT_PROGRESS_INTERVAL);
+        }
+        let mut matches = 0_u64;
+        let mut first_error = None;
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(count)) => matches += count,
+                // The other threads' errors are the cancels the first one caused.
+                Ok(Err(error)) => {
+                    if first_error.is_none() || is_cancel(first_error.as_ref()) {
+                        first_error = Some(error);
+                    }
+                }
+                Err(_) => bail!("a counting thread stopped unexpectedly"),
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(matches),
+        }
+    })
+}
+
+/// Counts a counting thread as ended and wakes the main thread when dropped,
+/// however the counting thread ends.
+struct WakeOnDrop<'a> {
+    thread: &'a thread::Thread,
+    ended: &'a AtomicUsize,
+}
+
+impl Drop for WakeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.ended.fetch_add(1, Ordering::Release);
+        self.thread.unpark();
     }
-    Ok(matches)
+}
+
+/// Whether `error` is a [`Cancelled`] read.
+fn is_cancel(error: Option<&anyhow::Error>) -> bool {
+    error.is_some_and(|error| error.downcast_ref::<Cancelled>().is_some())
+}
+
+/// Consecutive row groups of about `chunk_rows` rows (at least one row group
+/// each), in file order, for [`count_rows`].
+fn count_chunks(parquet: &ParquetSource, chunk_rows: u64) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut rows = 0_u64;
+    for (index, info) in parquet.row_groups().iter().enumerate() {
+        rows += info.row_count;
+        if rows >= chunk_rows {
+            chunks.push(start..index + 1);
+            start = index + 1;
+            rows = 0;
+        }
+    }
+    if start < parquet.row_groups().len() {
+        chunks.push(start..parquet.row_groups().len());
+    }
+    chunks
 }
 
 fn to_usize(value: u64) -> anyhow::Result<usize> {
@@ -932,6 +1076,43 @@ mod tests {
             "2\n"
         );
         assert_eq!(output(&[&path, "--count", "--filter", "id > 9"]), "0\n");
+    }
+
+    #[test]
+    fn counts_in_chunks_on_threads_like_a_filtered_read() {
+        let (_folder, path) = fixture();
+        let parquet = ParquetSource::open(Path::new(&path)).unwrap();
+        // Three row groups (2, 2, 1 rows): chunks of one row group each, or all
+        // in one chunk.
+        assert_eq!(count_chunks(&parquet, 1), [0..1, 1..2, 2..3]);
+        assert_eq!(count_chunks(&parquet, 3), [0..2, 2..3]);
+        let whole: Range<usize> = 0..3;
+        assert_eq!(count_chunks(&parquet, u64::MAX), [whole]);
+        let progress = Progress::hidden();
+        for filter in [
+            "id >= 2",
+            "id != 3",
+            "id > 9",
+            "name LIKE 'a%' OR id = 5",
+            "7 IS NULL",
+            "7 IS NOT NULL",
+            "name >= b AND id <= 4",
+        ] {
+            let parsed = parse_filter(&parquet, filter).unwrap();
+            let expected = parquet
+                .read_filtered_from(&parsed, 0, 100, &Projection::all(3), &|_| false)
+                .unwrap()
+                .batch
+                .num_rows() as u64;
+            for chunk_rows in [1, 3, u64::MAX] {
+                assert_eq!(
+                    count_rows(&parquet, Some(&parsed), chunk_rows, &progress).unwrap(),
+                    expected,
+                    "{filter} in chunks of {chunk_rows} rows"
+                );
+            }
+        }
+        assert_eq!(count_rows(&parquet, None, 1, &progress).unwrap(), 5);
     }
 
     #[test]
