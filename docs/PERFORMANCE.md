@@ -69,8 +69,9 @@ Each budget is a named constant. Change it in one place and update this table.
 
 ## Targets
 
-Measured 2026-11-09 (lookup, frame time and cancel rows: 2026-11-19) on the reference machine: Intel i5-11400H (12 threads), 16 GB RAM, SSD,
-Windows 11, release build (thin LTO), warm OS file cache, median of 3 runs.
+Measured 2026-11-22 on the reference machine: Intel i5-11400H (12 threads), 16 GB RAM, SSD,
+Windows 11, on mains power (on battery every timing is about 3–4× slower), release build (thin LTO),
+warm OS file cache, median of 3 runs. The first run after a build is slower (cold file cache) and is not counted.
 Files: `flights` (1M rows, 7 cols), `dummy_5m` (5M rows, 4 cols), `dummy_1b` (1B rows, 10 cols).
 
 Each target is about 1.5× the slowest measured file, rounded up, with a 50 ms floor so
@@ -78,18 +79,30 @@ sub-frame operations aren't held to timer noise. A change that breaks a target n
 
 | Scenario | How measured | flights | dummy_5m | dummy_1b | Target |
 |---|---|---|---|---|---|
-| Read footer metadata | bench `open_metadata_ms` | 0 ms | 0 ms | 16 ms | < 50 ms |
-| First page, all columns, empty cache | bench `first_page_all_cold_ms` | 8 ms | 3 ms | 19 ms | < 50 ms |
-| Jump to the last page | bench `large_jump_ms` | 5 ms | 1 ms | 11 ms | < 50 ms |
-| First batch of a `LIMIT` query | bench `query_first_batch_ms` | 7 ms | 3 ms | 15 ms | < 50 ms |
-| Scroll 8 pages (32,768 rows) | bench `sequential_scroll_ms` | 66 ms | 30 ms | 144 ms | < 220 ms |
-| App start to window, file given on the command line | `Start-Process` until the window exists | 177 ms | — | 76 ms | < 300 ms |
-| App memory after loading a file | working set 5 s after start | 96 MB | — | 114 MB | < 200 MB |
-| CLI open + 1,000-row preview (includes process start) | wall time | 167 ms | 167 ms | 237 ms | < 400 ms |
-| Full scan: filter matching nothing on a text column | `pavi-cli --filter "category contains zzz"` | — | 536 ms | — | < 800 ms (≥ 6M rows/s) |
-| Lookup in a column sorted within row groups (page index, ADR 0014) | `pavi-cli --filter "user_id == 123" --count` | — | — | 393 ms (2,126 ms before ADR 0016, 15,354 ms before ADR 0014) | < 3,200 ms |
-| Frame time while scrolling (UI thread: layout + tessellation, p95) | `cargo test --release -p pavi -- --ignored --nocapture frame_time` on a generated 1M-row, 12-column file, 20 rows a frame (the grid's work doesn't grow with the file): 5.5 ms | — | — | — | < 16 ms (60 fps) |
-| Cancel a running scan (cancel to return, all columns) | bench `cancel_scan_ms` | 1.3 ms | 0.1 ms | — | < 50 ms |
+| Read footer metadata | bench `open_metadata_ms` | 0 ms | 0 ms | 9 ms | < 50 ms |
+| First page, all columns, empty cache | bench `first_page_all_cold_ms` | 4 ms | 2 ms | 8 ms | < 50 ms |
+| Jump to the last page | bench `large_jump_ms` | 1 ms | 1 ms | 8 ms | < 50 ms |
+| First batch of a `LIMIT` query | bench `query_first_batch_ms` | 3 ms | 2 ms | 6 ms | < 50 ms |
+| Scroll 8 pages (32,768 rows) | bench `sequential_scroll_ms` | 33 ms | 17 ms | 55 ms | < 220 ms |
+| App start to window, file given on the command line | `Start-Process` until the window exists | 57 ms | 49 ms | 41 ms | < 300 ms |
+| App memory after loading a file | working set 5 s after start | 107 MB | 106 MB | 115 MB | < 200 MB |
+| CLI open + 1,000-row preview (includes process start) | wall time | 73 ms | 74 ms | 84 ms | < 400 ms |
+| Full scan: filter matching nothing on a text column | `pavi-cli --filter "category contains zzz"` | — | 318 ms | — | < 800 ms (≥ 6M rows/s) |
+| Lookup in a column sorted within row groups (page index, ADR 0014) | `pavi-cli --filter "user_id == 123" --count` | — | — | 394 ms (2,126 ms before ADR 0016, 15,354 ms before ADR 0014) | < 3,200 ms |
+| Frame time while scrolling (UI thread: layout + tessellation, p95) | `cargo test --release -p pavi -- --ignored --nocapture frame_time` on a generated 1M-row, 12-column file, 20 rows a frame (the grid's work doesn't grow with the file): 4.8 ms | — | — | — | < 16 ms (60 fps) |
+| Cancel a running scan (cancel to return, all columns) | bench `cancel_scan_ms` | 0.7 ms | 0.4 ms | — | < 50 ms |
+
+Whole-file jobs, measured the same day (no targets yet; `pavi_bench` doesn't finish these on
+`dummy_1b`, whose whole-file sort would spill hundreds of GB):
+
+| Job | How measured | flights | dummy_5m | dummy_1b |
+|---|---|---|---|---|
+| Read every row and column through the query engine | bench `scan_all_ms` | 25 ms | 182 ms | — |
+| Whole-file sort by one column: first rows / all rows | bench `sort_first_batch_ms` / `sort_all_ms` | 133 / 134 ms | 991 / 1,233 ms | — |
+| Export to CSV / Parquet | `pavi-cli --format csv/parquet -o …` | 607 / 152 ms | 1,860 / 727 ms | — |
+| Profile every column | `pavi-cli --profile` | 899 ms | 1,552 ms | — |
+| Count a filter the statistics settle (half the file matches) | `pavi-cli --filter "value_int > 5000000000" --count` | — | — | 93 ms |
+| Count a filter that reads every row (text search) | `pavi-cli --filter "label contains zzz" --count` | — | — | 5,631 ms |
 
 Not yet enforced in CI: GitHub runners are too noisy for millisecond targets. Check them with the
 `perf-check` skill before merging changes to reading, the runtime, the query engine or the grid,
