@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-22
+
 ### Changed
 - `GROUP BY`, `COUNT(DISTINCT …)` and other aggregates are 30–60% faster: each row's group is found without copying its key, and a query without `GROUP BY` skips the group lookup. Results are unchanged.
 - Exports from the app are much faster (about 20× for Arrow and 4–5× for CSV on the sample files), and so are column profiles and the CLI's `--sql` output: they no longer pause 5 ms each time they ask for the next 4,096 rows.
@@ -195,7 +197,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/elshanhsynv/pavi/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/elshanhsynv/pavi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/elshanhsynv/pavi/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/elshanhsynv/pavi/compare/v0.4.0...v0.5.0
