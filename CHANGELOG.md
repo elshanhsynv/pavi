@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-22
+
 ### Added
 - CLI: shell completions. `pavi-cli --completions bash` (or `zsh`, `fish`, `powershell`, `elvish`) prints a script that completes options and their values; `pavi-cli --help` says where to save it.
 - CLI: a manual page. `pavi-cli --man > pavi-cli.1` writes it; the Linux release includes it as `man/man1/pavi-cli.1`.
@@ -178,7 +180,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/elshanhsynv/pavi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/elshanhsynv/pavi/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/elshanhsynv/pavi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/elshanhsynv/pavi/compare/v0.3.0...v0.4.0

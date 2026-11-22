@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anstream",
  "anstyle",
@@ -3017,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "parquet_reader"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -3046,7 +3046,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pavi"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "pavi_bench"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "pavi_query"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arrow-arith",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "pavi_runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arrow-array",
