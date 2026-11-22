@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-22
+
 ### Added
 - Releases include a Linux x64 build (`pavi-X.Y.Z-linux-x64.tar.gz`) besides the Windows zip.
 - CLI: short flags `-c` (`--columns`), `-f` (`--filter`), `-s` (`--sort`) and `-n` (`--head`).
@@ -171,7 +173,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/elshanhsynv/pavi/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/elshanhsynv/pavi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/elshanhsynv/pavi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/elshanhsynv/pavi/compare/v0.2.0...v0.3.0
