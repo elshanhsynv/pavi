@@ -40,7 +40,7 @@ Dependencies point down only: app → query → runtime → parquet_reader.
 - **No async runtime** (tokio is banned in `deny.toml`). No new dependency without saying why in the PR.
 - **One source of truth:** value → text only in `parquet_reader::value`; type support only in `parquet_reader::types`; colors only in `ui/theme.rs`; spacing only via `ui/spacing.rs`.
 - **Writes are atomic** (temp file + rename).
-- **Tests:** inline `#[cfg(test)]` modules; fixtures written with `ArrowWriter` into `tempfile`, never from `data/`. App behavior is tested through `crates/app/src/app_tests.rs` without a window.
+- **Tests:** inline `#[cfg(test)]` modules; fixtures written with `ArrowWriter` into `tempfile`, never from `data/`. App behavior is tested through `crates/app/src/app_tests.rs` without a window. The one `tests/` folder is `crates/cli/tests/`, for end-to-end tests that run the built `pavi-cli` (exit codes, stdout/stderr, pipes, stdin, files left behind); everything else stays inline.
 - Keep changes small and focused. Don't refactor unrelated code in the same change.
 
 ## Read before you change
