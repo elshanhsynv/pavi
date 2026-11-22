@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use parquet_reader::{DataPage, FilteredWindow, GroupBudget, PAGE_ROWS, SortBudget, SortMerge};
+use parquet_reader::{FilteredWindow, GroupBudget, PAGE_ROWS, ScanCursor, SortBudget, SortMerge};
 use pavi_runtime::{
     CancellationToken, GenerationId, PageOutcome, PageTask, Runtime, RuntimeHandle, SortedRead,
     SubmitError, TaskId,
@@ -49,7 +49,6 @@ struct Running {
     pending: Option<PageTask>,
     in_flight: Option<InFlight>,
     buffered: VecDeque<(TaskId, RecordBatch)>,
-    next_page: u64,
     /// Source row the next filtered read resumes from.
     next_filter_row: u64,
     remaining: Option<usize>,
@@ -59,6 +58,9 @@ struct Running {
     sort_submitted: bool,
     /// A sort that spilled to disk; its rows are read a page at a time.
     sort_merge: Option<Arc<Mutex<SortMerge>>>,
+    /// The scan of a query without sort or aggregate: one open reader per run of
+    /// row groups, kept between reads (made at the first read).
+    scan_cursor: Option<Arc<Mutex<ScanCursor>>>,
     aggregate_submitted: bool,
 }
 
@@ -77,8 +79,6 @@ pub enum QueryPoll {
 }
 
 enum InFlight {
-    Page,
-    Window,
     Filtered,
     Sorted,
     SortMerge,
@@ -402,13 +402,13 @@ impl Running {
             pending: None,
             in_flight: None,
             buffered: VecDeque::new(),
-            next_page: 0,
             next_filter_row: 0,
             finished: false,
             cancelled: false,
             scheduled_reads: 0,
             sort_submitted: false,
             sort_merge: None,
+            scan_cursor: None,
             aggregate_submitted: false,
         }
     }
@@ -434,7 +434,7 @@ impl Running {
         match self.in_flight.as_ref()? {
             InFlight::Filtered => Some(task.progress().scanned_rows().max(self.next_filter_row)),
             InFlight::Sorted | InFlight::Aggregate => Some(task.progress().scanned_rows()),
-            InFlight::Page | InFlight::Window | InFlight::SortMerge => None,
+            InFlight::SortMerge => None,
         }
     }
 
@@ -478,7 +478,7 @@ impl Running {
                 .context("query execution lost its pending read")?;
 
             match response.outcome {
-                PageOutcome::Loaded(page) => self.buffer_page(page, in_flight, response.task_id)?,
+                PageOutcome::Loaded(_) => bail!("runtime returned a page for a query read"),
                 PageOutcome::Batch(batch) => {
                     self.buffer_batch(batch, in_flight, response.task_id)?
                 }
@@ -547,7 +547,7 @@ impl Running {
                 .context("query execution lost its pending read")?;
 
             match response.outcome {
-                PageOutcome::Loaded(page) => self.buffer_page(page, in_flight, response.task_id)?,
+                PageOutcome::Loaded(_) => bail!("runtime returned a page for a query read"),
                 PageOutcome::Batch(batch) => {
                     self.buffer_batch(batch, in_flight, response.task_id)?
                 }
@@ -574,15 +574,6 @@ impl Running {
         self.scheduled_reads
     }
 
-    fn buffer_page(&mut self, page: DataPage, in_flight: InFlight, task_id: TaskId) -> Result<()> {
-        if !matches!(in_flight, InFlight::Page) {
-            bail!("runtime returned a page for a non-page query read");
-        }
-        self.buffered
-            .extend(page.batches.into_iter().map(|batch| (task_id, batch)));
-        Ok(())
-    }
-
     fn buffer_batch(
         &mut self,
         batch: RecordBatch,
@@ -590,10 +581,8 @@ impl Running {
         task_id: TaskId,
     ) -> Result<()> {
         match in_flight {
-            InFlight::Window => {}
             InFlight::Filtered => bail!("runtime returned a plain batch for a filtered query read"),
             InFlight::Aggregate => self.finished = true,
-            InFlight::Page => bail!("runtime returned a batch for a page query read"),
             InFlight::Sorted | InFlight::SortMerge => {
                 bail!("runtime returned one batch for a sorted query read")
             }
@@ -708,7 +697,7 @@ impl Running {
 
         let source = Arc::clone(&self.plan.source);
         let projection = self.plan.projection.clone();
-        let (task, in_flight, advance_page) = if let Some(aggregate) = &self.plan.aggregate {
+        let (task, in_flight) = if let Some(aggregate) = &self.plan.aggregate {
             if self.aggregate_submitted {
                 return Ok(());
             }
@@ -721,7 +710,6 @@ impl Running {
                     self.generation_id,
                 ),
                 InFlight::Aggregate,
-                false,
             )
         } else if !self.plan.sort.is_empty() {
             if self.sort_submitted {
@@ -737,7 +725,6 @@ impl Running {
                         self.generation_id,
                     ),
                     InFlight::SortMerge,
-                    false,
                 )
             } else {
                 (
@@ -753,57 +740,32 @@ impl Running {
                         self.generation_id,
                     ),
                     InFlight::Sorted,
-                    false,
                 )
             }
-        } else if let Some(filter) = &self.plan.filter {
-            (
-                self.runtime.submit_filtered_from(
-                    source,
-                    filter.clone(),
-                    self.next_filter_row,
-                    row_count,
-                    projection,
-                    self.generation_id,
-                ),
-                InFlight::Filtered,
-                false,
-            )
         } else {
-            let first_row = self.next_page.saturating_mul(PAGE_ROWS);
-            if first_row >= self.plan.source.row_count() {
+            if self.next_filter_row >= self.plan.source.row_count() {
                 self.finished = true;
                 return Ok(());
             }
-            if row_count < PAGE_ROWS as usize {
-                (
-                    self.runtime.submit_window(
-                        source,
-                        first_row,
-                        row_count,
-                        projection,
-                        self.generation_id,
-                    ),
-                    InFlight::Window,
-                    true,
-                )
-            } else {
-                (
-                    self.runtime.submit_page(
-                        source,
-                        self.next_page,
-                        projection,
-                        self.generation_id,
-                    ),
-                    InFlight::Page,
-                    true,
-                )
-            }
+            let cursor = match &self.scan_cursor {
+                Some(cursor) => Arc::clone(cursor),
+                None => {
+                    let cursor = Arc::new(Mutex::new(self.plan.source.scan_cursor(
+                        self.plan.filter.clone(),
+                        self.next_filter_row,
+                        &projection,
+                    )?));
+                    self.scan_cursor = Some(Arc::clone(&cursor));
+                    cursor
+                }
+            };
+            (
+                self.runtime
+                    .submit_cursor(source, cursor, row_count, self.generation_id),
+                InFlight::Filtered,
+            )
         };
         let task = task.context("submit query source read")?;
-        if advance_page {
-            self.next_page = self.next_page.saturating_add(1);
-        }
         if matches!(in_flight, InFlight::Sorted) {
             self.sort_submitted = true;
         }
@@ -1084,11 +1046,11 @@ mod tests {
         let runtime = runtime();
         let rows = source.row_count();
 
-        // A plain scan reads pages: there is no scan position to report.
+        // A plain scan reports its position too, from its first read on.
         let execution = QueryEngine::new(&runtime)
             .execute(&LogicalPlan::scan(Arc::clone(&source)), GenerationId(1))
             .unwrap();
-        assert_eq!(execution.scanned_rows(), None);
+        assert!(execution.scanned_rows().is_some());
 
         // A filter that matches nothing scans the whole file in one read.
         let filtered = LogicalPlan::scan(Arc::clone(&source))

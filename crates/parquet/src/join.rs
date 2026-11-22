@@ -490,40 +490,14 @@ fn scan(
         .iter()
         .map(|column| unique.iter().position(|kept| kept == column).unwrap_or(0))
         .collect::<Vec<_>>();
-    let rows = side.source.row_count();
-    match &side.filter {
-        Some(filter) => {
-            let mut start = 0;
-            while start < rows {
-                let window = side.source.read_filtered_from(
-                    filter,
-                    start,
-                    BATCH_ROWS,
-                    &projection,
-                    checkpoint,
-                )?;
-                if window.batch.num_rows() > 0 {
-                    each(window.batch.project(&positions)?)?;
-                }
-                if window.next_row <= start {
-                    break;
-                }
-                start = window.next_row;
-            }
-        }
-        None => {
-            let mut start = 0;
-            while start < rows {
-                if checkpoint(start) {
-                    return Err(crate::Cancelled.into());
-                }
-                let batch = side.source.read_window(start, BATCH_ROWS, &projection)?;
-                if batch.num_rows() == 0 {
-                    break;
-                }
-                start += batch.num_rows() as u64;
-                each(batch.project(&positions)?)?;
-            }
+    // One reader per run of row groups, kept across batches.
+    let mut cursor = side
+        .source
+        .scan_cursor(side.filter.clone(), 0, &projection)?;
+    while !cursor.is_finished() {
+        let window = cursor.next_window(&side.source, BATCH_ROWS, checkpoint)?;
+        if window.batch.num_rows() > 0 {
+            each(window.batch.project(&positions)?)?;
         }
     }
     Ok(())
