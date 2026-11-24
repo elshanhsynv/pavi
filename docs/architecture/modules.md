@@ -51,7 +51,8 @@ crates/parquet/src/            (parquet_reader)
 ├── source.rs       ParquetSource (1,924 lines): open, read_page/window/filtered/sorted/aggregated,
 │                   GroupCollector/Accumulator/Scalar (aggregation)
 ├── dataset.rs      folder datasets (ADR 0006): find the files (and the folders searched, with their times), merge their columns (ADR 0019), `key=value` partition columns, their values and statistics
-├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007)
+├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007); ImportOptions, ImportReport, the retyping second pass (ADR 0020)
+├── encoding.rs     TextEncoding (detect, parse), Decoded: CSV and JSON text in UTF-16 or Windows-1252 decoded to UTF-8 (ADR 0020)
 ├── change.rs       FileStamp, FolderStamp, FileChanged: noticing that the files a source read changed on disk (ADR 0018)
 ├── join.rs         hash joins (inner, left, semi, anti) into a temporary table; TempTableWriter (ADR 0009)
 ├── remote.rs       URLs (ADR 0008): resolving s3/gs/az URLs, SigV4, RemoteObject (range requests, range cache, download), RemoteReader (ChunkReader)
@@ -91,6 +92,7 @@ crates/app/src/                (pavi)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count, number formats), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), progress, temp-file + rename; the writers are parquet_reader::export::BatchWriter
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
+├── import.rs       ImportChoice (format + ImportOptions, as kept in the session), ImportDialog state (ADR 0020)
 ├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator (parquet_reader::profile statistics + distribution chart), ColumnProfile (derefs to ColumnStats)
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving
 ├── compare.rs      CompareState, SchemaDiff, key_query (SQL for rows only in one tab)
@@ -103,6 +105,7 @@ crates/app/src/                (pavi)
     ├── toolbar.rs     top bar: file menu (path box, open file or folder, new tab, recent), Grid/SQL switch, filter box, Sort/Columns/Export menus, window controls, window resize strips
     ├── tabs.rs        tab strip under the top bar (from two tabs on); drag to reorder
     ├── shortcuts.rs   the keyboard shortcuts window (F1) and the one list of shortcuts
+    ├── import.rs      Import options window; open_import_dialog, apply_import (reads again in its tab, keeping filter and sort)
     ├── grid.rs        virtualized source grid + filtered/SQL/sort grid, keyboard, header click → select column, header and cell menus, pinned-column overlay, find bar
     ├── sql.rs         SQL workspace: highlighted editor with completions, History and Saved menus
     ├── inspector.rs   right panel: cell, whole row, column and profile, file info, schema, row-group stats

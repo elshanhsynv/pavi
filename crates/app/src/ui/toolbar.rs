@@ -195,6 +195,7 @@ impl PaviApp {
         let mut open = None;
         let mut browse = false;
         let mut browse_folder = false;
+        let mut browse_import = false;
         let mut new_tab = false;
         let mut refresh = false;
         let mut compare = false;
@@ -219,6 +220,9 @@ impl PaviApp {
             browse = widgets::menu_item(ui, "Open file…", "Ctrl+O").clicked();
             browse_folder = widgets::menu_item(ui, "Open folder…", "Ctrl+Shift+O")
                 .on_hover_text("Every Parquet file in the folder as one table")
+                .clicked();
+            browse_import = widgets::menu_item(ui, "Open with import options…", "")
+                .on_hover_text("A CSV or JSON file with a chosen delimiter, encoding or header")
                 .clicked();
             new_tab = widgets::menu_item(ui, "New tab", "Ctrl+T").clicked();
             if let Some(dataset) = &self.dataset {
@@ -304,6 +308,7 @@ impl PaviApp {
             if open.is_some()
                 || browse
                 || browse_folder
+                || browse_import
                 || new_tab
                 || refresh
                 || compare
@@ -326,6 +331,9 @@ impl PaviApp {
         }
         if browse_folder {
             self.pick_folder();
+        }
+        if browse_import {
+            self.pick_file_with_options();
         }
         if new_tab {
             self.new_tab();

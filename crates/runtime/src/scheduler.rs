@@ -141,6 +141,10 @@ struct OpenRequest {
     task_id: TaskId,
     generation_id: GenerationId,
     path: PathBuf,
+    /// Read as this format whatever the extension; `None` goes by it.
+    format: Option<parquet_reader::FileFormat>,
+    /// How to read a CSV or JSON file (ADR 0020).
+    options: parquet_reader::ImportOptions,
     cancellation: CancellationToken,
     /// Share of the open done, in millionths (see [`OpenTask::progress`]).
     progress: ScanProgress,
@@ -289,6 +293,23 @@ impl RuntimeHandle {
         path: impl Into<PathBuf>,
         generation_id: GenerationId,
     ) -> Result<OpenTask, SubmitError> {
+        self.submit_open_with(
+            path,
+            None,
+            parquet_reader::ImportOptions::default(),
+            generation_id,
+        )
+    }
+
+    /// Like [`Self::submit_open`], reading the file as `format` (when given)
+    /// and a CSV or JSON file with `options`.
+    pub fn submit_open_with(
+        &self,
+        path: impl Into<PathBuf>,
+        format: Option<parquet_reader::FileFormat>,
+        options: parquet_reader::ImportOptions,
+        generation_id: GenerationId,
+    ) -> Result<OpenTask, SubmitError> {
         let sender = self.sender()?;
         let task_id = self.next_task_id()?;
         let cancellation = CancellationToken::default();
@@ -298,6 +319,8 @@ impl RuntimeHandle {
             task_id,
             generation_id,
             path: path.into(),
+            format,
+            options,
             cancellation: cancellation.clone(),
             progress: progress.clone(),
             response: response_sender,
@@ -582,7 +605,14 @@ fn execute_open(request: OpenRequest, shutdown: &AtomicBool) {
                 .set_scanned_rows((done.clamp(0.0, 1.0) * OPEN_PROGRESS_SCALE) as u64);
             cancelled()
         };
-        match guarded(|| ParquetSource::open_cancellable(&request.path, &checkpoint)) {
+        match guarded(|| {
+            ParquetSource::open_with_options(
+                &request.path,
+                request.format,
+                &request.options,
+                &checkpoint,
+            )
+        }) {
             Ok(_) if cancelled() => OpenOutcome::Cancelled,
             Ok(source) => OpenOutcome::Opened(Arc::new(source)),
             Err(error) if error.downcast_ref::<parquet_reader::Cancelled>().is_some() => {

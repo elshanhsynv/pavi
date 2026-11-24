@@ -13,10 +13,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef};
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 
+pub use crate::encoding::TextEncoding;
 use crate::{
+    encoding::Decoded,
     page::PAGE_ROWS,
     source::{Cancelled, GuardedReader, panic_message},
     spill::TempFolder,
@@ -83,10 +85,97 @@ impl FileFormat {
     }
 }
 
+/// How to read a CSV or JSON file (ADR 0020). The default guesses everything.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ImportOptions {
+    /// CSV: the byte between fields; `None` guesses it (a tab for `.tsv`,
+    /// otherwise the most frequent of `,` `;` tab `|` in the first line).
+    pub delimiter: Option<u8>,
+    /// CSV: whether the first line names the columns. Without one, columns are
+    /// named `column_1`, `column_2`, ….
+    pub header: bool,
+    /// The text encoding; `None` detects it ([`TextEncoding::detect`]).
+    pub encoding: Option<TextEncoding>,
+    /// Reads every column as text instead of guessing types (JSON: every
+    /// column that isn't a list or an object).
+    pub all_text: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: None,
+            header: true,
+            encoding: None,
+            all_text: false,
+        }
+    }
+}
+
+/// How a CSV or JSON file was actually read: the options with every guess
+/// resolved, and what changed while it was read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportReport {
+    pub format: FileFormat,
+    /// CSV only.
+    pub delimiter: Option<u8>,
+    pub header: bool,
+    pub encoding: TextEncoding,
+    pub all_text: bool,
+    /// Columns whose type was chosen again after reading every value, because
+    /// a value past the first [`MAX_INFER_ROWS`] records didn't fit the guess.
+    pub retyped: Vec<String>,
+}
+
+impl ImportReport {
+    /// How the file was read, in one line: `CSV, ; between fields, header
+    /// line, UTF-8`.
+    pub fn summary(&self) -> String {
+        let mut parts = vec![self.format.name().to_string()];
+        if let Some(delimiter) = self.delimiter {
+            parts.push(format!("{} between fields", delimiter_name(delimiter)));
+            parts.push(
+                if self.header {
+                    "header line"
+                } else {
+                    "no header line"
+                }
+                .to_string(),
+            );
+        }
+        parts.push(self.encoding.name().to_string());
+        if self.all_text {
+            parts.push("every column as text".to_string());
+        }
+        parts.join(", ")
+    }
+
+    /// The options that read the file this way again.
+    pub fn options(&self) -> ImportOptions {
+        ImportOptions {
+            delimiter: self.delimiter,
+            header: self.header,
+            encoding: Some(self.encoding),
+            all_text: self.all_text,
+        }
+    }
+}
+
+/// A delimiter as people name it: `\t` as "Tab", others as themselves.
+pub fn delimiter_name(delimiter: u8) -> String {
+    match delimiter {
+        b'\t' => "Tab".to_string(),
+        b' ' => "Space".to_string(),
+        other => char::from(other).to_string(),
+    }
+}
+
 /// A temporary Parquet copy of a file, deleted with this value.
 #[derive(Debug)]
 pub(crate) struct ConvertedFile {
     pub(crate) path: PathBuf,
+    /// How a CSV or JSON file was read; `None` for Arrow.
+    pub(crate) report: Option<ImportReport>,
     _folder: TempFolder,
 }
 
@@ -113,14 +202,56 @@ impl<R: Seek> Seek for Tracked<R> {
     }
 }
 
+/// A reader that reports progress and stops when cancelled, for passes that
+/// read the whole file without handing out batches (type inference).
+struct Watched<'a, R> {
+    inner: R,
+    position: Rc<Cell<u64>>,
+    total: u64,
+    checkpoint: &'a dyn Fn(f64) -> bool,
+    cancelled: Rc<Cell<bool>>,
+    /// Bytes read since the last checkpoint.
+    since: u64,
+}
+
+impl<R: Read> Read for Watched<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.since >= 1024 * 1024 {
+            self.since = 0;
+            if (self.checkpoint)(self.position.get() as f64 / self.total as f64) {
+                self.cancelled.set(true);
+                return Err(std::io::Error::other(Cancelled));
+            }
+        }
+        let read = self.inner.read(buffer)?;
+        self.since += read as u64;
+        Ok(read)
+    }
+}
+
+/// A value that doesn't fit the column type it was read as; the context of
+/// the reader's error.
+#[derive(Debug)]
+struct ValueMismatch;
+
+impl std::fmt::Display for ValueMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "column types were guessed from the first {MAX_INFER_ROWS} records, and a later              value does not fit them"
+        )
+    }
+}
+
 type Batches = Box<dyn Iterator<Item = std::result::Result<RecordBatch, ArrowError>>>;
 
 /// Reads `source` as `format` and writes it to a temporary Parquet file.
-/// `checkpoint` is called before each batch with the share of the file read so
-/// far (0 to 1); when it returns `true` the conversion ends with [`Cancelled`].
+/// `checkpoint` is called with the share of the file read so far (0 to 1);
+/// when it returns `true` the conversion ends with [`Cancelled`].
 pub(crate) fn convert(
     source: &Path,
     format: FileFormat,
+    options: &ImportOptions,
     checkpoint: &dyn Fn(f64) -> bool,
 ) -> Result<ConvertedFile> {
     let total = std::fs::metadata(source)
@@ -136,29 +267,221 @@ pub(crate) fn convert(
             position: Rc::clone(&position),
         })
     };
-    // The arrow readers panic on some malformed input instead of returning an
-    // error (found by the `other_formats` fuzz target); as for Parquet pages, a
-    // panic becomes an error so callers outside the runtime are protected too.
-    let readers = catch_unwind(AssertUnwindSafe(|| match format {
-        FileFormat::Csv => csv_batches(source, &open),
-        FileFormat::Json => json_batches(&open),
-        FileFormat::Arrow => arrow_batches(open()?),
-        FileFormat::Parquet => bail!("{} is a Parquet file", source.display()),
-    }));
-    let (schema, batches) = match readers {
-        Ok(readers) => readers?,
+    let progress = Progress {
+        position: &position,
+        total,
+        checkpoint,
+        cancelled: Rc::new(Cell::new(false)),
+    };
+    if format == FileFormat::Arrow {
+        let (schema, batches) = guarded_readers(format, || arrow_batches(open()?))?;
+        let path = write_parquet(source, format, schema, batches, &progress)?;
+        return Ok(ConvertedFile {
+            path: path.0,
+            report: None,
+            _folder: path.1,
+        });
+    }
+    if format == FileFormat::Parquet {
+        bail!("{} is a Parquet file", source.display());
+    }
+
+    let mut head = Vec::new();
+    open()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
+    let encoding = options
+        .encoding
+        .unwrap_or_else(|| TextEncoding::detect(&head));
+    let mut decoded_head = String::new();
+    // Only the start is decoded: a character cut off at its end is replaced.
+    let _ = Decoded::new(&head[..], encoding).read_to_string(&mut decoded_head);
+    let mut text = TextReader {
+        format,
+        header: options.header,
+        delimiter: None,
+        json_array: false,
+        all_text: options.all_text,
+    };
+    match format {
+        FileFormat::Csv => {
+            let tab_separated = source
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("tsv"));
+            text.delimiter = Some(options.delimiter.unwrap_or_else(|| {
+                if tab_separated {
+                    b'\t'
+                } else {
+                    sniff_delimiter(decoded_head.as_bytes())
+                }
+            }));
+        }
+        _ => {
+            text.json_array = decoded_head
+                .bytes()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .is_some_and(|byte| byte == b'[');
+        }
+    }
+    let open_text = || -> Result<Decoded<Tracked<File>>> { Ok(Decoded::new(open()?, encoding)) };
+    let report = |retyped: Vec<String>| ImportReport {
+        format,
+        delimiter: text.delimiter,
+        header: text.header,
+        encoding,
+        all_text: text.all_text,
+        retyped,
+    };
+
+    read_text(source, &text, &open_text, &progress, &report)
+        .map_err(|error| encoding_hint(error, encoding))
+}
+
+/// When text isn't valid in the encoding it was read as, says to choose another.
+fn encoding_hint(error: anyhow::Error, encoding: TextEncoding) -> anyhow::Error {
+    let invalid = error
+        .chain()
+        .any(|cause| cause.to_string().to_ascii_lowercase().contains("utf-8"));
+    if invalid && encoding == TextEncoding::Utf8 {
+        error.context(
+            "this file isn't valid UTF-8; read it with another encoding, such as \
+             Windows-1252 or UTF-16",
+        )
+    } else {
+        error
+    }
+}
+
+/// Reads a CSV or JSON file in two passes at most: with column types guessed
+/// from the first records, and again with types chosen from every value when
+/// a later value doesn't fit them.
+fn read_text(
+    source: &Path,
+    text: &TextReader,
+    open_text: &dyn Fn() -> Result<Decoded<Tracked<File>>>,
+    progress: &Progress<'_>,
+    report: &dyn Fn(Vec<String>) -> ImportReport,
+) -> Result<ConvertedFile> {
+    let format = text.format;
+    // First pass: column types guessed from the first records.
+    let guessed = text.infer(open_text()?, Some(MAX_INFER_ROWS), progress)?;
+    let first = guarded_readers(format, || {
+        Ok((Arc::clone(&guessed), text.batches(open_text()?, &guessed)?))
+    })
+    .and_then(|(schema, batches)| write_parquet(source, format, schema, batches, progress));
+    let error = match first {
+        Ok((path, folder)) => {
+            return Ok(ConvertedFile {
+                path,
+                report: Some(report(Vec::new())),
+                _folder: folder,
+            });
+        }
+        Err(error) => error,
+    };
+    if error.downcast_ref::<ValueMismatch>().is_none() || text.all_text {
+        return Err(error);
+    }
+    // A later value didn't fit: choose the types again from every value, and
+    // read the file again with them.
+    let every = text
+        .infer(open_text()?, None, progress)
+        .context("read every value to choose the column types")?;
+    let retyped = every
+        .fields()
+        .iter()
+        .filter(|field| {
+            guessed
+                .field_with_name(field.name())
+                .map_or(true, |old| old.data_type() != field.data_type())
+        })
+        .map(|field| field.name().clone())
+        .collect();
+    let (path, folder) = guarded_readers(format, || {
+        Ok((Arc::clone(&every), text.batches(open_text()?, &every)?))
+    })
+    .and_then(|(schema, batches)| write_parquet(source, format, schema, batches, progress))
+    .map_err(|error| {
+        if error.downcast_ref::<ValueMismatch>().is_some() {
+            error.context(
+                "a value doesn't fit the column types chosen from every value; \
+                     reading every column as text avoids this",
+            )
+        } else {
+            error
+        }
+    })?;
+    Ok(ConvertedFile {
+        path,
+        report: Some(report(retyped)),
+        _folder: folder,
+    })
+}
+
+/// Where a conversion is, for its progress and cancellation.
+struct Progress<'a> {
+    position: &'a Rc<Cell<u64>>,
+    total: u64,
+    checkpoint: &'a dyn Fn(f64) -> bool,
+    /// Set when a watched reader stopped because the work was cancelled.
+    cancelled: Rc<Cell<bool>>,
+}
+
+impl Progress<'_> {
+    fn stop(&self) -> bool {
+        (self.checkpoint)(self.position.get() as f64 / self.total as f64)
+    }
+
+    fn watch<R: Read>(&self, inner: R) -> Watched<'_, R> {
+        Watched {
+            inner,
+            position: Rc::clone(self.position),
+            total: self.total,
+            checkpoint: self.checkpoint,
+            cancelled: Rc::clone(&self.cancelled),
+            since: 0,
+        }
+    }
+
+    /// An inference error, or [`Cancelled`] when a watched reader stopped it.
+    fn error(&self, error: ArrowError, context: &'static str) -> anyhow::Error {
+        if self.cancelled.get() {
+            Cancelled.into()
+        } else {
+            anyhow::Error::new(error).context(context)
+        }
+    }
+}
+
+/// The arrow readers panic on some malformed input instead of returning an
+/// error (found by the `other_formats` fuzz target); as for Parquet pages, a
+/// panic becomes an error so callers outside the runtime are protected too.
+fn guarded_readers(
+    format: FileFormat,
+    build: impl FnOnce() -> Result<(SchemaRef, Batches)>,
+) -> Result<(SchemaRef, Batches)> {
+    match catch_unwind(AssertUnwindSafe(build)) {
+        Ok(readers) => readers,
         Err(payload) => bail!(
             "malformed {} data: {}",
             format.name(),
             panic_message(&*payload)
         ),
-    };
+    }
+}
+
+/// Writes `batches` to a new temporary Parquet file. A value that doesn't fit
+/// its column type ends it with a [`ValueMismatch`] error.
+fn write_parquet(
+    source: &Path,
+    format: FileFormat,
+    schema: SchemaRef,
+    batches: Batches,
+    progress: &Progress<'_>,
+) -> Result<(PathBuf, TempFolder)> {
     let batches = GuardedReader::new(batches);
     if schema.fields().is_empty() {
         bail!("{} has no columns", source.display());
     }
     let inferred = matches!(format, FileFormat::Csv | FileFormat::Json);
-
     let folder = TempFolder::create(CONVERT_PREFIX)?;
     let path = folder.path.join("converted.parquet");
     let file =
@@ -170,19 +493,21 @@ pub(crate) fn convert(
     let mut writer = ArrowWriter::try_new(file, schema, Some(properties))
         .context("this file has a column type Parquet cannot store")?;
     for batch in batches {
-        if checkpoint(position.get() as f64 / total as f64) {
+        if progress.stop() {
             return Err(Cancelled.into());
         }
-        let batch = batch.map_err(|error| {
-            if inferred {
-                error.context(format!(
-                    "column types were guessed from the first {MAX_INFER_ROWS} records, \
-                     and a later value does not fit them"
-                ))
-            } else {
-                error
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error)
+                if inferred
+                    && error
+                        .downcast_ref::<ArrowError>()
+                        .is_some_and(is_value_mismatch) =>
+            {
+                return Err(error.context(ValueMismatch));
             }
-        })?;
+            Err(error) => return Err(error),
+        };
         writer.write(&batch)?;
         if writer.in_progress_size() > MAX_BUFFERED_BYTES {
             writer.flush()?;
@@ -197,38 +522,124 @@ pub(crate) fn convert(
     writer
         .close()
         .context("finish the temporary Parquet file")?;
-    Ok(ConvertedFile {
-        path,
-        _folder: folder,
-    })
+    Ok((path, folder))
 }
 
-fn csv_batches(
-    source: &Path,
-    open: &dyn Fn() -> Result<Tracked<File>>,
-) -> Result<(SchemaRef, Batches)> {
-    let tab_separated = source
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("tsv"));
-    let delimiter = if tab_separated {
-        b'\t'
-    } else {
-        let mut head = Vec::new();
-        open()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
-        sniff_delimiter(&head)
-    };
-    let format = arrow_csv::reader::Format::default()
-        .with_header(true)
-        .with_delimiter(delimiter);
-    let (schema, _) = format
-        .infer_schema(BufReader::new(open()?), Some(MAX_INFER_ROWS))
-        .context("read the CSV header and guess column types")?;
-    let schema = Arc::new(schema);
-    let reader = arrow_csv::ReaderBuilder::new(Arc::clone(&schema))
-        .with_format(format)
-        .with_batch_size(BATCH_ROWS)
-        .build(BufReader::new(open()?))?;
-    Ok((schema, Box::new(reader)))
+/// A parse error for one value (CSV), or a JSON value of another type than its
+/// column's, or a JSON field the guessed columns don't have.
+fn is_value_mismatch(error: &ArrowError) -> bool {
+    match error {
+        ArrowError::ParseError(_) => true,
+        ArrowError::JsonError(message) => {
+            message.contains("expected") || message.contains("missing from schema")
+        }
+        _ => false,
+    }
+}
+
+/// Reads a CSV or JSON file's decoded text.
+struct TextReader {
+    format: FileFormat,
+    header: bool,
+    /// CSV only.
+    delimiter: Option<u8>,
+    /// JSON only: one array of objects rather than one object per line.
+    json_array: bool,
+    all_text: bool,
+}
+
+impl TextReader {
+    fn csv_format(&self) -> arrow_csv::reader::Format {
+        arrow_csv::reader::Format::default()
+            .with_header(self.header)
+            .with_delimiter(self.delimiter.unwrap_or(b','))
+    }
+
+    fn json_lines<R: Read + 'static>(&self, reader: R) -> Box<dyn BufRead> {
+        if self.json_array {
+            Box::new(BufReader::new(ArrayAsLines::new(reader)))
+        } else {
+            Box::new(BufReader::new(reader))
+        }
+    }
+
+    /// The column types, guessed from the first `records` (all when `None`).
+    fn infer<R: Read>(
+        &self,
+        reader: R,
+        records: Option<usize>,
+        progress: &Progress<'_>,
+    ) -> Result<SchemaRef> {
+        let reader = progress.watch(reader);
+        let inferred = catch_unwind(AssertUnwindSafe(|| -> Result<Schema> {
+            Ok(match self.format {
+                FileFormat::Json => {
+                    let lines: Box<dyn BufRead + '_> = if self.json_array {
+                        Box::new(BufReader::new(ArrayAsLines::new(reader)))
+                    } else {
+                        Box::new(BufReader::new(reader))
+                    };
+                    arrow_json::reader::infer_json_schema(lines, records)
+                        .map(|(schema, _)| schema)
+                        .map_err(|error| {
+                            progress.error(error, "read the JSON records and guess column types")
+                        })?
+                }
+                _ => self
+                    .csv_format()
+                    .infer_schema(BufReader::new(reader), records)
+                    .map(|(schema, _)| schema)
+                    .map_err(|error| {
+                        progress.error(error, "read the CSV header and guess column types")
+                    })?,
+            })
+        }));
+        let schema = match inferred {
+            Ok(schema) => schema?,
+            Err(payload) => bail!(
+                "malformed {} data: {}",
+                self.format.name(),
+                panic_message(&*payload)
+            ),
+        };
+        if !self.all_text {
+            return Ok(Arc::new(schema));
+        }
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.data_type().is_nested() {
+                    field.as_ref().clone()
+                } else {
+                    field.as_ref().clone().with_data_type(DataType::Utf8)
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(Arc::new(Schema::new(fields)))
+    }
+
+    fn batches<R: Read + 'static>(&self, reader: R, schema: &SchemaRef) -> Result<Batches> {
+        Ok(match self.format {
+            FileFormat::Json => Box::new(
+                arrow_json::ReaderBuilder::new(Arc::clone(schema))
+                    .with_batch_size(BATCH_ROWS)
+                    // A field the guessed columns lack is an error, so the
+                    // types are chosen again from every record, instead of
+                    // the field being left out.
+                    .with_strict_mode(true)
+                    // Numbers and booleans in a text column are read as text.
+                    .with_coerce_primitive(true)
+                    .build(self.json_lines(reader))?,
+            ),
+            _ => Box::new(
+                arrow_csv::ReaderBuilder::new(Arc::clone(schema))
+                    .with_format(self.csv_format())
+                    .with_batch_size(BATCH_ROWS)
+                    .build(BufReader::new(reader))?,
+            ),
+        })
+    }
 }
 
 /// The most frequent of `,` `;` tab `|` outside quotes in the first line; `,`
@@ -255,29 +666,6 @@ fn sniff_delimiter(head: &[u8]) -> u8 {
         .max_by_key(|(position, count)| (**count, std::cmp::Reverse(*position)))
         .filter(|(_, count)| **count > 0)
         .map_or(b',', |(position, _)| CANDIDATES[position])
-}
-
-fn json_batches(open: &dyn Fn() -> Result<Tracked<File>>) -> Result<(SchemaRef, Batches)> {
-    let mut head = Vec::new();
-    open()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
-    let array = head
-        .iter()
-        .find(|byte| !byte.is_ascii_whitespace())
-        .is_some_and(|byte| *byte == b'[');
-    let lines = |file: Tracked<File>| -> Box<dyn BufRead> {
-        if array {
-            Box::new(BufReader::new(ArrayAsLines::new(file)))
-        } else {
-            Box::new(BufReader::new(file))
-        }
-    };
-    let (schema, _) = arrow_json::reader::infer_json_schema(lines(open()?), Some(MAX_INFER_ROWS))
-        .context("read the JSON records and guess column types")?;
-    let schema = Arc::new(schema);
-    let reader = arrow_json::ReaderBuilder::new(Arc::clone(&schema))
-        .with_batch_size(BATCH_ROWS)
-        .build(lines(open()?))?;
-    Ok((schema, Box::new(reader)))
 }
 
 /// Turns one JSON array of values into whitespace-separated values, which the
@@ -635,17 +1023,186 @@ mod tests {
         assert_eq!(ParquetSource::open(&empty).unwrap().row_count(), 0);
     }
 
-    #[test]
-    fn says_when_a_value_does_not_fit_the_guessed_type() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut contents = b"n\n".to_vec();
+    /// A CSV file of `rows` numbers under the header `n`, then `last`.
+    fn late_value(directory: &Path, name: &str, last: &str) -> PathBuf {
+        let mut contents = b"n,label\n".to_vec();
         for value in 0..MAX_INFER_ROWS + 5 {
-            writeln!(contents, "{value}").unwrap();
+            writeln!(contents, "{value},x").unwrap();
         }
-        contents.extend_from_slice(b"oops\n");
-        let path = write(directory.path(), "late.csv", &contents);
-        let error = format!("{:#}", ParquetSource::open(&path).err().unwrap());
-        assert!(error.contains("guessed from the first 10000"), "{error}");
+        writeln!(contents, "{last},y").unwrap();
+        write(directory, name, &contents)
+    }
+
+    fn open_with(path: &Path, options: ImportOptions) -> Result<ParquetSource> {
+        ParquetSource::open_with_options(path, None, &options, &|_| false)
+    }
+
+    #[test]
+    fn retypes_columns_when_a_later_value_does_not_fit() {
+        let directory = tempfile::tempdir().unwrap();
+        // Text after 10,000 numbers: the column becomes text.
+        let path = late_value(directory.path(), "late.csv", "oops");
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(source.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(source.row_count(), MAX_INFER_ROWS as u64 + 6);
+        let last = source
+            .read_window(source.row_count() - 1, 1, &Projection::all(2))
+            .unwrap();
+        assert_eq!(
+            scalar_text(last.column(0).as_ref(), 0).unwrap().unwrap(),
+            "oops"
+        );
+        let report = source.import_report().unwrap();
+        assert_eq!(report.retyped, ["n"]);
+
+        // A fraction after whole numbers: the column becomes a float.
+        let path = late_value(directory.path(), "fraction.csv", "2.5");
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(source.schema().field(0).data_type(), &DataType::Float64);
+        assert_eq!(source.schema().field(1).data_type(), &DataType::Utf8);
+
+        // A whole number too large for 64 bits: read as text.
+        let path = late_value(directory.path(), "huge.csv", "99999999999999999999999");
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(source.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn retypes_json_and_keeps_fields_that_appear_late() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut contents = Vec::new();
+        for value in 0..MAX_INFER_ROWS + 5 {
+            writeln!(contents, "{{\"id\": {value}}}").unwrap();
+        }
+        contents.extend_from_slice(b"{\"id\": \"A-7\", \"extra\": true}\n");
+        let path = write(directory.path(), "late.jsonl", &contents);
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(source.schema().field(0).data_type(), &DataType::Utf8);
+        // A field first seen after the guessed records is kept, not dropped.
+        let extra = source.schema().index_of("extra").unwrap();
+        let last = source
+            .read_window(source.row_count() - 1, 1, &Projection::all(2))
+            .unwrap();
+        assert_eq!(
+            scalar_text(last.column(0).as_ref(), 0).unwrap().unwrap(),
+            "A-7"
+        );
+        assert_eq!(
+            scalar_text(last.column(extra).as_ref(), 0)
+                .unwrap()
+                .unwrap(),
+            "true"
+        );
+        let mut retyped = source.import_report().unwrap().retyped.clone();
+        retyped.sort();
+        assert_eq!(retyped, ["extra", "id"]);
+    }
+
+    #[test]
+    fn reads_csv_with_the_options_asked_for() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write(directory.path(), "plain.txt", b"1|a;b|2.5\n2|c|3\n");
+        let options = ImportOptions {
+            delimiter: Some(b'|'),
+            header: false,
+            ..ImportOptions::default()
+        };
+        let source =
+            ParquetSource::open_with_options(&path, Some(FileFormat::Csv), &options, &|_| false)
+                .unwrap();
+        let names = source
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["column_1", "column_2", "column_3"]);
+        assert_eq!(texts(&source, 1), ["a;b", "c"]);
+        assert_eq!(source.schema().field(0).data_type(), &DataType::Int64);
+        let report = source.import_report().unwrap();
+        assert_eq!(report.delimiter, Some(b'|'));
+        assert!(!report.header);
+        assert_eq!(report.encoding, TextEncoding::Utf8);
+        assert_eq!(report.options().delimiter, Some(b'|'));
+
+        // Every column as text keeps leading zeros.
+        let codes = write(directory.path(), "codes.csv", b"zip,n\n02134,1\n");
+        let source = open_with(
+            &codes,
+            ImportOptions {
+                all_text: true,
+                ..ImportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(texts(&source, 0), ["02134"]);
+        assert_eq!(source.schema().field(1).data_type(), &DataType::Utf8);
+
+        // The guesses are reported.
+        let semicolons = write(directory.path(), "s.csv", b"a;b\n1;2\n");
+        let report = ParquetSource::open(&semicolons)
+            .unwrap()
+            .import_report()
+            .unwrap()
+            .clone();
+        assert_eq!(report.delimiter, Some(b';'));
+        assert!(report.retyped.is_empty());
+    }
+
+    #[test]
+    fn reads_csv_in_other_text_encodings() {
+        let directory = tempfile::tempdir().unwrap();
+        // UTF-8 with a byte order mark: the first column's name has no mark.
+        let marked = write(
+            directory.path(),
+            "bom.csv",
+            "\u{feff}id,name\n1,Zoë\n".as_bytes(),
+        );
+        let source = ParquetSource::open(&marked).unwrap();
+        assert_eq!(source.schema().field(0).name(), "id");
+        assert_eq!(texts(&source, 1), ["Zoë"]);
+
+        // UTF-16 as Excel's "Unicode text" writes it: tab-separated, with a mark.
+        let mut utf16 = vec![0xFF, 0xFE];
+        for unit in "id\tname\n1\tZoë €\n".encode_utf16() {
+            utf16.extend(unit.to_le_bytes());
+        }
+        let path = write(directory.path(), "unicode.txt", &utf16);
+        let source = ParquetSource::open_with_options(
+            &path,
+            Some(FileFormat::Csv),
+            &ImportOptions::default(),
+            &|_| false,
+        )
+        .unwrap();
+        assert_eq!(texts(&source, 1), ["Zoë €"]);
+        let report = source.import_report().unwrap();
+        assert_eq!(report.encoding, TextEncoding::Utf16Le);
+        assert_eq!(report.delimiter, Some(b'\t'));
+
+        // Windows-1252, detected because it isn't valid UTF-8, or asked for.
+        let latin = write(directory.path(), "latin.csv", b"city\nM\xfcnchen\n\x80 5\n");
+        let source = ParquetSource::open(&latin).unwrap();
+        assert_eq!(texts(&source, 0), ["München", "€ 5"]);
+        assert_eq!(
+            source.import_report().unwrap().encoding,
+            TextEncoding::Windows1252
+        );
+        let asked = open_with(
+            &write(directory.path(), "ascii.csv", b"a\nx\n"),
+            ImportOptions {
+                encoding: Some(TextEncoding::Windows1252),
+                ..ImportOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            asked.import_report().unwrap().encoding,
+            TextEncoding::Windows1252
+        );
+
+        // Arrow and Parquet files have no report.
+        assert!(asked.import_report().is_some());
     }
 
     #[test]

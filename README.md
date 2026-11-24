@@ -48,6 +48,7 @@ pavi-cli flights.parquet --schema --format csv
 pavi-cli flights.parquet --stats --columns DEP_DELAY      # min/max per row group, no scan
 pavi-cli flights.parquet --profile --format csv           # nulls, distinct, min, max, mean per column
 pavi-cli flights.csv -o flights.parquet                   # convert; the file appears when complete
+pavi-cli export.txt --input-format csv --delimiter ";" --encoding windows-1252 --all-text
 curl -s https://example.com/data.parquet | pavi-cli - --count
 pavi-cli flights.parquet --sql "SELECT ORIGIN, COUNT(*), AVG(DEP_DELAY) FROM flights GROUP BY ORIGIN"
 pavi-cli flights.parquet --table airports.csv --format csv \

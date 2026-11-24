@@ -662,6 +662,13 @@ impl PaviApp {
         let mut browse = false;
         let mut browse_folder = false;
         let mut open = None;
+        let mut import_options = None;
+        // A file (not a folder) that failed to open may need other import
+        // options: another delimiter or encoding, or read as CSV or JSON.
+        let failed_file = self
+            .failed_path
+            .clone()
+            .filter(|path| parquet_reader::is_remote(path) || path.extension().is_some());
         widgets::placeholder(ui, |ui| match &self.grid.loading {
             LoadState::Opening => {
                 ui.add(egui::Spinner::new().color(theme::accent()));
@@ -689,6 +696,16 @@ impl PaviApp {
                 widgets::error(ui, error);
                 browse = widgets::primary_button(ui, Some(Icon::Folder), "Choose another file")
                     .clicked();
+                if let Some(path) = &failed_file
+                    && ui
+                        .button("Import options…")
+                        .on_hover_text(
+                            "Read it as CSV or JSON, with another delimiter, encoding or                              header line, or every column as text",
+                        )
+                        .clicked()
+                {
+                    import_options = Some(path.clone());
+                }
             }
             _ => {
                 let (mark, _) =
@@ -729,6 +746,9 @@ impl PaviApp {
         }
         if browse_folder {
             self.pick_folder();
+        }
+        if let Some(path) = import_options {
+            self.open_import_dialog(path);
         }
         if let Some(path) = open {
             self.open_path(path);

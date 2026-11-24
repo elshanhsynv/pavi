@@ -169,9 +169,14 @@ fn run(
         false
     };
     // --input-format overrides the extension (and, for stdin, the first bytes).
-    let open = |path: &Path| match args.input_format {
-        Some(format) => ParquetSource::open_as(path, format.file_format(), &opening),
-        None => ParquetSource::open_cancellable(path, &opening),
+    let options = args.import_options();
+    let open = |path: &Path| {
+        ParquetSource::open_with_options(
+            path,
+            args.input_format.map(args::InputFormat::file_format),
+            &options,
+            &opening,
+        )
     };
     let parquet = match &stdin {
         Some(copy) => open(&copy.path).context("read standard input")?,
@@ -794,6 +799,16 @@ fn print_summary(parquet: &ParquetSource, out: &mut impl Write) -> io::Result<()
             writeln!(out, "Partitions: {}", partitions.join(", "))?;
         }
     }
+    if let Some(report) = parquet.import_report() {
+        writeln!(out, "Read as: {}", report.summary())?;
+        if !report.retyped.is_empty() {
+            writeln!(
+                out,
+                "Retyped after reading every value: {}",
+                report.retyped.join(", ")
+            )?;
+        }
+    }
     writeln!(out, "Rows: {}", parquet.row_count())?;
     writeln!(out, "Columns: {}", parquet.column_count())?;
     writeln!(out, "Row groups: {}", parquet.row_groups().len())?;
@@ -1366,6 +1381,47 @@ mod tests {
         let mut out = Vec::new();
         run(&parse(arguments), &mut &stdin[..], &mut out, 2).unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn reads_csv_with_the_delimiter_header_encoding_and_types_asked_for() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("cities.csv");
+        std::fs::write(&path, b"007;M\xfcnchen\n042;K\xf6ln\n").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        assert_eq!(
+            output(&[
+                &path,
+                "--delimiter",
+                ";",
+                "--no-header",
+                "--all-text",
+                "--format",
+                "csv"
+            ]),
+            "column_1,column_2\n007,München\n042,Köln\n"
+        );
+        // The summary says how it was read; the encoding was detected.
+        let summary = output(&[&path, "--delimiter", ";", "--no-header", "-n", "1"]);
+        assert!(
+            summary.contains("Read as: CSV, ; between fields, no header line, Windows-1252"),
+            "{summary}"
+        );
+        // An encoding asked for is used as it is; this file isn't UTF-8, and
+        // the error says what to do.
+        let arguments = [&path, "--delimiter", ";", "--encoding", "utf-8"];
+        let error = run(&parse(&arguments), &mut io::empty(), &mut Vec::new(), 2).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("another encoding"), "{error}");
+        // Bad values are refused before anything is read.
+        assert!(Args::try_parse_from(["pavi-cli", "x.csv", "--delimiter", "ab"]).is_err());
+        assert!(Args::try_parse_from(["pavi-cli", "x.csv", "--encoding", "ebcdic"]).is_err());
+        assert_eq!(
+            Args::try_parse_from(["pavi-cli", "x.csv", "--delimiter", "tab"])
+                .unwrap()
+                .delimiter,
+            Some(b'\t')
+        );
     }
 
     #[test]

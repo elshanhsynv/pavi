@@ -6,7 +6,7 @@ memory use before users do. It covers the inputs PAVI does not control (see `SEC
 | Target | Input | What it exercises |
 |---|---|---|
 | `parquet_file` | Raw bytes saved as a `.parquet` file | `ParquetSource::open` (footer, schema, statistics), first/last page reads, top-N sort, grouped aggregate, cell formatting for grid/CSV |
-| `other_formats` | First byte picks `.csv`, `.tsv`, `.jsonl` or `.arrow`; the rest is the file | Delimiter sniffing, CSV/JSON type inference, the JSON-array reader, Arrow file/stream detection, conversion to the temporary Parquet file (ADR 0007), first page read, cell formatting |
+| `other_formats` | First byte picks `.csv`, `.tsv`, `.jsonl` or `.arrow`, and import options (encoding, header line, every column as text); the rest is the file | Encoding detection and decoding (ADR 0020), delimiter sniffing, CSV/JSON type inference, the JSON-array reader, Arrow file/stream detection, conversion to the temporary Parquet file (ADR 0007), first page read, cell formatting |
 | `filter_expr` | Filter-box text | `FilterExpr::parse`, type checks, evaluation on every fixture column type, filtered scan with statistics pruning |
 | `sql_query` | SQL-workspace text | `SqlAst::parse` → logical plan → `Planner::plan` → the matching aggregate/sort/filter/window read, then formatting |
 

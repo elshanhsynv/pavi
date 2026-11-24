@@ -1,6 +1,6 @@
 # 0007. Other file formats are converted to Parquet when opened
 
-- Status: accepted
+- Status: accepted; reading options, other encodings and retyping after a late value are in [0020](0020-import-options.md)
 - Date: 2026-11-12
 
 ## Context
