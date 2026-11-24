@@ -3043,7 +3043,10 @@ fn reads_a_file_with_the_import_options_chosen_and_keeps_them() {
     let dataset = app.dataset.as_ref().unwrap();
     assert_eq!(dataset.column_names, ["column_1", "column_2"]);
     let report = dataset.source.import_report().unwrap();
-    assert_eq!(report.encoding, parquet_reader::TextEncoding::Windows1252);
+    assert_eq!(
+        report.encoding,
+        Some(parquet_reader::TextEncoding::Windows1252)
+    );
     assert_eq!(app.tab_count(), 1, "read again in the same tab");
 
     // Reload reads it the same way, and keeps the filter.
@@ -3077,4 +3080,51 @@ fn reads_a_file_with_the_import_options_chosen_and_keeps_them() {
     poll_until_opened(&mut restarted);
     assert!(restarted.session.saved_import(&path).is_none());
     assert!(restarted.dataset.is_none());
+}
+
+#[test]
+fn opens_an_excel_workbook_and_offers_its_sheets() {
+    let directory = TempDir::new().unwrap();
+    let path = std::path::absolute(directory.path().join("book.xlsx")).unwrap();
+    let batch = arrow_array::RecordBatch::try_from_iter(vec![
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+        ),
+        (
+            "name",
+            Arc::new(StringArray::from(vec!["a", "b", "c"])) as arrow_array::ArrayRef,
+        ),
+    ])
+    .unwrap();
+    let mut writer = parquet_reader::export::BatchWriter::new(
+        parquet_reader::export::ExportFormat::Xlsx,
+        File::create(&path).unwrap(),
+        batch.schema(),
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let mut app = PaviApp::new_with_store(
+        None,
+        SessionStore::new(directory.path().join("session.json")),
+    );
+    app.open_path(path.clone());
+    poll_until_opened(&mut app);
+    let dataset = app.dataset.as_ref().unwrap();
+    assert_eq!(dataset.source.format(), parquet_reader::FileFormat::Excel);
+    assert_eq!(dataset.column_names, ["id", "name"]);
+    app.filter_input = "id >= 2".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    assert_eq!(filtered_ids(&app), ["2", "3"]);
+
+    app.open_import_dialog(path);
+    let dialog = app.import_dialog.as_ref().unwrap();
+    assert_eq!(dialog.sheets, ["Data"]);
+    assert_eq!(
+        dialog.read_as.as_deref(),
+        Some("Excel, sheet Data (1 of 1), header row")
+    );
 }

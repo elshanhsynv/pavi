@@ -83,10 +83,18 @@ pub enum ExportFormat {
     Json,
     /// Arrow IPC file format (Feather v2).
     Arrow,
+    /// An Excel workbook with one sheet (ADR 0021).
+    Xlsx,
 }
 
 impl ExportFormat {
-    pub const ALL: [Self; 4] = [Self::Csv, Self::Parquet, Self::Json, Self::Arrow];
+    pub const ALL: [Self; 5] = [
+        Self::Csv,
+        Self::Parquet,
+        Self::Json,
+        Self::Arrow,
+        Self::Xlsx,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -94,6 +102,7 @@ impl ExportFormat {
             Self::Parquet => "Parquet",
             Self::Json => "JSON Lines",
             Self::Arrow => "Arrow",
+            Self::Xlsx => "Excel",
         }
     }
 
@@ -103,6 +112,7 @@ impl ExportFormat {
             Self::Parquet => "parquet",
             Self::Json => "jsonl",
             Self::Arrow => "arrow",
+            Self::Xlsx => "xlsx",
         }
     }
 }
@@ -114,6 +124,7 @@ pub enum BatchWriter<W: Write + Send> {
     Parquet(Box<ArrowWriter<W>>),
     Json(JsonWriter<W>),
     Arrow(Box<arrow_ipc::writer::FileWriter<W>>),
+    Xlsx(Box<XlsxWriter<W>>),
 }
 
 impl<W: Write + Send> BatchWriter<W> {
@@ -129,6 +140,7 @@ impl<W: Write + Send> BatchWriter<W> {
             ExportFormat::Arrow => Ok(Self::Arrow(Box::new(
                 arrow_ipc::writer::FileWriter::try_new(output, &schema)?,
             ))),
+            ExportFormat::Xlsx => Ok(Self::Xlsx(Box::new(XlsxWriter::new(output, schema)?))),
         }
     }
 
@@ -144,6 +156,7 @@ impl<W: Write + Send> BatchWriter<W> {
             Self::Parquet(writer) => writer.write(batch).map_err(Into::into),
             Self::Json(writer) => writer.write(batch),
             Self::Arrow(writer) => writer.write(batch).map_err(Into::into),
+            Self::Xlsx(writer) => writer.write(batch),
         }
     }
 
@@ -162,8 +175,255 @@ impl<W: Write + Send> BatchWriter<W> {
                 writer.get_mut().flush()?;
                 Ok(())
             }
+            Self::Xlsx(writer) => writer.finish(),
         }
     }
+}
+
+/// Rows an Excel sheet holds, its header row included.
+pub const MAX_XLSX_ROWS: u32 = 1_048_576;
+/// Characters an Excel cell holds; longer text is cut to this.
+pub const MAX_XLSX_CELL_CHARS: usize = 32_767;
+/// Days from Excel's day 0 (1899-12-30) to 1970-01-01.
+const EXCEL_UNIX_EPOCH_DAYS: f64 = 25_569.0;
+/// The first day Excel's 1900 calendar counts correctly (1900-03-01); earlier
+/// dates are written as text.
+const EXCEL_FIRST_EXACT_DAY: f64 = 61.0;
+/// The day after Excel's last date (9999-12-31); later dates are written as text.
+const EXCEL_LAST_DAY: f64 = 2_958_466.0;
+
+/// How one column is written to an Excel sheet.
+enum XlsxColumn {
+    /// Integers, floats and decimals, as Excel numbers (which are 64-bit
+    /// floats: integers past 2^53 lose their last digits).
+    Number,
+    Bool,
+    /// Dates and naive timestamps, as Excel dates with a date format.
+    Date {
+        with_time: bool,
+    },
+    /// Times of day, as a fraction of a day with a time format.
+    Time,
+    /// Everything else, as the grid's text.
+    Text,
+}
+
+impl XlsxColumn {
+    fn of(data_type: &DataType) -> Self {
+        match data_type {
+            data_type if crate::types::is_numeric(data_type) => Self::Number,
+            DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) => {
+                Self::Number
+            }
+            DataType::Boolean => Self::Bool,
+            DataType::Date32 => Self::Date { with_time: false },
+            DataType::Date64 | DataType::Timestamp(_, None) => Self::Date { with_time: true },
+            DataType::Time32(_) | DataType::Time64(_) => Self::Time,
+            _ => Self::Text,
+        }
+    }
+}
+
+/// An Excel workbook with one sheet: a header row with the column names, then
+/// one row per row. Rows go to temporary files as they are written (the
+/// writer's constant-memory mode), so memory stays bounded; the workbook is
+/// assembled into the output at the end. Nulls are empty cells.
+pub struct XlsxWriter<W: Write + Send> {
+    output: Option<W>,
+    workbook: rust_xlsxwriter::Workbook,
+    columns: Vec<XlsxColumn>,
+    schema: SchemaRef,
+    /// The next row to write.
+    row: u32,
+    date: rust_xlsxwriter::Format,
+    date_time: rust_xlsxwriter::Format,
+    time: rust_xlsxwriter::Format,
+    /// Holds the writer's temporary files; deleted with the writer.
+    _folder: crate::spill::TempFolder,
+}
+
+impl<W: Write + Send> XlsxWriter<W> {
+    pub fn new(output: W, schema: SchemaRef) -> Result<Self> {
+        let folder = crate::spill::TempFolder::create("pavi-xlsx-")?;
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        workbook.set_tempdir(&folder.path)?;
+        let sheet = workbook.add_worksheet_with_constant_memory()?;
+        sheet.set_name("Data")?;
+        let bold = rust_xlsxwriter::Format::new().set_bold();
+        for (column, field) in schema.fields().iter().enumerate() {
+            let column = xlsx_column(column)?;
+            sheet.write_string_with_format(0, column, field.name(), &bold)?;
+        }
+        sheet.set_freeze_panes(1, 0)?;
+        Ok(Self {
+            output: Some(output),
+            workbook,
+            columns: schema
+                .fields()
+                .iter()
+                .map(|field| XlsxColumn::of(field.data_type()))
+                .collect(),
+            schema,
+            row: 1,
+            date: rust_xlsxwriter::Format::new().set_num_format("yyyy-mm-dd"),
+            date_time: rust_xlsxwriter::Format::new().set_num_format("yyyy-mm-dd hh:mm:ss"),
+            time: rust_xlsxwriter::Format::new().set_num_format("hh:mm:ss"),
+            _folder: folder,
+        })
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if batch.schema() != self.schema {
+            bail!("export batch schema changed");
+        }
+        let rows = u32::try_from(batch.num_rows()).unwrap_or(u32::MAX);
+        if self.row.saturating_add(rows) > MAX_XLSX_ROWS {
+            bail!(
+                "an Excel sheet holds at most {} rows; export to CSV or Parquet, or \
+                 filter the rows first",
+                MAX_XLSX_ROWS - 1
+            );
+        }
+        // Each column is prepared once for the batch: numbers and dates as
+        // f64 or i64, text through the shared formatter.
+        let mut prepared = Vec::with_capacity(batch.num_columns());
+        for (array, kind) in batch.columns().iter().zip(&self.columns) {
+            let array = array.as_ref();
+            let values = match kind {
+                // A 32-bit float goes through its shortest decimal text, so
+                // Excel shows 11.783334 as the grid does, not 11.7833337783813.
+                XlsxColumn::Number if array.data_type() == &DataType::Float32 => {
+                    Some(std::sync::Arc::new(
+                        array
+                            .as_primitive::<arrow_array::types::Float32Type>()
+                            .iter()
+                            .map(|value| {
+                                value.map(|value| {
+                                    value.to_string().parse().unwrap_or(f64::from(value))
+                                })
+                            })
+                            .collect::<arrow_array::Float64Array>(),
+                    ) as arrow_array::ArrayRef)
+                }
+                XlsxColumn::Number => Some(arrow_cast::cast(array, &DataType::Float64)?),
+                XlsxColumn::Date { .. } => Some(arrow_cast::cast(
+                    &arrow_cast::cast(
+                        array,
+                        &DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                    )?,
+                    &DataType::Int64,
+                )?),
+                XlsxColumn::Time => Some(arrow_cast::cast(
+                    &arrow_cast::cast(
+                        array,
+                        &DataType::Time64(arrow_schema::TimeUnit::Nanosecond),
+                    )?,
+                    &DataType::Int64,
+                )?),
+                _ => None,
+            };
+            let texts = if matches!(kind, XlsxColumn::Text) && is_scalar_type(array.data_type()) {
+                Some(ScalarTexts::new(array)?)
+            } else {
+                None
+            };
+            prepared.push((array, kind, values, texts));
+        }
+        let sheet = self.workbook.worksheet_from_index(0)?;
+        let mut text = String::new();
+        // The constant-memory sheet takes cells row by row, left to right.
+        for offset in 0..batch.num_rows() {
+            let row = self.row + offset as u32;
+            for (index, (array, kind, values, texts)) in prepared.iter().enumerate() {
+                if array.is_null(offset) {
+                    continue;
+                }
+                let column = xlsx_column(index)?;
+                match (kind, values) {
+                    (XlsxColumn::Number, Some(values)) => {
+                        let value = values
+                            .as_primitive::<arrow_array::types::Float64Type>()
+                            .value(offset);
+                        if value.is_finite() {
+                            sheet.write_number(row, column, value)?;
+                        } else {
+                            sheet.write_string(row, column, value.to_string())?;
+                        }
+                    }
+                    (XlsxColumn::Date { with_time }, Some(values)) => {
+                        let millis = values
+                            .as_primitive::<arrow_array::types::Int64Type>()
+                            .value(offset);
+                        let serial = millis as f64 / 86_400_000.0 + EXCEL_UNIX_EPOCH_DAYS;
+                        if (EXCEL_FIRST_EXACT_DAY..EXCEL_LAST_DAY).contains(&serial) {
+                            let format = if *with_time {
+                                &self.date_time
+                            } else {
+                                &self.date
+                            };
+                            sheet.write_number_with_format(row, column, serial, format)?;
+                        } else {
+                            sheet.write_string(
+                                row,
+                                column,
+                                crate::value::format_cell(*array, offset),
+                            )?;
+                        }
+                    }
+                    (XlsxColumn::Time, Some(values)) => {
+                        let nanos = values
+                            .as_primitive::<arrow_array::types::Int64Type>()
+                            .value(offset);
+                        sheet.write_number_with_format(
+                            row,
+                            column,
+                            nanos as f64 / 86_400_000_000_000.0,
+                            &self.time,
+                        )?;
+                    }
+                    (XlsxColumn::Bool, _) => {
+                        sheet.write_boolean(row, column, array.as_boolean().value(offset))?;
+                    }
+                    _ => {
+                        text.clear();
+                        match texts {
+                            Some(texts) => {
+                                if is_binary(array.data_type()) {
+                                    text.push_str("0x");
+                                }
+                                texts.write(offset, &mut text)?;
+                            }
+                            None => text.push_str(&crate::value::format_cell(*array, offset)),
+                        }
+                        if text.chars().count() > MAX_XLSX_CELL_CHARS {
+                            text = text.chars().take(MAX_XLSX_CELL_CHARS).collect();
+                        }
+                        sheet.write_string(row, column, &text)?;
+                    }
+                }
+            }
+        }
+        self.row += rows;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        let mut output = self
+            .output
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("the Excel export was already finished"))?;
+        self.workbook.save_to_writer(&mut output)?;
+        output.flush()?;
+        Ok(())
+    }
+}
+
+/// An Excel column number; a sheet holds 16,384 columns.
+fn xlsx_column(index: usize) -> Result<u16> {
+    u16::try_from(index)
+        .ok()
+        .filter(|column| *column < 16_384)
+        .ok_or_else(|| anyhow::anyhow!("an Excel sheet holds at most 16,384 columns"))
 }
 
 /// JSON Lines: one object per row. Scalars use the shared value text, so they
@@ -770,8 +1030,135 @@ mod tests {
                 ExportFormat::Json => assert_eq!(output, b"{\"id\":1}\n{\"id\":2}\n"),
                 ExportFormat::Parquet => assert!(output.starts_with(b"PAR1")),
                 ExportFormat::Arrow => assert!(output.starts_with(b"ARROW1")),
+                ExportFormat::Xlsx => assert!(output.starts_with(b"PK")),
             }
         }
+    }
+
+    #[test]
+    fn writes_an_excel_sheet_that_reads_back_with_its_types() {
+        use arrow_array::{BooleanArray, Date32Array, Float64Array, TimestampMillisecondArray};
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])) as ArrayRef,
+            ),
+            (
+                "price",
+                Arc::new(Float64Array::from(vec![2.5, f64::NAN, 0.1])) as ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from(vec![Some("a"), Some("b, c"), None])) as ArrayRef,
+            ),
+            (
+                "ok",
+                Arc::new(BooleanArray::from(vec![true, false, true])) as ArrayRef,
+            ),
+            (
+                "day",
+                // 2024-02-29, and a date before 1900-03-01, written as text.
+                Arc::new(Date32Array::from(vec![19_782, -25_567, 0])) as ArrayRef,
+            ),
+            (
+                "at",
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    1_704_191_400_000,
+                    0,
+                    86_399_000,
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("out.xlsx");
+        let mut writer = BatchWriter::new(
+            ExportFormat::Xlsx,
+            std::fs::File::create(&path).unwrap(),
+            batch.schema(),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+
+        let source = crate::ParquetSource::open(&path).unwrap();
+        assert_eq!(source.row_count(), 6);
+        let types = source
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                DataType::Int64,
+                // NaN is written as text, so the column reads back as text.
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Boolean,
+                DataType::Utf8,
+                DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            ]
+        );
+        let rows = source
+            .read_window(0, 3, &crate::Projection::all(6))
+            .unwrap();
+        let text = |column: usize| {
+            (0..3)
+                .map(|row| {
+                    scalar_text(rows.column(column).as_ref(), row)
+                        .unwrap()
+                        .unwrap_or_else(|| "null".to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(0), ["1", "null", "3"]);
+        assert_eq!(text(1), ["2.5", "NaN", "0.1"]);
+        // A 32-bit float keeps its short decimal form.
+        let mut float32 = Vec::new();
+        let small = RecordBatch::try_from_iter(vec![(
+            "x",
+            Arc::new(arrow_array::Float32Array::from(vec![11.783_334_f32])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut writer =
+            BatchWriter::new(ExportFormat::Xlsx, &mut float32, small.schema()).unwrap();
+        writer.write(&small).unwrap();
+        writer.finish().unwrap();
+        let small_path = directory.path().join("small.xlsx");
+        std::fs::write(&small_path, &float32).unwrap();
+        let small = crate::ParquetSource::open(&small_path).unwrap();
+        let rows = small.read_window(0, 1, &crate::Projection::all(1)).unwrap();
+        assert_eq!(
+            scalar_text(rows.column(0).as_ref(), 0).unwrap().unwrap(),
+            "11.783334"
+        );
+        assert_eq!(text(2), ["a", "b, c", "null"]);
+        assert_eq!(text(4), ["2024-02-29", "1900-01-01", "1970-01-01"]);
+        assert_eq!(
+            text(5),
+            [
+                "2024-01-02T10:30:00",
+                "1970-01-01T00:00:00",
+                "1970-01-01T23:59:59"
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_more_rows_than_an_excel_sheet_holds() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "id",
+            Arc::new(Int32Array::from(vec![0; 600_000])) as ArrayRef,
+        )])
+        .unwrap();
+        let mut output = Vec::new();
+        let mut writer = BatchWriter::new(ExportFormat::Xlsx, &mut output, batch.schema()).unwrap();
+        writer.write(&batch).unwrap();
+        let error = writer.write(&batch).unwrap_err().to_string();
+        assert!(error.contains("at most 1048575 rows"), "{error}");
     }
 
     #[test]

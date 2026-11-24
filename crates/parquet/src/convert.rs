@@ -29,7 +29,7 @@ pub const MAX_CONVERTED_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// CSV and JSON records read to guess the column types.
 pub const MAX_INFER_ROWS: usize = 10_000;
 /// Rows read and written at a time.
-const BATCH_ROWS: usize = 8_192;
+pub(crate) const BATCH_ROWS: usize = 8_192;
 /// Rows per row group of the converted file, so filters can skip row groups.
 const ROW_GROUP_ROWS: usize = 64 * PAGE_ROWS as usize;
 /// A row group is written out once this much is buffered, whatever its rows.
@@ -52,12 +52,16 @@ pub enum FileFormat {
     Json,
     /// Arrow IPC: the file format (Feather v2) or the stream format.
     Arrow,
+    /// An Excel or OpenDocument workbook: `.xlsx`, `.xlsm`, `.xlsb`, `.xls`
+    /// or `.ods`; one sheet is read (ADR 0021).
+    Excel,
 }
 
 impl FileFormat {
     /// File extensions PAVI opens, for file dialogs.
     pub const EXTENSIONS: &[&str] = &[
         "parquet", "csv", "tsv", "json", "jsonl", "ndjson", "arrow", "feather", "ipc", "arrows",
+        "xlsx", "xlsm", "xlsb", "xls", "ods",
     ];
 
     /// The format for `path`'s extension; anything not listed is read as Parquet.
@@ -71,6 +75,7 @@ impl FileFormat {
             "csv" | "tsv" => Self::Csv,
             "json" | "jsonl" | "ndjson" => Self::Json,
             "arrow" | "feather" | "ipc" | "arrows" => Self::Arrow,
+            "xlsx" | "xlsm" | "xlsb" | "xls" | "ods" => Self::Excel,
             _ => Self::Parquet,
         }
     }
@@ -81,24 +86,28 @@ impl FileFormat {
             Self::Csv => "CSV",
             Self::Json => "JSON",
             Self::Arrow => "Arrow",
+            Self::Excel => "Excel",
         }
     }
 }
 
-/// How to read a CSV or JSON file (ADR 0020). The default guesses everything.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+/// How to read a CSV, JSON or Excel file (ADR 0020, 0021). The default
+/// guesses everything.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImportOptions {
     /// CSV: the byte between fields; `None` guesses it (a tab for `.tsv`,
     /// otherwise the most frequent of `,` `;` tab `|` in the first line).
     pub delimiter: Option<u8>,
-    /// CSV: whether the first line names the columns. Without one, columns are
-    /// named `column_1`, `column_2`, ….
+    /// CSV and Excel: whether the first line (row) names the columns. Without
+    /// one, columns are named `column_1`, `column_2`, ….
     pub header: bool,
     /// The text encoding; `None` detects it ([`TextEncoding::detect`]).
     pub encoding: Option<TextEncoding>,
     /// Reads every column as text instead of guessing types (JSON: every
     /// column that isn't a list or an object).
     pub all_text: bool,
+    /// Excel: the sheet to read, by name; `None` reads the first worksheet.
+    pub sheet: Option<String>,
 }
 
 impl Default for ImportOptions {
@@ -108,6 +117,7 @@ impl Default for ImportOptions {
             header: true,
             encoding: None,
             all_text: false,
+            sheet: None,
         }
     }
 }
@@ -120,11 +130,16 @@ pub struct ImportReport {
     /// CSV only.
     pub delimiter: Option<u8>,
     pub header: bool,
-    pub encoding: TextEncoding,
+    /// CSV and JSON only; Excel files hold their own text.
+    pub encoding: Option<TextEncoding>,
     pub all_text: bool,
     /// Columns whose type was chosen again after reading every value, because
     /// a value past the first [`MAX_INFER_ROWS`] records didn't fit the guess.
     pub retyped: Vec<String>,
+    /// Excel: the sheet read.
+    pub sheet: Option<String>,
+    /// Excel: the workbook's worksheets, in order.
+    pub sheets: Vec<String>,
 }
 
 impl ImportReport {
@@ -132,6 +147,24 @@ impl ImportReport {
     /// line, UTF-8`.
     pub fn summary(&self) -> String {
         let mut parts = vec![self.format.name().to_string()];
+        if let Some(sheet) = &self.sheet {
+            let position = self
+                .sheets
+                .iter()
+                .position(|name| name == sheet)
+                .map_or_else(String::new, |index| {
+                    format!(" ({} of {})", index + 1, self.sheets.len())
+                });
+            parts.push(format!("sheet {sheet}{position}"));
+            parts.push(
+                if self.header {
+                    "header row"
+                } else {
+                    "no header row"
+                }
+                .to_string(),
+            );
+        }
         if let Some(delimiter) = self.delimiter {
             parts.push(format!("{} between fields", delimiter_name(delimiter)));
             parts.push(
@@ -143,7 +176,9 @@ impl ImportReport {
                 .to_string(),
             );
         }
-        parts.push(self.encoding.name().to_string());
+        if let Some(encoding) = self.encoding {
+            parts.push(encoding.name().to_string());
+        }
         if self.all_text {
             parts.push("every column as text".to_string());
         }
@@ -155,8 +190,9 @@ impl ImportReport {
         ImportOptions {
             delimiter: self.delimiter,
             header: self.header,
-            encoding: Some(self.encoding),
+            encoding: self.encoding,
             all_text: self.all_text,
+            sheet: self.sheet.clone(),
         }
     }
 }
@@ -285,6 +321,14 @@ pub(crate) fn convert(
     if format == FileFormat::Parquet {
         bail!("{} is a Parquet file", source.display());
     }
+    if format == FileFormat::Excel {
+        let (path, folder, report) = crate::excel::convert(source, options, checkpoint)?;
+        return Ok(ConvertedFile {
+            path,
+            report: Some(report),
+            _folder: folder,
+        });
+    }
 
     let mut head = Vec::new();
     open()?.take(SNIFF_BYTES).read_to_end(&mut head)?;
@@ -326,9 +370,11 @@ pub(crate) fn convert(
         format,
         delimiter: text.delimiter,
         header: text.header,
-        encoding,
+        encoding: Some(encoding),
         all_text: text.all_text,
         retyped,
+        sheet: None,
+        sheets: Vec::new(),
     };
 
     read_text(source, &text, &open_text, &progress, &report)
@@ -468,6 +514,57 @@ fn guarded_readers(
     }
 }
 
+/// A temporary Parquet file being written, row group by row group.
+pub(crate) struct ParquetSink {
+    writer: ArrowWriter<File>,
+    path: PathBuf,
+    folder: TempFolder,
+}
+
+impl ParquetSink {
+    pub(crate) fn new(source: &Path, schema: SchemaRef) -> Result<Self> {
+        if schema.fields().is_empty() {
+            bail!("{} has no columns", source.display());
+        }
+        let folder = TempFolder::create(CONVERT_PREFIX)?;
+        let path = folder.path.join("converted.parquet");
+        let file = File::create(&path)
+            .with_context(|| format!("create temporary file {}", path.display()))?;
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+            .build();
+        let writer = ArrowWriter::try_new(file, schema, Some(properties))
+            .context("this file has a column type Parquet cannot store")?;
+        Ok(Self {
+            writer,
+            path,
+            folder,
+        })
+    }
+
+    pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        self.writer.write(batch)?;
+        if self.writer.in_progress_size() > MAX_BUFFERED_BYTES {
+            self.writer.flush()?;
+        }
+        if self.writer.bytes_written() as u64 > MAX_CONVERTED_BYTES {
+            bail!(
+                "reading this file needs more than {} GB of temporary disk space",
+                MAX_CONVERTED_BYTES / (1024 * 1024 * 1024)
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<(PathBuf, TempFolder)> {
+        self.writer
+            .close()
+            .context("finish the temporary Parquet file")?;
+        Ok((self.path, self.folder))
+    }
+}
+
 /// Writes `batches` to a new temporary Parquet file. A value that doesn't fit
 /// its column type ends it with a [`ValueMismatch`] error.
 fn write_parquet(
@@ -478,20 +575,8 @@ fn write_parquet(
     progress: &Progress<'_>,
 ) -> Result<(PathBuf, TempFolder)> {
     let batches = GuardedReader::new(batches);
-    if schema.fields().is_empty() {
-        bail!("{} has no columns", source.display());
-    }
     let inferred = matches!(format, FileFormat::Csv | FileFormat::Json);
-    let folder = TempFolder::create(CONVERT_PREFIX)?;
-    let path = folder.path.join("converted.parquet");
-    let file =
-        File::create(&path).with_context(|| format!("create temporary file {}", path.display()))?;
-    let properties = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema, Some(properties))
-        .context("this file has a column type Parquet cannot store")?;
+    let mut sink = ParquetSink::new(source, schema)?;
     for batch in batches {
         if progress.stop() {
             return Err(Cancelled.into());
@@ -508,21 +593,9 @@ fn write_parquet(
             }
             Err(error) => return Err(error),
         };
-        writer.write(&batch)?;
-        if writer.in_progress_size() > MAX_BUFFERED_BYTES {
-            writer.flush()?;
-        }
-        if writer.bytes_written() as u64 > MAX_CONVERTED_BYTES {
-            bail!(
-                "reading this file needs more than {} GB of temporary disk space",
-                MAX_CONVERTED_BYTES / (1024 * 1024 * 1024)
-            );
-        }
+        sink.write(&batch)?;
     }
-    writer
-        .close()
-        .context("finish the temporary Parquet file")?;
-    Ok((path, folder))
+    sink.finish()
 }
 
 /// A parse error for one value (CSV), or a JSON value of another type than its
@@ -1122,7 +1195,7 @@ mod tests {
         let report = source.import_report().unwrap();
         assert_eq!(report.delimiter, Some(b'|'));
         assert!(!report.header);
-        assert_eq!(report.encoding, TextEncoding::Utf8);
+        assert_eq!(report.encoding, Some(TextEncoding::Utf8));
         assert_eq!(report.options().delimiter, Some(b'|'));
 
         // Every column as text keeps leading zeros.
@@ -1177,7 +1250,7 @@ mod tests {
         .unwrap();
         assert_eq!(texts(&source, 1), ["Zoë €"]);
         let report = source.import_report().unwrap();
-        assert_eq!(report.encoding, TextEncoding::Utf16Le);
+        assert_eq!(report.encoding, Some(TextEncoding::Utf16Le));
         assert_eq!(report.delimiter, Some(b'\t'));
 
         // Windows-1252, detected because it isn't valid UTF-8, or asked for.
@@ -1186,7 +1259,7 @@ mod tests {
         assert_eq!(texts(&source, 0), ["München", "€ 5"]);
         assert_eq!(
             source.import_report().unwrap().encoding,
-            TextEncoding::Windows1252
+            Some(TextEncoding::Windows1252)
         );
         let asked = open_with(
             &write(directory.path(), "ascii.csv", b"a\nx\n"),
@@ -1198,7 +1271,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             asked.import_report().unwrap().encoding,
-            TextEncoding::Windows1252
+            Some(TextEncoding::Windows1252)
         );
 
         // Arrow and Parquet files have no report.

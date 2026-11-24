@@ -443,6 +443,7 @@ fn batch_writer<W: Write + Send>(
         Format::Jsonl => ExportFormat::Json,
         Format::Parquet => ExportFormat::Parquet,
         Format::Arrow => ExportFormat::Arrow,
+        Format::Xlsx => ExportFormat::Xlsx,
         Format::Table => bail!("the table is not a streamed format"),
     };
     BatchWriter::new(format, out, schema)
@@ -1522,6 +1523,25 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(ParquetSource::open(&parquet).unwrap().row_count(), 4);
+
+        // An Excel workbook, read back from its one sheet, "Data".
+        let xlsx = target("out.xlsx");
+        convert(&[&path, "-o", xlsx.to_str().unwrap(), "--filter", "id >= 2"]).unwrap();
+        assert_eq!(
+            output(&[xlsx.to_str().unwrap(), "--sheet", "Data", "--format", "csv"]),
+            output(&[&path, "--filter", "id >= 2", "--format", "csv"])
+        );
+        let summary = output(&[xlsx.to_str().unwrap(), "-n", "1"]);
+        assert!(
+            summary.contains("Read as: Excel, sheet Data (1 of 1), header row"),
+            "{summary}"
+        );
+        let missing = [xlsx.to_str().unwrap(), "--sheet", "Nope"];
+        let error = run(&parse(&missing), &mut io::empty(), &mut Vec::new(), 2).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("its sheets are Data"),
+            "{error:#}"
+        );
 
         let csv = target("out.csv");
         convert(&[&path, "-o", csv.to_str().unwrap(), "--columns", "name"]).unwrap();

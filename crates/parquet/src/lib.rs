@@ -4,6 +4,7 @@ mod change;
 pub mod convert;
 pub mod dataset;
 mod encoding;
+mod excel;
 pub mod export;
 pub mod filter;
 mod footer;
@@ -31,6 +32,7 @@ pub use convert::{
 pub use dataset::{
     MAX_DATASET_FILES, MAX_DATASET_METADATA_BYTES, MAX_FOLDER_DEPTH, MAX_FOLDER_ENTRIES,
 };
+pub use excel::{MAX_EXCEL_COLUMNS, MAX_EXCEL_SHARED_BYTES, MAX_EXCEL_WHOLE_BYTES};
 pub use filter::{Comparison, FilterExpr, FilterOp};
 pub use join::{
     JoinKind, JoinSide, MAX_JOIN_BUILD_BYTES, MAX_JOIN_BUILD_ROWS, MAX_JOIN_KEYS,

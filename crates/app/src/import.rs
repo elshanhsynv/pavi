@@ -9,7 +9,7 @@ use crate::session::SavedImport;
 
 /// How the user chose to read a file: a format other than its extension's,
 /// and options for CSV and JSON.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ImportChoice {
     pub(crate) format: Option<FileFormat>,
     pub(crate) options: ImportOptions,
@@ -22,12 +22,13 @@ impl ImportChoice {
     }
 
     /// As the session keeps it.
-    pub(crate) fn to_saved(self, path: &Path) -> SavedImport {
+    pub(crate) fn to_saved(&self, path: &Path) -> SavedImport {
         SavedImport {
             path: path.to_path_buf(),
             format: match self.format {
                 Some(FileFormat::Csv) => "csv",
                 Some(FileFormat::Json) => "json",
+                Some(FileFormat::Excel) => "excel",
                 _ => "",
             }
             .to_string(),
@@ -43,6 +44,7 @@ impl ImportChoice {
                 .map(|encoding| encoding.name().to_string())
                 .unwrap_or_default(),
             all_text: self.options.all_text,
+            sheet: self.options.sheet.clone().unwrap_or_default(),
         }
     }
 
@@ -56,6 +58,7 @@ impl ImportChoice {
             format: match saved.format.as_str() {
                 "csv" => Some(FileFormat::Csv),
                 "json" => Some(FileFormat::Json),
+                "excel" => Some(FileFormat::Excel),
                 _ => None,
             },
             options: ImportOptions {
@@ -63,6 +66,7 @@ impl ImportChoice {
                 header: !saved.no_header,
                 encoding: TextEncoding::parse(&saved.encoding),
                 all_text: saved.all_text,
+                sheet: (!saved.sheet.is_empty()).then(|| saved.sheet.clone()),
             },
         }
     }
@@ -114,6 +118,10 @@ pub(crate) struct ImportDialog {
     /// `None` detects it.
     pub(crate) encoding: Option<TextEncoding>,
     pub(crate) all_text: bool,
+    /// Excel: the sheet's name; empty for the first.
+    pub(crate) sheet: String,
+    /// Excel: the workbook's sheets, when it has been read.
+    pub(crate) sheets: Vec<String>,
     /// How the file was read last, when it is open (`ImportReport::summary`).
     pub(crate) read_as: Option<String>,
     /// Columns retyped after a late value, last time it was read.
@@ -139,6 +147,8 @@ impl ImportDialog {
             header: choice.options.header,
             encoding: choice.options.encoding,
             all_text: choice.options.all_text,
+            sheet: choice.options.sheet.clone().unwrap_or_default(),
+            sheets: Vec::new(),
             read_as: None,
             retyped: Vec::new(),
             error: None,
@@ -184,6 +194,7 @@ impl ImportDialog {
                 header: self.header,
                 encoding: self.encoding,
                 all_text: self.all_text,
+                sheet: (!self.sheet.trim().is_empty()).then(|| self.sheet.trim().to_string()),
             },
         })
     }
@@ -202,6 +213,7 @@ mod tests {
                 header: false,
                 encoding: Some(TextEncoding::Utf16Le),
                 all_text: true,
+                sheet: Some("Q3".to_string()),
             },
         };
         let saved = choice.to_saved(Path::new("a.txt"));

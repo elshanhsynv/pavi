@@ -16,7 +16,7 @@ PAVI opens local Parquet files, or a folder of them as one table (ADR 0006), eac
 | GUI | `eframe 0.31.1` with default features → **glow** (OpenGL) renderer, winit, accesskit. **No `persistence` feature.** `egui_extras 0.31` (`TableBuilder`) for the grid. No `egui_plot` — charts are hand-painted. | `Cargo.toml`, `crates/app/Cargo.toml` |
 | Dialogs | `rfd 0.15` synchronous `FileDialog` (open/save) | `app.rs:444`, `app.rs:855`, `ui/toolbar.rs:115` |
 | Clipboard | egui's `ctx.copy_text` (no extra crate) | `app.rs:1745`, `ui/inspector.rs:66,127` |
-| Parquet/Arrow | `parquet 60` (feature `arrow`), `arrow-array/-schema/-select/-ord 60`, `arrow-cast 60` (value display rules), `arrow-csv`/`arrow-json`/`arrow-ipc 60` (opening CSV, JSON and Arrow files, Arrow export; ADR 0007), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
+| Parquet/Arrow | `parquet 60` (feature `arrow`), `arrow-array/-schema/-select/-ord 60`, `arrow-cast 60` (value display rules), `calamine` and `rust_xlsxwriter` (reading workbooks, writing `.xlsx`, ADR 0021), `arrow-csv`/`arrow-json`/`arrow-ipc 60` (opening CSV, JSON and Arrow files, Arrow export; ADR 0007), `arrow-array`'s `chrono-tz` feature (named time zones). **No** polars/datafusion/duckdb. | workspace `Cargo.toml` |
 | SQL | `sqlparser 0.62` (GenericDialect) used only for parsing; execution is custom | `crates/query/src/sql.rs` |
 | Network | `ureq 3` (blocking HTTP), `rustls` with `ring` and `rustls-native-certs` (system root certificates); `ring` also signs S3 requests (SigV4). ADR 0008 | `crates/parquet/src/remote.rs` |
 | Threading | `std::thread` + `std::sync::mpsc::sync_channel` + `Arc<AtomicBool>` cancellation. No tokio, no rayon. | `crates/runtime/` |
@@ -52,6 +52,7 @@ crates/parquet/src/            (parquet_reader)
 │                   GroupCollector/Accumulator/Scalar (aggregation)
 ├── dataset.rs      folder datasets (ADR 0006): find the files (and the folders searched, with their times), merge their columns (ADR 0019), `key=value` partition columns, their values and statistics
 ├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007); ImportOptions, ImportReport, the retyping second pass (ADR 0020)
+├── excel.rs        Excel and OpenDocument workbooks read a sheet at a time into Parquet (calamine; size checks, column kinds, two passes) (ADR 0021)
 ├── encoding.rs     TextEncoding (detect, parse), Decoded: CSV and JSON text in UTF-16 or Windows-1252 decoded to UTF-8 (ADR 0020)
 ├── change.rs       FileStamp, FolderStamp, FileChanged: noticing that the files a source read changed on disk (ADR 0018)
 ├── join.rs         hash joins (inner, left, semi, anti) into a temporary table; TempTableWriter (ADR 0009)

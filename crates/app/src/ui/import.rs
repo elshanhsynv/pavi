@@ -25,6 +25,7 @@ impl PaviApp {
         {
             dialog.read_as = Some(report.summary());
             dialog.retyped = report.retyped.clone();
+            dialog.sheets = report.sheets.clone();
         }
         self.import_dialog = Some(dialog);
     }
@@ -33,8 +34,11 @@ impl PaviApp {
     pub(in crate::app) fn pick_file_with_options(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(
-                "CSV and JSON",
-                &["csv", "tsv", "txt", "json", "jsonl", "ndjson"],
+                "CSV, JSON and Excel",
+                &[
+                    "csv", "tsv", "txt", "json", "jsonl", "ndjson", "xlsx", "xlsm", "xlsb", "xls",
+                    "ods",
+                ],
             )
             .add_filter("Any file", &["*"])
             .pick_file()
@@ -66,7 +70,7 @@ impl PaviApp {
         }
     }
 
-    /// The Import options window: how to read a CSV or JSON file.
+    /// The Import options window: how to read a CSV, JSON or Excel file.
     pub(in crate::app) fn show_import_window(&mut self, ctx: &egui::Context) {
         let Some(dialog) = self.import_dialog.as_mut() else {
             return;
@@ -88,6 +92,7 @@ impl PaviApp {
                 ui.spacing_mut().item_spacing = Spacing::Md.vec(Spacing::Sm);
                 let format = dialog.effective_format();
                 let csv = format == FileFormat::Csv;
+                let excel = format == FileFormat::Excel;
                 egui::Grid::new("import_options")
                     .num_columns(2)
                     .spacing(Spacing::Lg.vec(Spacing::Sm))
@@ -100,7 +105,7 @@ impl PaviApp {
                         ui.label(RichText::new("Read as").color(theme::muted()));
                         let by_extension = FileFormat::from_path(&dialog.path);
                         let by_extension = match by_extension {
-                            FileFormat::Csv | FileFormat::Json => {
+                            FileFormat::Csv | FileFormat::Json | FileFormat::Excel => {
                                 format!("By extension ({})", by_extension.name())
                             }
                             _ => "By extension".to_string(),
@@ -122,8 +127,46 @@ impl PaviApp {
                                     Some(FileFormat::Json),
                                     "JSON",
                                 );
+                                ui.selectable_value(
+                                    &mut dialog.format,
+                                    Some(FileFormat::Excel),
+                                    "Excel or OpenDocument workbook",
+                                );
                             });
                         ui.end_row();
+
+                        if excel {
+                            ui.label(RichText::new("Sheet").color(theme::muted()));
+                            if dialog.sheets.is_empty() {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut dialog.sheet)
+                                        .desired_width(180.0)
+                                        .hint_text("The first sheet"),
+                                );
+                            } else {
+                                egui::ComboBox::from_id_salt("import_sheet")
+                                    .selected_text(if dialog.sheet.is_empty() {
+                                        "The first sheet"
+                                    } else {
+                                        dialog.sheet.as_str()
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut dialog.sheet,
+                                            String::new(),
+                                            "The first sheet",
+                                        );
+                                        for sheet in &dialog.sheets {
+                                            ui.selectable_value(
+                                                &mut dialog.sheet,
+                                                sheet.clone(),
+                                                sheet,
+                                            );
+                                        }
+                                    });
+                            }
+                            ui.end_row();
+                        }
 
                         ui.label(RichText::new("Between fields").color(theme::muted()));
                         ui.add_enabled_ui(csv, |ui| {
@@ -152,27 +195,34 @@ impl PaviApp {
 
                         ui.label("");
                         ui.add_enabled(
-                            csv,
+                            csv || excel,
                             egui::Checkbox::new(
                                 &mut dialog.header,
-                                "The first line holds the column names",
+                                if excel {
+                                    "The first row holds the column names"
+                                } else {
+                                    "The first line holds the column names"
+                                },
                             ),
                         );
                         ui.end_row();
 
+                        // A workbook holds its own text; there is no encoding to choose.
                         ui.label(RichText::new("Encoding").color(theme::muted()));
-                        egui::ComboBox::from_id_salt("import_encoding")
-                            .selected_text(dialog.encoding.map_or("Detect", TextEncoding::name))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut dialog.encoding, None, "Detect");
-                                for encoding in TextEncoding::ALL {
-                                    ui.selectable_value(
-                                        &mut dialog.encoding,
-                                        Some(encoding),
-                                        encoding.name(),
-                                    );
-                                }
-                            });
+                        ui.add_enabled_ui(!excel, |ui| {
+                            egui::ComboBox::from_id_salt("import_encoding")
+                                .selected_text(dialog.encoding.map_or("Detect", TextEncoding::name))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut dialog.encoding, None, "Detect");
+                                    for encoding in TextEncoding::ALL {
+                                        ui.selectable_value(
+                                            &mut dialog.encoding,
+                                            Some(encoding),
+                                            encoding.name(),
+                                        );
+                                    }
+                                });
+                        });
                         ui.end_row();
 
                         ui.label("");
@@ -220,6 +270,7 @@ impl PaviApp {
                             ImportDialog::new(dialog.path.clone(), ImportChoice::default());
                         reset.read_as = dialog.read_as.take();
                         reset.retyped = std::mem::take(&mut dialog.retyped);
+                        reset.sheets = std::mem::take(&mut dialog.sheets);
                         *dialog = reset;
                     }
                     close = ui.button("Cancel").clicked();

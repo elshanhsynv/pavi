@@ -1,4 +1,4 @@
-//! Arbitrary bytes as a CSV, TSV, JSON or Arrow file (the first byte picks which, and the
+//! Arbitrary bytes as a CSV, TSV, JSON, Arrow or Excel file (the first byte picks which, and the
 //! import options: encoding, header line, every column as text; ADR 0020): open it, which
 //! reads it into a temporary Parquet file (ADR 0007), then read the first page and format
 //! every cell. A panic, hang or runaway allocation here is a bug a user could hit by
@@ -34,6 +34,7 @@ fn check(data: &[u8]) {
         header: selector & 0x08 == 0,
         encoding: encodings[usize::from(selector >> 6)],
         all_text: selector & 0x20 != 0,
+        sheet: None,
     };
     let Ok(source) = ParquetSource::open_with_options(&path, None, &options, &|_| false) else {
         return;

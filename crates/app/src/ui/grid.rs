@@ -714,7 +714,7 @@ impl PaviApp {
                 ui.heading("Open a data file or folder");
                 ui.label(
                     RichText::new(
-                        "Parquet, CSV, JSON or Arrow/Feather. Drop files or folders on this \
+                        "Parquet, CSV, JSON, Arrow/Feather or Excel. Drop files or folders on this \
                          window; a folder of Parquet files opens as one table.",
                     )
                     .color(theme::muted()),

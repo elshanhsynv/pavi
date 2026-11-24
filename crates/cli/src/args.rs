@@ -58,13 +58,14 @@ pub struct Args {
     )]
     pub file: Option<String>,
 
-    /// Read FILE as parquet, csv, json or arrow, whatever its name says
+    /// Read FILE as parquet, csv, json, arrow or excel, whatever its name says
     ///
     /// For a CSV saved as .txt, say, or standard input that starts like another format.
     ///   parquet  a Parquet file
     ///   csv      comma, tab, semicolon or pipe separated, with a header line
     ///   json     JSON Lines, or one array of objects
     ///   arrow    an Arrow IPC file or stream
+    ///   excel    an Excel or OpenDocument workbook
     #[arg(
         long,
         value_enum,
@@ -82,7 +83,7 @@ pub struct Args {
     #[arg(long, value_name = "CHAR", value_parser = parse_delimiter, help_heading = "Input")]
     pub delimiter: Option<u8>,
 
-    /// CSV: the first line is data, not column names
+    /// CSV and Excel: the first line (row) is data, not column names
     ///
     /// The columns are then called column_1, column_2, …
     #[arg(long, help_heading = "Input")]
@@ -101,6 +102,10 @@ pub struct Args {
     /// Keeps values such as 007 or 1e5 exactly as written.
     #[arg(long, help_heading = "Input")]
     pub all_text: bool,
+
+    /// Excel: the sheet to read, by name [default: the first]
+    #[arg(long, value_name = "NAME", help_heading = "Input")]
+    pub sheet: Option<String>,
 
     /// Only these columns, by name or 0-based number: -c id,name
     ///
@@ -140,7 +145,7 @@ pub struct Args {
     )]
     pub offset: u64,
 
-    /// table, csv, tsv, jsonl, parquet or arrow [default: table]
+    /// table, csv, tsv, jsonl, parquet, arrow or xlsx [default: table]
     ///
     /// With -o, the default is the format its extension names.
     /// Every format but the table writes only the rows (all of them unless --head is given).
@@ -150,6 +155,7 @@ pub struct Args {
     ///   jsonl    one JSON object per line (also: json)
     ///   parquet  a Parquet file
     ///   arrow    an Arrow IPC file (Feather v2)
+    ///   xlsx     an Excel workbook with one sheet (at most 1,048,575 rows)
     #[arg(
         long,
         value_enum,
@@ -315,6 +321,8 @@ pub enum Format {
     Parquet,
     /// An Arrow IPC file (Feather v2)
     Arrow,
+    /// An Excel workbook with one sheet
+    Xlsx,
 }
 
 /// How to read FILE when its extension (or, for -, its first bytes) would
@@ -329,6 +337,8 @@ pub enum InputFormat {
     Json,
     /// An Arrow IPC file or stream
     Arrow,
+    /// An Excel or OpenDocument workbook (.xlsx, .xlsm, .xlsb, .xls, .ods)
+    Excel,
 }
 
 /// A delimiter: one ASCII character, or `tab` / `space` / `\t`.
@@ -369,6 +379,7 @@ impl Args {
             header: !self.no_header,
             encoding: self.encoding,
             all_text: self.all_text,
+            sheet: self.sheet.clone(),
         }
     }
 }
@@ -380,6 +391,7 @@ impl InputFormat {
             Self::Csv => parquet_reader::FileFormat::Csv,
             Self::Json => parquet_reader::FileFormat::Json,
             Self::Arrow => parquet_reader::FileFormat::Arrow,
+            Self::Excel => parquet_reader::FileFormat::Excel,
         }
     }
 }

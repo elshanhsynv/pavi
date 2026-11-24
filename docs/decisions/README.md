@@ -46,3 +46,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0018](0018-file-changes-on-disk.md) | Files that change on disk are noticed, refused for reads and reloaded on request, keeping the filter and sort |
 | [0019](0019-folder-schema-merging.md) | The files of a folder may differ: columns are merged by name, types widened, missing columns read as null (amends 0006) |
 | [0020](0020-import-options.md) | CSV and JSON are read with import options (delimiter, header, encoding, all text); a late value retypes the column instead of failing (amends 0007) |
+| [0021](0021-excel-workbooks.md) | Excel and OpenDocument workbooks are read a sheet at a time (calamine) and results exported to .xlsx (rust_xlsxwriter) (amends 0007) |

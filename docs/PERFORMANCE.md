@@ -43,6 +43,8 @@ Each budget is a named constant. Change it in one place and update this table.
 | Dictionary page (uncompressed) | 256 MB; also never more values than its bytes can hold | `MAX_DICTIONARY_PAGE_BYTES` in `crates/parquet/src/source.rs` |
 | Restored tab views | one per open tab (≤16): filter ≤ 16 KB, ≤ 8 sort keys | `session::MAX_SAVED_FILTER_BYTES`, `MAX_SAVED_SORT_KEYS` |
 | Saved import options (ADR 0020) | 32 files | `session::MAX_SAVED_IMPORTS` |
+| Reading an Excel workbook (ADR 0021) | `.xlsx`/`.xlsm`: the sheet streamed cell by cell, twice; shared strings, styles and workbook part ≤ 256 MB uncompressed. `.xlsb`/`.ods` ≤ 256 MB uncompressed and `.xls` ≤ 256 MB, read whole; ≤ 16,384 columns; rows in 8,192-row batches | `excel::MAX_EXCEL_SHARED_BYTES`, `MAX_EXCEL_WHOLE_BYTES`, `MAX_EXCEL_COLUMNS` |
+| Excel export (ADR 0021) | one sheet of ≤ 1,048,575 rows, written row by row to temporary files (constant-memory mode); cells ≤ 32,767 characters | `export::MAX_XLSX_ROWS`, `MAX_XLSX_CELL_CHARS` |
 | Text decoding of CSV and JSON (ADR 0020) | 64 KB read and decoded at a time; a file that needs retyping is read up to three times (guessed types, inference from every value, conversion) | `encoding::CHUNK_BYTES` |
 | Log file and crash reports | 1 MB, then it becomes `pavi.old.log` (2 MB in all); the newest 5 crash reports | `logging::MAX_LOG_BYTES`, `MAX_CRASH_REPORTS` |
 | Remote request in flight (ADR 0015) | one `pavi-http` helper thread per waiting worker; a cancel is noticed within 50 ms, and the abandoned request stops at its next 64 KB of body or its timeout | `remote::INTERRUPT_POLL`, `BODY_CHUNK_BYTES` |
