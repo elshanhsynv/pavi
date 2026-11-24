@@ -50,8 +50,9 @@ crates/parquet/src/            (parquet_reader)
 ├── lib.rs          re-exports the public surface
 ├── source.rs       ParquetSource (1,924 lines): open, read_page/window/filtered/sorted/aggregated,
 │                   GroupCollector/Accumulator/Scalar (aggregation)
-├── dataset.rs      folder datasets (ADR 0006): find the files, `key=value` partition columns, their values and statistics
+├── dataset.rs      folder datasets (ADR 0006): find the files (and the folders searched, with their times), `key=value` partition columns, their values and statistics
 ├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007)
+├── change.rs       FileStamp, FolderStamp, FileChanged: noticing that the files a source read changed on disk (ADR 0018)
 ├── join.rs         hash joins (inner, left, semi, anti) into a temporary table; TempTableWriter (ADR 0009)
 ├── remote.rs       URLs (ADR 0008): resolving s3/gs/az URLs, SigV4, RemoteObject (range requests, range cache, download), RemoteReader (ChunkReader)
 ├── statistics.rs   row-group statistics → display text, typed by the column's Arrow type
@@ -86,6 +87,7 @@ crates/app/src/                (pavi)
 ├── results.rs      FilteredGrid, QueryKind, MatchCount: the bounded filter/SQL/sort result window, its size and jumps (ADR 0012)
 ├── app_tests.rs    57 tests driving PaviApp without a window
 ├── tabs.rs         TabState (one tab's fields, parked), Tabs, switch/new/close/move tab, tab_views (each tab's filter and sort for the session), open_path (mounted inside app.rs)
+├── watch.rs        FileWatch: the open tab's change checks every 2 s, reload_document (keeps filter and sort) (ADR 0018, mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count, number formats), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), progress, temp-file + rename; the writers are parquet_reader::export::BatchWriter
 ├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
@@ -152,7 +154,7 @@ None. No crate defines `[features]`, there are no optional dependencies, no `bui
 | Type | Holds | Ref |
 |---|---|---|
 | `PaviApp` | runtime, the open tab's id and the parked tabs (`tabs: Tabs`), the Compare window (`compare: CompareState`, shared by all tabs), dataset, open task, `pages: SourcePages`, `filtered: Option<FilteredGrid>`, column layout, grid window offsets, `export: ExportState`, chart/profile state (the profile includes the whole-file one), text inputs, session, UI toggles, status string | `app.rs` |
-| `TabState`, `Tabs` | One parked tab: the same fields as `PaviApp` from `tab_id` to `workspace` (dataset, pages, result, layout, inputs, chart, profile, export). Switching swaps them with `PaviApp`'s; nothing is re-run. `Tabs` holds the parked tabs (≤16) and the open tab's position | `tabs.rs` |
+| `TabState`, `Tabs` | One parked tab: the same fields as `PaviApp` from `tab_id` to `file_watch`, and `pending_view` (dataset, pages, result, layout, inputs, chart, profile, export, change checks). Switching swaps them with `PaviApp`'s; nothing is re-run. `Tabs` holds the parked tabs (≤16) and the open tab's position | `tabs.rs` |
 | `SourcePages` | page reads in flight, loaded pages (LRU ≤8), this frame's requests and drawn page range; `poll`, `track`, `cancel_offscreen`, `clear` | `pages.rs` |
 | `Dataset` | `Arc<ParquetSource>`, path, column names | `app.rs:45-49` |
 | `GridState` | generation, `first_row` (absolute index of the first row in a slid result window), row/column counts, load state, requested/loaded page sets, selection (absolute rows) | `state.rs:198-319` |

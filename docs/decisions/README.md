@@ -43,3 +43,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0015](0015-interruptible-remote-requests.md) | Remote requests wait on a helper thread, so cancelling a task ends the wait at once (amends 0008) |
 | [0016](0016-counts-from-statistics.md) | Counts take whole row groups from statistics that prove every row matches; the CLI counts on threads (amends 0011) |
 | [0017](0017-locked-temp-folders.md) | Temporary folders are locked while in use; left-over ones are removed when the app or CLI starts (amends 0005, 0007, 0011) |
+| [0018](0018-file-changes-on-disk.md) | Files that change on disk are noticed, refused for reads and reloaded on request, keeping the filter and sort |

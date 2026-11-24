@@ -121,6 +121,7 @@ enum ReadOperation {
     CountMatches {
         filter: FilterExpr,
     },
+    CheckChanged,
 }
 
 struct PageRequest {
@@ -456,6 +457,22 @@ impl RuntimeHandle {
         )
     }
 
+    /// Checks whether the source's files changed on disk since it opened
+    /// (`ParquetSource::check_changed`); the outcome is [`PageOutcome::Checked`].
+    pub fn submit_change_check(
+        &self,
+        source: Arc<ParquetSource>,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.submit_read(
+            source,
+            Projection::all(0),
+            generation_id,
+            ReadOperation::CheckChanged,
+            None,
+        )
+    }
+
     fn submit_read(
         &self,
         source: Arc<ParquetSource>,
@@ -715,6 +732,9 @@ fn read_source(
         ReadOperation::CountMatches { filter } => source
             .count_matches_by_row_group(&filter, checkpoint)
             .map(PageOutcome::Counted),
+        ReadOperation::CheckChanged => source
+            .check_changed(&|| checkpoint(0))
+            .map(PageOutcome::Checked),
     }
 }
 
@@ -778,6 +798,48 @@ mod tests {
         let response = task.recv().unwrap();
         assert!(matches!(response.outcome, PageOutcome::Loaded(_)));
         response
+    }
+
+    #[test]
+    fn change_check_reports_a_file_rewritten_on_disk() {
+        let (_dir, source, path) = test_source();
+        let runtime = runtime(1, 4);
+        let check = |generation| {
+            let response = runtime
+                .handle()
+                .submit_change_check(source.clone(), GenerationId(generation))
+                .unwrap()
+                .recv()
+                .unwrap();
+            assert_eq!(response.generation_id, GenerationId(generation));
+            match response.outcome {
+                PageOutcome::Checked(change) => change,
+                other => panic!("expected Checked, got {other:?}"),
+            }
+        };
+        assert_eq!(check(1), None);
+
+        fs::write(&path, b"no longer the file that was opened").unwrap();
+        let change = check(2).unwrap();
+        assert!(
+            change.summary().contains("runtime.parquet changed on disk"),
+            "{change}"
+        );
+        // A read of the changed file fails with the same kind of error.
+        let response = runtime
+            .submit_page(source, 0, Projection::all(2), GenerationId(3))
+            .unwrap()
+            .recv()
+            .unwrap();
+        let PageOutcome::ReadFailed(error) = response.outcome else {
+            panic!("expected ReadFailed, got {:?}", response.outcome);
+        };
+        assert!(
+            error
+                .downcast_ref::<parquet_reader::FileChanged>()
+                .is_some(),
+            "{error:#}"
+        );
     }
 
     #[test]

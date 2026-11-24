@@ -48,6 +48,7 @@ pub(super) struct TabState {
     show_safe_full_selection: bool,
     show_nested_selection: bool,
     workspace: Workspace,
+    file_watch: watch::FileWatch,
     pending_view: Option<TabView>,
 }
 
@@ -87,6 +88,7 @@ impl TabState {
             show_safe_full_selection: false,
             show_nested_selection: false,
             workspace: Workspace::default(),
+            file_watch: watch::FileWatch::default(),
             pending_view: None,
         }
     }
@@ -142,6 +144,40 @@ fn tab_title(path: Option<&Path>) -> String {
     )
 }
 
+/// A tab's filter and sort: from its result, or, while it is still opening,
+/// the view waiting to be restored. `None` for neither, or a SQL result.
+fn tab_view(
+    path: PathBuf,
+    dataset: Option<&Dataset>,
+    filtered: Option<&FilteredGrid>,
+    pending: Option<&TabView>,
+) -> Option<TabView> {
+    let view = match (dataset, filtered) {
+        (Some(dataset), Some(filtered)) if filtered.kind != QueryKind::Sql => TabView {
+            path,
+            filter: filtered
+                .filter
+                .as_ref()
+                .filter(|_| filtered.kind == QueryKind::Filter)
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            sort: filtered
+                .sort
+                .iter()
+                .filter_map(|key| {
+                    Some(SavedSortKey {
+                        column: dataset.column_names.get(key.column)?.clone(),
+                        descending: key.direction == SortDirection::Descending,
+                    })
+                })
+                .collect(),
+        },
+        (_, None) => pending.cloned()?,
+        _ => return None,
+    };
+    (!view.is_empty()).then_some(view)
+}
+
 impl PaviApp {
     /// Swaps the open tab's state with `tab`.
     fn swap_tab(&mut self, tab: &mut TabState) {
@@ -181,6 +217,7 @@ impl PaviApp {
             &mut tab.show_nested_selection,
         );
         swap(&mut self.workspace, &mut tab.workspace);
+        swap(&mut self.file_watch, &mut tab.file_watch);
         swap(&mut self.pending_view, &mut tab.pending_view);
     }
 
@@ -269,32 +306,20 @@ impl PaviApp {
                         tab.pending_view.as_ref(),
                     )
                 };
-                let view = match (dataset, filtered) {
-                    (Some(dataset), Some(filtered)) if filtered.kind != QueryKind::Sql => TabView {
-                        path,
-                        filter: filtered
-                            .filter
-                            .as_ref()
-                            .filter(|_| filtered.kind == QueryKind::Filter)
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
-                        sort: filtered
-                            .sort
-                            .iter()
-                            .filter_map(|key| {
-                                Some(SavedSortKey {
-                                    column: dataset.column_names.get(key.column)?.clone(),
-                                    descending: key.direction == SortDirection::Descending,
-                                })
-                            })
-                            .collect(),
-                    },
-                    (_, None) => pending.cloned()?,
-                    _ => return None,
-                };
-                (!view.is_empty()).then_some(view)
+                tab_view(path, dataset, filtered, pending)
             })
             .collect()
+    }
+
+    /// The filter and sort the open tab shows, as [`Self::tab_views`] keeps them.
+    pub(super) fn active_tab_view(&self) -> Option<TabView> {
+        let path = self.dataset.as_ref()?.path.clone();
+        tab_view(
+            path,
+            self.dataset.as_ref(),
+            self.filtered.as_ref(),
+            self.pending_view.as_ref(),
+        )
     }
 
     /// Moves tab `from` to position `to` (both clamped to the tabs open); the

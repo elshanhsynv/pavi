@@ -2,6 +2,8 @@
 mod tabs;
 #[path = "ui/mod.rs"]
 mod ui;
+#[path = "watch.rs"]
+mod watch;
 
 use std::{
     path::PathBuf,
@@ -138,6 +140,8 @@ pub(crate) struct PaviApp {
     show_safe_full_selection: bool,
     show_nested_selection: bool,
     workspace: Workspace,
+    /// Checks for the open tab's file changing on disk.
+    file_watch: watch::FileWatch,
     show_column_types: bool,
     freeze_header: bool,
     status: String,
@@ -346,6 +350,7 @@ impl PaviApp {
             show_safe_full_selection: false,
             show_nested_selection: false,
             workspace: Workspace::default(),
+            file_watch: watch::FileWatch::default(),
             show_column_types: true,
             freeze_header: true,
             status: "Choose a Parquet file to begin".to_string(),
@@ -504,12 +509,6 @@ impl PaviApp {
         }
     }
 
-    fn refresh_document(&mut self) {
-        if let Some(path) = self.dataset.as_ref().map(|dataset| dataset.path.clone()) {
-            self.begin_open(path);
-        }
-    }
-
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
         // Matched on the key event's own modifiers, so a quick Ctrl+Shift+F is not
         // read as Ctrl+F once Shift is already up.
@@ -594,7 +593,7 @@ impl PaviApp {
         if self.toolbar_availability().enabled(ToolbarCommand::Refresh)
             && ctx.input(|input| input.key_pressed(egui::Key::R))
         {
-            self.refresh_document();
+            self.reload_document();
         }
         if self.toolbar_availability().enabled(ToolbarCommand::Filter)
             && ctx.input(|input| input.key_pressed(egui::Key::F))
@@ -831,6 +830,7 @@ impl PaviApp {
         self.show_safe_full_selection = false;
         self.show_nested_selection = false;
         self.workspace = Workspace::Grid;
+        self.file_watch = watch::FileWatch::default();
         self.dataset = None;
         self.filter_error = None;
         self.sql_error = None;
@@ -2609,6 +2609,7 @@ impl eframe::App for PaviApp {
         self.poll_profile();
         self.poll_file_profile();
         self.poll_export();
+        let next_check = self.poll_file_watch(Instant::now());
         self.show_top_bar(ctx);
         ui::toolbar::window_resize_handles(ctx);
         self.show_chart_window(ctx);
@@ -2675,6 +2676,8 @@ impl eframe::App for PaviApp {
             // Only the match count runs: pick it up, and show its progress,
             // without redrawing every frame.
             ctx.request_repaint_after(COUNT_REPAINT);
+        } else if let Some(next_check) = next_check {
+            ctx.request_repaint_after(next_check);
         }
     }
 }

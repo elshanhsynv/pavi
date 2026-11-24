@@ -95,7 +95,14 @@ impl SourcePages {
                         grid.requested.remove(&page_index);
                     }
                     PageOutcome::ReadFailed(error) => {
-                        grid.requested.remove(&page_index);
+                        // A page of a file that changed on disk would fail again
+                        // every frame; it stays unread until the file is reloaded.
+                        if error
+                            .downcast_ref::<parquet_reader::FileChanged>()
+                            .is_none()
+                        {
+                            grid.requested.remove(&page_index);
+                        }
                         status = Some(format!("load page {page_index}: {error:#}"));
                     }
                     PageOutcome::SortSpilled(_) | PageOutcome::Merged { .. } => {
@@ -106,6 +113,7 @@ impl SourcePages {
                     | PageOutcome::Batches(_)
                     | PageOutcome::Filtered(_)
                     | PageOutcome::Counted(_)
+                    | PageOutcome::Checked(_)
                     | PageOutcome::Loaded(_) => {
                         grid.requested.remove(&page_index);
                         status = Some(format!("unexpected response for page {page_index}"));

@@ -1,6 +1,6 @@
 use anyhow::Error;
 use arrow_array::RecordBatch;
-use parquet_reader::{DataPage, FilteredWindow, ParquetSource, SortMerge};
+use parquet_reader::{DataPage, FileChanged, FilteredWindow, ParquetSource, SortMerge};
 use std::sync::{Arc, Mutex};
 
 use crate::{GenerationId, TaskId};
@@ -24,6 +24,9 @@ pub enum PageOutcome {
         batches: Vec<RecordBatch>,
         finished: bool,
     },
+    /// Whether the source's files changed on disk since it opened (see
+    /// `RuntimeHandle::submit_change_check`): `Some` says what changed.
+    Checked(Option<FileChanged>),
     Cancelled,
     ReadFailed(Error),
 }

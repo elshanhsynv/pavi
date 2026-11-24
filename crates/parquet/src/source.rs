@@ -34,6 +34,7 @@ use crate::{
     AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
     PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo, RowWindow,
     SortBudget, SortSpec,
+    change::{FileChanged, FileStamp, FolderStamp},
     convert::{self, ConvertedFile, FileFormat},
     dataset::{
         self, MAX_DATASET_METADATA_BYTES, PartitionColumn, constant_array, partition_statistics,
@@ -275,6 +276,8 @@ impl From<std::fs::Metadata> for FileInfo {
 struct SourceFile {
     location: Location,
     bytes: u64,
+    /// A local file's size and time when its footer was read; reads check it.
+    stamp: Option<FileStamp>,
     metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
     /// The Parquet leaf column of each file column; `None` when nested.
@@ -315,19 +318,74 @@ pub struct ParquetSource {
     /// file downloaded because its server doesn't answer range requests
     /// (ADR 0008), or a table prepared for a join or subquery (ADR 0009).
     temporary: Option<TempFolder>,
+    /// What [`ParquetSource::check_changed`] compares with the disk.
+    watch: Watch,
 }
 
-/// Reads one file's footer.
-fn open_file(location: &Location, name: &Path) -> Result<(u64, ArrowReaderMetadata)> {
+/// What a source checks to notice that it changed on disk (ADR 0018).
+#[derive(Debug)]
+enum Watch {
+    /// Nothing: a remote object, or a temporary table PAVI wrote itself.
+    Nothing,
+    /// Parquet files read in place: each file's stamp, and the folders searched.
+    Files(Vec<FolderStamp>),
+    /// A CSV, JSON or Arrow file read into a temporary copy: the original.
+    Original(FileStamp),
+}
+
+/// A file whose footer was read, before it becomes a [`SourceFile`].
+struct OpenedFile {
+    location: Location,
+    bytes: u64,
+    stamp: Option<FileStamp>,
+    arrow_metadata: ArrowReaderMetadata,
+    partition_values: Vec<Option<String>>,
+}
+
+impl SourceFile {
+    /// Opens the file for a read, refusing one that changed since the footer was read.
+    fn open(&self) -> Result<Handle> {
+        let handle = self.location.open()?;
+        if let (Handle::Local(file), Some(stamp), Location::Local(path)) =
+            (&handle, &self.stamp, &self.location)
+        {
+            let now = file
+                .metadata()
+                .with_context(|| format!("read the size of {}", path.display()))?;
+            if FileStamp::of(&now) != *stamp {
+                return Err(FileChanged::modified(path).into());
+            }
+        }
+        Ok(handle)
+    }
+}
+
+/// Reads one file's footer, and a local file's size and time.
+fn open_file(location: Location, name: &Path) -> Result<OpenedFile> {
     use parquet::file::reader::Length;
 
     let file = location.open()?;
+    // From the handle the footer is read through, so they describe the same bytes.
+    let stamp = match &file {
+        Handle::Local(local) => {
+            Some(FileStamp::of(&local.metadata().with_context(|| {
+                format!("read the size of {}", name.display())
+            })?))
+        }
+        Handle::Remote(_) => None,
+    };
     let bytes = file.len();
     crate::footer::check_footer(&file)
         .with_context(|| format!("read Parquet metadata from {}", name.display()))?;
     let arrow_metadata = load_arrow_metadata(&file)
         .with_context(|| format!("read Parquet metadata from {}", name.display()))?;
-    Ok((bytes, arrow_metadata))
+    Ok(OpenedFile {
+        location,
+        bytes,
+        stamp,
+        arrow_metadata,
+        partition_values: Vec::new(),
+    })
 }
 
 /// Remote downloads go in `<temp>/pavi-download-<pid>-<n>/`.
@@ -387,16 +445,13 @@ impl ParquetSource {
             return Self::open_converted(path.clone(), &path, file_info, format, checkpoint);
         }
         if !file_info.is_dir {
-            let location = Location::Local(path.clone());
-            let (bytes, arrow_metadata) = open_file(&location, &path)?;
-            return Self::from_files(
-                path,
-                file_info,
-                vec![(location, bytes, arrow_metadata, Vec::new())],
-                Vec::new(),
-            );
+            let opened = open_file(Location::Local(path.clone()), &path)?;
+            let mut source = Self::from_files(path, file_info, vec![opened], Vec::new())?;
+            source.watch = Watch::Files(Vec::new());
+            return Ok(source);
         }
-        let found = dataset::find_files(&path, &|| checkpoint(0.0))?;
+        let listing = dataset::find_files(&path, &|| checkpoint(0.0))?;
+        let found = listing.files;
         let file_count = found.len().max(1);
         let partition_columns = dataset::partition_columns(&found);
         let mut files = Vec::with_capacity(found.len());
@@ -405,9 +460,9 @@ impl ParquetSource {
             if checkpoint(index as f64 / file_count as f64) {
                 return Err(Cancelled.into());
             }
-            let location = Location::Local(file.path.clone());
-            let (bytes, arrow_metadata) = open_file(&location, &file.path)?;
-            metadata_bytes = metadata_bytes.saturating_add(arrow_metadata.metadata().memory_size());
+            let mut opened = open_file(Location::Local(file.path.clone()), &file.path)?;
+            metadata_bytes =
+                metadata_bytes.saturating_add(opened.arrow_metadata.metadata().memory_size());
             if metadata_bytes > MAX_DATASET_METADATA_BYTES {
                 bail!(
                     "the footers of this folder's files need more than {} MB of memory; \
@@ -415,14 +470,16 @@ impl ParquetSource {
                     MAX_DATASET_METADATA_BYTES / (1024 * 1024)
                 );
             }
-            let values = file
+            opened.partition_values = file
                 .partitions
                 .into_iter()
                 .map(|(_, value)| value)
                 .collect();
-            files.push((location, bytes, arrow_metadata, values));
+            files.push(opened);
         }
-        Self::from_files(path, file_info, files, partition_columns)
+        let mut source = Self::from_files(path, file_info, files, partition_columns)?;
+        source.watch = Watch::Files(listing.folders);
+        Ok(source)
     }
 
     /// Reads `input` (a CSV, JSON or Arrow file) into a temporary Parquet file
@@ -436,14 +493,16 @@ impl ParquetSource {
     ) -> Result<Self> {
         let converted = convert::convert(input, format, checkpoint)
             .with_context(|| format!("open {} as {}", path.display(), format.name()))?;
-        let location = Location::Local(converted.path.clone());
-        let (bytes, arrow_metadata) = open_file(&location, &path)?;
-        let mut source = Self::from_files(
-            path,
-            file_info,
-            vec![(location, bytes, arrow_metadata, Vec::new())],
-            Vec::new(),
-        )?;
+        let opened = open_file(Location::Local(converted.path.clone()), &path)?;
+        // The copy is PAVI's own; the original is what can change. Its size and
+        // time are from before it was read, so a change while it was read shows.
+        let watch = if remote::is_remote(&path) {
+            Watch::Nothing
+        } else {
+            Watch::Original(FileStamp::new(file_info.len, file_info.modified))
+        };
+        let mut source = Self::from_files(path, file_info, vec![opened], Vec::new())?;
+        source.watch = watch;
         source.compression = format.name().to_string();
         source.format = format;
         source.converted = Some(converted);
@@ -456,15 +515,9 @@ impl ParquetSource {
         let file_info = FileInfo::from(
             std::fs::metadata(&file).with_context(|| format!("open {}", file.display()))?,
         );
-        let location = Location::Local(file);
         let path = PathBuf::from(name);
-        let (bytes, arrow_metadata) = open_file(&location, &path)?;
-        let mut source = Self::from_files(
-            path,
-            file_info,
-            vec![(location, bytes, arrow_metadata, Vec::new())],
-            Vec::new(),
-        )?;
+        let opened = open_file(Location::Local(file), &path)?;
+        let mut source = Self::from_files(path, file_info, vec![opened], Vec::new())?;
         source.temporary = Some(folder);
         Ok(source)
     }
@@ -490,14 +543,8 @@ impl ParquetSource {
         };
         let format = format.unwrap_or_else(|| FileFormat::from_path(&path));
         if format == FileFormat::Parquet && object.supports_ranges() {
-            let location = Location::Remote(object);
-            let (bytes, arrow_metadata) = open_file(&location, &path)?;
-            return Self::from_files(
-                path,
-                file_info,
-                vec![(location, bytes, arrow_metadata, Vec::new())],
-                Vec::new(),
-            );
+            let opened = open_file(Location::Remote(object), &path)?;
+            return Self::from_files(path, file_info, vec![opened], Vec::new());
         }
         let folder = TempFolder::create(DOWNLOAD_PREFIX)?;
         let name = remote::path_part(&path)
@@ -517,14 +564,8 @@ impl ParquetSource {
         object
             .download(&downloaded, checkpoint)
             .with_context(|| format!("download {}", redact(&url)))?;
-        let location = Location::Local(downloaded);
-        let (bytes, arrow_metadata) = open_file(&location, &path)?;
-        let mut source = Self::from_files(
-            path,
-            file_info,
-            vec![(location, bytes, arrow_metadata, Vec::new())],
-            Vec::new(),
-        )?;
+        let opened = open_file(Location::Local(downloaded), &path)?;
+        let mut source = Self::from_files(path, file_info, vec![opened], Vec::new())?;
         source.temporary = Some(folder);
         Ok(source)
     }
@@ -533,21 +574,21 @@ impl ParquetSource {
     fn from_files(
         path: PathBuf,
         file_info: FileInfo,
-        opened: Vec<(Location, u64, ArrowReaderMetadata, Vec<Option<String>>)>,
+        opened: Vec<OpenedFile>,
         partition_columns: Vec<PartitionColumn>,
     ) -> Result<Self> {
-        let Some((first_path, _, first_metadata, _)) = opened.first() else {
+        let Some(first) = opened.first() else {
             bail!("{} holds no Parquet files", path.display());
         };
-        let first_schema = first_metadata.schema().clone();
+        let first_schema = first.arrow_metadata.schema().clone();
         // A column is nullable when it is in any file.
         let mut fields = first_schema
             .fields()
             .iter()
             .map(|field| field.as_ref().clone())
             .collect::<Vec<_>>();
-        for (other_path, _, other, _) in &opened[1..] {
-            let other_fields = other.schema().fields();
+        for other in &opened[1..] {
+            let other_fields = other.arrow_metadata.schema().fields();
             let mismatch = if other_fields.len() != fields.len() {
                 Some(format!(
                     "it has {} columns, not {}",
@@ -580,8 +621,8 @@ impl ParquetSource {
             if let Some(mismatch) = mismatch {
                 bail!(
                     "{} does not have the same columns as {}: {mismatch}",
-                    other_path.describe(),
-                    first_path.describe()
+                    other.location.describe(),
+                    first.location.describe()
                 );
             }
             for (field, other) in fields.iter_mut().zip(other_fields.iter()) {
@@ -629,9 +670,14 @@ impl ParquetSource {
         let mut row_group_files = Vec::new();
         let mut statistics = vec![Vec::new(); schema.fields().len()];
         let mut files = Vec::with_capacity(opened.len());
-        for (index, (file_path, bytes, arrow_metadata, partition_values)) in
-            opened.into_iter().enumerate()
-        {
+        for (index, opened) in opened.into_iter().enumerate() {
+            let OpenedFile {
+                location,
+                bytes,
+                stamp,
+                arrow_metadata,
+                partition_values,
+            } = opened;
             let partition_values = partition_values
                 .into_iter()
                 .zip(&keep)
@@ -676,8 +722,9 @@ impl ParquetSource {
                 statistics[column].extend(file_statistics);
             }
             files.push(SourceFile {
-                location: file_path,
+                location,
                 bytes,
+                stamp,
                 leaf_columns: leaf_columns(&metadata, file_columns),
                 metadata,
                 arrow_metadata,
@@ -708,6 +755,7 @@ impl ParquetSource {
             format: FileFormat::Parquet,
             converted: None,
             temporary: None,
+            watch: Watch::Nothing,
         })
     }
 
@@ -719,6 +767,41 @@ impl ParquetSource {
     /// `true` when this source is a folder of files.
     pub fn is_folder(&self) -> bool {
         self.file_info.is_dir
+    }
+
+    /// Whether the file or folder this source was opened from changed on disk
+    /// since then (ADR 0018): `Some` says what changed. A local Parquet file is
+    /// compared by size and modification time; a folder also by the times of the
+    /// folders searched, which change when a file is added, removed or renamed;
+    /// a CSV, JSON or Arrow file by the original's size and time. Remote objects
+    /// and temporary tables are not checked. Looks at the disk (one `stat` per
+    /// file and folder), so call it on a worker; `cancelled` is checked between files.
+    pub fn check_changed(&self, cancelled: &dyn Fn() -> bool) -> Result<Option<FileChanged>> {
+        match &self.watch {
+            Watch::Nothing => Ok(None),
+            Watch::Original(stamp) => Ok(stamp.check(&self.path)),
+            Watch::Files(folders) => {
+                for file in &self.files {
+                    if cancelled() {
+                        return Err(Cancelled.into());
+                    }
+                    if let (Location::Local(path), Some(stamp)) = (&file.location, &file.stamp)
+                        && let Some(change) = stamp.check(path)
+                    {
+                        return Ok(Some(change));
+                    }
+                }
+                for folder in folders {
+                    if cancelled() {
+                        return Err(Cancelled.into());
+                    }
+                    if let Some(change) = folder.check() {
+                        return Ok(Some(change));
+                    }
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// How many Parquet files the source reads.
@@ -1458,7 +1541,7 @@ impl ParquetSource {
         let mut ranges: Vec<Range<u64>> = Vec::new();
         let mut pruned = false;
         let handle = match filter {
-            Some(_) => Some(file.location.open()?),
+            Some(_) => Some(file.open()?),
             None => None,
         };
         let leaf_of = |column: usize| {
@@ -1642,7 +1725,7 @@ impl ParquetSource {
         row_groups: Vec<usize>,
         selection: Option<RowSelection>,
     ) -> Result<GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
-        let file = source_file.location.open()?;
+        let file = source_file.open()?;
         let parquet_columns = self.decoded_columns(projection);
         self.check_dictionary_pages(&file, source_file, &parquet_columns, &row_groups)?;
         let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
@@ -1754,7 +1837,7 @@ impl ParquetSource {
         }
         // The file is opened only when a bloom filter has to be read.
         let handle = std::cell::OnceCell::new();
-        let reader = || handle.get_or_init(|| file.location.open().ok()).as_ref();
+        let reader = || handle.get_or_init(|| file.open().ok()).as_ref();
         let leaf_of = |column: usize| {
             if column >= self.file_columns {
                 return None;
@@ -6018,6 +6101,143 @@ mod tests {
                 .row_groups()
                 .iter()
                 .all(|group| source.row_group_might_match(&filter, group))
+        );
+    }
+
+    /// Sets a file's modification time without changing its bytes.
+    fn touch(path: &Path, modified: std::time::SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+
+    fn changed_message(source: &ParquetSource) -> Option<String> {
+        source
+            .check_changed(&|| false)
+            .unwrap()
+            .map(|change| change.summary().to_string())
+    }
+
+    #[test]
+    fn notices_a_parquet_file_rewritten_after_it_opened() {
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "ids.parquet", 0..100, false);
+        let path = directory.path().join("ids.parquet");
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(changed_message(&source), None);
+
+        write_ids(directory.path(), "ids.parquet", 0..5000, false);
+        let message = changed_message(&source).unwrap();
+        assert!(message.contains("ids.parquet changed on disk"), "{message}");
+        // Reading the old footer against the new bytes is refused, with an
+        // error the app can recognise.
+        let error = source
+            .read_page(0, &Projection::all(source.column_count()))
+            .unwrap_err();
+        assert!(error.downcast_ref::<FileChanged>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains("open it again"), "{error:#}");
+        // Opening it again reads it as it is now.
+        assert_eq!(ParquetSource::open(&path).unwrap().row_count(), 5000);
+    }
+
+    #[test]
+    fn notices_a_new_modification_time_with_the_same_size() {
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "ids.parquet", 0..100, false);
+        let path = directory.path().join("ids.parquet");
+        let source = ParquetSource::open(&path).unwrap();
+        touch(
+            &path,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000),
+        );
+        assert!(changed_message(&source).is_some());
+        let error = source
+            .read_window(0, 10, &Projection::all(source.column_count()))
+            .unwrap_err();
+        assert!(error.downcast_ref::<FileChanged>().is_some(), "{error:#}");
+    }
+
+    #[test]
+    fn notices_a_removed_file() {
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "ids.parquet", 0..100, false);
+        let path = directory.path().join("ids.parquet");
+        let source = ParquetSource::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let message = changed_message(&source).unwrap();
+        assert!(message.contains("was removed"), "{message}");
+    }
+
+    #[test]
+    fn notices_files_added_to_or_changed_in_a_folder() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        write_ids(root, "year=2023/a.parquet", 0..100, false);
+        write_ids(root, "year=2024/b.parquet", 100..200, false);
+        let source = ParquetSource::open(root).unwrap();
+        assert_eq!(changed_message(&source), None);
+
+        // A new file in a partition folder changes that folder's time.
+        write_ids(root, "year=2024/c.parquet", 200..300, false);
+        let message = changed_message(&source).unwrap();
+        assert!(message.contains("added to or removed from"), "{message}");
+        assert!(message.contains("year=2024"), "{message}");
+
+        // A file rewritten in place changes its own size and time.
+        let source = ParquetSource::open(root).unwrap();
+        assert_eq!(changed_message(&source), None);
+        write_ids(root, "year=2023/a.parquet", 0..5000, false);
+        let message = changed_message(&source).unwrap();
+        assert!(message.contains("a.parquet changed on disk"), "{message}");
+    }
+
+    #[test]
+    fn a_change_check_stops_when_cancelled() {
+        let directory = TempDir::new().unwrap();
+        write_ids(directory.path(), "a/x.parquet", 0..10, false);
+        let source = ParquetSource::open(directory.path()).unwrap();
+        let error = source.check_changed(&|| true).unwrap_err();
+        assert!(error.is::<Cancelled>(), "{error:#}");
+    }
+
+    #[test]
+    fn notices_a_csv_file_changed_after_it_was_read() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("ids.csv");
+        std::fs::write(
+            &path, "id
+1
+2
+",
+        )
+        .unwrap();
+        let source = ParquetSource::open(&path).unwrap();
+        assert_eq!(changed_message(&source), None);
+
+        std::fs::write(
+            &path,
+            "id
+1
+2
+3
+",
+        )
+        .unwrap();
+        let message = changed_message(&source).unwrap();
+        assert!(message.contains("ids.csv changed on disk"), "{message}");
+        // The rows already read stay readable from PAVI's own copy.
+        let page = source
+            .read_page(0, &Projection::all(source.column_count()))
+            .unwrap();
+        assert_eq!(
+            page.batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            2
         );
     }
 }
