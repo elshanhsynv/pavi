@@ -21,6 +21,13 @@ ring.workspace = true
 serde_json.workspace = true
 rustls-native-certs.workspace = true
 ureq.workspace = true
+# Reading Excel and OpenDocument workbooks (ADR 0021).
+calamine = { version = "0.38", default-features = false }
+# Writing .xlsx exports, a sheet at a time through temporary files (ADR 0021).
+rust_xlsxwriter = { version = "0.104", features = ["constant_memory"] }
+# Already in the tree via calamine: reads a workbook's list of parts to check
+# their sizes before calamine loads them (ADR 0021).
+zip = { version = "9", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

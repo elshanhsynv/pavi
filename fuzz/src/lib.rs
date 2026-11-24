@@ -235,7 +235,7 @@ pub fn parquet_seeds() -> Vec<(String, Vec<u8>)> {
 }
 
 /// File extensions the `other_formats` target picks from with its first byte.
-pub const OTHER_FORMAT_EXTENSIONS: &[&str] = &["csv", "tsv", "jsonl", "arrow"];
+pub const OTHER_FORMAT_EXTENSIONS: &[&str] = &["csv", "tsv", "jsonl", "arrow", "xlsx"];
 
 /// Seeds for `other_formats`: the selector byte, then a small file of that format.
 pub fn other_format_seeds() -> Vec<(String, Vec<u8>)> {
@@ -251,6 +251,15 @@ pub fn other_format_seeds() -> Vec<(String, Vec<u8>)> {
     writer.write(&batch).expect("write ipc");
     writer.finish().expect("finish ipc");
     drop(writer);
+    let mut xlsx = Vec::new();
+    let mut writer = parquet_reader::export::BatchWriter::new(
+        parquet_reader::export::ExportFormat::Xlsx,
+        &mut xlsx,
+        batch.schema(),
+    )
+    .expect("xlsx writer");
+    writer.write(&batch).expect("write xlsx");
+    writer.finish().expect("finish xlsx");
     vec![
         (
             "seed-csv".to_string(),
@@ -266,6 +275,7 @@ pub fn other_format_seeds() -> Vec<(String, Vec<u8>)> {
             with(2, b"[{\"id\": 1, \"s\": \"]\\\"[\"}, {\"id\": 2}]"),
         ),
         ("seed-arrow".to_string(), with(3, &arrow)),
+        ("seed-xlsx".to_string(), with(4, &xlsx)),
     ]
 }
 

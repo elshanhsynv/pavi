@@ -751,6 +751,10 @@ impl PaviApp {
             .add_filter("CSV", &["csv", "tsv"])
             .add_filter("JSON", &["json", "jsonl", "ndjson"])
             .add_filter("Arrow / Feather", &["arrow", "feather", "ipc", "arrows"])
+            .add_filter(
+                "Excel / OpenDocument",
+                &["xlsx", "xlsm", "xlsb", "xls", "ods"],
+            )
             .pick_file()
         {
             self.open_path(path);

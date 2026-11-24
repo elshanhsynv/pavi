@@ -135,6 +135,8 @@ pub struct SavedImport {
     /// An encoding name `TextEncoding::parse` reads; empty to detect it.
     pub encoding: String,
     pub all_text: bool,
+    /// Excel: the sheet's name; empty for the first.
+    pub sheet: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -22,9 +22,11 @@
 | JSON | `.json`, `.jsonl`, `.ndjson`, or any file read as JSON | One object per line, or one array of objects. Types inferred like CSV; nested objects become structs, arrays become lists. Encoding and every column as text as for CSV | Same as CSV; a field first seen after the inferred records also triggers the second pass (strict mode) instead of being dropped |
 | Arrow IPC | `.arrow`, `.feather`, `.ipc`, `.arrows` | File format (Feather v2, `ARROW1` magic) or stream format; LZ4 and Zstd buffers | Feather v1 is refused. Each record batch is read whole. Before reading, every block and message must lie inside the file; metadata messages are capped at 64 MB and a compressed buffer at 1 GB uncompressed |
 
+| Excel / OpenDocument | `.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`, or any workbook read as Excel | One sheet: the first worksheet, or one named (ADR 0021). First row names the columns unless "no header". Types from every cell: whole numbers, floats, booleans, dates, timestamps, durations, else text; error cells are null (text in text columns); empty rows between data rows kept | `.xlsx`/`.xlsm` streamed cell by cell, their shared parts ≤ 256 MB uncompressed (`MAX_EXCEL_SHARED_BYTES`); `.xlsb`/`.ods` ≤ 256 MB uncompressed and `.xls` ≤ 256 MB (`MAX_EXCEL_WHOLE_BYTES`), read whole; ≤ 16,384 columns. Formulas read as their cached values |
+
 All are read into a temporary Parquet file of at most 32 GiB (`MAX_CONVERTED_BYTES`) before the first row shows. Other extensions are opened as Parquet. ORC is not supported (see the ADR).
 
-Export writes CSV, Parquet, JSON Lines (`.jsonl`) and Arrow IPC file format (`.arrow`).
+Export writes CSV, Parquet, JSON Lines (`.jsonl`), Arrow IPC file format (`.arrow`) and Excel (`.xlsx`, one sheet of at most 1,048,575 rows; ADR 0021).
 
 ## Parquet/Arrow features
 | Feature | Status |

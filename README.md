@@ -4,14 +4,14 @@ Pavi is a native desktop explorer for **Parquet** files with a bounded Arrow-bas
 
 ## Goals
 
-* Open large Parquet files through a fixed background worker pool, as well as CSV, JSON and Arrow/Feather files and remote files (HTTPS, S3, GCS, Azure), or a folder of them (with `key=value` partition folders) as one table, each in its own tab
+* Open large Parquet files through a fixed background worker pool, as well as CSV, JSON, Arrow/Feather and Excel/OpenDocument workbooks (a sheet at a time) and remote files (HTTPS, S3, GCS, Azure), or a folder of them (with `key=value` partition folders) as one table, each in its own tab
 * Virtualized scrolling to any row of very large files (a moving 500,000-row window with a whole-file scrollbar), projected page caching, column resizing, and cell selection
 * Filters, SQL (`SELECT [DISTINCT]` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT`, aggregates including `COUNT(DISTINCT …)`, calculations (`price * qty`, `CASE`, `CAST`, `UPPER`, `YEAR` …), aliases, joins between open tabs and subqueries), and deterministic sorting by up to 8 columns over booleans, numbers, decimals, text, dates, timestamps and times of day (e.g. `FL_DATE >= 2006-02-15`), on files of any size (large sorts spill to temporary files); filters combine tests with `AND` / `OR` and support `IN`, `BETWEEN`, `LIKE` and `IS NULL` (e.g. `DEP_DELAY > 60 AND DISTANCE BETWEEN 500 AND 1000`); filtered results stream from a resume cursor, and `ORDER BY … LIMIT n` keeps only the top rows so it works on files of any size
 * Dark and light themes (or follow the system); runs on Windows, Linux and macOS
 * Bounded charts with several series and PNG/SVG export, whole-file profiles, comparing two tabs, Inspector metadata/statistics, query history, recent files and folders, and a restored session (open tabs and preferences)
 * A SQL editor with highlighting, column-name completion, query history and saved queries
 * Find in the loaded rows, pinned columns, a whole-row view in the Inspector, and clipboard copy of full values (tab-separated, up to 16 MB)
-* Streaming CSV, Parquet, JSON Lines and Arrow export for the current source/query/filter result, plus cached selected-row export
+* Streaming CSV, Parquet, JSON Lines, Arrow and Excel (.xlsx) export for the current source/query/filter result, plus cached selected-row export
 
 ## Tech Stack
 
@@ -49,13 +49,15 @@ pavi-cli flights.parquet --stats --columns DEP_DELAY      # min/max per row grou
 pavi-cli flights.parquet --profile --format csv           # nulls, distinct, min, max, mean per column
 pavi-cli flights.csv -o flights.parquet                   # convert; the file appears when complete
 pavi-cli export.txt --input-format csv --delimiter ";" --encoding windows-1252 --all-text
+pavi-cli budget.xlsx --sheet "2026" -o budget-2026.parquet      # one sheet of a workbook
+pavi-cli flights.parquet --filter "DEP_DELAY > 60" -o late.xlsx
 curl -s https://example.com/data.parquet | pavi-cli - --count
 pavi-cli flights.parquet --sql "SELECT ORIGIN, COUNT(*), AVG(DEP_DELAY) FROM flights GROUP BY ORIGIN"
 pavi-cli flights.parquet --table airports.csv --format csv \
     --sql "SELECT f.FL_DATE, a.name FROM flights AS f JOIN airports AS a ON f.ORIGIN = a.code"
 ```
 
-`--format` is `table`, `csv`, `tsv`, `jsonl`, `parquet` or `arrow`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `pavi-cli -h` shows the options by group with a few examples; `pavi-cli --help` adds the details, more examples and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
+`--format` is `table`, `csv`, `tsv`, `jsonl`, `parquet`, `arrow` or `xlsx`. The streamed formats write every row unless `--head` is given, and use the same text as the app's export. `pavi-cli -h` shows the options by group with a few examples; `pavi-cli --help` adds the details, more examples and the exit codes (0 ok, also when the reader stops early; 1 error; 2 invalid arguments).
 
 Tab completion and a manual page come from the program itself (the release archives include them):
 

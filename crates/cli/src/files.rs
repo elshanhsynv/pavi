@@ -102,9 +102,10 @@ pub fn format_for_extension(path: &Path) -> Result<Format> {
         "jsonl" | "ndjson" | "json" => Format::Jsonl,
         "parquet" => Format::Parquet,
         "arrow" | "feather" | "ipc" => Format::Arrow,
+        "xlsx" => Format::Xlsx,
         _ => bail!(
-            "cannot tell the output format from {}; add --format csv, tsv, jsonl, parquet, arrow \
-             or table",
+            "cannot tell the output format from {}; add --format csv, tsv, jsonl, parquet, arrow, \
+             xlsx or table",
             path.display()
         ),
     })
@@ -187,6 +188,7 @@ mod tests {
         assert_eq!(format("out.json"), Some(Format::Jsonl));
         assert_eq!(format("dir/out.parquet"), Some(Format::Parquet));
         assert_eq!(format("out.feather"), Some(Format::Arrow));
+        assert_eq!(format("out.XLSX"), Some(Format::Xlsx));
         assert_eq!(format("out.tsv"), Some(Format::Tsv));
         assert_eq!(format("out.txt"), None);
         assert_eq!(format("out"), None);
