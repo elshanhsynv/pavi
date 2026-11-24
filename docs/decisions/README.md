@@ -45,3 +45,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0017](0017-locked-temp-folders.md) | Temporary folders are locked while in use; left-over ones are removed when the app or CLI starts (amends 0005, 0007, 0011) |
 | [0018](0018-file-changes-on-disk.md) | Files that change on disk are noticed, refused for reads and reloaded on request, keeping the filter and sort |
 | [0019](0019-folder-schema-merging.md) | The files of a folder may differ: columns are merged by name, types widened, missing columns read as null (amends 0006) |
+| [0020](0020-import-options.md) | CSV and JSON are read with import options (delimiter, header, encoding, all text); a late value retypes the column instead of failing (amends 0007) |

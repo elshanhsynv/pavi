@@ -142,6 +142,8 @@ pub(crate) struct PaviApp {
     workspace: Workspace,
     /// Checks for the open tab's file changing on disk.
     file_watch: watch::FileWatch,
+    /// The file the open tab failed to open, to offer import options for it.
+    failed_path: Option<PathBuf>,
     show_column_types: bool,
     freeze_header: bool,
     status: String,
@@ -153,6 +155,8 @@ pub(crate) struct PaviApp {
     pending_view: Option<TabView>,
     /// A message shown above the grid until dismissed (a crash last time).
     notice: Option<String>,
+    /// The Import options window, while it is open (ADR 0020).
+    import_dialog: Option<crate::import::ImportDialog>,
 }
 
 /// Installs PAVI's fonts and style. Call once, before the first frame: fonts
@@ -351,6 +355,7 @@ impl PaviApp {
             show_nested_selection: false,
             workspace: Workspace::default(),
             file_watch: watch::FileWatch::default(),
+            failed_path: None,
             show_column_types: true,
             freeze_header: true,
             status: "Choose a Parquet file to begin".to_string(),
@@ -358,6 +363,7 @@ impl PaviApp {
             show_shortcuts: false,
             pending_view: None,
             notice: None,
+            import_dialog: None,
         };
         if app.runtime.is_none() {
             app.grid.loading = LoadState::Error("start background runtime".to_string());
@@ -831,6 +837,7 @@ impl PaviApp {
         self.show_nested_selection = false;
         self.workspace = Workspace::Grid;
         self.file_watch = watch::FileWatch::default();
+        self.failed_path = None;
         self.dataset = None;
         self.filter_error = None;
         self.sql_error = None;
@@ -843,7 +850,13 @@ impl PaviApp {
             self.open_error("background runtime is unavailable".to_string());
             return;
         };
-        match runtime.submit_open(path.clone(), generation) {
+        // Options the user chose for this file are used on every open of it.
+        let choice = self
+            .session
+            .saved_import(&path)
+            .map(crate::import::ImportChoice::from_saved)
+            .unwrap_or_default();
+        match runtime.submit_open_with(path.clone(), choice.format, choice.options, generation) {
             Ok(task) => {
                 self.opening = Some(task);
                 self.opening_path = Some(path);
@@ -931,6 +944,7 @@ impl PaviApp {
             }
             OpenOutcome::OpenFailed(error) => {
                 self.pending_view = None;
+                self.failed_path = Some(path.clone());
                 self.session.remove_recent_file(&path);
                 self.persist_session();
                 self.open_error(format!("open file: {error:#}"));
@@ -2615,6 +2629,7 @@ impl eframe::App for PaviApp {
         self.show_chart_window(ctx);
         self.show_file_profile_window(ctx);
         self.show_compare_window(ctx);
+        self.show_import_window(ctx);
         ui::shortcuts::window(ctx, &mut self.show_shortcuts);
         let compression = self
             .dataset

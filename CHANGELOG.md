@@ -9,12 +9,16 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ### Added
 - Folders whose files have different columns open as one table. Columns are matched by name; a column some files lack is empty (null) in their rows; a column stored as different types is read as one that holds both (`Int32` and `Int64` as `Int64`, an integer and a float as `Float64`, text types as large text, decimals with enough digits). Columns whose types can't be combined (say, a number in one file and text in another) still stop the open, with a message naming both files.
+- Import options for CSV and JSON files: the delimiter, whether the first line holds the column names, the text encoding (UTF-8, UTF-16 as Excel's "Unicode text" saves it, or Windows-1252), and reading every column as text (to keep values such as `007`). In the app: File menu → Open with import options…, the Inspector of a CSV or JSON tab, or the screen of a file that couldn't be opened; the choice is remembered for that file. In the CLI: `--delimiter`, `--no-header`, `--encoding` and `--all-text`. The CLI summary and the Inspector say how the file was read.
 - PAVI notices when the open file changes on disk, or when files are added to, removed from or rewritten in an open folder. A bar above the grid says what changed and offers Reload. Remote files are not checked.
 
 ### Changed
 - Reload (Ctrl+R) keeps the tab's filter and sort.
 
 ### Fixed
+- A CSV or JSON file whose value after the first 10,000 records doesn't fit the type guessed from them (text in a number column, a fraction among whole numbers) now opens: the column types are chosen again from every value. Before, the open stopped with an error.
+- A JSON field that first appears after the first 10,000 records is no longer left out.
+- Files in UTF-16 or Windows-1252 open with their text intact instead of failing or showing garbled characters, and a UTF-8 byte order mark no longer ends up in the first column's name.
 - Reading a Parquet file that another program rewrote after PAVI opened it no longer mixes the old file's layout with the new bytes, which could fail with a confusing error or show wrong rows. The read stops with a message that says the file changed; Reload reads it as it is now. The CLI does the same.
 - CLI: a table wider than the terminal no longer wraps into an unreadable mess. Its widest columns are narrowed (down to 10 characters) until it fits; if that isn't enough, middle columns are left out and shown as one `…` column, and the title says how many columns are shown. Tables written to a pipe or a file keep every column.
 - CLI: floating-point numbers in the table read as people write them: `0.009` instead of `0.009000000000000001`, and `1e-20` instead of twenty zeros. CSV, JSON and the other formats keep the full value.

@@ -8,6 +8,7 @@ mod compare;
 mod copy;
 mod export;
 mod find;
+mod import;
 mod inspector;
 mod logging;
 mod pages;

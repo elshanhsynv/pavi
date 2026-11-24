@@ -45,6 +45,7 @@ impl PaviApp {
         let mut start_profile = None;
         let mut cancel_profile = false;
         let mut profile_all = false;
+        let mut import_options = None;
         let Some(dataset) = &self.dataset else {
             widgets::placeholder(ui, |ui| {
                 ui.label(
@@ -261,6 +262,14 @@ impl PaviApp {
                 }
                 format => {
                     widgets::detail(ui, "Format", format.name());
+                    if let Some(report) = dataset.source.import_report() {
+                        widgets::detail(ui, "Read as", report.summary());
+                        if !report.retyped.is_empty() {
+                            // A value past the first 10,000 records didn't fit
+                            // the guessed type, so these were chosen again.
+                            widgets::detail(ui, "Retyped", report.retyped.join(", "));
+                        }
+                    }
                     ui.label(
                         RichText::new(
                             "Read into a temporary Parquet file when opened. Reload to see \
@@ -269,6 +278,15 @@ impl PaviApp {
                         .color(theme::muted())
                         .small(),
                     );
+                    if dataset.source.import_report().is_some()
+                        && widgets::tool_button(ui, None, "Import options…", false)
+                            .on_hover_text(
+                                "Delimiter, header line, encoding, or every column as text",
+                            )
+                            .clicked()
+                    {
+                        import_options = Some(dataset.path.clone());
+                    }
                 }
             }
             widgets::detail(
@@ -389,6 +407,9 @@ impl PaviApp {
         if let Some((row, column)) = select_field {
             self.grid.select(row, column);
             self.reveal_column(column);
+        }
+        if let Some(path) = import_options {
+            self.open_import_dialog(path);
         }
         if cancel_profile {
             self.cancel_profile();

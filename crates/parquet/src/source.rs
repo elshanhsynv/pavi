@@ -35,7 +35,7 @@ use crate::{
     PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo, RowWindow,
     SortBudget, SortSpec,
     change::{FileChanged, FileStamp, FolderStamp},
-    convert::{self, ConvertedFile, FileFormat},
+    convert::{self, ConvertedFile, FileFormat, ImportOptions, ImportReport},
     dataset::{
         self, MAX_DATASET_METADATA_BYTES, PartitionColumn, constant_array, partition_statistics,
     },
@@ -411,7 +411,7 @@ impl ParquetSource {
         path: impl AsRef<Path>,
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
-        Self::open_with(path.as_ref(), None, checkpoint)
+        Self::open_with(path.as_ref(), None, &ImportOptions::default(), checkpoint)
     }
 
     /// Like [`Self::open_cancellable`], but reads a file (local or remote) as
@@ -422,17 +422,35 @@ impl ParquetSource {
         format: FileFormat,
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
-        Self::open_with(path.as_ref(), Some(format), checkpoint)
+        Self::open_with(
+            path.as_ref(),
+            Some(format),
+            &ImportOptions::default(),
+            checkpoint,
+        )
+    }
+
+    /// Like [`Self::open_cancellable`], reading a CSV or JSON file with
+    /// `options` (ADR 0020), and as `format` when one is given. Options don't
+    /// apply to Parquet and Arrow files or folders.
+    pub fn open_with_options(
+        path: impl AsRef<Path>,
+        format: Option<FileFormat>,
+        options: &ImportOptions,
+        checkpoint: &dyn Fn(f64) -> bool,
+    ) -> Result<Self> {
+        Self::open_with(path.as_ref(), format, options, checkpoint)
     }
 
     fn open_with(
         path: &Path,
         format: Option<FileFormat>,
+        options: &ImportOptions,
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
         let path = path.to_owned();
         if remote::is_remote(&path) {
-            return Self::open_remote(path, format, checkpoint);
+            return Self::open_remote(path, format, options, checkpoint);
         }
         let file_info = FileInfo::from(
             std::fs::metadata(&path).with_context(|| format!("open {}", path.display()))?,
@@ -448,7 +466,14 @@ impl ParquetSource {
         }
         let format = format.unwrap_or_else(|| FileFormat::from_path(&path));
         if !file_info.is_dir && format != FileFormat::Parquet {
-            return Self::open_converted(path.clone(), &path, file_info, format, checkpoint);
+            return Self::open_converted(
+                path.clone(),
+                &path,
+                file_info,
+                format,
+                options,
+                checkpoint,
+            );
         }
         if !file_info.is_dir {
             let opened = open_file(Location::Local(path.clone()), &path)?;
@@ -495,9 +520,10 @@ impl ParquetSource {
         input: &Path,
         file_info: FileInfo,
         format: FileFormat,
+        options: &ImportOptions,
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
-        let converted = convert::convert(input, format, checkpoint)
+        let converted = convert::convert(input, format, options, checkpoint)
             .with_context(|| format!("open {} as {}", path.display(), format.name()))?;
         let opened = open_file(Location::Local(converted.path.clone()), &path)?;
         // The copy is PAVI's own; the original is what can change. Its size and
@@ -534,6 +560,7 @@ impl ParquetSource {
     fn open_remote(
         path: PathBuf,
         format: Option<FileFormat>,
+        options: &ImportOptions,
         checkpoint: &dyn Fn(f64) -> bool,
     ) -> Result<Self> {
         let url = path
@@ -563,7 +590,7 @@ impl ParquetSource {
                 .download(&downloaded, &|done| checkpoint(done / 2.0))
                 .with_context(|| format!("download {}", redact(&url)))?;
             // The download is not needed once it is converted.
-            return Self::open_converted(path, &downloaded, file_info, format, &|done| {
+            return Self::open_converted(path, &downloaded, file_info, format, options, &|done| {
                 checkpoint(0.5 + done / 2.0)
             });
         }
@@ -826,6 +853,15 @@ impl ParquetSource {
     /// temporary Parquet file.
     pub fn format(&self) -> FileFormat {
         self.format
+    }
+
+    /// How a CSV or JSON file was read (ADR 0020): its options with every
+    /// guess resolved, and the columns retyped after a late value. `None` for
+    /// Parquet and Arrow.
+    pub fn import_report(&self) -> Option<&ImportReport> {
+        self.converted
+            .as_ref()
+            .and_then(|converted| converted.report.as_ref())
     }
 
     /// Whether a remote file was downloaded rather than read with range requests.

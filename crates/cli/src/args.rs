@@ -75,6 +75,33 @@ pub struct Args {
     )]
     pub input_format: Option<InputFormat>,
 
+    /// CSV: the character between fields: --delimiter ";"  (or tab)
+    ///
+    /// One character, or tab / space by name. Guessed when not given: a tab
+    /// for .tsv, otherwise the most common of , ; tab | in the first line.
+    #[arg(long, value_name = "CHAR", value_parser = parse_delimiter, help_heading = "Input")]
+    pub delimiter: Option<u8>,
+
+    /// CSV: the first line is data, not column names
+    ///
+    /// The columns are then called column_1, column_2, …
+    #[arg(long, help_heading = "Input")]
+    pub no_header: bool,
+
+    /// CSV and JSON: the text encoding: utf-8, utf-16le, utf-16be or windows-1252
+    ///
+    /// Detected when not given: from a byte order mark, then UTF-16 by its
+    /// zero bytes, then UTF-8 if the start of the file is valid UTF-8, else
+    /// windows-1252 (also called cp1252, latin1).
+    #[arg(long, value_name = "NAME", value_parser = parse_encoding, help_heading = "Input")]
+    pub encoding: Option<parquet_reader::TextEncoding>,
+
+    /// CSV and JSON: read every column as text instead of guessing types
+    ///
+    /// Keeps values such as 007 or 1e5 exactly as written.
+    #[arg(long, help_heading = "Input")]
+    pub all_text: bool,
+
     /// Only these columns, by name or 0-based number: -c id,name
     ///
     /// Comma-separated, in the order to output. A name is tried before a
@@ -302,6 +329,48 @@ pub enum InputFormat {
     Json,
     /// An Arrow IPC file or stream
     Arrow,
+}
+
+/// A delimiter: one ASCII character, or `tab` / `space` / `\t`.
+fn parse_delimiter(text: &str) -> Result<u8, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "tab" | "\\t" | "\t" => return Ok(b'\t'),
+        "space" => return Ok(b' '),
+        _ => {}
+    }
+    match text.as_bytes() {
+        [byte]
+            if byte.is_ascii()
+                && !byte.is_ascii_alphanumeric()
+                && *byte != b'"'
+                && *byte != b'\n' =>
+        {
+            Ok(*byte)
+        }
+        _ => Err(format!(
+            "{text:?} is not a delimiter; give one character such as , ; | or the word tab"
+        )),
+    }
+}
+
+fn parse_encoding(text: &str) -> Result<parquet_reader::TextEncoding, String> {
+    parquet_reader::TextEncoding::parse(text).ok_or_else(|| {
+        format!(
+            "{text:?} is not an encoding PAVI reads; use utf-8, utf-16le, utf-16be or windows-1252"
+        )
+    })
+}
+
+impl Args {
+    /// How to read a CSV or JSON FILE.
+    pub fn import_options(&self) -> parquet_reader::ImportOptions {
+        parquet_reader::ImportOptions {
+            delimiter: self.delimiter,
+            header: !self.no_header,
+            encoding: self.encoding,
+            all_text: self.all_text,
+        }
+    }
 }
 
 impl InputFormat {

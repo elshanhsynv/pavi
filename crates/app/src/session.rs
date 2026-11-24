@@ -24,6 +24,8 @@ pub const MAX_SAVED_NAME_CHARS: usize = 80;
 pub const MAX_SAVED_FILTER_BYTES: usize = 16 * 1024;
 /// Sort keys kept per tab (the app's own sort limit).
 pub const MAX_SAVED_SORT_KEYS: usize = 8;
+/// Files whose import options the user chose, kept to read them the same way.
+pub const MAX_SAVED_IMPORTS: usize = 32;
 /// The interface zoom the app allows, as a factor of the normal size.
 pub const MIN_ZOOM: f32 = 0.5;
 pub const MAX_ZOOM: f32 = 2.0;
@@ -117,6 +119,24 @@ impl TabView {
     }
 }
 
+/// How the user chose to read a CSV or JSON file (ADR 0020), kept by path so
+/// every later open of it (Reload, the recent list, tabs at start) reads it
+/// the same way. Text fields, so an unknown value from another version reads
+/// as "guess" instead of discarding the session.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct SavedImport {
+    pub path: PathBuf,
+    /// `csv` or `json`; empty to go by the extension.
+    pub format: String,
+    /// The delimiter character; empty to guess it.
+    pub delimiter: String,
+    pub no_header: bool,
+    /// An encoding name `TextEncoding::parse` reads; empty to detect it.
+    pub encoding: String,
+    pub all_text: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Preferences {
@@ -166,6 +186,8 @@ pub struct SessionState {
     pub preferences: Preferences,
     /// The filter and sort of open tabs that had one, by path.
     pub tab_views: Vec<TabView>,
+    /// Import options the user chose, newest first (≤ `MAX_SAVED_IMPORTS`).
+    pub imports: Vec<SavedImport>,
     /// When the newest crash report already told about was written (seconds
     /// since 1970), so each crash is reported once.
     pub last_crash_report: u64,
@@ -187,6 +209,7 @@ impl Default for SessionState {
                 ..Preferences::default()
             },
             tab_views: Vec::new(),
+            imports: Vec::new(),
             last_crash_report: 0,
         }
     }
@@ -209,6 +232,24 @@ impl SessionState {
             .retain(|existing| existing.schema_key != layout.schema_key);
         self.preferences.grid_layouts.insert(0, layout);
         self.preferences.grid_layouts.truncate(MAX_GRID_LAYOUTS);
+    }
+
+    /// The import options chosen for `path`, if any.
+    pub fn saved_import(&self, path: &Path) -> Option<&SavedImport> {
+        self.imports.iter().find(|saved| saved.path == path)
+    }
+
+    /// Keeps `saved` as the import options of its path, or forgets the
+    /// options of `path` when `saved` is `None`. A URL with a query string
+    /// (which may hold a token) is never kept.
+    pub fn set_saved_import(&mut self, path: &Path, saved: Option<SavedImport>) {
+        self.imports.retain(|existing| existing.path != path);
+        if let Some(saved) = saved
+            && !is_secret_url(path)
+        {
+            self.imports.insert(0, saved);
+            self.imports.truncate(MAX_SAVED_IMPORTS);
+        }
     }
 
     pub fn record_recent_file(&mut self, path: PathBuf) {
@@ -429,6 +470,8 @@ impl SessionState {
         }
         self.tab_views.retain(|view| !view.is_empty());
         self.tab_views.truncate(MAX_OPEN_FILES);
+        self.imports.retain(|saved| !is_secret_url(&saved.path));
+        self.imports.truncate(MAX_SAVED_IMPORTS);
     }
 
     fn trim_history(&mut self) {

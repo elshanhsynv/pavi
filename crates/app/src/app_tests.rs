@@ -3017,3 +3017,64 @@ fn a_change_check_of_a_file_no_longer_shown_is_dropped() {
     }
     assert_eq!(app.file_watch.changed, None);
 }
+
+#[test]
+fn reads_a_file_with_the_import_options_chosen_and_keeps_them() {
+    let directory = TempDir::new().unwrap();
+    let path = std::path::absolute(directory.path().join("export.txt")).unwrap();
+    std::fs::write(&path, b"1;M\xfcnchen\n2;K\xf6ln\n3;Wien\n").unwrap();
+    let store = SessionStore::new(directory.path().join("session.json"));
+    let mut app = PaviApp::new_with_store(None, store.clone());
+    // Read as Parquet by its extension, it can't be opened.
+    app.open_path(path.clone());
+    poll_until_opened(&mut app);
+    assert!(app.dataset.is_none());
+    assert_eq!(app.failed_path.as_deref(), Some(path.as_path()));
+
+    app.open_import_dialog(path.clone());
+    let dialog = app.import_dialog.as_mut().unwrap();
+    dialog.format = Some(parquet_reader::FileFormat::Csv);
+    dialog.delimiter = crate::import::DelimiterChoice::Semicolon;
+    dialog.header = false;
+    let choice = dialog.choice().unwrap();
+    app.import_dialog = None;
+    app.apply_import(path.clone(), choice);
+    poll_until_opened(&mut app);
+    let dataset = app.dataset.as_ref().unwrap();
+    assert_eq!(dataset.column_names, ["column_1", "column_2"]);
+    let report = dataset.source.import_report().unwrap();
+    assert_eq!(report.encoding, parquet_reader::TextEncoding::Windows1252);
+    assert_eq!(app.tab_count(), 1, "read again in the same tab");
+
+    // Reload reads it the same way, and keeps the filter.
+    app.filter_input = "column_1 >= 2".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    app.reload_document();
+    poll_until_opened(&mut app);
+    poll_until_idle(&mut app);
+    assert_eq!(app.dataset.as_ref().unwrap().source.row_count(), 3);
+    assert_eq!(filtered_ids(&app), ["2", "3"]);
+
+    // The next start reads it the same way too.
+    app.persist_session();
+    assert_eq!(
+        store
+            .load()
+            .saved_import(&path)
+            .map(|saved| saved.delimiter.clone()),
+        Some(";".to_string())
+    );
+    let mut restarted = PaviApp::new_with_store(None, store.clone());
+    poll_until_opened(&mut restarted);
+    assert_eq!(
+        restarted.dataset.as_ref().unwrap().column_names,
+        ["column_1", "column_2"]
+    );
+
+    // Guessing everything again forgets the choice.
+    restarted.apply_import(path.clone(), crate::import::ImportChoice::default());
+    poll_until_opened(&mut restarted);
+    assert!(restarted.session.saved_import(&path).is_none());
+    assert!(restarted.dataset.is_none());
+}

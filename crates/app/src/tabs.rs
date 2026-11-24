@@ -49,6 +49,7 @@ pub(super) struct TabState {
     show_nested_selection: bool,
     workspace: Workspace,
     file_watch: watch::FileWatch,
+    failed_path: Option<PathBuf>,
     pending_view: Option<TabView>,
 }
 
@@ -89,6 +90,7 @@ impl TabState {
             show_nested_selection: false,
             workspace: Workspace::default(),
             file_watch: watch::FileWatch::default(),
+            failed_path: None,
             pending_view: None,
         }
     }
@@ -218,6 +220,7 @@ impl PaviApp {
         );
         swap(&mut self.workspace, &mut tab.workspace);
         swap(&mut self.file_watch, &mut tab.file_watch);
+        swap(&mut self.failed_path, &mut tab.failed_path);
         swap(&mut self.pending_view, &mut tab.pending_view);
     }
 
@@ -226,7 +229,7 @@ impl PaviApp {
     }
 
     /// The file or folder shown (or being opened) in tab `index`.
-    fn tab_path_at(&self, index: usize) -> Option<&Path> {
+    pub(super) fn tab_path_at(&self, index: usize) -> Option<&Path> {
         if index == self.tabs.active {
             tab_path(self.dataset.as_ref(), self.opening_path.as_deref())
         } else {
