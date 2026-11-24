@@ -5,9 +5,9 @@
 ## What `update()` does every frame (`app.rs:1780-1831`)
 
 1. Apply theme once; `handle_global_shortcuts` (may open a blocking rfd dialog on Ctrl+O).
-2. Poll: `poll_open`, `SourcePages::poll` (iterates all pending page tasks), `poll_filtered` (drains available batches), `poll_chart`, `poll_profile`, `poll_export`. All are `try_recv` — no blocking waits.
+2. Poll: `poll_open`, `SourcePages::poll` (iterates all pending page tasks), `poll_filtered` (drains available batches), `poll_chart`, `poll_profile`, `poll_export`, `poll_file_watch` (picks up the change check and sends the next when due, ADR 0018). All are `try_recv` — no blocking waits.
 3. Draw top bar, chart window, status bar, inspector, central grid/SQL workspace.
-4. If anything is pending → `request_repaint_after(16 ms)`.
+4. If anything is pending → `request_repaint_after(16 ms)`; otherwise, while a file is open, wake for its next change check (≤ 2 s, or 100 ms while one is in flight).
 
 **Per-frame allocations worth knowing:** `column_names.clone()` and a fresh `Vec<Header>` (with `type_label` strings and `source.schema()` `Arc` clones per column) in the grid (`ui/grid.rs:72-102`); `display_columns.clone()` for filtered grids (`ui/grid.rs:211`); one `String` per visible cell from `format_cell_with_limit` (≤256 chars) plus `on_hover_text(text)` per cell. With ~40 visible rows × ~15 columns this is a few hundred small strings per frame — fine, but formatting is not cached between frames. No large data is cloned per frame (`RecordBatch` clones are `Arc` bumps).
 
@@ -18,6 +18,7 @@
 | Work | Thread | Cancel mechanism | Effective? |
 |---|---|---|---|
 | Open, page, window, filtered read, sort, aggregate | `pavi-page-N` pool (N = CPU count) | `CancellationToken` and the runtime's shutdown flag, combined into a `stop` check (`scheduler.rs::execute`). Checked before and after every read. Filtered/sorted/aggregated scans call the runtime's `checkpoint(scanned_rows)` before each 4,096-row batch: it stores the scan position in the task's `ScanProgress` (an `Arc<AtomicU64>`, written by the worker and read by the UI with relaxed ordering; it is a display value and guards nothing) and returns the `stop` check. A stopped scan returns `parquet_reader::Cancelled`, reported as `PageOutcome::Cancelled` | Yes; a running scan stops within one batch (sub-millisecond on the sample files) |
+| Change check (ADR 0018) | `pavi-page-N` pool, one at a time for the open tab | the `stop` check between files and folders | Yes; it is a few `stat` calls |
 | Export | `pavi-export` (one per export) | token checked between batches | Yes, at batch granularity |
 | Profile | `pavi-profile` | token checked between polls; cancels its query's pool task | Yes, at batch granularity |
 | Left-over temp folders (ADR 0017) | `pavi-cleanup` (one, at app and CLI start) | none needed: it removes only folders whose `.pavi-lock` it can lock, so never one in use; the CLI joins it after its output | — |

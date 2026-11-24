@@ -7,7 +7,14 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Added
+- PAVI notices when the open file changes on disk, or when files are added to, removed from or rewritten in an open folder. A bar above the grid says what changed and offers Reload. Remote files are not checked.
+
+### Changed
+- Reload (Ctrl+R) keeps the tab's filter and sort.
+
 ### Fixed
+- Reading a Parquet file that another program rewrote after PAVI opened it no longer mixes the old file's layout with the new bytes, which could fail with a confusing error or show wrong rows. The read stops with a message that says the file changed; Reload reads it as it is now. The CLI does the same.
 - CLI: a table wider than the terminal no longer wraps into an unreadable mess. Its widest columns are narrowed (down to 10 characters) until it fits; if that isn't enough, middle columns are left out and shown as one `…` column, and the title says how many columns are shown. Tables written to a pipe or a file keep every column.
 - CLI: floating-point numbers in the table read as people write them: `0.009` instead of `0.009000000000000001`, and `1e-20` instead of twenty zeros. CSV, JSON and the other formats keep the full value.
 

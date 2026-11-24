@@ -132,6 +132,34 @@ impl PaviApp {
                 self.notice = None;
             }
         }
+        if let Some(changed) = self.file_watch.changed.clone() {
+            let mut reload = false;
+            egui::TopBottomPanel::top("file_changed")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::panel())
+                        .inner_margin(Spacing::Lg.symmetric(Spacing::Sm)),
+                )
+                .show(ctx, |ui| {
+                    // The button comes first: a long path is cut at the right
+                    // edge, never the button.
+                    ui.horizontal(|ui| {
+                        reload = widgets::primary_button(ui, Some(Icon::Refresh), "Reload")
+                            .on_hover_text("Open it again, keeping the filter and sort (Ctrl+R)")
+                            .clicked();
+                        ui.add_space(Spacing::Md.px());
+                        let text = format!("{changed}. Reload to see it as it is now.");
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&text).color(theme::text()))
+                                .truncate(),
+                        )
+                        .on_hover_text(&text);
+                    });
+                });
+            if reload {
+                self.reload_document();
+            }
+        }
         if let Some(error) = &self.filter_error {
             egui::TopBottomPanel::top("filter_error")
                 .frame(
@@ -303,7 +331,7 @@ impl PaviApp {
             self.new_tab();
         }
         if refresh {
-            self.refresh_document();
+            self.reload_document();
         }
         if compare {
             self.open_compare();
@@ -688,7 +716,7 @@ impl PaviApp {
             .on_hover_text("Reload from disk (Ctrl+R)")
             .clicked()
         {
-            self.refresh_document();
+            self.reload_document();
         }
     }
 

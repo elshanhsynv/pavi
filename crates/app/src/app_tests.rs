@@ -136,12 +136,19 @@ fn desktop_layout_keeps_grid_selection_jump_and_workspace_actions_connected() {
 fn source(rows: usize) -> (TempDir, Arc<ParquetSource>, PathBuf) {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("filters.parquet");
+    write_rows(&path, rows);
+    let source = Arc::new(ParquetSource::open(&path).unwrap());
+    (directory, source, path)
+}
+
+/// Writes ids `0..rows` and alternating names to `path`.
+fn write_rows(path: &std::path::Path, rows: usize) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, false),
     ]));
     let mut writer = ArrowWriter::try_new(
-        File::create(&path).unwrap(),
+        File::create(path).unwrap(),
         schema.clone(),
         Some(
             WriterProperties::builder()
@@ -165,8 +172,6 @@ fn source(rows: usize) -> (TempDir, Arc<ParquetSource>, PathBuf) {
         )
         .unwrap();
     writer.close().unwrap();
-    let source = Arc::new(ParquetSource::open(&path).unwrap());
-    (directory, source, path)
 }
 
 fn make_app(source: Arc<ParquetSource>, path: PathBuf) -> PaviApp {
@@ -2910,4 +2915,105 @@ fn tells_once_about_a_crash_in_the_last_run() {
         app.session_store.load().last_crash_report,
         app.session.last_crash_report
     );
+}
+
+/// Runs change checks, each one interval after the last on `clock`, until one
+/// finds a change or `checks` have found none.
+fn poll_file_watch_until_changed(app: &mut PaviApp, clock: &mut Instant, checks: u32) -> bool {
+    let mut sent = 0;
+    for _ in 0..2_000 {
+        app.poll_file_watch(*clock);
+        if app.file_watch.changed.is_some() {
+            return true;
+        }
+        if app.file_watch.is_idle() {
+            if sent == checks {
+                return false;
+            }
+            sent += 1;
+            *clock += watch::CHANGE_CHECK_INTERVAL;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("change checks did not finish");
+}
+
+#[test]
+fn notices_a_file_changed_on_disk_and_reloads_it_with_its_filter_and_sort() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path.clone());
+    app.filter_input = "id > 70".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    app.apply_sort(vec![SortSpec::new(
+        0,
+        SortDirection::Descending,
+        NullOrder::Last,
+    )]);
+    poll_until_idle(&mut app);
+    let mut clock = Instant::now();
+    assert!(!poll_file_watch_until_changed(&mut app, &mut clock, 3));
+
+    write_rows(&path, 120);
+    assert!(poll_file_watch_until_changed(&mut app, &mut clock, 3));
+    let changed = app.file_watch.changed.clone().unwrap();
+    assert!(
+        changed.contains("filters.parquet changed on disk"),
+        "{changed}"
+    );
+    // Once it has noticed, it stops checking.
+    assert_eq!(app.poll_file_watch(Instant::now()), None);
+
+    app.reload_document();
+    poll_until_opened(&mut app);
+    poll_until_idle(&mut app);
+    assert_eq!(app.file_watch.changed, None);
+    assert_eq!(app.dataset.as_ref().unwrap().source.row_count(), 120);
+    assert_eq!(app.filter_input, "id > 70");
+    assert_eq!(
+        app.sort_keys(),
+        [SortSpec::new(0, SortDirection::Descending, NullOrder::Last)]
+    );
+    assert_eq!(filtered_ids(&app)[..3], ["119", "118", "117"]);
+    assert!(!poll_file_watch_until_changed(&mut app, &mut clock, 2));
+}
+
+#[test]
+fn a_page_of_a_changed_file_is_not_read_again_every_frame() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path.clone());
+    write_rows(&path, 120);
+    app.request_page(0);
+    for _ in 0..1_000 {
+        if let Some(status) = app.pages.poll(&mut app.grid) {
+            assert!(status.contains("changed on disk"), "{status}");
+            // Still marked as requested, so the grid does not ask for it again.
+            assert!(app.grid.requested.contains(&0));
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the page read did not fail");
+}
+
+#[test]
+fn a_change_check_of_a_file_no_longer_shown_is_dropped() {
+    let (_other_directory, other, other_path) = source(20);
+    let (_directory, source, path) = source(10);
+    let mut app = make_app(source, path.clone());
+    write_rows(&path, 30);
+    // A check of the changed file is sent, and the tab shows another file
+    // before it is picked up.
+    app.poll_file_watch(Instant::now());
+    assert!(!app.file_watch.is_idle());
+    app.dataset = Some(Dataset {
+        source: other,
+        path: other_path,
+        column_names: vec!["id".to_string(), "name".to_string()],
+    });
+    for _ in 0..200 {
+        app.poll_file_watch(Instant::now());
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(app.file_watch.changed, None);
 }

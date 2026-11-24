@@ -50,6 +50,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Open tabs | 16; each parked tab keeps its own bounded pages, result window and footer metadata, so the per-dataset budgets above apply per tab | `tabs::MAX_TABS` (= `session::MAX_OPEN_FILES`) |
 | Folder dataset search (ADR 0006) | 4,096 files, 16 folder levels, 100,000 directory entries looked at | `dataset::MAX_DATASET_FILES`, `MAX_FOLDER_DEPTH`, `MAX_FOLDER_ENTRIES` |
 | Folder dataset footers in memory | 256 MB for all files together | `dataset::MAX_DATASET_METADATA_BYTES` |
+| Change check of the open tab (ADR 0018) | one in flight, every 2 s; one `stat` per file (≤ 4,096) and per searched folder (the folder times kept are bounded by the 100,000 entries a search looks at) | `watch::CHANGE_CHECK_INTERVAL` |
 | CSV / JSON type inference (ADR 0007) | first 10,000 records | `convert::MAX_INFER_ROWS` |
 | Reading CSV, JSON, Arrow into Parquet | 8,192-row batches; a row group is written at 262,144 rows or 64 MB buffered; the temporary file ≤ 32 GiB | `convert::BATCH_ROWS`, `ROW_GROUP_ROWS`, `MAX_BUFFERED_BYTES`, `MAX_CONVERTED_BYTES` |
 | Remote range cache (ADR 0008) | 256 MB per object; ranges over 128 MB are not kept | `remote::REMOTE_CACHE_BYTES`, `MAX_CACHED_RANGE_BYTES` |

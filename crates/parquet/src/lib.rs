@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod cache;
+mod change;
 pub mod convert;
 pub mod dataset;
 pub mod export;
@@ -21,6 +22,7 @@ pub mod value;
 
 pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
 pub use cache::{PageCache, PageCacheLimits, PageCacheStats};
+pub use change::FileChanged;
 pub use convert::{
     FileFormat, MAX_ARROW_BUFFER_BYTES, MAX_ARROW_MESSAGE_BYTES, MAX_CONVERTED_BYTES,
     MAX_INFER_ROWS,

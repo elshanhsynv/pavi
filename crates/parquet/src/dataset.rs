@@ -12,7 +12,7 @@ use arrow_array::{ArrayRef, Int64Array, StringArray, new_null_array};
 use arrow_schema::DataType;
 use parquet::{data_type::ByteArray, file::statistics::Statistics};
 
-use crate::source::Cancelled;
+use crate::{change::FolderStamp, source::Cancelled};
 
 /// Parquet files one folder dataset may hold. Each file's footer stays in memory.
 pub const MAX_DATASET_FILES: usize = 4_096;
@@ -34,6 +34,14 @@ pub(crate) struct FoundFile {
     pub(crate) partitions: Vec<(String, Option<String>)>,
 }
 
+/// What a dataset folder holds: its Parquet files, and every folder searched,
+/// with its modification time from just before it was listed.
+#[derive(Debug)]
+pub(crate) struct Listing {
+    pub(crate) files: Vec<FoundFile>,
+    pub(crate) folders: Vec<FolderStamp>,
+}
+
 /// A column made from partition folder names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PartitionColumn {
@@ -45,10 +53,14 @@ pub(crate) struct PartitionColumn {
 /// Finds the Parquet files under `root`, in name order. Names starting with `.`
 /// or `_` (`_SUCCESS`, `_delta_log`, hidden files) are skipped. Every file must
 /// sit under the same partition keys, in the same order.
-pub(crate) fn find_files(root: &Path, cancelled: &dyn Fn() -> bool) -> Result<Vec<FoundFile>> {
-    let mut files = Vec::new();
+pub(crate) fn find_files(root: &Path, cancelled: &dyn Fn() -> bool) -> Result<Listing> {
+    let mut listing = Listing {
+        files: Vec::new(),
+        folders: Vec::new(),
+    };
     let mut entries = 0_usize;
-    walk(root, 0, &[], &mut files, &mut entries, cancelled)?;
+    walk(root, 0, &[], &mut listing, &mut entries, cancelled)?;
+    let files = &listing.files;
     let Some(first) = files.first() else {
         bail!(
             "{} holds no .parquet files (names starting with . or _ are skipped)",
@@ -80,20 +92,22 @@ pub(crate) fn find_files(root: &Path, cancelled: &dyn Fn() -> bool) -> Result<Ve
             first_keys.join(", ")
         );
     }
-    Ok(files)
+    Ok(listing)
 }
 
 fn walk(
     folder: &Path,
     depth: usize,
     partitions: &[(String, Option<String>)],
-    files: &mut Vec<FoundFile>,
+    listing: &mut Listing,
     entries: &mut usize,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
     if cancelled() {
         return Err(Cancelled.into());
     }
+    // Taken before listing, so an entry added while it is listed shows as a change.
+    listing.folders.push(FolderStamp::of(folder));
     let mut children = Vec::new();
     for entry in
         std::fs::read_dir(folder).with_context(|| format!("list folder {}", folder.display()))?
@@ -126,15 +140,15 @@ fn walk(
             }
             let mut below = partitions.to_vec();
             below.extend(parse_partition(&name));
-            walk(&path, depth + 1, &below, files, entries, cancelled)?;
+            walk(&path, depth + 1, &below, listing, entries, cancelled)?;
         } else if path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
         {
-            if files.len() >= MAX_DATASET_FILES {
+            if listing.files.len() >= MAX_DATASET_FILES {
                 bail!("this folder holds more than {MAX_DATASET_FILES} Parquet files");
             }
-            files.push(FoundFile {
+            listing.files.push(FoundFile {
                 path,
                 partitions: partitions.to_vec(),
             });
@@ -333,7 +347,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"").unwrap();
         }
-        let files = find_files(root, &|| false).unwrap();
+        let files = find_files(root, &|| false).unwrap().files;
         let names = files
             .iter()
             .map(|file| {

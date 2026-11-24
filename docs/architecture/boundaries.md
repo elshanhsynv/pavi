@@ -4,7 +4,7 @@
 
 ## File system
 - Local files and folders, by path, up to 16 open at once in tabs (`MAX_TABS`). A folder is one table of every `.parquet` file below it (ADR 0006, `parquet_reader::dataset`): searched in path order, skipping names that start with `.` or `_`, at most 16 folder levels (`MAX_FOLDER_DEPTH`), 100,000 directory entries (`MAX_FOLDER_ENTRIES`), 4,096 files (`MAX_DATASET_FILES`) and 256 MB of footer metadata (`MAX_DATASET_METADATA_BYTES`). All files must have the same column names and types; `key=value` folders become partition columns (`Int64` if every value is an integer, else `Utf8`). Symbolic links are followed, within the depth limit. No globbing, URLs or object storage.
-- Each file is **re-opened by path for every read** (a read that crosses files opens each) (`source.rs:670-671`); metadata is cached from open time. If the file changes on disk, reads use stale metadata against new bytes.
+- Each file is **re-opened by path for every read** (a read that crosses files opens each); metadata is cached from open time. Each local file's size and modification time are recorded with its footer, and a read of a file whose size or time differ fails with `FileChanged` instead of using the old footer against new bytes (ADR 0018). The app checks the open tab's file or folder every 2 seconds (`ParquetSource::check_changed`: one `stat` per file and per searched folder; for a CSV, JSON or Arrow file, the original) and offers Reload. Remote objects are not checked. A file rewritten with the same size and modification time is not noticed.
 - Writes: export target (+ temp file next to it) and the session JSON.
 
 ## Network (ADR 0008)
