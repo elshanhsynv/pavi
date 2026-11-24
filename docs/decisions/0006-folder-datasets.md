@@ -1,6 +1,6 @@
 # 0006. A folder of Parquet files is one table
 
-- Status: accepted
+- Status: accepted; the "same columns" rule is replaced by [0019](0019-folder-schema-merging.md)
 - Date: 2026-11-12
 
 ## Context

@@ -280,7 +280,13 @@ struct SourceFile {
     stamp: Option<FileStamp>,
     metadata: Arc<ParquetMetaData>,
     arrow_metadata: ArrowReaderMetadata,
-    /// The Parquet leaf column of each file column; `None` when nested.
+    /// For each of the source's file columns, this file's top-level column
+    /// holding it; `None` when the file lacks it, so its rows read as null
+    /// (ADR 0019).
+    columns: Vec<Option<usize>>,
+    /// For each of the source's file columns, the Parquet leaf column whose
+    /// statistics, page index and bloom filter describe it; `None` when nested,
+    /// missing, or stored as another type than the source's.
     leaf_columns: Vec<Option<usize>>,
     /// Source-wide index of this file's first row group.
     first_row_group: usize,
@@ -570,7 +576,8 @@ impl ParquetSource {
         Ok(source)
     }
 
-    /// Builds the source from opened files, which must have the same columns.
+    /// Builds the source from opened files; a folder's files may have different
+    /// columns, merged as ADR 0019 describes.
     fn from_files(
         path: PathBuf,
         file_info: FileInfo,
@@ -581,67 +588,29 @@ impl ParquetSource {
             bail!("{} holds no Parquet files", path.display());
         };
         let first_schema = first.arrow_metadata.schema().clone();
-        // A column is nullable when it is in any file.
-        let mut fields = first_schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>();
-        for other in &opened[1..] {
-            let other_fields = other.arrow_metadata.schema().fields();
-            let mismatch = if other_fields.len() != fields.len() {
-                Some(format!(
-                    "it has {} columns, not {}",
-                    other_fields.len(),
-                    fields.len()
-                ))
-            } else {
-                fields
-                    .iter()
-                    .zip(other_fields.iter())
-                    .find_map(|(field, other)| {
-                        if field.name() != other.name() {
-                            Some(format!(
-                                "it has column {} where the first file has {}",
-                                other.name(),
-                                field.name()
-                            ))
-                        } else if field.data_type() != other.data_type() {
-                            Some(format!(
-                                "its column {} is {} there but {} here",
-                                field.name(),
-                                field.data_type(),
-                                other.data_type()
-                            ))
-                        } else {
-                            None
-                        }
-                    })
-            };
-            if let Some(mismatch) = mismatch {
-                bail!(
-                    "{} does not have the same columns as {}: {mismatch}",
-                    other.location.describe(),
-                    first.location.describe()
-                );
-            }
-            for (field, other) in fields.iter_mut().zip(other_fields.iter()) {
-                if other.is_nullable() && !field.is_nullable() {
-                    *field = field.clone().with_nullable(true);
-                }
-            }
-        }
         // Columns are read as `types::read_type`: dictionaries as their values,
         // and so on. `reorder_batch` casts each decoded batch to match.
-        for field in &mut fields {
-            let read = crate::types::read_type(field.data_type());
-            if &read != field.data_type() {
-                *field = field.clone().with_data_type(read);
-            }
-        }
+        let own_schemas = opened
+            .iter()
+            .map(|file| {
+                let fields = file
+                    .arrow_metadata
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        let read = crate::types::read_type(field.data_type());
+                        field.as_ref().clone().with_data_type(read)
+                    })
+                    .collect::<Vec<_>>();
+                (file.location.describe(), Schema::new(fields))
+            })
+            .collect::<Vec<_>>();
+        // Files of a folder may differ: their columns are merged by name and
+        // widened (ADR 0019).
+        let merged = dataset::merge_columns(&own_schemas)?;
+        let mut fields = merged.fields;
         let file_columns = fields.len();
-        let file_schema =
-            Schema::new_with_metadata(fields.clone(), first_schema.metadata().clone());
         // A partition key the files also store as a column (Polars writes both) is
         // read from the files; its folders add no column.
         let keep = partition_columns
@@ -670,7 +639,12 @@ impl ParquetSource {
         let mut row_group_files = Vec::new();
         let mut statistics = vec![Vec::new(); schema.fields().len()];
         let mut files = Vec::with_capacity(opened.len());
-        for (index, opened) in opened.into_iter().enumerate() {
+        for (index, ((opened, columns), (_, own_schema))) in opened
+            .into_iter()
+            .zip(merged.file_columns)
+            .zip(&own_schemas)
+            .enumerate()
+        {
             let OpenedFile {
                 location,
                 bytes,
@@ -715,17 +689,48 @@ impl ParquetSource {
                     }));
                 }
             }
-            for (column, file_statistics) in metadata_statistics(&metadata, &file_schema)
-                .into_iter()
-                .enumerate()
-            {
-                statistics[column].extend(file_statistics);
+            // Statistics are this file's own, shown as its own type; a column the
+            // file lacks is null in every row.
+            let mut own_statistics = metadata_statistics(&metadata, own_schema);
+            for (column, file_column) in columns.iter().enumerate() {
+                let column_statistics = match file_column {
+                    Some(own) => own_statistics.get_mut(*own).map(std::mem::take),
+                    None => None,
+                };
+                statistics[column].extend(column_statistics.unwrap_or_else(|| {
+                    (0..metadata.num_row_groups())
+                            .map(|local| {
+                                Some(ColumnStatistics {
+                                    min: None,
+                                    max: None,
+                                    null_count: Some(
+                                        metadata.row_group(local).num_rows().max(0) as u64
+                                    ),
+                                    distinct_count: Some(0),
+                                })
+                            })
+                            .collect()
+                }));
             }
+            // Statistics, page indexes and bloom filters prune only a column
+            // stored as the source's type: they hold values of the file's type.
+            let own_leaves = leaf_columns(&metadata, own_schema.fields().len());
+            let leaves = columns
+                .iter()
+                .enumerate()
+                .map(|(column, own)| {
+                    let own = (*own)?;
+                    (own_schema.field(own).data_type() == schema.field(column).data_type())
+                        .then(|| own_leaves.get(own).copied().flatten())
+                        .flatten()
+                })
+                .collect();
             files.push(SourceFile {
                 location,
                 bytes,
                 stamp,
-                leaf_columns: leaf_columns(&metadata, file_columns),
+                columns,
+                leaf_columns: leaves,
                 metadata,
                 arrow_metadata,
                 first_row_group,
@@ -1702,16 +1707,19 @@ impl ParquetSource {
         Ok(batches)
     }
 
-    /// The file columns decoded for `projection`, in file order. Partition columns
-    /// are not stored; when only they are wanted, the first column is decoded so
-    /// batches still carry their row counts.
-    fn decoded_columns(&self, projection: &Projection) -> Vec<usize> {
+    /// The top-level columns of `file` decoded for `projection`, in file order.
+    /// Partition columns and columns the file lacks are not stored; when only
+    /// they are wanted, the file's first column is decoded so batches still
+    /// carry their row counts.
+    fn decoded_columns(&self, projection: &Projection, file: &SourceFile) -> Vec<usize> {
         let mut columns = projection
-            .parquet_columns()
-            .into_iter()
-            .filter(|column| *column < self.file_columns)
+            .as_slice()
+            .iter()
+            .filter_map(|column| file.columns.get(*column).copied().flatten())
             .collect::<Vec<_>>();
-        if columns.is_empty() && self.file_columns > 0 {
+        columns.sort_unstable();
+        columns.dedup();
+        if columns.is_empty() && !file.arrow_metadata.schema().fields().is_empty() {
             columns.push(0);
         }
         columns
@@ -1726,7 +1734,7 @@ impl ParquetSource {
         selection: Option<RowSelection>,
     ) -> Result<GuardedReader<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
         let file = source_file.open()?;
-        let parquet_columns = self.decoded_columns(projection);
+        let parquet_columns = self.decoded_columns(projection, source_file);
         self.check_dictionary_pages(&file, source_file, &parquet_columns, &row_groups)?;
         let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
             file,
@@ -1913,7 +1921,7 @@ impl ParquetSource {
         projection: &Projection,
         file: &SourceFile,
     ) -> Result<RecordBatch> {
-        let decoded = self.decoded_columns(projection);
+        let decoded = self.decoded_columns(projection, file);
         let rows = batch.num_rows();
         let arrays = projection
             .as_slice()
@@ -1929,14 +1937,19 @@ impl ParquetSource {
                     let value = file.partition_values.get(partition).cloned().flatten();
                     return constant_array(data_type, value.as_deref(), rows);
                 }
+                let wanted = self.dataset_metadata.schema.field(column).data_type();
+                // A folder column this file doesn't have (ADR 0019).
+                let Some(own) = file.columns.get(column).copied().flatten() else {
+                    return Ok(arrow_array::new_null_array(wanted, rows));
+                };
                 let array = decoded
                     .iter()
-                    .position(|read_column| *read_column == column)
+                    .position(|read_column| *read_column == own)
                     .map(|position| batch.column(position).clone())
                     .ok_or_else(|| anyhow!("projected column {column} was not decoded"))?;
                 // A column stored as a dictionary (or a narrow Decimal256) is
-                // read as its values (`types::read_type`).
-                let wanted = self.dataset_metadata.schema.field(column).data_type();
+                // read as its values (`types::read_type`), and a folder column
+                // stored as a narrower type than other files' is widened.
                 if array.data_type() == wanted {
                     Ok(array)
                 } else {
@@ -4184,7 +4197,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_folders_whose_files_differ() {
+    fn rejects_folders_whose_column_types_cannot_be_merged() {
         let directory = TempDir::new().unwrap();
         let root = directory.path();
         write_ids(root, "a.parquet", 0..10, false);
@@ -4199,8 +4212,11 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         let error = format!("{:#}", ParquetSource::open(root).err().unwrap());
-        assert!(error.contains("does not have the same columns"), "{error}");
-        assert!(error.contains("Int32"), "{error}");
+        assert!(error.contains("can't be read as one table"), "{error}");
+        assert!(
+            error.contains("column id is Utf8 in") && error.contains("but Int32 in"),
+            "{error}"
+        );
 
         // A partition key the files also store (as Polars writes them) is read
         // from the files, not added again.
@@ -6239,5 +6255,211 @@ mod tests {
                 .sum::<usize>(),
             2
         );
+    }
+
+    /// Writes `batch` as one Parquet file at `root/relative`, in row groups of `rows`.
+    fn write_batch(root: &Path, relative: &str, batch: &RecordBatch, rows: usize) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+                .unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// A folder whose second file widens `id`, stores `name` as large text,
+    /// adds `score` and puts its columns in another order.
+    fn drifted_folder() -> (TempDir, ParquetSource) {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        let old = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..4)) as ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(root, "part-0.parquet", &old, 2);
+        let new = RecordBatch::try_from_iter(vec![
+            (
+                "score",
+                Arc::new(arrow_array::Float64Array::from(vec![0.5, 2.5, 4.5])) as ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(arrow_array::LargeStringArray::from(vec!["e", "f", "g"])) as ArrayRef,
+            ),
+            (
+                "id",
+                Arc::new(arrow_array::Int64Array::from(vec![5_000_000_000, 5, 6])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(root, "part-1.parquet", &new, 2);
+        let source = ParquetSource::open(root).unwrap();
+        (directory, source)
+    }
+
+    #[test]
+    fn merges_folder_files_with_different_columns_and_types() {
+        let (_directory, source) = drifted_folder();
+        let schema = source.schema();
+        let shape = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                (
+                    field.name().as_str(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                ("id", DataType::Int64, false),
+                ("name", DataType::LargeUtf8, false),
+                // Only the second file has it, so the first file's rows are null.
+                ("score", DataType::Float64, true),
+            ]
+        );
+        assert_eq!(source.row_count(), 7);
+        let all = Projection::all(3);
+        // A window across both files.
+        let window = source.read_window(2, 4, &all).unwrap();
+        assert_eq!(texts(&window, 0), ["2", "3", "5000000000", "5"]);
+        assert_eq!(texts(&window, 1), ["c", "d", "e", "f"]);
+        assert_eq!(texts(&window, 2), ["null", "null", "0.5", "2.5"]);
+        // Only a column the first file lacks: its rows still come back, as nulls.
+        let scores = source
+            .read_window(0, 7, &Projection::columns(vec![2], 3).unwrap())
+            .unwrap();
+        assert_eq!(
+            texts(&scores, 0),
+            ["null", "null", "null", "null", "0.5", "2.5", "4.5"]
+        );
+        // Columns in another order: the same values under the same names.
+        let reordered = source
+            .read_window(4, 3, &Projection::columns(vec![1, 0], 3).unwrap())
+            .unwrap();
+        assert_eq!(texts(&reordered, 0), ["e", "f", "g"]);
+        assert_eq!(texts(&reordered, 1), ["5000000000", "5", "6"]);
+    }
+
+    #[test]
+    fn filters_sorts_counts_and_groups_a_drifted_folder() {
+        let (_directory, source) = drifted_folder();
+        let all = Projection::all(3);
+        let filtered = |expression: &str| {
+            source
+                .read_filtered_window(&FilterExpr::parse(expression).unwrap(), 0, 100, &all)
+                .unwrap()
+        };
+        // On the widened column: the first file is scanned (its Int32
+        // statistics aren't used for an Int64 column), the second pruned by them.
+        assert_eq!(
+            texts(&filtered("id >= 3"), 0),
+            ["3", "5000000000", "5", "6"]
+        );
+        assert_eq!(texts(&filtered("id > 4000000000"), 0), ["5000000000"]);
+        // On the added column: rows of the file without it are null.
+        assert_eq!(texts(&filtered("score > 1"), 0), ["5", "6"]);
+        assert_eq!(texts(&filtered("score IS NULL"), 0), ["0", "1", "2", "3"]);
+        assert_eq!(texts(&filtered("name == f"), 0), ["5"]);
+        // Counting per row group agrees with the rows read.
+        let counts = source
+            .count_matches_by_row_group(&FilterExpr::parse("score IS NULL").unwrap(), &|_| false)
+            .unwrap();
+        assert_eq!(counts.iter().sum::<u64>(), 4);
+        let counts = source
+            .count_matches_by_row_group(&FilterExpr::parse("id < 10").unwrap(), &|_| false)
+            .unwrap();
+        assert_eq!(counts.iter().sum::<u64>(), 6);
+
+        let sorted = source
+            .read_sorted_all(
+                None,
+                &all,
+                &[SortSpec::new(2, SortDirection::Descending, NullOrder::Last)],
+                SortBudget::default(),
+                None,
+                &|_| false,
+            )
+            .unwrap();
+        let sorted = concat_batches(&sorted[0].schema(), &sorted).unwrap();
+        assert_eq!(
+            texts(&sorted, 0),
+            ["6", "5", "5000000000", "0", "1", "2", "3"]
+        );
+
+        let grouped = source
+            .read_aggregated(
+                None,
+                &AggregateSpec::new(vec![AggregateExpr::count(2), AggregateExpr::max(0)]).unwrap(),
+                GroupBudget::default(),
+                &|_| false,
+            )
+            .unwrap();
+        assert_eq!(texts(&grouped, 0), ["3"]);
+        assert_eq!(texts(&grouped, 1), ["5000000000"]);
+    }
+
+    #[test]
+    fn shows_each_files_statistics_in_a_drifted_folder() {
+        let (_directory, source) = drifted_folder();
+        let columns = source.metadata().columns();
+        // Row groups: part-0 has two of 2 rows, part-1 one of 2 and one of 1.
+        let score = &columns[2].row_group_statistics;
+        assert_eq!(score.len(), 4);
+        let missing = score[0].as_ref().unwrap();
+        assert_eq!(
+            (missing.min.as_deref(), missing.null_count),
+            (None, Some(2))
+        );
+        let stored = score[2].as_ref().unwrap();
+        assert_eq!(stored.min.as_deref(), Some("0.5"));
+        let id = &columns[0].row_group_statistics;
+        assert_eq!(id[1].as_ref().unwrap().max.as_deref(), Some("3"));
+        assert_eq!(id[2].as_ref().unwrap().max.as_deref(), Some("5000000000"));
+    }
+
+    #[test]
+    fn merges_partitioned_folders_whose_files_differ() {
+        let directory = TempDir::new().unwrap();
+        let root = directory.path();
+        write_ids(root, "year=2023/a.parquet", 0..3, false);
+        let newer = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(3..5)) as ArrayRef,
+            ),
+            (
+                "note",
+                Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(root, "year=2024/b.parquet", &newer, 10);
+        let source = ParquetSource::open(root).unwrap();
+        let names = source
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        // File columns first, then the partition column.
+        assert_eq!(names, ["id", "note", "year"]);
+        let rows = source.read_window(0, 5, &Projection::all(3)).unwrap();
+        assert_eq!(texts(&rows, 1), ["null", "null", "null", "x", "y"]);
+        assert_eq!(texts(&rows, 2), ["2023", "2023", "2023", "2024", "2024"]);
     }
 }

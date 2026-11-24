@@ -24,6 +24,7 @@ Current support is the table in `docs/architecture/boundaries.md` ("Parquet/Arro
 | Charts | `crates/app/src/chart.rs` `ChartAccumulator` | Has its own checks; keep them in line |
 | Row-group statistics | `crates/parquet/src/statistics.rs` `metadata_statistics` | Rebuild min/max as the Arrow type, format like the grid |
 | Inspector type label | `crates/app/src/ui/inspector.rs` `type_label` | |
+| Folders whose files store it differently (ADR 0019) | `types::common_type` | Widen only when `arrow_cast::cast` holds every value; otherwise leave it to the "no type holds both" error |
 
 Change `types.rs` first; most other places call its predicates.
 
