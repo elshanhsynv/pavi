@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use arrow_array::{ArrayRef, Int64Array, StringArray, new_null_array};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 use parquet::{data_type::ByteArray, file::statistics::Statistics};
 
 use crate::{change::FolderStamp, source::Cancelled};
@@ -193,6 +193,86 @@ fn percent_decode(text: &str) -> String {
         }
     }
     String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// A folder's columns, merged from its files' columns (ADR 0019).
+#[derive(Debug)]
+pub(crate) struct MergedColumns {
+    /// Each column's name, the type that holds every file's values
+    /// ([`crate::types::common_type`]) and whether it can be null.
+    pub(crate) fields: Vec<Field>,
+    /// For each file, the file's top-level column holding each merged column;
+    /// `None` where the file doesn't have it (its rows are null there).
+    pub(crate) file_columns: Vec<Vec<Option<usize>>>,
+}
+
+/// Merges the files' columns by name: the first file's columns in its order,
+/// then each column a later file adds, in the order it appears. Types are
+/// widened to hold every file's values; a column some file lacks can be null.
+/// `files` are each file's description (for messages) and its schema, with
+/// every type already a [`crate::types::read_type`].
+pub(crate) fn merge_columns(files: &[(String, Schema)]) -> Result<MergedColumns> {
+    let mut fields: Vec<Field> = Vec::new();
+    // The file each column's current type comes from, for messages.
+    let mut origins: Vec<usize> = Vec::new();
+    let mut present = Vec::new();
+    let mut by_name = std::collections::HashMap::new();
+    let mut file_columns = Vec::with_capacity(files.len());
+    for (index, (name, schema)) in files.iter().enumerate() {
+        let mut columns = vec![None; fields.len()];
+        for (position, field) in schema.fields().iter().enumerate() {
+            let merged = match by_name.get(field.name()) {
+                Some(merged) => *merged,
+                None => {
+                    by_name.insert(field.name().clone(), fields.len());
+                    fields.push(field.as_ref().clone());
+                    origins.push(index);
+                    present.push(0_usize);
+                    columns.push(None);
+                    fields.len() - 1
+                }
+            };
+            if columns[merged].is_some() {
+                bail!("{name} has two columns named {}", field.name());
+            }
+            columns[merged] = Some(position);
+            present[merged] += 1;
+            let current = &fields[merged];
+            let Some(data_type) = crate::types::common_type(current.data_type(), field.data_type())
+            else {
+                bail!(
+                    "{name} and {} can't be read as one table: column {} is {} in {name}                      but {} in {}, and no type holds both",
+                    files[origins[merged]].0,
+                    field.name(),
+                    field.data_type(),
+                    current.data_type(),
+                    files[origins[merged]].0
+                );
+            };
+            if &data_type != current.data_type() {
+                origins[merged] = index;
+            }
+            let nullable = current.is_nullable() || field.is_nullable();
+            fields[merged] = current
+                .clone()
+                .with_data_type(data_type)
+                .with_nullable(nullable);
+        }
+        file_columns.push(columns);
+    }
+    for (field, present) in fields.iter_mut().zip(&present) {
+        if *present < files.len() {
+            *field = field.clone().with_nullable(true);
+        }
+    }
+    // Columns added by later files are missing from the earlier files' maps.
+    for columns in &mut file_columns {
+        columns.resize(fields.len(), None);
+    }
+    Ok(MergedColumns {
+        fields,
+        file_columns,
+    })
 }
 
 /// The partition columns of `files` (which share their keys), typed from all the

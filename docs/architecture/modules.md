@@ -50,7 +50,7 @@ crates/parquet/src/            (parquet_reader)
 ├── lib.rs          re-exports the public surface
 ├── source.rs       ParquetSource (1,924 lines): open, read_page/window/filtered/sorted/aggregated,
 │                   GroupCollector/Accumulator/Scalar (aggregation)
-├── dataset.rs      folder datasets (ADR 0006): find the files (and the folders searched, with their times), `key=value` partition columns, their values and statistics
+├── dataset.rs      folder datasets (ADR 0006): find the files (and the folders searched, with their times), merge their columns (ADR 0019), `key=value` partition columns, their values and statistics
 ├── convert.rs      FileFormat; CSV, JSON and Arrow files read into a temporary Parquet file (ADR 0007)
 ├── change.rs       FileStamp, FolderStamp, FileChanged: noticing that the files a source read changed on disk (ADR 0018)
 ├── join.rs         hash joins (inner, left, semi, anti) into a temporary table; TempTableWriter (ADR 0009)
@@ -63,7 +63,7 @@ crates/parquet/src/            (parquet_reader)
 ├── filter.rs       FilterExpr (AND/OR tree), Comparison, FilterOp: text parser, schema validation, batch evaluation, stats pruning, Display
 ├── sort.rs         SortSpec, SortDirection, NullOrder, SortBudget (100k rows / 128 MB), MAX_SORT_KEYS
 ├── spill.rs        external sort: SortKeys, RunWriter (sorted runs in temp Parquet files), SortMerge (ADR 0005)
-├── types.rs        which Arrow types each operation accepts (is_comparable, is_numeric, is_string, …)
+├── types.rs        which Arrow types each operation accepts (is_comparable, is_numeric, is_string, …), read_type, common_type (folder columns, ADR 0019)
 ├── aggregate.rs    AggregateFunction/Expr/Spec, GroupBudget (10k groups / 8 MB)
 └── value.rs        shared value → text: format_cell* (bounded display), scalar_text / ScalarTexts (full, for CSV/JSON/profiling; ScalarTexts prepares a column once)
 

@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- Folders whose files have different columns open as one table. Columns are matched by name; a column some files lack is empty (null) in their rows; a column stored as different types is read as one that holds both (`Int32` and `Int64` as `Int64`, an integer and a float as `Float64`, text types as large text, decimals with enough digits). Columns whose types can't be combined (say, a number in one file and text in another) still stop the open, with a message naming both files.
 - PAVI notices when the open file changes on disk, or when files are added to, removed from or rewritten in an open folder. A bar above the grid says what changed and offers Reload. Remote files are not checked.
 
 ### Changed
