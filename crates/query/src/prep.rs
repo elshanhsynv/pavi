@@ -15,8 +15,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_schema::Schema;
 use parquet_reader::{
-    Cancelled, FilterExpr, FilterOp, JoinKind, JoinSide, ParquetSource, TempTableWriter,
-    value::scalar_text,
+    Cancelled, FilterExpr, FilterOp, JoinKind, JoinSide, ParquetSource, SortSpec, TempTableWriter,
+    WindowSpec, value::scalar_text,
 };
 use pavi_runtime::{GenerationId, RuntimeHandle};
 
@@ -60,6 +60,14 @@ pub(crate) enum Prep {
         schema: arrow_schema::SchemaRef,
         columns: Vec<usize>,
     },
+    /// The input's columns and, after them, a column per window function
+    /// (ADR 0024), in the order of their `windows` indexes.
+    Window {
+        input: Box<Prep>,
+        groups: Vec<WindowGroup>,
+        /// Window functions in all the groups.
+        count: usize,
+    },
     /// A join; `left_keys` and `right_keys` index the inputs' columns, and
     /// `names` name the output columns.
     Join {
@@ -70,6 +78,17 @@ pub(crate) enum Prep {
         right_keys: Vec<usize>,
         names: Vec<String>,
     },
+}
+
+/// Window functions that sort the rows one way: the rows are sorted by `sort`
+/// (empty: as they are), then [`parquet_reader::compute_windows`] adds a
+/// column per window function. `spec` and `sort` index the input's columns.
+pub(crate) struct WindowGroup {
+    pub(crate) sort: Vec<SortSpec>,
+    pub(crate) spec: WindowSpec,
+    /// Each window function's place in the query's list, and its column's name.
+    pub(crate) windows: Vec<usize>,
+    pub(crate) names: Vec<String>,
 }
 
 /// A `WHERE` filter over a prepared input; columns index the input's columns.
@@ -194,6 +213,8 @@ fn count_joins(prep: &Prep) -> usize {
         // Writing the parts reads each once, like a join: a step of progress.
         Prep::Union { .. } => 1,
         Prep::Filter { input, .. } => count_joins(input),
+        // Sorting and computing each group reads every row: a step of progress.
+        Prep::Window { input, groups, .. } => groups.len() + count_joins(input),
         // Calculating reads every input row once, like a join: a step of progress.
         Prep::Compute { input, .. } => 1 + count_joins(input),
         Prep::Join { left, right, .. } => 1 + count_joins(left) + count_joins(right),
@@ -240,6 +261,30 @@ fn run(prep: &Prep, context: &PrepContext) -> Result<Relation> {
         Prep::Compute { input, expressions } => {
             let relation = run(input, context)?;
             compute_table(relation, expressions, context)
+        }
+        Prep::Window {
+            input,
+            groups,
+            count,
+        } => {
+            let mut relation = run(input, context)?;
+            let width = relation.columns.len();
+            // Each group's columns come after the ones before; the query wants
+            // them in its own order.
+            let mut positions = vec![0; *count];
+            let mut written = width;
+            for group in groups {
+                relation = window_table(relation, group, context)?;
+                for (offset, window) in group.windows.iter().enumerate() {
+                    *positions
+                        .get_mut(*window)
+                        .ok_or_else(|| anyhow!("window function {window} out of range"))? =
+                        written + offset;
+                }
+                written += group.windows.len();
+            }
+            relation.columns = (0..width).chain(positions).collect();
+            Ok(relation)
         }
         Prep::Join {
             left,
@@ -374,6 +419,62 @@ fn compute_table(
     let columns = (0..source.column_count()).collect();
     Ok(Relation {
         source: Arc::new(source),
+        filter: None,
+        columns,
+    })
+}
+
+/// Sorts `relation`'s rows for `group` (through the query engine, which
+/// spills large sorts to disk) and writes them with the group's window
+/// functions after them, to a temporary table.
+fn window_table(
+    relation: Relation,
+    group: &WindowGroup,
+    context: &PrepContext,
+) -> Result<Relation> {
+    let (source, filter, columns) = if group.sort.is_empty() {
+        (relation.source, relation.filter, relation.columns)
+    } else {
+        let mut plan = LogicalPlan::scan(Arc::clone(&relation.source));
+        if let Some(filter) = relation.filter.clone() {
+            plan = plan.filter(crate::Filter::new(filter));
+        }
+        // Sort keys name the source's columns.
+        let sort = group
+            .sort
+            .iter()
+            .map(|key| {
+                relation
+                    .columns
+                    .get(key.column)
+                    .map(|column| SortSpec::new(*column, key.direction, key.nulls))
+                    .ok_or_else(|| anyhow!("window sort column {} out of range", key.column))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let plan = plan.project(relation.columns.clone()).sort_by(sort);
+        let sorted = query_table(&plan, context)?;
+        let columns = (0..sorted.column_count()).collect();
+        (sorted, None, columns)
+    };
+    let done = context.joins_done.get();
+    let output = parquet_reader::compute_windows(
+        &source,
+        filter,
+        &columns,
+        &group.spec,
+        &group.names,
+        &|fraction| {
+            context.progress.store(
+                ((done as f64 + fraction) / context.joins.max(1) as f64 * PROGRESS_SCALE) as u64,
+                Ordering::Relaxed,
+            );
+            context.cancelled()
+        },
+    )?;
+    context.joins_done.set(done + 1);
+    let columns = (0..output.column_count()).collect();
+    Ok(Relation {
+        source: Arc::new(output),
         filter: None,
         columns,
     })

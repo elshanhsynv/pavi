@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- SQL window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG(x, n, default)`, `LEAD(…)` and `COUNT` / `SUM` / `AVG` / `MIN` / `MAX … OVER (PARTITION BY … ORDER BY …)`, with running totals, `ROWS BETWEEN n PRECEDING AND CURRENT ROW` moving frames and whole-partition totals (`x / SUM(x) OVER ()`). They work on files of any size: rows are sorted on disk if needed, and no partition is held in memory.
 - SQL: `MEDIAN(x)`, `QUANTILE_CONT(x, 0.9)` and `PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY x)`, and `STDDEV` / `STDDEV_POP` / `VARIANCE` / `VAR_POP`, also per group and on calculations.
 - SQL: `REPLACE(text, from, to)`; `DATE_TRUNC('month', day)`; `DATE_DIFF('day', start, end)`; `day + INTERVAL '7 days'` (or `- INTERVAL 1 MONTH`); `NOW()`, `CURRENT_TIMESTAMP` and `CURRENT_DATE`; and `DATE '2024-03-01'` / `TIMESTAMP '…'` values.
 - SQL: `UNION` and `UNION ALL` stack the rows of several queries (column types widen to fit both sides), and `WITH name AS (SELECT …)` names a subquery to use in the query.

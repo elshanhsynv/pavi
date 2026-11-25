@@ -67,6 +67,7 @@ crates/parquet/src/            (parquet_reader)
 ├── spill.rs        external sort: SortKeys, RunWriter (sorted runs in temp Parquet files), SortMerge (ADR 0005)
 ├── types.rs        which Arrow types each operation accepts (is_comparable, is_numeric, is_string, …), read_type, common_type (folder columns, ADR 0019)
 ├── aggregate.rs    AggregateFunction/Expr/Spec, GroupBudget (10k groups / 8 MB)
+├── window.rs       window functions over sorted rows: WindowSpec, compute_windows (run starts, shifted cursors for LAG/LEAD, totals tables, moving frames) (ADR 0024)
 └── value.rs        shared value → text: format_cell* (bounded display), scalar_text / ScalarTexts (full, for CSV/JSON/profiling; ScalarTexts prepares a column once)
 
 crates/runtime/src/            (pavi_runtime)
@@ -77,7 +78,7 @@ crates/runtime/src/            (pavi_runtime)
 
 crates/query/src/              (pavi_query)
 ├── sql.rs          SqlAst::parse, Tables, to_logical_plan(_with): direct plans, and prepared plans for joins and subqueries
-├── prep.rs         Prep tree (tables, subqueries, filters, joins, unions) and PrepTask, the thread that runs it (ADR 0009, 0023)
+├── prep.rs         Prep tree (tables, subqueries, filters, joins, unions, window steps) and PrepTask, the thread that runs it (ADR 0009, 0023, 0024)
 ├── dates.rs        DATE_TRUNC, DATE_DIFF, ± INTERVAL and NOW on wall-clock time in the column's zone (chrono) (ADR 0023)
 ├── logical.rs      LogicalPlan tree (Scan/Prepared/Projection/Filter/Limit/Sort/Aggregate), replace_sort, bind
 ├── planner.rs      Planner::validate (schema only, also for prepared plans) and Planner::plan → PhysicalPlan

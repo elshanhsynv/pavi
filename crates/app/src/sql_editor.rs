@@ -56,8 +56,17 @@ const KEYWORDS: &[&str] = &[
     "TIMESTAMP",
     "CURRENT_DATE",
     "CURRENT_TIMESTAMP",
+    "OVER",
+    "PARTITION",
+    "ROWS",
+    "RANGE",
+    "UNBOUNDED",
+    "PRECEDING",
+    "FOLLOWING",
+    "CURRENT",
+    "ROW",
 ];
-/// Aggregate and calculation functions, highlighted apart from keywords.
+/// Aggregate, window and calculation functions, highlighted apart from keywords.
 const FUNCTIONS: &[&str] = &[
     "COUNT",
     "SUM",
@@ -75,6 +84,11 @@ const FUNCTIONS: &[&str] = &[
     "DATE_TRUNC",
     "DATE_DIFF",
     "NOW",
+    "ROW_NUMBER",
+    "RANK",
+    "DENSE_RANK",
+    "LAG",
+    "LEAD",
     "LOWER",
     "UPPER",
     "TRIM",
@@ -416,7 +430,13 @@ mod tests {
         assert_eq!(names("dep"), ["DEP_DELAY", "DEP_TIME"]);
         assert_eq!(
             names("de"),
-            ["DEP_DELAY", "DEP_TIME", "\"dest city\"", "DESC"]
+            [
+                "DEP_DELAY",
+                "DEP_TIME",
+                "\"dest city\"",
+                "DESC",
+                "DENSE_RANK"
+            ]
         );
         assert_eq!(names("dat"), ["dataset", "DATE", "DATE_TRUNC", "DATE_DIFF"]);
         // `count` is a column too, so it is quoted; COUNT the function is offered as well.

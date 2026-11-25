@@ -19,6 +19,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
 | Sort keys / GROUP BY columns | 8 / 8 | `sort::MAX_SORT_KEYS`, `aggregate::MAX_GROUP_COLUMNS` |
 | Values MEDIAN and QUANTILE_CONT keep (ADR 0023), for one query across its groups | 16,777,216 (128 MB); they don't count against the group budget | `parquet_reader::MAX_QUANTILE_VALUES` |
+| Window functions (ADR 0024) | 16 per query, sorting the rows at most 4 ways; `LAG`/`LEAD` offsets and `ROWS n PRECEDING` ≤ 1,000 (a moving frame keeps n + 1 values). Nothing is held per partition: the rows are sorted (spilling) and streamed into a temporary table under the 32 GiB prepared limit | `pavi_query::MAX_WINDOWS`, `MAX_WINDOW_SORTS`, `parquet_reader::MAX_WINDOW_OFFSET` |
 | UNION parts, WITH names (ADR 0023) | 16 each; UNION without ALL groups by every column, so it has the GROUP BY limits below | `pavi_query::MAX_UNION_PARTS`, `MAX_WITH_NAMES` |
 | GROUP BY, SELECT DISTINCT, UNION without ALL (and the values `COUNT(DISTINCT …)` keeps, which count against the bytes, as does each group's encoded key); HAVING and ORDER BY on an aggregate work on this one result | 10,000 groups / 8 MB | `GroupBudget::DEFAULT_MAX_GROUPS`, `DEFAULT_MAX_BYTES` |
 | Profile distinct values | 4,096 values / 1 MB, 128 bytes each | `parquet_reader::profile::MAX_DISTINCT_*` |

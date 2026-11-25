@@ -3,14 +3,16 @@ use std::{collections::BTreeSet, sync::Arc};
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_schema::{Field, Schema, SchemaRef};
 use parquet_reader::{
-    FilterExpr, FilterOp, JoinKind, MAX_JOIN_KEYS, MAX_SORT_KEYS, NullOrder, ParquetSource,
-    SortDirection, SortSpec, aggregate::MAX_GROUP_COLUMNS, join::check_join_key_types,
+    FilterExpr, FilterOp, JoinKind, MAX_JOIN_KEYS, MAX_SORT_KEYS, MAX_WINDOW_OFFSET, NullOrder,
+    ParquetSource, SortDirection, SortSpec, WindowExpr, WindowFrame, WindowFunction, WindowSpec,
+    aggregate::MAX_GROUP_COLUMNS, join::check_join_key_types,
 };
 use sqlparser::{
     ast::{
         BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
         FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, OrderBy, OrderByKind, Query,
-        SelectItem, SetExpr, Statement, TableFactor, UnaryOperator,
+        SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, WindowFrameBound,
+        WindowFrameUnits, WindowType,
     },
     dialect::GenericDialect,
     parser::Parser,
@@ -20,7 +22,7 @@ use crate::{
     AggregateExpr, AggregateFunction, Filter, LogicalPlan, Planner,
     expr::{self as calc},
     logical::{Output, OutputFilter, Prepared},
-    prep::{MAX_JOINS, MAX_SUBQUERY_DEPTH, Prep, PrepFilter, PrepValue},
+    prep::{MAX_JOINS, MAX_SUBQUERY_DEPTH, Prep, PrepFilter, PrepValue, WindowGroup},
 };
 
 /// The tables a query can name: `dataset` (the tab running the query) and the
@@ -176,6 +178,16 @@ impl SqlCalcs {
     /// the hidden column of its calculation.
     fn column(&mut self, expression: &Expr, outside_select: bool) -> Result<SqlColumn> {
         let parsed = calc::parse(expression)?;
+        self.add(parsed, expression.to_string(), outside_select)
+    }
+
+    /// The column an already parsed calculation stands for.
+    fn add(
+        &mut self,
+        parsed: calc::Expr<SqlColumn>,
+        text: String,
+        outside_select: bool,
+    ) -> Result<SqlColumn> {
         if let calc::Expr::Column(column) = parsed {
             return Ok(column);
         }
@@ -190,7 +202,7 @@ impl SqlCalcs {
         self.items.push(SqlCalc {
             name: name.clone(),
             expr: parsed,
-            text: expression.to_string(),
+            text,
             outside_select,
         });
         Ok(SqlColumn::new(name))
@@ -232,11 +244,70 @@ pub struct SqlAst {
     /// The SQL text of SELECT items that calculate, as their default names.
     labels: Vec<Option<String>>,
     calcs: SqlCalcs,
+    /// The window functions SELECT uses (ADR 0024); the one at `n` is the
+    /// column `#win{n}`.
+    windows: Vec<SqlWindow>,
     predicate: Option<SqlPredicate>,
     having: Option<SqlHaving>,
     /// ORDER BY keys, most significant first.
     sort: Vec<SqlSort>,
     limit: Option<usize>,
+}
+
+/// Columns that hold a window function's result.
+const WIN_PREFIX: &str = "#win";
+/// Window functions in one query.
+pub const MAX_WINDOWS: usize = 16;
+/// Different `OVER (PARTITION BY … ORDER BY …)` in one query: each sorts the rows.
+pub const MAX_WINDOW_SORTS: usize = 4;
+
+/// One window function, `function(column) OVER (PARTITION BY … ORDER BY …
+/// frame)` (ADR 0024). Its column and keys may be calculations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlWindow {
+    pub function: WindowFunction,
+    pub column: Option<SqlColumn>,
+    /// LAG/LEAD's default, as text.
+    pub default: Option<String>,
+    pub frame: WindowFrame,
+    pub partition_by: Vec<SqlColumn>,
+    pub order_by: Vec<(SqlColumn, SortDirection, NullOrder)>,
+}
+
+impl SqlWindow {
+    /// Whether `other` sorts the rows the same way, so they share one pass.
+    fn same_order(&self, other: &Self) -> bool {
+        self.partition_by.len() == other.partition_by.len()
+            && self
+                .partition_by
+                .iter()
+                .zip(&other.partition_by)
+                .all(|(left, right)| left.same(right))
+            && self.order_by.len() == other.order_by.len()
+            && self.order_by.iter().zip(&other.order_by).all(
+                |((left, left_direction, left_nulls), (right, right_direction, right_nulls))| {
+                    left.same(right)
+                        && left_direction == right_direction
+                        && left_nulls == right_nulls
+                },
+            )
+    }
+
+    fn columns(&self) -> impl Iterator<Item = &SqlColumn> {
+        self.column
+            .iter()
+            .chain(&self.partition_by)
+            .chain(self.order_by.iter().map(|(column, _, _)| column))
+    }
+}
+
+/// Which window function `column` names, when it holds one's result.
+fn window_result(column: &SqlColumn) -> Option<usize> {
+    column
+        .table
+        .is_none()
+        .then(|| column.name.strip_prefix(WIN_PREFIX)?.parse().ok())
+        .flatten()
 }
 
 /// `FROM` a table or subquery, then `JOIN`s.
@@ -723,6 +794,7 @@ impl SqlAst {
                     aliases: Vec::new(),
                     labels: Vec::new(),
                     calcs,
+                    windows: Vec::new(),
                     predicate: None,
                     having: None,
                     sort,
@@ -737,8 +809,14 @@ impl SqlAst {
             Some(Distinct::Distinct) => true,
             Some(Distinct::On(_)) => bail!("DISTINCT ON is not supported; use SELECT DISTINCT"),
         };
-        let (projection, aliases, labels) =
-            parse_projection(&select.projection, &select.group_by, distinct, &mut calcs)?;
+        let mut windows = Vec::new();
+        let (projection, aliases, labels) = parse_projection(
+            &select.projection,
+            &select.group_by,
+            distinct,
+            &mut calcs,
+            &mut windows,
+        )?;
         let predicate = select
             .selection
             .as_ref()
@@ -755,6 +833,7 @@ impl SqlAst {
             aliases,
             labels,
             calcs,
+            windows,
             predicate,
             having,
             sort,
@@ -766,6 +845,10 @@ impl SqlAst {
     /// filtered, grouped or sorted, so it runs on prepared rows (ADR 0013).
     /// Calculations only in a plain SELECT list are made on the way out.
     fn calculates_first(&self) -> bool {
+        // Window functions are made on prepared rows, with every calculation.
+        if !self.windows.is_empty() {
+            return true;
+        }
         if self.calcs.is_empty() {
             return false;
         }
@@ -839,7 +922,8 @@ impl SqlAst {
                 .predicate
                 .as_ref()
                 .is_some_and(SqlPredicate::has_subquery)
-            && !self.calculates_first();
+            && !self.calculates_first()
+            && self.windows.is_empty();
         let plan = if direct {
             self.direct_plan(tables)?
         } else {
@@ -1222,9 +1306,21 @@ impl SqlAst {
                 columns.push(right);
             }
         }
-        // Hidden calculation columns are made later, from the columns they read.
-        columns.retain(|column| self.calcs.position(column).is_none());
-        columns.extend(self.calcs.columns());
+        // Hidden calculation and window columns are made later, from the
+        // columns they read.
+        let hidden = |column: &SqlColumn| {
+            self.calcs.position(column).is_some() || window_result(column).is_some()
+        };
+        columns.retain(|column| !hidden(column));
+        columns.extend(
+            self.calcs
+                .columns()
+                .into_iter()
+                .filter(|column| window_result(column).is_none()),
+        );
+        for window in &self.windows {
+            columns.extend(window.columns().filter(|column| !hidden(column)));
+        }
         columns
     }
 
@@ -1264,6 +1360,10 @@ impl SqlAst {
         for column in self.referenced_columns() {
             let (relation, index) = find(column)?;
             kept[relation].insert(index);
+        }
+        // Window functions read at least one column, for the row count.
+        if !self.windows.is_empty() && kept.iter().all(BTreeSet::is_empty) {
+            kept[0].insert(0);
         }
         let kept = kept
             .into_iter()
@@ -1426,38 +1526,172 @@ impl SqlAst {
                 })
                 .collect::<Vec<Field>>(),
         ));
-        // Calculations, over the joined rows, become columns after them (ADR 0013).
+        // Calculations, over the joined rows, become columns after them (ADR
+        // 0013); then WHERE tests on them, then window functions (ADR 0024),
+        // then the calculations that use window functions' results.
         let base = output.len();
-        if !self.calcs.is_empty() {
-            let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
-            let mut expressions = Vec::new();
-            for item in &self.calcs.items {
-                let expression = item.expr.map_columns(&output_index)?;
-                let data_type = expression
-                    .data_type(&schema)
-                    .with_context(|| format!("calculation {}", item.text))?;
-                fields.push(Arc::new(Field::new(&item.name, data_type, true)));
-                expressions.push((item.name.clone(), expression));
-            }
-            prepared = Prep::Compute {
-                input: Box::new(prepared),
-                expressions,
-            };
-            schema = Arc::new(Schema::new(fields));
+        let uses_windows = |item: &SqlCalc| {
+            let mut read = Vec::new();
+            item.expr.columns(&mut read);
+            read.iter().any(|column| window_result(column).is_some())
+        };
+        let (late, early): (Vec<usize>, Vec<usize>) =
+            (0..self.calcs.items.len()).partition(|index| uses_windows(&self.calcs.items[*index]));
+        let mut calc_columns = vec![0; self.calcs.items.len()];
+        for (offset, index) in early.iter().enumerate() {
+            calc_columns[*index] = base + offset;
+        }
+        let window_base = base + early.len();
+        for (offset, index) in late.iter().enumerate() {
+            calc_columns[*index] = window_base + self.windows.len() + offset;
         }
         let resolve = |column: &SqlColumn| -> Result<usize> {
-            match self.calcs.position(column) {
-                Some(index) => Ok(base + index),
+            if let Some(index) = self.calcs.position(column) {
+                return Ok(calc_columns[index]);
+            }
+            match window_result(column) {
+                Some(index) if index < self.windows.len() => Ok(window_base + index),
+                Some(_) => bail!("window function {column} is missing"),
                 None => output_index(column),
             }
         };
+        let compute =
+            |prepared: Prep, schema: SchemaRef, items: &[usize]| -> Result<(Prep, SchemaRef)> {
+                if items.is_empty() {
+                    return Ok((prepared, schema));
+                }
+                let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+                let mut expressions = Vec::new();
+                for index in items {
+                    let item = &self.calcs.items[*index];
+                    let expression = item.expr.map_columns(&resolve)?;
+                    let data_type = expression
+                        .data_type(&schema)
+                        .with_context(|| format!("calculation {}", item.text))?;
+                    fields.push(Arc::new(Field::new(&item.name, data_type, true)));
+                    expressions.push((item.name.clone(), expression));
+                }
+                Ok((
+                    Prep::Compute {
+                        input: Box::new(prepared),
+                        expressions,
+                    },
+                    Arc::new(Schema::new(fields)),
+                ))
+            };
+        (prepared, schema) = compute(prepared, schema, &early)?;
         prepared = apply_where(prepared, &after, tables, &resolve, &schema)?;
+        if !self.windows.is_empty() {
+            (prepared, schema) = self.window_step(prepared, &schema, &resolve)?;
+        }
+        (prepared, schema) = compute(prepared, schema, &late)?;
         let plan = LogicalPlan::Prepared(Prepared {
             prep: Arc::new(prepared),
             schema,
         });
-        let all = (!self.calcs.is_empty()).then_some(base);
+        let all = (!self.calcs.is_empty() || !self.windows.is_empty()).then_some(base);
         self.shape(plan, None, &resolve, all)
+    }
+
+    /// Adds a column per window function after `schema`'s (ADR 0024). Window
+    /// functions with the same `OVER (PARTITION BY … ORDER BY …)` share one
+    /// sort and one pass over the rows.
+    fn window_step(
+        &self,
+        prepared: Prep,
+        schema: &SchemaRef,
+        resolve: &dyn Fn(&SqlColumn) -> Result<usize>,
+    ) -> Result<(Prep, SchemaRef)> {
+        let mut grouped: Vec<Vec<usize>> = Vec::new();
+        for (index, window) in self.windows.iter().enumerate() {
+            match grouped
+                .iter_mut()
+                .find(|members| self.windows[members[0]].same_order(window))
+            {
+                Some(members) => members.push(index),
+                None => grouped.push(vec![index]),
+            }
+        }
+        if grouped.len() > MAX_WINDOW_SORTS {
+            bail!(
+                "window functions sort the rows at most {MAX_WINDOW_SORTS} ways in one query; \
+                 this one has {} different OVER (PARTITION BY … ORDER BY …)",
+                grouped.len()
+            );
+        }
+        let mut types = vec![None; self.windows.len()];
+        let mut groups = Vec::new();
+        for members in grouped {
+            let first = &self.windows[members[0]];
+            let partition_by = first
+                .partition_by
+                .iter()
+                .map(resolve)
+                .collect::<Result<Vec<_>>>()?;
+            // Sorted by PARTITION BY, then ORDER BY; a column once.
+            let mut sort = partition_by
+                .iter()
+                .map(|column| SortSpec::new(*column, SortDirection::Ascending, NullOrder::Last))
+                .collect::<Vec<_>>();
+            let mut order_by = Vec::new();
+            for (column, direction, nulls) in &first.order_by {
+                let column = resolve(column)?;
+                if !order_by.contains(&column) {
+                    order_by.push(column);
+                }
+                if !sort.iter().any(|key| key.column == column) {
+                    sort.push(SortSpec::new(column, *direction, *nulls));
+                }
+            }
+            let windows = members
+                .iter()
+                .map(|index| {
+                    let window = &self.windows[*index];
+                    Ok(WindowExpr {
+                        function: window.function,
+                        column: window.column.as_ref().map(resolve).transpose()?,
+                        default: window.default.clone(),
+                        frame: window.frame,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let spec = WindowSpec {
+                partition_by,
+                order_by,
+                windows,
+            };
+            for (index, data_type) in members
+                .iter()
+                .zip(parquet_reader::check_windows(schema, &spec)?)
+            {
+                types[*index] = Some(data_type);
+            }
+            groups.push(WindowGroup {
+                sort,
+                spec,
+                names: members
+                    .iter()
+                    .map(|index| format!("{WIN_PREFIX}{index}"))
+                    .collect(),
+                windows: members,
+            });
+        }
+        let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+        for (index, data_type) in types.into_iter().enumerate() {
+            fields.push(Arc::new(Field::new(
+                format!("{WIN_PREFIX}{index}"),
+                data_type.ok_or_else(|| anyhow!("window function {index} has no type"))?,
+                true,
+            )));
+        }
+        Ok((
+            Prep::Window {
+                input: Box::new(prepared),
+                groups,
+                count: self.windows.len(),
+            },
+            Arc::new(Schema::new(fields)),
+        ))
     }
 }
 
@@ -1823,9 +2057,10 @@ fn parse_target(expression: &Expr, clause: &str, calcs: &mut SqlCalcs) -> Result
     }
 }
 
-/// Whether a function call is one of the aggregates.
+/// Whether a function call is one of the aggregates (`SUM(x) OVER (…)` is a
+/// window function).
 fn is_aggregate(function: &Function) -> bool {
-    parquet_reader::is_aggregate_name(&function.name.to_string())
+    function.over.is_none() && parquet_reader::is_aggregate_name(&function.name.to_string())
 }
 
 /// Fails when a column appears twice (names compare case-insensitively).
@@ -1980,6 +2215,7 @@ fn parse_projection(
     group_by: &GroupByExpr,
     distinct: bool,
     calcs: &mut SqlCalcs,
+    windows: &mut Vec<SqlWindow>,
 ) -> Result<(SqlProjection, Vec<Option<String>>, Vec<Option<String>>)> {
     if matches!(items, [SelectItem::Wildcard(_)]) {
         if !matches!(group_by, GroupByExpr::Expressions(expressions, modifiers) if expressions.is_empty() && modifiers.is_empty())
@@ -2015,6 +2251,7 @@ fn parse_projection(
             }
         };
         let calculated = calcs.items.len();
+        let windowed = windows.len();
         let mut on_result = false;
         match expression {
             Expr::Function(function) if is_aggregate(function) => {
@@ -2026,12 +2263,17 @@ fn parse_projection(
             _ => {
                 let mut inner: Vec<SqlAggregateExpr> = Vec::new();
                 let mut hook = |function: &Function| -> Result<SqlColumn> {
+                    if function.over.is_some() {
+                        return parse_window(function, calcs, windows);
+                    }
                     inner.push(parse_aggregate(function, calcs)?);
                     Ok(SqlColumn::new(format!("{AGG_PREFIX}{}", inner.len() - 1)))
                 };
                 let parsed = calc::parse_with(expression, &mut hook)?;
                 if inner.is_empty() {
-                    let column = calcs.column(expression, false)?;
+                    // A column, a calculation, or one with window functions'
+                    // results (`amount - LAG(amount) OVER (…)`).
+                    let column = calcs.add(parsed, expression.to_string(), false)?;
                     columns.push(column);
                     // Its place among the columns for now; GROUP BY's below.
                     result.push(SqlItem::Group(columns.len() - 1));
@@ -2064,6 +2306,7 @@ fn parse_projection(
         }
         // An item that calculates is shown by its SQL text unless it has an alias.
         let calculates = calcs.items.len() > calculated
+            || windows.len() > windowed
             || columns
                 .last()
                 .is_some_and(|column| calcs.position(column).is_some())
@@ -2083,6 +2326,12 @@ fn parse_projection(
             bail!("two result columns are called {name}");
         }
         aliases.push(alias);
+    }
+    if !windows.is_empty() && (!aggregates.is_empty() || !group_by.is_empty() || distinct) {
+        bail!(
+            "window functions can't be combined with GROUP BY, DISTINCT or aggregates in one \
+             SELECT; group in a subquery or WITH, then use window functions on its rows"
+        );
     }
     if aggregates.is_empty() {
         if !distinct && group_by.is_empty() {
@@ -2173,10 +2422,7 @@ fn parse_group_by(group_by: &GroupByExpr, calcs: &mut SqlCalcs) -> Result<Vec<Sq
 fn parse_aggregate(function: &Function, calcs: &mut SqlCalcs) -> Result<SqlAggregateExpr> {
     let function_name = function.name.to_string().to_ascii_uppercase();
     if function.over.is_some() {
-        bail!(
-            "{function_name}(…) OVER (…): window functions are not supported yet; \
-             use GROUP BY for one row per group"
-        );
+        bail!("{function_name}(…) OVER (…): {}", calc::WINDOW_PLACE);
     }
     let within_group = function_name == "PERCENTILE_CONT";
     if function.uses_odbc_syntax
@@ -2253,6 +2499,239 @@ fn parse_aggregate(function: &Function, calcs: &mut SqlCalcs) -> Result<SqlAggre
         _ => bail!("aggregate needs exactly one column argument"),
     };
     Ok(SqlAggregateExpr { function, column })
+}
+
+/// Parses `function(…) OVER (…)` into `windows` and names the column that
+/// will hold its result (ADR 0024).
+fn parse_window(
+    function: &Function,
+    calcs: &mut SqlCalcs,
+    windows: &mut Vec<SqlWindow>,
+) -> Result<SqlColumn> {
+    let name = function.name.to_string().to_ascii_uppercase();
+    let spec = match &function.over {
+        Some(WindowType::WindowSpec(spec)) if spec.window_name.is_none() => spec,
+        Some(_) => bail!("named windows (OVER w, WINDOW w AS …) are not supported; write OVER (…)"),
+        None => bail!("{name} needs OVER (…) to be a window function"),
+    };
+    if function.uses_odbc_syntax
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        bail!("{name} … OVER (…): FILTER, IGNORE NULLS and other modifiers are not supported");
+    }
+    let arguments = match &function.args {
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::List(list) => {
+            if !list.clauses.is_empty() {
+                bail!("{name} … OVER (…): argument clauses are not supported");
+            }
+            if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+                bail!("{name}(DISTINCT …) OVER (…) is not supported");
+            }
+            list.args.iter().collect()
+        }
+        FunctionArguments::Subquery(_) => bail!("{name} … OVER (…) takes columns, not a subquery"),
+    };
+    fn argument<'a>(name: &str, argument: &'a FunctionArg) -> Result<&'a Expr> {
+        match argument {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Ok(expression),
+            _ => bail!("{name} … OVER (…) takes values, not named arguments or *"),
+        }
+    }
+    let (window_function, column, default) = match name.as_str() {
+        "ROW_NUMBER" | "RANK" | "DENSE_RANK" => {
+            if !arguments.is_empty() {
+                bail!("{name}() takes no arguments");
+            }
+            let function = match name.as_str() {
+                "ROW_NUMBER" => WindowFunction::RowNumber,
+                "RANK" => WindowFunction::Rank,
+                _ => WindowFunction::DenseRank,
+            };
+            (function, None, None)
+        }
+        "LAG" | "LEAD" => {
+            let (column, offset, default) = match arguments.as_slice() {
+                [column] => (column, None, None),
+                [column, offset] => (column, Some(offset), None),
+                [column, offset, default] => (column, Some(offset), Some(default)),
+                _ => bail!(
+                    "{name} takes a column, then optionally an offset and a default, e.g. \
+                     {name}(amount, 1, 0)"
+                ),
+            };
+            let offset = match offset {
+                Some(offset) => parse_literal(argument(&name, offset)?)
+                    .ok()
+                    .and_then(|text| text.parse::<usize>().ok())
+                    .filter(|offset| *offset <= MAX_WINDOW_OFFSET)
+                    .ok_or_else(|| {
+                        anyhow!("{name}'s offset is a whole number from 0 to {MAX_WINDOW_OFFSET}")
+                    })?,
+                None => 1,
+            };
+            let default = match default
+                .map(|default| argument(&name, default))
+                .transpose()?
+            {
+                Some(Expr::Value(literal))
+                    if matches!(literal.value, sqlparser::ast::Value::Null) =>
+                {
+                    None
+                }
+                Some(default) => Some(parse_literal(default).map_err(|_| {
+                    anyhow!("{name}'s default is a number, text or date literal, e.g. 0 or 'none'")
+                })?),
+                None => None,
+            };
+            let function = if name == "LAG" {
+                WindowFunction::Lag(offset)
+            } else {
+                WindowFunction::Lead(offset)
+            };
+            (
+                function,
+                Some(calcs.column(argument(&name, column)?, true)?),
+                default,
+            )
+        }
+        _ => match parquet_reader::aggregate_by_name(&name) {
+            Some(
+                aggregate @ (AggregateFunction::Count
+                | AggregateFunction::Sum
+                | AggregateFunction::Avg
+                | AggregateFunction::Min
+                | AggregateFunction::Max),
+            ) => {
+                let column = match arguments.as_slice() {
+                    [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
+                        if aggregate == AggregateFunction::Count =>
+                    {
+                        None
+                    }
+                    [only] => Some(calcs.column(argument(&name, only)?, true)?),
+                    _ => bail!("{name} … OVER (…) takes one column"),
+                };
+                (WindowFunction::Aggregate(aggregate), column, None)
+            }
+            Some(_) => bail!(
+                "{name} … OVER (…) is not supported; window aggregates are COUNT, SUM, AVG, MIN \
+                 and MAX"
+            ),
+            None => bail!(
+                "{name} is not a window function; they are ROW_NUMBER, RANK, DENSE_RANK, LAG, \
+                 LEAD, COUNT, SUM, AVG, MIN and MAX"
+            ),
+        },
+    };
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|expression| calcs.column(expression, true))
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = spec
+        .order_by
+        .iter()
+        .map(|expression| {
+            if expression.with_fill.is_some() {
+                bail!("ORDER BY WITH FILL is not supported");
+            }
+            Ok((
+                calcs.column(&expression.expr, true)?,
+                if expression.options.asc == Some(false) {
+                    SortDirection::Descending
+                } else {
+                    SortDirection::Ascending
+                },
+                if expression.options.nulls_first == Some(true) {
+                    NullOrder::First
+                } else {
+                    NullOrder::Last
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if partition_by.len() + order_by.len() > MAX_SORT_KEYS {
+        bail!(
+            "OVER (…) sorts by at most {MAX_SORT_KEYS} columns, PARTITION BY and ORDER BY together"
+        );
+    }
+    let whole = if order_by.is_empty() {
+        WindowFrame::Partition
+    } else {
+        WindowFrame::Peers
+    };
+    let frame = match &spec.window_frame {
+        None => whole,
+        Some(frame) => {
+            let end = frame
+                .end_bound
+                .as_ref()
+                .unwrap_or(&WindowFrameBound::CurrentRow);
+            match (frame.units, &frame.start_bound, end) {
+                (_, WindowFrameBound::Preceding(None), WindowFrameBound::Following(None)) => {
+                    WindowFrame::Partition
+                }
+                (
+                    WindowFrameUnits::Range,
+                    WindowFrameBound::Preceding(None),
+                    WindowFrameBound::CurrentRow,
+                ) => whole,
+                (
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(None),
+                    WindowFrameBound::CurrentRow,
+                ) => WindowFrame::Rows,
+                (
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::CurrentRow,
+                    WindowFrameBound::CurrentRow,
+                ) => WindowFrame::Preceding(0),
+                (
+                    WindowFrameUnits::Rows,
+                    WindowFrameBound::Preceding(Some(rows)),
+                    WindowFrameBound::CurrentRow,
+                ) => WindowFrame::Preceding(
+                    parse_literal(rows)
+                        .ok()
+                        .and_then(|text| text.parse::<usize>().ok())
+                        .filter(|rows| *rows <= MAX_WINDOW_OFFSET)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "ROWS BETWEEN n PRECEDING takes a whole number from 0 to \
+                                 {MAX_WINDOW_OFFSET}"
+                            )
+                        })?,
+                ),
+                _ => bail!(
+                    "this window frame is not supported; use ROWS BETWEEN UNBOUNDED PRECEDING \
+                     AND CURRENT ROW, ROWS BETWEEN n PRECEDING AND CURRENT ROW, or none"
+                ),
+            }
+        }
+    };
+    let window = SqlWindow {
+        function: window_function,
+        column,
+        default,
+        frame,
+        partition_by,
+        order_by,
+    };
+    let index = match windows.iter().position(|other| *other == window) {
+        Some(index) => index,
+        None => {
+            if windows.len() >= MAX_WINDOWS {
+                bail!("a query uses at most {MAX_WINDOWS} window functions");
+            }
+            windows.push(window);
+            windows.len() - 1
+        }
+    };
+    Ok(SqlColumn::new(format!("{WIN_PREFIX}{index}")))
 }
 
 /// A quantile's fraction: a number literal from 0 to 1.
@@ -3643,11 +4122,149 @@ mod tests {
                 "SELECT MEDIAN(name) FROM customers",
                 "MEDIAN needs a number column",
             ),
-            (
-                "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM orders",
-                "window functions",
+        ] {
+            let error = format!("{:#}", run(sql, &tables).unwrap_err());
+            assert!(error.contains(message), "{sql}: {error}");
+        }
+    }
+
+    #[test]
+    fn runs_window_functions() {
+        let (_directory, tables) = tables();
+        let rows = |sql: &str| run(sql, &tables).unwrap();
+        // Numbering by a sort of its own, shown in the query's order.
+        let (names, numbered) = rows(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY amount DESC) AS rn FROM orders ORDER BY id",
+        );
+        assert_eq!(names, ["id", "rn"]);
+        assert_eq!(numbered, ["1,5", "2,4", "3,3", "4,2", "5,1"]);
+        // Running totals per partition; NULL is a partition of its own.
+        assert_eq!(
+            rows(
+                "SELECT id, customer, SUM(amount) OVER (PARTITION BY customer ORDER BY id) \
+                 AS running FROM orders ORDER BY id"
+            )
+            .1,
+            ["1,10,5", "2,20,10", "3,10,20", "4,null,20", "5,30,50"]
+        );
+        // Calculations with window functions' results, and a whole-table total.
+        assert_eq!(
+            rows(
+                "SELECT id, amount - LAG(amount, 1, 0) OVER (ORDER BY id) AS change, \
+                 ROUND(amount * 100 / SUM(amount) OVER (), 1) AS share FROM orders ORDER BY id"
+            )
+            .1,
+            ["1,5,5", "2,5,10", "3,5,15", "4,5,20", "5,30,50"]
+        );
+        // Ties share a rank; NULLs sort last.
+        assert_eq!(
+            rows(
+                "SELECT id, RANK() OVER (ORDER BY customer) AS r, \
+                 DENSE_RANK() OVER (ORDER BY customer) AS d FROM orders ORDER BY id"
+            )
+            .1,
+            ["1,1,1", "2,3,2", "3,1,1", "4,5,4", "5,4,3"]
+        );
+        // A moving average over the row and the one before it.
+        assert_eq!(
+            rows(
+                "SELECT AVG(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM orders ORDER BY id"
             ),
-            ("SELECT SUM(amount) OVER () FROM orders", "window functions"),
+            (
+                vec![
+                    "AVG(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+                        .to_owned()
+                ],
+                ["5", "7.5", "12.5", "17.5", "35"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+        // WHERE filters before the window functions number the rows.
+        assert_eq!(
+            rows(
+                "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM orders WHERE amount > 10 \
+                 ORDER BY id"
+            )
+            .1,
+            ["3,1", "4,2", "5,3"]
+        );
+        // The top row per partition, filtered in an outer query.
+        assert_eq!(
+            rows(
+                "SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY customer \
+                 ORDER BY amount DESC) AS rn FROM orders) AS ranked WHERE rn = 1 ORDER BY id"
+            )
+            .1,
+            ["2", "3", "4", "5"]
+        );
+        // Over grouped rows from WITH, and over joined tables.
+        assert_eq!(
+            rows(
+                "WITH totals AS (SELECT customer, SUM(amount) AS total FROM orders \
+                 GROUP BY customer) \
+                 SELECT customer, RANK() OVER (ORDER BY total DESC) AS place FROM totals \
+                 ORDER BY place, customer"
+            )
+            .1,
+            ["30,1", "10,2", "null,2", "20,4"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT o.id, c.name, COUNT(*) OVER (PARTITION BY c.name) AS n FROM orders o \
+                 JOIN customers c ON o.customer = c.id ORDER BY o.id"
+            )
+            .1,
+            ["1,Ann,2", "2,Bo,1", "3,Ann,2", "5,Cy,1"]
+        );
+        // No column read: one is read for the row count.
+        assert_eq!(
+            rows("SELECT ROW_NUMBER() OVER () AS n FROM orders ORDER BY n DESC LIMIT 2").1,
+            ["5", "4"]
+        );
+        for (sql, message) in [
+            (
+                "SELECT id FROM orders WHERE ROW_NUMBER() OVER (ORDER BY id) = 1",
+                "work only in the SELECT list",
+            ),
+            (
+                "SELECT SUM(ROW_NUMBER() OVER (ORDER BY id)) OVER () FROM orders",
+                "work only in the SELECT list",
+            ),
+            (
+                "SELECT customer, COUNT(*) OVER () FROM orders GROUP BY customer",
+                "can't be combined with GROUP BY",
+            ),
+            (
+                "SELECT NTILE(4) OVER (ORDER BY id) FROM orders",
+                "not a window function",
+            ),
+            (
+                "SELECT MEDIAN(amount) OVER () FROM orders",
+                "window aggregates are COUNT, SUM, AVG, MIN and MAX",
+            ),
+            (
+                "SELECT LAG(amount, 2000) OVER (ORDER BY id) FROM orders",
+                "offset is a whole number from 0 to 1000",
+            ),
+            (
+                "SELECT LAG(amount, 1, 'x') OVER (ORDER BY id) FROM orders",
+                "LAG's default x is not a Float64 value",
+            ),
+            (
+                "SELECT SUM(amount) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND \
+                 UNBOUNDED FOLLOWING) FROM orders",
+                "window frame is not supported",
+            ),
+            (
+                "SELECT SUM(name) OVER () FROM customers",
+                "SUM needs a number column",
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER w FROM orders WINDOW w AS (ORDER BY id)",
+                "not supported",
+            ),
         ] {
             let error = format!("{:#}", run(sql, &tables).unwrap_err());
             assert!(error.contains(message), "{sql}: {error}");

@@ -21,6 +21,7 @@ pub mod spill;
 mod statistics;
 pub mod types;
 pub mod value;
+pub mod window;
 
 pub use aggregate::{
     AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget, MAX_QUANTILE_VALUES,
@@ -54,3 +55,7 @@ pub use source::{
 };
 pub use spill::{MAX_SPILL_BYTES, SortMerge, remove_leftover_temp_folders};
 pub use value::{MAX_FORMAT_DECIMALS, NumberFormat};
+pub use window::{
+    MAX_WINDOW_OFFSET, WindowExpr, WindowFrame, WindowFunction, WindowSpec, check_windows,
+    compute_windows,
+};

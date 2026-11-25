@@ -3243,3 +3243,43 @@ fn runs_sql_with_quantiles_unions_and_with() {
         ["0", "1", "2", "78", "79"]
     );
 }
+
+#[test]
+fn runs_sql_with_window_functions() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    // Even ids are alpha, odd ones beta.
+    app.sql_input = "SELECT id, name, ROW_NUMBER() OVER (PARTITION BY name ORDER BY id DESC) AS rn,                      id - LAG(id) OVER (PARTITION BY name ORDER BY id) AS gap,                      SUM(id) OVER (PARTITION BY name) AS total                      FROM dataset WHERE id >= 76 ORDER BY id"
+        .to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert_eq!(app.sql_error, None);
+    let rows = (0..app.grid.rows)
+        .map(|row| {
+            (0..app.grid.columns)
+                .map(|column| app.filtered_cell_text(row, column).unwrap())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        [
+            "76,alpha,2,null,154",
+            "77,beta,2,null,156",
+            "78,alpha,1,2,154",
+            "79,beta,1,2,156"
+        ]
+    );
+    // A window function outside SELECT is explained under the editor.
+    app.sql_input = "SELECT id FROM dataset WHERE RANK() OVER (ORDER BY id) = 1".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert!(
+        app.sql_error
+            .as_deref()
+            .is_some_and(|error| error.contains("work only in the SELECT list")),
+        "{:?}",
+        app.sql_error
+    );
+}

@@ -346,6 +346,10 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT REPLACE(name, 'me', 'you'), ts - INTERVAL 90 MINUTE FROM dataset WHERE ts < NOW() AND day <= CURRENT_DATE",
     "SELECT id, name FROM dataset WHERE id < 3 UNION ALL SELECT id, category FROM dataset WHERE id > 7 ORDER BY 1 DESC LIMIT 4",
     "WITH red AS (SELECT id, score FROM dataset WHERE category = 'red') SELECT id FROM red UNION SELECT id FROM dataset WHERE score > 2",
+    "SELECT id, ROW_NUMBER() OVER (PARTITION BY category ORDER BY score DESC NULLS FIRST) AS rn, RANK() OVER (ORDER BY day), DENSE_RANK() OVER (ORDER BY day) FROM dataset ORDER BY rn",
+    "SELECT id, score - LAG(score, 2, 0) OVER (ORDER BY id), LEAD(name) OVER (PARTITION BY active ORDER BY id) FROM dataset WHERE id > 1",
+    "SELECT category, SUM(amount) OVER (PARTITION BY category), AVG(score) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), MAX(day) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM dataset",
+    "SELECT id FROM (SELECT id, COUNT(*) OVER (PARTITION BY category ORDER BY id) AS n FROM dataset) AS t WHERE n < 3",
 ];
 
 /// One runtime shared by fuzz inputs that need the query engine. It is kept in a

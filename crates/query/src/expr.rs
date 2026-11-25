@@ -240,8 +240,9 @@ impl<C> Expr<C> {
 
 // ---------------------------------------------------------------- parsing
 
-/// What a calculation in an aggregate query's SELECT list does with an
-/// aggregate it contains: names the column that will hold its result.
+/// What a calculation in a SELECT list does with an aggregate or a window
+/// function (`… OVER (…)`) it contains: names the column that will hold its
+/// result.
 pub(crate) type AggregateHook<'a> = &'a mut dyn FnMut(&ast::Function) -> Result<SqlColumn>;
 
 /// Parses a calculation from sqlparser's AST. A plain column becomes
@@ -260,6 +261,11 @@ pub(crate) fn parse_with(
     parse_node(expression, &mut 0, &mut Some(on_aggregate))
 }
 
+/// Where window functions may be written (ADR 0024).
+pub(crate) const WINDOW_PLACE: &str = "window functions work only in the SELECT list, outside \
+     aggregates and other window functions; ORDER BY can use their alias, and a subquery or WITH \
+     can filter or group by them";
+
 /// Whether a function name is one of the aggregates.
 pub(crate) fn is_aggregate_name(name: &str) -> bool {
     parquet_reader::is_aggregate_name(name)
@@ -276,9 +282,11 @@ fn parse_node(
     }
     if let ast::Expr::Function(function) = expression {
         let name = function.name.to_string().to_ascii_uppercase();
-        if is_aggregate_name(&name) {
+        let window = function.over.is_some();
+        if window || is_aggregate_name(&name) {
             return match on_aggregate {
                 Some(hook) => Ok(Expr::Column(hook(function)?)),
+                None if window => bail!("{name}(…) OVER (…): {WINDOW_PLACE}"),
                 None => bail!(
                     "{name} is an aggregate and can't be used here; calculations with aggregates (ROUND(AVG(x), 2)) work in SELECT, and an alias lets ORDER BY and HAVING use them"
                 ),
@@ -429,12 +437,6 @@ fn parse_node(
         }
         ast::Expr::Function(function) => {
             let name = function.name.to_string().to_ascii_uppercase();
-            if function.over.is_some() {
-                bail!(
-                    "{name}(…) OVER (…): window functions are not supported yet; \
-                     use GROUP BY for one row per group"
-                );
-            }
             if function.filter.is_some()
                 || !function.within_group.is_empty()
                 || !matches!(function.parameters, FunctionArguments::None)
