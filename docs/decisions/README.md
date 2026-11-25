@@ -48,3 +48,4 @@ What gets easier, what gets harder, what we must keep doing because of this.
 | [0020](0020-import-options.md) | CSV and JSON are read with import options (delimiter, header, encoding, all text); a late value retypes the column instead of failing (amends 0007) |
 | [0021](0021-excel-workbooks.md) | Excel and OpenDocument workbooks are read a sheet at a time (calamine) and results exported to .xlsx (rust_xlsxwriter) (amends 0007) |
 | [0022](0022-whole-file-search.md) | Find looks through the whole file on a worker; `* contains` filters rows by text in any column |
+| [0023](0023-sql-statistics-dates-union.md) | SQL gains MEDIAN, quantiles, STDDEV/VARIANCE, REPLACE, DATE_TRUNC, DATE_DIFF, INTERVAL, NOW, UNION and WITH (amends 0009, 0013) |

@@ -1,5 +1,6 @@
 //! A bounded logical query layer over PAVI data sources.
 
+mod dates;
 mod execution;
 pub mod expr;
 mod logical;
@@ -17,6 +18,7 @@ pub use parquet_reader::{
 };
 pub use planner::{PhysicalPlan, Planner};
 pub use prep::{MAX_JOINS, MAX_SUBQUERY_DEPTH};
+pub use sql::{MAX_UNION_PARTS, MAX_WITH_NAMES};
 pub use sql::{
     SqlAggregate, SqlAggregateExpr, SqlAst, SqlColumn, SqlFrom, SqlJoin, SqlPredicate,
     SqlProjection, SqlRelation, SqlSort, SqlTable, Tables, table_name,

@@ -3196,6 +3196,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
+ "chrono",
  "parquet",
  "parquet_reader",
  "pavi_runtime",

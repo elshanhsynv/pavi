@@ -3207,3 +3207,39 @@ fn shows_the_rows_where_any_column_contains_the_find_text() {
         ]
     );
 }
+
+#[test]
+fn runs_sql_with_quantiles_unions_and_with() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    let run = |app: &mut PaviApp, sql: &str| {
+        app.sql_input = sql.to_string();
+        app.run_sql();
+        poll_until_idle(app);
+        assert_eq!(app.sql_error, None, "{sql}");
+        (0..app.grid.rows)
+            .map(|row| {
+                (0..app.grid.columns)
+                    .map(|column| app.filtered_cell_text(row, column).unwrap())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect::<Vec<_>>()
+    };
+    // Even ids are alpha, odd ones beta.
+    assert_eq!(
+        run(
+            &mut app,
+            "SELECT name, MEDIAN(id), ROUND(STDDEV_POP(id), 2) FROM dataset GROUP BY name ORDER BY name"
+        ),
+        ["alpha,39,23.09", "beta,40,23.09"]
+    );
+    assert_eq!(
+        run(
+            &mut app,
+            "WITH small AS (SELECT id FROM dataset WHERE id < 3) \
+             SELECT id FROM small UNION ALL SELECT id FROM dataset WHERE id > 77 ORDER BY id"
+        ),
+        ["0", "1", "2", "78", "79"]
+    );
+}

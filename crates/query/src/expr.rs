@@ -89,6 +89,20 @@ pub enum Function {
     Minute,
     Second,
     DayOfWeek,
+    /// `REPLACE(text, from, to)`: every `from` in `text` becomes `to`.
+    Replace,
+    /// `DATE_TRUNC(unit, value)`: the start of the unit the value is in.
+    DateTrunc(crate::dates::DateUnit),
+    /// `DATE_DIFF(unit, start, end)`: unit boundaries from start to end.
+    DateDiff(crate::dates::DateUnit),
+    /// `value ± INTERVAL …`.
+    Shift(crate::dates::Interval),
+    /// `NOW()` / `CURRENT_TIMESTAMP`: the moment the query was written, as a
+    /// timestamp without a zone holding UTC's wall-clock time (microseconds
+    /// since 1970), the same for every row.
+    Now(i64),
+    /// `CURRENT_DATE`: the day the query was written (UTC), in days since 1970.
+    Today(i32),
 }
 
 impl Function {
@@ -248,10 +262,7 @@ pub(crate) fn parse_with(
 
 /// Whether a function name is one of the aggregates.
 pub(crate) fn is_aggregate_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-    )
+    parquet_reader::is_aggregate_name(name)
 }
 
 fn parse_node(
@@ -301,6 +312,39 @@ fn parse_node(
             op: UnaryOperator::Not,
             expr,
         } => Expr::Not(child(expr)?),
+        // `value + INTERVAL '7 days'`, `value - INTERVAL 1 MONTH`.
+        ast::Expr::BinaryOp {
+            left,
+            op: op @ (SqlOperator::Plus | SqlOperator::Minus),
+            right,
+        } if matches!(right.as_ref(), ast::Expr::Interval(_))
+            || (matches!(left.as_ref(), ast::Expr::Interval(_)) && *op == SqlOperator::Plus) =>
+        {
+            let (value, interval) = match (left.as_ref(), right.as_ref()) {
+                (value, ast::Expr::Interval(interval))
+                    if !matches!(value, ast::Expr::Interval(_)) =>
+                {
+                    (value, interval)
+                }
+                (ast::Expr::Interval(interval), value)
+                    if !matches!(value, ast::Expr::Interval(_)) =>
+                {
+                    (value, interval)
+                }
+                _ => bail!("an interval is added to a date or timestamp, not to another interval"),
+            };
+            let mut interval = parse_interval(interval)?;
+            if *op == SqlOperator::Minus {
+                interval = interval.negated();
+            }
+            Expr::Call {
+                function: Function::Shift(interval),
+                args: vec![*child(value)?],
+            }
+        }
+        ast::Expr::Interval(_) => {
+            bail!("an interval is used as date ± INTERVAL '7 days', not on its own")
+        }
         ast::Expr::BinaryOp { left, op, right } => {
             let op = match op {
                 SqlOperator::Plus => BinaryOp::Add,
@@ -343,6 +387,17 @@ fn parse_node(
             to: sql_type(data_type)?,
             safe: !matches!(kind, CastKind::Cast | CastKind::DoubleColon),
         },
+        // `DATE '2024-03-01'`, `TIMESTAMP '…'`: the text cast to the type.
+        ast::Expr::TypedString(typed) => {
+            let Value::SingleQuotedString(text) = &typed.value.value else {
+                bail!("{} needs its value in quotes", typed.data_type);
+            };
+            Expr::Cast {
+                expr: Box::new(Expr::Literal(Literal::Text(text.clone()))),
+                to: sql_type(&typed.data_type)?,
+                safe: false,
+            }
+        }
         ast::Expr::Case {
             operand,
             conditions,
@@ -374,12 +429,38 @@ fn parse_node(
         }
         ast::Expr::Function(function) => {
             let name = function.name.to_string().to_ascii_uppercase();
-            if function.over.is_some()
-                || function.filter.is_some()
+            if function.over.is_some() {
+                bail!(
+                    "{name}(…) OVER (…): window functions are not supported yet; \
+                     use GROUP BY for one row per group"
+                );
+            }
+            if function.filter.is_some()
                 || !function.within_group.is_empty()
                 || !matches!(function.parameters, FunctionArguments::None)
             {
                 bail!("{name}: function modifiers are not supported");
+            }
+            // `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`: fixed when written.
+            let no_arguments = match &function.args {
+                FunctionArguments::None => true,
+                FunctionArguments::List(list) => list.args.is_empty(),
+                FunctionArguments::Subquery(_) => false,
+            };
+            match name.as_str() {
+                "NOW" | "CURRENT_TIMESTAMP" | "GETDATE" if no_arguments => {
+                    return Ok(Expr::Call {
+                        function: Function::Now(crate::dates::now_micros()),
+                        args: Vec::new(),
+                    });
+                }
+                "CURRENT_DATE" | "TODAY" if no_arguments => {
+                    return Ok(Expr::Call {
+                        function: Function::Today(crate::dates::today_days()),
+                        args: Vec::new(),
+                    });
+                }
+                _ => {}
             }
             let FunctionArguments::List(list) = &function.args else {
                 bail!("{name} needs parentheses");
@@ -397,6 +478,27 @@ fn parse_node(
                     _ => bail!("{name} takes plain arguments"),
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // `DATE_TRUNC('month', x)` and `DATE_DIFF('day', a, b)`: the unit
+            // is text written in the query, read now.
+            if matches!(name.as_str(), "DATE_TRUNC" | "DATE_DIFF" | "DATEDIFF") {
+                let mut args = args.into_iter();
+                let unit = match args.next() {
+                    Some(Expr::Literal(Literal::Text(unit))) => {
+                        crate::dates::DateUnit::parse(&unit)?
+                    }
+                    _ => bail!("{name}'s first argument is a unit in quotes, such as 'month'"),
+                };
+                let args = args.collect::<Vec<_>>();
+                let (function, wanted) = if name == "DATE_TRUNC" {
+                    (Function::DateTrunc(unit), 1)
+                } else {
+                    (Function::DateDiff(unit), 2)
+                };
+                if args.len() != wanted {
+                    bail!("{name} takes a unit and {wanted} date or timestamp argument(s)");
+                }
+                return Ok(Expr::Call { function, args });
+            }
             call(&name, args)?
         }
         ast::Expr::Substring {
@@ -451,6 +553,25 @@ fn literal(value: &Value, negative: bool) -> Result<Literal> {
     })
 }
 
+/// `INTERVAL '7 days'` or `INTERVAL 7 DAY`.
+fn parse_interval(interval: &ast::Interval) -> Result<crate::dates::Interval> {
+    if interval.last_field.is_some() {
+        bail!("an interval range such as DAY TO HOUR is not supported; write '1 day 2 hours'");
+    }
+    let text = match interval.value.as_ref() {
+        ast::Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) | Value::Number(text, _) => text.clone(),
+            other => bail!("the interval {other} is not a number of units"),
+        },
+        other => bail!("the interval {other} is not a number of units"),
+    };
+    let unit = interval
+        .leading_field
+        .as_ref()
+        .map(|field| field.to_string());
+    crate::dates::Interval::parse(&text, unit.as_deref())
+}
+
 /// A function call by name, with its arguments checked for count.
 fn call(name: &str, args: Vec<Expr<SqlColumn>>) -> Result<Expr<SqlColumn>> {
     let (function, arity) = match name {
@@ -471,8 +592,11 @@ fn call(name: &str, args: Vec<Expr<SqlColumn>>) -> Result<Expr<SqlColumn>> {
         "MINUTE" => (Function::Minute, 1..=1),
         "SECOND" => (Function::Second, 1..=1),
         "DAYOFWEEK" | "DOW" | "ISODOW" => (Function::DayOfWeek, 1..=1),
+        "REPLACE" => (Function::Replace, 3..=3),
         _ => bail!(
-            "unknown function {name}; calculations support LOWER, UPPER, TRIM, LENGTH, SUBSTRING, CONCAT, ABS, ROUND, COALESCE, YEAR, QUARTER, MONTH, DAY, HOUR, MINUTE, SECOND and DAYOFWEEK"
+            "unknown function {name}; calculations support LOWER, UPPER, TRIM, LENGTH, SUBSTRING, \
+             CONCAT, REPLACE, ABS, ROUND, COALESCE, YEAR, QUARTER, MONTH, DAY, HOUR, MINUTE, \
+             SECOND, DAYOFWEEK, DATE_TRUNC, DATE_DIFF, NOW and CURRENT_DATE"
         ),
     };
     if !arity.contains(&args.len()) {
@@ -759,6 +883,41 @@ impl Expr<usize> {
                         numeric_type(&first, &first)
                     }
                     Function::Coalesce => common_type(&types).context("COALESCE")?,
+                    Function::Replace => {
+                        if let Some(nested) = types.iter().find(|data_type| is_nested(data_type)) {
+                            bail!("REPLACE needs text, not {nested}");
+                        }
+                        DataType::Utf8
+                    }
+                    Function::DateTrunc(_) | Function::Shift(_) => {
+                        if !crate::dates::is_date_or_time(&first) {
+                            bail!(
+                                "{} needs a date or timestamp, not {first}",
+                                function_name(*function)
+                            );
+                        }
+                        match function {
+                            Function::Shift(interval) => {
+                                crate::dates::shift_type(&first, *interval)
+                            }
+                            _ => crate::dates::trunc_type(&first),
+                        }
+                    }
+                    Function::DateDiff(_) => {
+                        if let Some(bad) = types
+                            .iter()
+                            .find(|data_type| !crate::dates::is_date_or_time(data_type))
+                        {
+                            bail!("DATE_DIFF needs dates or timestamps, not {bad}");
+                        }
+                        DataType::Int64
+                    }
+                    // Without a zone, so it compares with the timestamps most
+                    // files hold; the wall-clock time is UTC's.
+                    Function::Now(_) => {
+                        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+                    }
+                    Function::Today(_) => DataType::Date32,
                     _ => {
                         let time_of_day =
                             matches!(first, DataType::Time32(_) | DataType::Time64(_));
@@ -1029,10 +1188,49 @@ fn call_function(
     result: &DataType,
     rows: usize,
 ) -> Result<ArrayRef> {
+    match function {
+        Function::Now(micros) => {
+            return Ok(Arc::new(
+                arrow_array::TimestampMicrosecondArray::from_value(micros, rows),
+            ));
+        }
+        Function::Today(days) => {
+            return Ok(Arc::new(arrow_array::Date32Array::from_value(days, rows)));
+        }
+        _ => {}
+    }
     let first = values
         .first()
         .ok_or_else(|| anyhow!("{function:?} needs an argument"))?;
     Ok(match function {
+        Function::Replace => {
+            let text = as_string(first)?;
+            let from = as_string(values.get(1).context("REPLACE needs what to replace")?)?;
+            let to = as_string(values.get(2).context("REPLACE needs a replacement")?)?;
+            Arc::new(
+                (0..rows)
+                    .map(|row| {
+                        if text.is_null(row) || from.is_null(row) || to.is_null(row) {
+                            return None;
+                        }
+                        let from = from.value(row);
+                        // Replacing nothing changes nothing.
+                        Some(if from.is_empty() {
+                            text.value(row).to_owned()
+                        } else {
+                            text.value(row).replace(from, to.value(row))
+                        })
+                    })
+                    .collect::<StringArray>(),
+            )
+        }
+        Function::DateTrunc(unit) => crate::dates::date_trunc(unit, first, result)?,
+        Function::DateDiff(unit) => crate::dates::date_diff(
+            unit,
+            first,
+            values.get(1).context("DATE_DIFF needs an end")?,
+        )?,
+        Function::Shift(interval) => crate::dates::shift(interval, first, result)?,
         Function::Lower => map_text(first, str::to_lowercase)?,
         Function::Upper => map_text(first, str::to_uppercase)?,
         Function::Trim => map_text(first, |text| text.trim().to_owned())?,
@@ -1153,6 +1351,17 @@ fn call_function(
             }
         }
     })
+}
+
+/// A function's SQL name, for messages.
+fn function_name(function: Function) -> &'static str {
+    match function {
+        Function::DateTrunc(_) => "DATE_TRUNC",
+        Function::DateDiff(_) => "DATE_DIFF",
+        Function::Shift(_) => "± INTERVAL",
+        Function::Replace => "REPLACE",
+        _ => "this function",
+    }
 }
 
 fn float64(array: &ArrayRef) -> Result<Float64Array> {

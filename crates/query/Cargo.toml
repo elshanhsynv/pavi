@@ -16,6 +16,10 @@ arrow-cast.workspace = true
 arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+# Already in the tree through arrow-array: calendar arithmetic for DATE_TRUNC,
+# DATE_DIFF and INTERVAL (ADR 0023). No default features: the time comes
+# from the standard library.
+chrono = { version = "0.4", default-features = false }
 parquet_reader = { path = "../parquet" }
 pavi_runtime = { path = "../runtime" }
 sqlparser.workspace = true

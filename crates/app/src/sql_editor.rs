@@ -9,18 +9,72 @@ pub(crate) const MAX_SUGGESTIONS: usize = 8;
 
 /// Words the SQL subset uses, offered as completions and highlighted.
 const KEYWORDS: &[&str] = &[
-    "SELECT", "FROM", "WHERE", "GROUP", "BY", "ORDER", "LIMIT", "AND", "OR", "NOT", "IN",
-    "BETWEEN", "LIKE", "IS", "NULL", "ASC", "DESC", "NULLS", "FIRST", "LAST", "TRUE", "FALSE",
-    "JOIN", "INNER", "LEFT", "OUTER", "ON", "AS", "HAVING", "DISTINCT", "CASE", "WHEN", "THEN",
-    "ELSE", "END", "CAST", "TRY_CAST", "EXTRACT",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "BY",
+    "ORDER",
+    "LIMIT",
+    "AND",
+    "OR",
+    "NOT",
+    "IN",
+    "BETWEEN",
+    "LIKE",
+    "IS",
+    "NULL",
+    "ASC",
+    "DESC",
+    "NULLS",
+    "FIRST",
+    "LAST",
+    "TRUE",
+    "FALSE",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "OUTER",
+    "ON",
+    "AS",
+    "HAVING",
+    "DISTINCT",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "CAST",
+    "TRY_CAST",
+    "EXTRACT",
+    "UNION",
+    "ALL",
+    "WITH",
+    "INTERVAL",
+    "WITHIN",
+    "DATE",
+    "TIMESTAMP",
+    "CURRENT_DATE",
+    "CURRENT_TIMESTAMP",
 ];
-/// Aggregate functions, highlighted apart from keywords.
+/// Aggregate and calculation functions, highlighted apart from keywords.
 const FUNCTIONS: &[&str] = &[
     "COUNT",
     "SUM",
     "AVG",
     "MIN",
     "MAX",
+    "MEDIAN",
+    "QUANTILE_CONT",
+    "PERCENTILE_CONT",
+    "STDDEV",
+    "STDDEV_POP",
+    "VARIANCE",
+    "VAR_POP",
+    "REPLACE",
+    "DATE_TRUNC",
+    "DATE_DIFF",
+    "NOW",
     "LOWER",
     "UPPER",
     "TRIM",
@@ -364,10 +418,14 @@ mod tests {
             names("de"),
             ["DEP_DELAY", "DEP_TIME", "\"dest city\"", "DESC"]
         );
-        assert_eq!(names("dat"), ["dataset"]);
+        assert_eq!(names("dat"), ["dataset", "DATE", "DATE_TRUNC", "DATE_DIFF"]);
         // `count` is a column too, so it is quoted; COUNT the function is offered as well.
         assert_eq!(names("cou"), ["\"count\"", "COUNT"]);
-        assert_eq!(names("time"), ["DEP_TIME"], "a column containing the text");
+        assert_eq!(
+            names("time"),
+            ["TIMESTAMP", "DEP_TIME"],
+            "a word starting with the text, then a column containing it"
+        );
         assert_eq!(names("id"), Vec::<String>::new(), "already complete");
         assert!(names("").is_empty());
         let many = (0..20)

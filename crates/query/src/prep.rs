@@ -53,6 +53,13 @@ pub(crate) enum Prep {
         input: Box<Prep>,
         expressions: Vec<(String, crate::expr::Expr<usize>)>,
     },
+    /// The rows of each query in turn, as `schema` (each column cast to its
+    /// type), written to one temporary table: `UNION ALL` (ADR 0023).
+    Union {
+        plans: Vec<LogicalPlan>,
+        schema: arrow_schema::SchemaRef,
+        columns: Vec<usize>,
+    },
     /// A join; `left_keys` and `right_keys` index the inputs' columns, and
     /// `names` name the output columns.
     Join {
@@ -184,6 +191,8 @@ impl PrepContext {
 fn count_joins(prep: &Prep) -> usize {
     match prep {
         Prep::Table { .. } | Prep::Query { .. } => 0,
+        // Writing the parts reads each once, like a join: a step of progress.
+        Prep::Union { .. } => 1,
         Prep::Filter { input, .. } => count_joins(input),
         // Calculating reads every input row once, like a join: a step of progress.
         Prep::Compute { input, .. } => 1 + count_joins(input),
@@ -203,6 +212,15 @@ fn run(prep: &Prep, context: &PrepContext) -> Result<Relation> {
         }),
         Prep::Query { plan, columns } => Ok(Relation {
             source: query_table(plan, context)?,
+            filter: None,
+            columns: columns.clone(),
+        }),
+        Prep::Union {
+            plans,
+            schema,
+            columns,
+        } => Ok(Relation {
+            source: union_table(plans, schema, context)?,
             filter: None,
             columns: columns.clone(),
         }),
@@ -288,9 +306,22 @@ fn compute_table(
     if let Some(filter) = relation.filter.clone() {
         plan = plan.filter(crate::Filter::new(filter));
     }
-    let plan = plan.project(relation.columns.clone());
+    // With no input column kept (calculations such as NOW() read none), the
+    // first column is read only for its row count, and not written: an empty
+    // projection would read them all.
+    let keep_input = !relation.columns.is_empty();
+    let plan = plan.project(if keep_input {
+        relation.columns.clone()
+    } else {
+        vec![0]
+    });
     let engine = QueryEngine::from_handle(context.runtime.clone());
-    let input = engine.output_schema(&plan)?;
+    let read = engine.output_schema(&plan)?;
+    let input = if keep_input {
+        Arc::clone(&read)
+    } else {
+        Arc::new(Schema::empty())
+    };
     let mut fields = input.fields().iter().cloned().collect::<Vec<_>>();
     for (name, expression) in expressions {
         fields.push(Arc::new(arrow_schema::Field::new(
@@ -319,6 +350,15 @@ fn compute_table(
             break;
         };
         let batch = batch.batch;
+        let batch = if keep_input {
+            batch
+        } else {
+            arrow_array::RecordBatch::try_new_with_options(
+                Arc::clone(&input),
+                Vec::new(),
+                &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+            )?
+        };
         let mut columns = batch.columns().to_vec();
         for (_, expression) in expressions {
             columns.push(expression.evaluate(&batch)?);
@@ -356,6 +396,47 @@ fn query_table(plan: &LogicalPlan, context: &PrepContext) -> Result<Arc<ParquetS
         }
     }
     Ok(Arc::new(writer.finish("subquery")?))
+}
+
+/// Writes each query's rows in turn, cast to `schema`, to one temporary table.
+fn union_table(
+    plans: &[LogicalPlan],
+    schema: &arrow_schema::SchemaRef,
+    context: &PrepContext,
+) -> Result<Arc<ParquetSource>> {
+    let engine = QueryEngine::from_handle(context.runtime.clone());
+    let mut writer = TempTableWriter::new(schema)?;
+    for plan in plans {
+        let mut execution = engine.execute(plan, GenerationId(0))?;
+        loop {
+            if context.cancelled() {
+                execution.cancel();
+                return Err(Cancelled.into());
+            }
+            let Some(batch) = execution.next_batch()? else {
+                break;
+            };
+            let columns = batch
+                .batch
+                .columns()
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| {
+                    arrow_cast::cast(column, field.data_type()).with_context(|| {
+                        format!("make the UNION's column {} one type", field.name())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let batch = arrow_array::RecordBatch::try_new_with_options(
+                Arc::clone(schema),
+                columns,
+                &arrow_array::RecordBatchOptions::new()
+                    .with_row_count(Some(batch.batch.num_rows())),
+            )?;
+            writer.write(&batch)?;
+        }
+    }
+    Ok(Arc::new(writer.finish("union")?))
 }
 
 /// The one value a scalar subquery returns, as filter text; `None` for NULL.

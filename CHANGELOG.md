@@ -8,6 +8,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- SQL: `MEDIAN(x)`, `QUANTILE_CONT(x, 0.9)` and `PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY x)`, and `STDDEV` / `STDDEV_POP` / `VARIANCE` / `VAR_POP`, also per group and on calculations.
+- SQL: `REPLACE(text, from, to)`; `DATE_TRUNC('month', day)`; `DATE_DIFF('day', start, end)`; `day + INTERVAL '7 days'` (or `- INTERVAL 1 MONTH`); `NOW()`, `CURRENT_TIMESTAMP` and `CURRENT_DATE`; and `DATE '2024-03-01'` / `TIMESTAMP '…'` values.
+- SQL: `UNION` and `UNION ALL` stack the rows of several queries (column types widen to fit both sides), and `WITH name AS (SELECT …)` names a subquery to use in the query.
 - Find (Ctrl+Shift+F) looks through the whole file. Enter, F3 and the arrows check the loaded rows first, then search the rest of the file in the background, from the selected cell forward or back, and jump to the next match. The find bar shows how far it has got, and a new search or closing the bar stops it.
 - `* contains text` in the filter box (and the CLI's `--filter`) keeps the rows where any column contains the text, ignoring case, e.g. `* contains boston AND year > 2020`. The find bar's new "Show matching rows" button applies it.
 - Open Excel and OpenDocument workbooks (`.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`), a sheet at a time: the first one, or one chosen in the Import options window or with `--sheet`. Columns get their types from the cells (numbers, whole numbers, booleans, dates and times), and the first row names them unless you say otherwise.

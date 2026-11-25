@@ -1,6 +1,6 @@
 # 0013. SQL calculations: on the way out in a plain SELECT, otherwise prepared first
 
-- Status: accepted
+- Status: accepted; more functions (`REPLACE`, `DATE_TRUNC`, `DATE_DIFF`, `± INTERVAL`, `NOW`, `CURRENT_DATE`) are added by [0023](0023-sql-statistics-dates-union.md)
 - Date: 2026-11-15
 - Amends: [0009](0009-joins-and-subqueries.md) (prepared rows also hold calculations)
 
