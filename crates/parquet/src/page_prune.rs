@@ -61,6 +61,8 @@ pub(crate) fn row_group_ranges<R: ChunkReader>(
 ) -> Option<Ranges> {
     match filter {
         FilterExpr::Compare(comparison) => comparison_ranges(comparison, context),
+        // Page indexes hold least and greatest values, not text: no narrowing.
+        FilterExpr::AnyContains(_) => None,
         // Rows must pass every part: what each part allows, intersected.
         FilterExpr::And(parts) => parts
             .iter()
@@ -156,6 +158,8 @@ pub(crate) fn bloom_rules_out<'r, R: ChunkReader + 'r>(
         }
         FilterExpr::And(parts) => parts.iter().any(rules_out),
         FilterExpr::Or(parts) => !parts.is_empty() && parts.iter().all(rules_out),
+        // A bloom filter answers "is this exact value here", not "contains".
+        FilterExpr::AnyContains(_) => false,
     }
 }
 

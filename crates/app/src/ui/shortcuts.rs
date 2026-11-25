@@ -39,7 +39,7 @@ pub(crate) const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+C", "Copy the selection"),
             ("Ctrl+G", "Go to row"),
             ("Ctrl+F", "Filter"),
-            ("Ctrl+Shift+F", "Find in loaded rows"),
+            ("Ctrl+Shift+F", "Find in the file"),
             ("F3 / Shift+F3", "Find next / previous"),
         ],
     ),

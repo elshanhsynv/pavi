@@ -210,7 +210,9 @@ fn read_page(
         PageOutcome::Batches(_) => bail!("page {page} unexpectedly returned record batches"),
         PageOutcome::Filtered(_) => bail!("page {page} unexpectedly returned a filtered window"),
         PageOutcome::Counted(_) => bail!("page {page} unexpectedly returned match counts"),
-        PageOutcome::Checked(_) => bail!("page {page} unexpectedly returned a change check"),
+        PageOutcome::Checked(_) | PageOutcome::FoundText(_) => {
+            bail!("page {page} unexpectedly returned another task's outcome")
+        }
         PageOutcome::SortSpilled(_) | PageOutcome::Merged { .. } => {
             bail!("page {page} unexpectedly returned sorted rows")
         }

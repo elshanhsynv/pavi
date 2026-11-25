@@ -27,6 +27,10 @@ pub enum PageOutcome {
     /// Whether the source's files changed on disk since it opened (see
     /// `RuntimeHandle::submit_change_check`): `Some` says what changed.
     Checked(Option<FileChanged>),
+    /// The cell a whole-file find stopped at, as (row, position among the
+    /// columns searched); `None` when no cell matches (see
+    /// `RuntimeHandle::submit_find_text`).
+    FoundText(Option<(u64, usize)>),
     Cancelled,
     ReadFailed(Error),
 }

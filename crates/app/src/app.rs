@@ -223,6 +223,28 @@ pub(crate) struct FindState {
     pub(crate) message: Option<String>,
     /// Where a search that ran out of its cell budget stopped.
     pub(crate) resume: Option<crate::find::Cell>,
+    /// A search of the whole file in the background (ADR 0022).
+    pub(crate) searching: Option<FileSearch>,
+}
+
+/// A whole-file find running on a worker.
+pub(crate) struct FileSearch {
+    pub(crate) task: pavi_runtime::PageTask,
+    /// The source searched; a result for another one is dropped.
+    pub(crate) source: Arc<ParquetSource>,
+    pub(crate) query: String,
+    pub(crate) backwards: bool,
+    /// The searched columns' display order, as source columns.
+    pub(crate) columns: Vec<usize>,
+}
+
+impl FindState {
+    /// Stops a whole-file search, if one runs.
+    pub(crate) fn cancel_search(&mut self) {
+        if let Some(search) = self.searching.take() {
+            search.task.cancel();
+        }
+    }
 }
 
 /// One row of the Inspector's Row section.
@@ -2425,6 +2447,16 @@ impl PaviApp {
             self.find.message = None;
             return;
         }
+        // A search of the file for this text in this direction is already on its way.
+        if self
+            .find
+            .searching
+            .as_ref()
+            .is_some_and(|search| search.query == query && search.backwards == backwards)
+        {
+            return;
+        }
+        self.find.cancel_search();
         let columns = self.visible_batch_columns();
         let from = self.find.resume.take().or(self.grid.selection);
         let outcome = {
@@ -2455,13 +2487,115 @@ impl PaviApp {
                     ui::theme::number(MAX_FIND_CELLS as u64)
                 )
             }
+            // Every row of the file is loaded and none holds it.
+            (FindOutcome::NotFound, Some((0, end)))
+                if self.filtered.is_none() && end >= self.grid.rows =>
+            {
+                "Not in the file".to_string()
+            }
+            // Not in the rows loaded: the grid shows the file, so look through all of it.
+            (FindOutcome::NotFound, _) if self.filtered.is_none() && self.dataset.is_some() => {
+                self.search_file(query, from, backwards);
+                "Searching the whole file…".to_string()
+            }
             (FindOutcome::NotFound, Some((first, end))) if end > first => format!(
-                "Not in the loaded rows ({}–{})",
+                "Not in the loaded rows ({}–{}); Show matching rows looks through the file",
                 ui::theme::number(first + 1),
                 ui::theme::number(end)
             ),
             (FindOutcome::NotFound, _) => "No rows are loaded yet".to_string(),
         });
+    }
+
+    /// Starts looking for `query` through the whole file from `from`, on a worker.
+    fn search_file(&mut self, query: String, from: Option<(u64, usize)>, backwards: bool) {
+        let (Some(dataset), Some(runtime)) = (&self.dataset, &self.runtime) else {
+            return;
+        };
+        let columns = self.column_layout.visible().to_vec();
+        let task = runtime.handle().submit_find_text(
+            Arc::clone(&dataset.source),
+            parquet_reader::value::TextNeedle::new(&query),
+            columns.clone(),
+            from,
+            backwards,
+            self.grid.generation,
+        );
+        match task {
+            Ok(task) => {
+                self.find.searching = Some(FileSearch {
+                    task,
+                    source: Arc::clone(&dataset.source),
+                    query,
+                    backwards,
+                    columns,
+                });
+            }
+            Err(error) => self.find.message = Some(format!("Can't search the file now: {error}")),
+        }
+    }
+
+    /// Picks up a whole-file search when it ends, and shows how far it is.
+    pub(super) fn poll_find(&mut self) {
+        let Some(search) = &self.find.searching else {
+            return;
+        };
+        let current = self
+            .dataset
+            .as_ref()
+            .is_some_and(|dataset| Arc::ptr_eq(&dataset.source, &search.source));
+        let columns_same = search.columns == self.column_layout.visible();
+        let response = match search.task.try_recv() {
+            Ok(response) => response,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let rows = search.source.row_count().max(1);
+                let looked = search.task.progress().scanned_rows().min(rows);
+                self.find.message = Some(format!(
+                    "Searching the whole file… {}%",
+                    looked * 100 / rows
+                ));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.find.searching = None;
+                return;
+            }
+        };
+        self.find.searching = None;
+        if !current || !columns_same {
+            self.find.message = None;
+            return;
+        }
+        self.find.message = Some(match response.outcome {
+            pavi_runtime::PageOutcome::FoundText(Some((row, column))) => {
+                self.grid.select(row, column);
+                self.jump_target = Some(row);
+                self.reveal_column(column);
+                let name = self.display_column_name(column).unwrap_or_default();
+                format!("Row {}, {name}", ui::theme::number(row + 1))
+            }
+            pavi_runtime::PageOutcome::FoundText(None) => "Not in the file".to_string(),
+            pavi_runtime::PageOutcome::ReadFailed(error) => format!("Search failed: {error:#}"),
+            _ => return,
+        });
+    }
+
+    /// Shows the rows where any column contains the find text: the filter
+    /// `* contains text`, on top of the filter already applied (ADR 0022).
+    fn show_find_matches(&mut self) {
+        let query = self.find.query.trim();
+        if query.is_empty() || self.dataset.is_none() {
+            return;
+        }
+        let any = FilterExpr::AnyContains(query.to_string());
+        let filter = match self.active_filter() {
+            Some(existing) => existing.clone().and(any),
+            None => any,
+        };
+        self.find.cancel_search();
+        self.filter_input = filter.to_string();
+        self.workspace = Workspace::Grid;
+        self.apply_filter();
     }
 
     /// Name of a display column of the grid on screen.
@@ -2623,6 +2757,7 @@ impl eframe::App for PaviApp {
         self.poll_profile();
         self.poll_file_profile();
         self.poll_export();
+        self.poll_find();
         let next_check = self.poll_file_watch(Instant::now());
         self.show_top_bar(ctx);
         ui::toolbar::window_resize_handles(ctx);
@@ -2680,6 +2815,7 @@ impl eframe::App for PaviApp {
             || self.chart.loading()
             || self.profile.loading()
             || self.export.is_running()
+            || self.find.searching.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self

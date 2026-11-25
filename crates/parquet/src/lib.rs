@@ -46,7 +46,7 @@ pub use remote::{
 };
 pub use sort::{MAX_SORT_KEYS, NullOrder, SortBudget, SortDirection, SortSpec, validate_sort_keys};
 pub use source::{
-    Cancelled, FileInfo, FilteredWindow, ParquetSource, ScanCursor, SortOutput,
+    Cancelled, FIND_WINDOW_ROWS, FileInfo, FilteredWindow, ParquetSource, ScanCursor, SortOutput,
     aggregate_output_schema, check_aggregate, check_sort,
 };
 pub use spill::{MAX_SPILL_BYTES, SortMerge, remove_leftover_temp_folders};

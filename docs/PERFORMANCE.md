@@ -25,6 +25,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | Chart series | 6 Y columns | `chart::MAX_SERIES` |
 | Clipboard copy | 16 MB of text; values are formatted only up to the space left | `MAX_CLIPBOARD_BYTES` |
 | Find, one step on the UI thread | 500,000 cells (only rows already loaded) | `find::MAX_FIND_CELLS` |
+| Find through the whole file (ADR 0022) | on a worker, one at a time per tab; the visible columns, 16,384 rows at a time, cancellable between windows | `parquet_reader::FIND_WINDOW_ROWS` |
 | Cell value used as a filter | 1,024 bytes | `MAX_FILTER_VALUE_BYTES` |
 | SQL calculations (ADR 0013) | 256 parts per calculation, 32 calculations per query; evaluated one batch at a time; calculations used to filter, group or sort write a temporary table under the 32 GiB prepared limit | `expr::MAX_EXPR_NODES`, `sql::MAX_CALCULATIONS` |
 | Comparisons in one filter | 64 (each `IN` value counts), 16 levels deep | `filter::MAX_FILTER_TERMS`, `MAX_FILTER_DEPTH` |

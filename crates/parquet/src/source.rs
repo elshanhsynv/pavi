@@ -394,6 +394,24 @@ fn open_file(location: Location, name: &Path) -> Result<OpenedFile> {
     })
 }
 
+/// One stretch of rows [`ParquetSource::find_text`] reads, and the cells in
+/// it that count (cells are numbered row * columns + position).
+struct FindPass {
+    first: u64,
+    end: u64,
+    cells: std::ops::RangeInclusive<u64>,
+}
+
+impl FindPass {
+    fn new(first: u64, end: u64, cells: std::ops::RangeInclusive<u64>) -> Self {
+        Self { first, end, cells }
+    }
+}
+
+/// Rows [`ParquetSource::find_text`] reads at a time; it checks for
+/// cancellation between them.
+pub const FIND_WINDOW_ROWS: usize = 4 * PAGE_ROWS as usize;
+
 /// Remote downloads go in `<temp>/pavi-download-<pid>-<n>/`.
 const DOWNLOAD_PREFIX: &str = "pavi-download-";
 
@@ -956,6 +974,129 @@ impl ParquetSource {
     ) -> Result<RecordBatch> {
         let batches = self.read_window_batches(first_row, row_count, projection)?;
         self.concat_or_empty(projection, batches)
+    }
+
+    /// Finds the next cell, after `from` (before it when `backwards`), whose
+    /// text as the grid shows it contains `needle`, ignoring case, in the
+    /// whole file (ADR 0022). Cells are taken row by row and, within a row, in
+    /// the order of `columns` (source columns, as displayed). The search wraps
+    /// around the file once, so `from` itself is looked at last; with no
+    /// `from` it starts at the first (last) cell. Returns the row and the
+    /// position in `columns`, or `None` when no cell matches.
+    ///
+    /// Rows are read [`FIND_WINDOW_ROWS`] at a time, with only `columns`, and
+    /// `checkpoint(rows looked at)` is called before each window; when it
+    /// returns `true` the search ends with [`Cancelled`].
+    pub fn find_text(
+        &self,
+        needle: &crate::value::TextNeedle,
+        columns: &[usize],
+        from: Option<(u64, usize)>,
+        backwards: bool,
+        checkpoint: &dyn Fn(u64) -> bool,
+    ) -> Result<Option<(u64, usize)>> {
+        let total = self.row_count();
+        let width = columns.len() as u64;
+        if needle.is_empty() || total == 0 || width == 0 {
+            return Ok(None);
+        }
+        let projection = Projection::columns(columns.to_vec(), self.column_count())?;
+        let schema = &self.dataset_metadata.schema;
+        // Columns whose text can never hold the needle are not looked at.
+        let searched = columns
+            .iter()
+            .map(|column| needle.could_match(schema.field(*column).data_type()))
+            .collect::<Vec<_>>();
+        if !searched.contains(&true) {
+            return Ok(None);
+        }
+        // Cells are numbered row * width + position, in reading order.
+        let start = from
+            .map(|(row, position)| row.min(total - 1) * width + (position as u64).min(width - 1));
+        // The rows to read, in order, and which cells of them count: first
+        // from `from` to the end (start), then around to `from`.
+        let passes = match (start, backwards) {
+            (None, _) => vec![FindPass::new(0, total, 0..=u64::MAX)],
+            (Some(start), false) => {
+                let row = start / width;
+                vec![
+                    FindPass::new(row, total, start + 1..=u64::MAX),
+                    FindPass::new(0, row + 1, 0..=start),
+                ]
+            }
+            (Some(start), true) => {
+                let row = start / width;
+                let mut passes = Vec::with_capacity(2);
+                // From the very first cell, nothing comes before it.
+                if let Some(last) = start.checked_sub(1) {
+                    passes.push(FindPass::new(0, row + 1, 0..=last));
+                }
+                passes.push(FindPass::new(row, total, start..=u64::MAX));
+                passes
+            }
+        };
+        let mut looked_at = 0_u64;
+        for FindPass {
+            first,
+            end,
+            cells: counts,
+        } in &passes
+        {
+            let windows = (*first..*end)
+                .step_by(FIND_WINDOW_ROWS)
+                .map(|window| (window, (window + FIND_WINDOW_ROWS as u64).min(*end)))
+                .collect::<Vec<_>>();
+            let ordered: Box<dyn Iterator<Item = &(u64, u64)>> = if backwards {
+                Box::new(windows.iter().rev())
+            } else {
+                Box::new(windows.iter())
+            };
+            for &(window_start, window_end) in ordered {
+                if checkpoint(looked_at) {
+                    return Err(Cancelled.into());
+                }
+                let rows = usize::try_from(window_end - window_start)?;
+                looked_at += rows as u64;
+                let batch = self.read_window(window_start, rows, &projection)?;
+                let matches = batch
+                    .columns()
+                    .iter()
+                    .zip(&searched)
+                    .map(|(array, searched)| {
+                        if *searched {
+                            crate::value::text_matches(array.as_ref(), needle).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let cell_found = |offset: usize, position: usize| {
+                    matches[position]
+                        .as_ref()
+                        .is_some_and(|found| found.value(offset))
+                        && counts
+                            .contains(&((window_start + offset as u64) * width + position as u64))
+                };
+                let offsets: Box<dyn Iterator<Item = usize>> = if backwards {
+                    Box::new((0..batch.num_rows()).rev())
+                } else {
+                    Box::new(0..batch.num_rows())
+                };
+                for offset in offsets {
+                    let positions: Box<dyn Iterator<Item = usize>> = if backwards {
+                        Box::new((0..columns.len()).rev())
+                    } else {
+                        Box::new(0..columns.len())
+                    };
+                    for position in positions {
+                        if cell_found(offset, position) {
+                            return Ok(Some((window_start + offset as u64, position)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn read_page(&self, page_index: u64, projection: &Projection) -> Result<DataPage> {
@@ -6497,5 +6638,114 @@ mod tests {
         let rows = source.read_window(0, 5, &Projection::all(3)).unwrap();
         assert_eq!(texts(&rows, 1), ["null", "null", "null", "x", "y"]);
         assert_eq!(texts(&rows, 2), ["2023", "2023", "2023", "2024", "2024"]);
+    }
+
+    /// 40,000 rows: `id` and `name` ("row <id>", but "Needle" at rows 5 and 35,000).
+    fn find_fixture() -> (TempDir, ParquetSource) {
+        let directory = TempDir::new().unwrap();
+        let names = (0..40_000)
+            .map(|id| {
+                if id == 5 || id == 35_000 {
+                    "Needle".to_string()
+                } else {
+                    format!("row {id}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..40_000)) as ArrayRef,
+            ),
+            (
+                "name",
+                Arc::new(StringArray::from_iter_values(names)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(directory.path(), "find.parquet", &batch, 10_000);
+        let source = ParquetSource::open(directory.path().join("find.parquet")).unwrap();
+        (directory, source)
+    }
+
+    #[test]
+    fn finds_text_anywhere_in_the_file_and_wraps_around() {
+        let (_directory, source) = find_fixture();
+        let needle = crate::value::TextNeedle::new("NEEDLE");
+        let find = |from, backwards| {
+            source
+                .find_text(&needle, &[0, 1], from, backwards, &|_| false)
+                .unwrap()
+        };
+        assert_eq!(find(None, false), Some((5, 1)));
+        assert_eq!(find(Some((5, 1)), false), Some((35_000, 1)));
+        // Past the last match, it wraps to the first.
+        assert_eq!(find(Some((35_000, 1)), false), Some((5, 1)));
+        assert_eq!(find(Some((35_000, 1)), true), Some((5, 1)));
+        assert_eq!(find(Some((5, 1)), true), Some((35_000, 1)));
+        assert_eq!(find(None, true), Some((35_000, 1)));
+        // A cell in the row it starts from, before the start, is looked at last.
+        assert_eq!(find(Some((35_000, 0)), false), Some((35_000, 1)));
+
+        // Columns in display order: the id comes before the name in a row.
+        let digits = crate::value::TextNeedle::new("34999");
+        assert_eq!(
+            source
+                .find_text(&digits, &[0, 1], None, false, &|_| false)
+                .unwrap(),
+            Some((34_999, 0))
+        );
+        assert_eq!(
+            source
+                .find_text(&digits, &[1, 0], None, false, &|_| false)
+                .unwrap(),
+            Some((34_999, 0)),
+            "the name column, shown first"
+        );
+        // Only the columns asked for are searched.
+        assert_eq!(
+            source
+                .find_text(&needle, &[0], None, false, &|_| false)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            source
+                .find_text(
+                    &crate::value::TextNeedle::new("absent"),
+                    &[0, 1],
+                    None,
+                    false,
+                    &|_| false
+                )
+                .unwrap(),
+            None
+        );
+        let error = source
+            .find_text(&needle, &[0, 1], Some((5, 1)), false, &|looked_at| {
+                looked_at > 0
+            })
+            .unwrap_err();
+        assert!(error.is::<Cancelled>(), "{error:#}");
+    }
+
+    #[test]
+    fn filters_rows_with_text_in_any_column() {
+        let (_directory, source) = find_fixture();
+        let all = Projection::all(2);
+        let rows = source
+            .read_filtered_window(
+                &FilterExpr::parse("* contains needle").unwrap(),
+                0,
+                100,
+                &all,
+            )
+            .unwrap();
+        assert_eq!(texts(&rows, 0), ["5", "35000"]);
+        let counts = source
+            .count_matches_by_row_group(&FilterExpr::parse("* contains 3999").unwrap(), &|_| false)
+            .unwrap();
+        // 3999, 13999, 23999, 33999 (id and name), 39990-39999.
+        assert_eq!(counts.iter().sum::<u64>(), 14);
     }
 }

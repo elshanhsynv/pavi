@@ -28,6 +28,8 @@ pub const MAX_FILTER_TERMS: usize = 64;
 pub const MAX_FILTER_DEPTH: usize = 16;
 /// Longest `LIKE` pattern, in characters.
 pub const MAX_LIKE_PATTERN_CHARS: usize = 256;
+/// The column name that stands for every column, with `contains` (ADR 0022).
+pub const ANY_COLUMN: &str = "*";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FilterOp {
@@ -66,6 +68,9 @@ pub enum FilterExpr {
     And(Vec<FilterExpr>),
     /// At least one part must pass.
     Or(Vec<FilterExpr>),
+    /// `* contains text`: the text the grid shows for some cell of the row
+    /// contains this, ignoring case (ADR 0022). Null cells never match.
+    AnyContains(String),
 }
 
 impl FilterExpr {
@@ -80,15 +85,45 @@ impl FilterExpr {
     ///          | column [NOT] BETWEEN value AND value
     ///          | column [NOT] LIKE pattern  % any run of characters, _ one character
     ///          | column IS [NOT] NULL
+    ///          | * contains value          any column's text holds the value
     /// ```
     ///
     /// Keywords are case-insensitive. Quote a value (`"..."` or `'...'`) when it
     /// contains a keyword, a comma or parentheses. A `column` is a column's
     /// name or, when no column has that name, its 0-based position.
     pub fn parse(input: &str) -> Result<Self> {
-        let filter = parse_filter(input, 0)?;
+        let filter = parse_filter(input, 0)?.any_columns()?;
         filter.check_size()?;
         Ok(filter)
+    }
+
+    /// Turns tests on the column `*` into [`Self::AnyContains`]; `*` takes
+    /// `contains` only.
+    fn any_columns(self) -> Result<Self> {
+        match self {
+            Self::Compare(comparison) if comparison.column == ANY_COLUMN => {
+                if comparison.op != FilterOp::Contains {
+                    bail!(
+                        "* stands for every column and works only with contains, \
+                         e.g. * contains \"Boston\""
+                    );
+                }
+                Ok(Self::AnyContains(comparison.value))
+            }
+            Self::And(parts) => Ok(Self::And(
+                parts
+                    .into_iter()
+                    .map(Self::any_columns)
+                    .collect::<Result<_>>()?,
+            )),
+            Self::Or(parts) => Ok(Self::Or(
+                parts
+                    .into_iter()
+                    .map(Self::any_columns)
+                    .collect::<Result<_>>()?,
+            )),
+            other => Ok(other),
+        }
     }
 
     /// The single test `column OP value`.
@@ -115,14 +150,14 @@ impl FilterExpr {
 
     fn comparisons(&self) -> usize {
         match self {
-            Self::Compare(_) => 1,
+            Self::Compare(_) | Self::AnyContains(_) => 1,
             Self::And(parts) | Self::Or(parts) => parts.iter().map(Self::comparisons).sum(),
         }
     }
 
     fn depth(&self) -> usize {
         match self {
-            Self::Compare(_) => 0,
+            Self::Compare(_) | Self::AnyContains(_) => 0,
             Self::And(parts) | Self::Or(parts) => {
                 1 + parts.iter().map(Self::depth).max().unwrap_or_default()
             }
@@ -153,11 +188,24 @@ impl FilterExpr {
             Self::And(parts) | Self::Or(parts) => parts
                 .iter()
                 .try_for_each(|part| part.for_each_comparison(visit)),
+            Self::AnyContains(_) => Ok(()),
+        }
+    }
+
+    /// Whether any part is `* contains`, which reads every column.
+    fn reads_every_column(&self) -> bool {
+        match self {
+            Self::Compare(_) => false,
+            Self::AnyContains(_) => true,
+            Self::And(parts) | Self::Or(parts) => parts.iter().any(Self::reads_every_column),
         }
     }
 
     /// The source columns this filter reads, in ascending order, each once.
     pub fn columns(&self, schema: &Schema) -> Result<Vec<usize>> {
+        if self.reads_every_column() {
+            return Ok((0..schema.fields().len()).collect());
+        }
         let mut columns = Vec::new();
         self.for_each_comparison(&mut |comparison| {
             let column = comparison.column_index(schema)?;
@@ -187,6 +235,21 @@ impl FilterExpr {
             Self::Compare(comparison) => {
                 let position = position_of(comparison.column_index(schema)?)?;
                 comparison.evaluate_batch(batch, position)
+            }
+            Self::AnyContains(text) => {
+                let needle = crate::value::TextNeedle::new(text);
+                let mut combined = vec![false; batch.num_rows()];
+                for column in 0..schema.fields().len() {
+                    let array = batch
+                        .columns()
+                        .get(position_of(column)?)
+                        .ok_or_else(|| anyhow!("column {column} was not read"))?;
+                    let matches = crate::value::text_matches(array.as_ref(), &needle)?;
+                    for (row, found) in matches.values().iter().enumerate() {
+                        combined[row] |= found;
+                    }
+                }
+                Ok(BooleanArray::from(combined))
             }
             Self::And(parts) | Self::Or(parts) => {
                 let all = matches!(self, Self::And(_));
@@ -232,6 +295,8 @@ impl FilterExpr {
                 .is_none_or(|(statistics, data_type)| {
                     comparison.might_match_statistics(statistics, data_type)
                 }),
+            // Statistics hold a column's least and greatest value, not its text.
+            Self::AnyContains(_) => true,
             Self::And(parts) => parts
                 .iter()
                 .all(|part| part.might_match(schema, column_statistics)),
@@ -257,6 +322,7 @@ impl FilterExpr {
                 .is_some_and(|(statistics, data_type)| {
                     comparison.must_match_statistics(statistics, data_type)
                 }),
+            Self::AnyContains(_) => false,
             Self::And(parts) => parts
                 .iter()
                 .all(|part| part.must_match(schema, column_statistics)),
@@ -273,6 +339,12 @@ impl std::fmt::Display for FilterExpr {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Compare(comparison) => comparison.fmt(formatter),
+            Self::AnyContains(text) => Comparison {
+                column: ANY_COLUMN.to_string(),
+                op: FilterOp::Contains,
+                value: text.clone(),
+            }
+            .fmt(formatter),
             Self::And(parts) | Self::Or(parts) => {
                 let all = matches!(self, Self::And(_));
                 for (index, part) in parts.iter().enumerate() {
@@ -1605,6 +1677,64 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::*;
+
+    #[test]
+    fn any_column_contains_parses_prints_and_matches_every_column() {
+        let filter = FilterExpr::parse("* contains bos").unwrap();
+        assert_eq!(filter, FilterExpr::AnyContains("bos".to_string()));
+        assert_eq!(filter.to_string(), "* contains bos");
+        let quoted = FilterExpr::parse("* CONTAINS \"new york\" AND id > 1").unwrap();
+        assert_eq!(quoted.to_string(), "* contains \"new york\" AND id > 1");
+        assert_eq!(FilterExpr::parse(&quoted.to_string()).unwrap(), quoted);
+        for wrong in ["* == bos", "* IN (a, b)", "* IS NULL", "* LIKE b%"] {
+            let error = FilterExpr::parse(wrong).unwrap_err().to_string();
+            assert!(
+                error.contains("works only with contains"),
+                "{wrong}: {error}"
+            );
+        }
+
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from(vec![1, 2, 3, 120])) as arrow_array::ArrayRef,
+            ),
+            (
+                "city",
+                Arc::new(StringArray::from(vec![
+                    Some("Boston"),
+                    Some("Austin"),
+                    None,
+                    Some("Lisbon"),
+                ])) as arrow_array::ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        // Every column is read; a number matches its text.
+        assert_eq!(filter.columns(&schema).unwrap(), [0, 1]);
+        assert_eq!(
+            filter.evaluate_batch(&batch).unwrap(),
+            BooleanArray::from(vec![true, false, false, false])
+        );
+        assert_eq!(
+            FilterExpr::parse("* contains 2")
+                .unwrap()
+                .evaluate_batch(&batch)
+                .unwrap(),
+            BooleanArray::from(vec![false, true, false, true])
+        );
+        assert_eq!(
+            FilterExpr::parse("* contains ON AND id < 100")
+                .unwrap()
+                .evaluate_batch(&batch)
+                .unwrap(),
+            BooleanArray::from(vec![true, false, false, false])
+        );
+        // Statistics can't rule a row group out, or prove it all matches.
+        assert!(filter.might_match(&schema, &|_| None));
+        assert!(!filter.must_match(&schema, &|_| None));
+    }
 
     #[test]
     fn float32_columns_match_the_value_they_display() {
