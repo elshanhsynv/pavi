@@ -122,6 +122,12 @@ enum ReadOperation {
         filter: FilterExpr,
     },
     CheckChanged,
+    FindText {
+        needle: parquet_reader::value::TextNeedle,
+        columns: Vec<usize>,
+        from: Option<(u64, usize)>,
+        backwards: bool,
+    },
 }
 
 struct PageRequest {
@@ -480,6 +486,33 @@ impl RuntimeHandle {
         )
     }
 
+    /// Finds the next cell whose text contains `needle` in the whole file
+    /// (`ParquetSource::find_text`, ADR 0022); the outcome is
+    /// [`PageOutcome::FoundText`]. Reports how many rows it has looked at and
+    /// stops between windows when cancelled.
+    pub fn submit_find_text(
+        &self,
+        source: Arc<ParquetSource>,
+        needle: parquet_reader::value::TextNeedle,
+        columns: Vec<usize>,
+        from: Option<(u64, usize)>,
+        backwards: bool,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        self.submit_read(
+            source,
+            Projection::all(0),
+            generation_id,
+            ReadOperation::FindText {
+                needle,
+                columns,
+                from,
+                backwards,
+            },
+            None,
+        )
+    }
+
     /// Checks whether the source's files changed on disk since it opened
     /// (`ParquetSource::check_changed`); the outcome is [`PageOutcome::Checked`].
     pub fn submit_change_check(
@@ -765,6 +798,14 @@ fn read_source(
         ReadOperation::CheckChanged => source
             .check_changed(&|| checkpoint(0))
             .map(PageOutcome::Checked),
+        ReadOperation::FindText {
+            needle,
+            columns,
+            from,
+            backwards,
+        } => source
+            .find_text(&needle, &columns, from, backwards, checkpoint)
+            .map(PageOutcome::FoundText),
     }
 }
 

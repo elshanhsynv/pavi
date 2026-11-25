@@ -117,7 +117,8 @@ pub struct Args {
     /// Only rows that match: -f "DEP_DELAY > 60 AND ORIGIN = 'JFK'"
     ///
     /// Tests joined by AND / OR, with brackets: = != < <= > >= contains,
-    /// [NOT] IN (a, b), [NOT] BETWEEN a AND b, [NOT] LIKE 'a%', IS [NOT] NULL.
+    /// [NOT] IN (a, b), [NOT] BETWEEN a AND b, [NOT] LIKE 'a%', IS [NOT] NULL,
+    /// and `* contains TEXT`: any column's text holds TEXT, ignoring case.
     /// Quote a value that holds spaces, commas, brackets or keywords.
     #[arg(short, long, value_name = "EXPR", help_heading = "Choosing rows")]
     pub filter: Option<String>,

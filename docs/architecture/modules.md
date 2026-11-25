@@ -92,7 +92,7 @@ crates/app/src/                (pavi)
 ├── watch.rs        FileWatch: the open tab's change checks every 2 s, reload_document (keeps filter and sort) (ADR 0018, mounted inside app.rs)
 ├── state.rs        GridState, ColumnLayout (order, hidden, widths, pinned count, number formats), SelectionRange, LoadState, Workspace, ToolbarCommand
 ├── export.rs       ExportState, ExportTask (own thread), progress, temp-file + rename; the writers are parquet_reader::export::BatchWriter
-├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped
+├── find.rs         find text in the loaded rows: bounded steps that resume where they stopped (the whole-file search is `FileSearch` in app.rs, ADR 0022)
 ├── import.rs       ImportChoice (format + ImportOptions, as kept in the session), ImportDialog state (ADR 0020)
 ├── profile.rs      ProfileState, ProfileTask and FileProfileTask (own threads), ProfileAccumulator (parquet_reader::profile statistics + distribution chart), ColumnProfile (derefs to ColumnStats)
 ├── chart.rs        ChartState, ChartConfig, ChartAccumulator, ChartModel (bounded sampling/binning, series), image saving

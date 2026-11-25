@@ -516,8 +516,8 @@ impl Running {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
                 PageOutcome::Counted(_) => bail!("runtime returned match counts for a query read"),
-                PageOutcome::Checked(_) => {
-                    bail!("runtime returned a change check for a query read")
+                PageOutcome::Checked(_) | PageOutcome::FoundText(_) => {
+                    bail!("runtime returned another task's outcome for a query read")
                 }
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {
@@ -606,8 +606,8 @@ impl Running {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
                 PageOutcome::Counted(_) => bail!("runtime returned match counts for a query read"),
-                PageOutcome::Checked(_) => {
-                    bail!("runtime returned a change check for a query read")
+                PageOutcome::Checked(_) | PageOutcome::FoundText(_) => {
+                    bail!("runtime returned another task's outcome for a query read")
                 }
                 PageOutcome::Cancelled => bail!("query task {} was cancelled", response.task_id.0),
                 PageOutcome::ReadFailed(error) => {

@@ -449,6 +449,7 @@ impl PaviApp {
         response.on_hover_text(
             "column == value, !=, >, >=, <, <=, contains, LIKE a%\n\
              column IN (a, b), BETWEEN a AND b, IS NULL; NOT IN / NOT LIKE / IS NOT NULL\n\
+             * contains text: any column holds the text\n\
              Join tests with AND and OR; group them with brackets\n\
              Enter applies the filter (Ctrl+F)",
         );

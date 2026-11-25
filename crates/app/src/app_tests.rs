@@ -1129,8 +1129,13 @@ fn finds_text_in_loaded_rows_and_scrolls_to_it() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);
     app.find.query = "BETA".to_string();
+    // With no rows loaded, the whole file is searched (see the next test).
     app.find_next(false);
-    assert_eq!(app.find.message.as_deref(), Some("No rows are loaded yet"));
+    assert_eq!(
+        app.find.message.as_deref(),
+        Some("Searching the whole file…")
+    );
+    app.find.cancel_search();
 
     app.request_page(0);
     poll_until_page_loaded(&mut app, 0);
@@ -1152,10 +1157,9 @@ fn finds_text_in_loaded_rows_and_scrolls_to_it() {
     app.find.query = "zzz".to_string();
     app.find_next(false);
     assert_eq!(app.grid.selection, Some((7, 1)));
-    assert_eq!(
-        app.find.message.as_deref(),
-        Some("Not in the loaded rows (1–8)")
-    );
+    // Every row is loaded, so there is nothing more to search.
+    assert_eq!(app.find.message.as_deref(), Some("Not in the file"));
+    assert!(app.find.searching.is_none());
 
     // In a filtered result, find looks at the result rows.
     app.filter_input = "id >= 4".to_string();
@@ -3126,5 +3130,80 @@ fn opens_an_excel_workbook_and_offers_its_sheets() {
     assert_eq!(
         dialog.read_as.as_deref(),
         Some("Excel, sheet Data (1 of 1), header row")
+    );
+}
+
+fn poll_until_found(app: &mut PaviApp) {
+    for _ in 0..2_000 {
+        app.poll_find();
+        if app.find.searching.is_none() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the file search did not finish");
+}
+
+#[test]
+fn finds_text_in_rows_not_loaded_by_searching_the_whole_file() {
+    let (_directory, source, path) = source(50_000);
+    let mut app = make_app(source, path);
+    app.open_find();
+    app.find.query = "BETA".to_string();
+    // No rows are loaded, so the file itself is searched.
+    app.find_next(false);
+    assert!(app.find.searching.is_some());
+    poll_until_found(&mut app);
+    assert_eq!(app.grid.selection, Some((1, 1)));
+    assert_eq!(app.jump_target, Some(1));
+    assert_eq!(app.find.message.as_deref(), Some("Row 2, name"));
+
+    app.find_next(false);
+    poll_until_found(&mut app);
+    assert_eq!(app.grid.selection, Some((3, 1)));
+    app.find_next(true);
+    poll_until_found(&mut app);
+    assert_eq!(app.grid.selection, Some((1, 1)));
+    // From the first match, back wraps around to the last.
+    app.find_next(true);
+    poll_until_found(&mut app);
+    assert_eq!(app.grid.selection, Some((49_999, 1)));
+
+    app.find.query = "gamma".to_string();
+    app.find_next(false);
+    poll_until_found(&mut app);
+    assert_eq!(app.find.message.as_deref(), Some("Not in the file"));
+
+    // Closing the find bar stops a search on its way.
+    app.find.query = "alpha".to_string();
+    app.find_next(false);
+    app.find.cancel_search();
+    assert!(app.find.searching.is_none());
+}
+
+#[test]
+fn shows_the_rows_where_any_column_contains_the_find_text() {
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    app.filter_input = "id < 10".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    app.find.query = "beta".to_string();
+    app.show_find_matches();
+    poll_until_idle(&mut app);
+    // On top of the filter already applied.
+    assert_eq!(app.filter_input, "id < 10 AND * contains beta");
+    assert_eq!(filtered_ids(&app), ["1", "3", "5", "7", "9"]);
+
+    // Numbers are searched as the grid shows them.
+    app.filter_input = "* contains 7".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    assert_eq!(
+        filtered_ids(&app),
+        [
+            "7", "17", "27", "37", "47", "57", "67", "70", "71", "72", "73", "74", "75", "76",
+            "77", "78", "79"
+        ]
     );
 }

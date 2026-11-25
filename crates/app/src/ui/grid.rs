@@ -1187,6 +1187,7 @@ impl PaviApp {
     fn show_find_bar(&mut self, ui: &mut egui::Ui) {
         let mut search = None;
         let mut close = false;
+        let mut show_matches = false;
         egui::Frame::new()
             .fill(theme::panel())
             .inner_margin(Spacing::Md.symmetric(Spacing::Sm))
@@ -1198,7 +1199,7 @@ impl PaviApp {
                         egui::TextEdit::singleline(&mut self.find.query)
                             .id(find_box_id())
                             .desired_width(FIND_BOX_WIDTH)
-                            .hint_text("Find in loaded rows"),
+                            .hint_text("Find in the file"),
                     );
                     if std::mem::take(&mut self.find.focus) {
                         response.request_focus();
@@ -1206,6 +1207,7 @@ impl PaviApp {
                     if response.changed() {
                         self.find.resume = None;
                         self.find.message = None;
+                        self.find.cancel_search();
                     }
                     if response.lost_focus() {
                         if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -1228,6 +1230,16 @@ impl PaviApp {
                     {
                         search = Some(false);
                     }
+                    show_matches = ui
+                        .add_enabled(
+                            !self.find.query.trim().is_empty(),
+                            egui::Button::new("Show matching rows"),
+                        )
+                        .on_hover_text(
+                            "Filter to the rows where any column contains this text \
+                             (* contains …)",
+                        )
+                        .clicked();
                     if let Some(message) = &self.find.message {
                         ui.label(
                             RichText::new(message)
@@ -1245,7 +1257,7 @@ impl PaviApp {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(
-                                    "Looks only at the rows loaded in memory; filter to search the whole file.",
+                                    "Looks at the loaded rows first, then the whole file; in a filter, sort or SQL result, only at its loaded rows.",
                                 )
                                 .font(theme::small())
                                 .color(theme::muted()),
@@ -1258,7 +1270,11 @@ impl PaviApp {
         if let Some(backwards) = search {
             self.find_next(backwards);
         }
+        if show_matches {
+            self.show_find_matches();
+        }
         if close {
+            self.find.cancel_search();
             self.find = Default::default();
         }
     }

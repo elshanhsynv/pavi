@@ -8,6 +8,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Added
+- Find (Ctrl+Shift+F) looks through the whole file. Enter, F3 and the arrows check the loaded rows first, then search the rest of the file in the background, from the selected cell forward or back, and jump to the next match. The find bar shows how far it has got, and a new search or closing the bar stops it.
+- `* contains text` in the filter box (and the CLI's `--filter`) keeps the rows where any column contains the text, ignoring case, e.g. `* contains boston AND year > 2020`. The find bar's new "Show matching rows" button applies it.
 - Open Excel and OpenDocument workbooks (`.xlsx`, `.xlsm`, `.xlsb`, `.xls`, `.ods`), a sheet at a time: the first one, or one chosen in the Import options window or with `--sheet`. Columns get their types from the cells (numbers, whole numbers, booleans, dates and times), and the first row names them unless you say otherwise.
 - Export to Excel (`.xlsx`): from the Export menu, or with `-o result.xlsx` / `--format xlsx` in the CLI. Numbers, booleans and dates stay numbers, booleans and dates in Excel. A sheet holds at most 1,048,575 rows; larger results need CSV or Parquet.
 - Folders whose files have different columns open as one table. Columns are matched by name; a column some files lack is empty (null) in their rows; a column stored as different types is read as one that holds both (`Int32` and `Int64` as `Int64`, an integer and a float as `Float64`, text types as large text, decimals with enough digits). Columns whose types can't be combined (say, a number in one file and text in another) still stop the open, with a message naming both files.

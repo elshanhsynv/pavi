@@ -404,6 +404,7 @@ impl PaviApp {
         self.cancel_export();
         self.record_sql_history(false, None);
         self.cancel_filter();
+        self.find.cancel_search();
         self.chart.reset();
         self.profile.reset();
     }

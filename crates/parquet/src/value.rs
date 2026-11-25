@@ -907,8 +907,123 @@ pub fn temporal_text(data_type: &DataType, value: f64) -> Option<String> {
     scalar_text(array.as_ref(), 0).ok().flatten()
 }
 
+/// Text looked for in cells, ignoring case: what find and `* contains`
+/// match (ADR 0022). A cell matches when the text the grid shows for it
+/// contains the needle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextNeedle {
+    lower: String,
+}
+
+impl TextNeedle {
+    pub fn new(text: &str) -> Self {
+        Self {
+            lower: text.to_lowercase(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lower.is_empty()
+    }
+
+    /// Whether `haystack` contains the needle, ignoring case.
+    pub fn found_in(&self, haystack: &str) -> bool {
+        let needle = self.lower.as_bytes();
+        if needle.is_empty() {
+            return true;
+        }
+        if self.lower.is_ascii() {
+            // No allocation: an ASCII needle is compared byte by byte, and a
+            // non-ASCII byte never equals an ASCII one.
+            return haystack
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle));
+        }
+        haystack.to_lowercase().contains(&self.lower)
+    }
+
+    /// Whether a value of this type can ever show text containing the needle:
+    /// a number never shows a letter other than those of `e`, `NaN` and `inf`,
+    /// a boolean only `true` or `false`, a date only digits and `-`. Columns
+    /// that can't are not looked at.
+    pub fn could_match(&self, data_type: &DataType) -> bool {
+        let only = |allowed: &str| self.lower.chars().all(|c| allowed.contains(c));
+        match data_type {
+            DataType::Dictionary(_, values) => self.could_match(values),
+            data_type if crate::types::is_signed_integer(data_type) => only("0123456789-"),
+            data_type if crate::types::is_unsigned_integer(data_type) => only("0123456789"),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => only("0123456789-+.einfa"),
+            DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..) => only("0123456789-."),
+            DataType::Boolean => "true".contains(&self.lower) || "false".contains(&self.lower),
+            DataType::Date32 => only("0123456789-"),
+            _ => true,
+        }
+    }
+}
+
+/// For each row of `array`, whether the text the grid shows for it contains
+/// `needle`, ignoring case. A null never matches.
+pub fn text_matches(array: &dyn Array, needle: &TextNeedle) -> Result<BooleanArray> {
+    let rows = array.len();
+    if !needle.could_match(array.data_type()) {
+        return Ok(BooleanArray::from(vec![false; rows]));
+    }
+    let mut matches = Vec::with_capacity(rows);
+    if is_scalar_type(array.data_type()) {
+        let texts = ScalarTexts::new(array)?;
+        let mut text = String::new();
+        for row in 0..rows {
+            text.clear();
+            matches.push(texts.write(row, &mut text)? && needle.found_in(&text));
+        }
+    } else {
+        for row in 0..rows {
+            matches.push(!array.is_null(row) && needle.found_in(&format_cell(array, row)));
+        }
+    }
+    Ok(BooleanArray::from(matches))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn matches_text_as_the_grid_shows_it_ignoring_case() {
+        use std::sync::Arc;
+
+        let needle = TextNeedle::new("bOs");
+        assert!(needle.found_in("Boston"));
+        assert!(needle.found_in("in BOSTON"));
+        assert!(!needle.found_in("Bo s"));
+        assert!(TextNeedle::new("zoë").found_in("ZOË Smith"));
+        assert!(TextNeedle::new("").found_in("anything"));
+
+        let names: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some("Boston"), None, Some("bos")]));
+        assert_eq!(
+            text_matches(names.as_ref(), &needle).unwrap(),
+            BooleanArray::from(vec![true, false, true])
+        );
+        // Numbers match their text; a letter can't be in a number.
+        let numbers: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1205, -12, 7]));
+        assert_eq!(
+            text_matches(numbers.as_ref(), &TextNeedle::new("-12")).unwrap(),
+            BooleanArray::from(vec![false, true, false])
+        );
+        assert!(!TextNeedle::new("x").could_match(&DataType::Int64));
+        assert!(TextNeedle::new("nan").could_match(&DataType::Float64));
+        assert!(TextNeedle::new("ru").could_match(&DataType::Boolean));
+        assert!(!TextNeedle::new("yes").could_match(&DataType::Boolean));
+        let dates: Arc<dyn Array> = Arc::new(arrow_array::Date32Array::from(vec![19_782]));
+        assert_eq!(
+            text_matches(dates.as_ref(), &TextNeedle::new("02-29")).unwrap(),
+            BooleanArray::from(vec![true])
+        );
+    }
+
     use arrow_array::{
         ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
         DurationSecondArray, Float64Array, Int32Array, LargeListArray, ListArray, StringArray,

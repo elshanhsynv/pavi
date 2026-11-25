@@ -119,6 +119,10 @@ sequenceDiagram
     Q->>RT: submit_cursor(same cursor, 4096)
 ```
 
+**Text in any column** (ADR 0022): `* contains text` parses to `FilterExpr::AnyContains`. `columns()` is every source column; evaluation ORs `value::text_matches` over them (the shown text, ignoring case; columns whose type can't show the text are skipped). It never prunes by statistics, page index or bloom filter. The find bar's "Show matching rows" applies it, joined with `AND` to the active filter.
+
+**Find** (`find_next`, `poll_find`): the loaded rows first (`find::find`, on the UI thread, 500,000 cells a step). On the file's own grid, when they don't hold the text, `RuntimeHandle::submit_find_text` runs `ParquetSource::find_text` from the selected cell: the visible columns, 16,384 rows at a time, forward or back, wrapping once. The task's `ScanProgress` gives the share shown in the find bar; the result selects the cell and jumps to its row. A new query, closing the bar or `cancel_tab_work` cancel it.
+
 ## 4.4 Sort (Sort menu, header right-click, SQL ORDER BY)
 
 1. The Sort menu in the top bar calls `toggle_sort(source_column)` (Asc → Desc → Asc, by that column alone). A right-click on a grid header offers "Sort ascending" / "Sort descending" (`HeaderAction::Sort`, by that column alone) and, once something is sorted, "Then by ascending" / "Then by descending" (`HeaderAction::ThenSort`, adds the column as the next key or changes its direction). All end in `apply_sort(keys)`, which replaces the plan's sort (`LogicalPlan::replace_sort`) and keeps any filter. A plain header click only selects the column. SQL `ORDER BY a DESC, b` builds the same `Vec<SortSpec>`. At most `MAX_SORT_KEYS` (8) keys; nulls are last unless SQL says `NULLS FIRST`.

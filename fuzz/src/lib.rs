@@ -300,6 +300,9 @@ pub const FILTER_SEEDS: &[&str] = &[
     "amount == 12.340 OR at BETWEEN 00:10:00 AND 00:20:00.5",
     "wait >= PT1.5S AND wait < 5000",
     "blob == 0x05000000 OR category == 'red'",
+    "* contains me-1",
+    "* contains \"2023-12\" OR id > 3",
+    "(* contains RED AND score < 2) OR * contains é",
 ];
 
 pub const SQL_SEEDS: &[&str] = &[
