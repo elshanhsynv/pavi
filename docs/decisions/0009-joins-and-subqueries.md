@@ -1,6 +1,6 @@
 # 0009. Joins and subqueries are evaluated into a temporary table first
 
-- Status: accepted
+- Status: accepted; `UNION` and `WITH` are added by [0023](0023-sql-statistics-dates-union.md)
 - Date: 2026-11-12
 - Amends: [0004](0004-custom-query-engine.md) (the engine reads one source per query)
 

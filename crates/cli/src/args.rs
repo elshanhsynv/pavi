@@ -249,9 +249,11 @@ pub struct Args {
     /// Run a SQL query; FILE is the table `dataset`
     ///
     /// The same SQL as the app's editor: WHERE, ORDER BY, LIMIT, GROUP BY with
-    /// HAVING, COUNT / SUM / AVG / MIN / MAX and COUNT(DISTINCT …), SELECT
-    /// DISTINCT, AS aliases, calculations (arithmetic, CASE, CAST, UPPER, YEAR,
-    /// …), INNER and LEFT joins, and subqueries. FILE can also be named by its
+    /// HAVING, COUNT / SUM / AVG / MIN / MAX, COUNT(DISTINCT …), MEDIAN,
+    /// QUANTILE_CONT, STDDEV and VARIANCE, SELECT DISTINCT, AS aliases,
+    /// calculations (arithmetic, CASE, CAST, UPPER, REPLACE, YEAR, DATE_TRUNC,
+    /// DATE_DIFF, + INTERVAL '7 days', NOW() …), INNER and LEFT joins,
+    /// subqueries, UNION [ALL] and WITH. FILE can also be named by its
     /// file name (flights.parquet → flights). --head and --offset cut the
     /// result.
     #[arg(

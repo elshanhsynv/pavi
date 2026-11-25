@@ -77,7 +77,8 @@ crates/runtime/src/            (pavi_runtime)
 
 crates/query/src/              (pavi_query)
 ├── sql.rs          SqlAst::parse, Tables, to_logical_plan(_with): direct plans, and prepared plans for joins and subqueries
-├── prep.rs         Prep tree (tables, subqueries, filters, joins) and PrepTask, the thread that runs it (ADR 0009)
+├── prep.rs         Prep tree (tables, subqueries, filters, joins, unions) and PrepTask, the thread that runs it (ADR 0009, 0023)
+├── dates.rs        DATE_TRUNC, DATE_DIFF, ± INTERVAL and NOW on wall-clock time in the column's zone (chrono) (ADR 0023)
 ├── logical.rs      LogicalPlan tree (Scan/Prepared/Projection/Filter/Limit/Sort/Aggregate), replace_sort, bind
 ├── planner.rs      Planner::validate (schema only, also for prepared plans) and Planner::plan → PhysicalPlan
 └── execution.rs    QueryEngine, QueryExecution (a preparing stage, then Running: next_batch / poll_next_batch / wait_next_batch), QueryPoll
@@ -176,7 +177,7 @@ State changes happen by direct method calls. Every "restart" (open, filter, SQL,
 | `DatasetMetadata`, `RowGroupInfo`, `ColumnInfo`, `ColumnStatistics` | Schema, cumulative row ranges per row group, stringified min/max/null/distinct per (column, row group) | `crates/parquet/src/metadata.rs` |
 | `Projection` | Ordered unique top-level column indexes; `parquet_columns()` gives sorted order for the reader | `projection.rs` |
 | `FilterExpr` | A tree of `Comparison`s joined by `And` / `Or`. A `Comparison` is `col OP value` with `== != > >= < <= contains LIKE NOT LIKE IS NULL IS NOT NULL`; `col` is a name, or a 0-based position when no column has that name (`column_index`); a null cell passes only `IS NULL`. `IN` / `BETWEEN` are parsed into comparisons. The value is parsed for the column's type (`ordered_value`): integers exactly (as `i128`), floats as `f64` (rounded to the nearest `f32` for `Float32` columns, so a filter on the displayed value matches the cell), decimals as unscaled integers in the column's scale (`decimal_value`), times as `HH:MM:SS[.fff]` in the column's unit, dates as `YYYY-MM-DD`, timestamps as `YYYY-MM-DD[THH:MM:SS][offset]` (read in the column's time zone when no offset is given). Row-group pruning reads statistics in the same units | `filter.rs:28-157` |
-| `SortSpec`/`SortBudget`, `AggregateSpec`/`GroupBudget` | Up to 8 sort keys (a `&[SortSpec]`, most significant first); up to 8 GROUP BY columns with COUNT/SUM/AVG/MIN/MAX | `sort.rs`, `aggregate.rs` |
+| `SortSpec`/`SortBudget`, `AggregateSpec`/`GroupBudget` | Up to 8 sort keys (a `&[SortSpec]`, most significant first); up to 8 GROUP BY columns with COUNT/SUM/AVG/MIN/MAX, COUNT(DISTINCT), STDDEV/VARIANCE (Welford) and MEDIAN/QUANTILE_CONT (values kept, `MAX_QUANTILE_VALUES`) | `sort.rs`, `aggregate.rs` |
 | `SqlAst` → `LogicalPlan` → `Planner` → `PhysicalPlan` | Parse → tree → validated flat struct `{projection, filter, limit, sort, aggregate}` (operator order is ignored) | `crates/query/src/{sql,logical,planner}.rs` |
 | `format_cell_with_limit` / `scalar_text` / `ScalarTexts` | Arrow value → text. Display is truncated (nested ≤8 deep/≤16 items); `scalar_text` is full-length for scalars. `ScalarTexts::new(array)` looks at the type (and builds the date/timestamp/decimal formatter) once per column and appends each row's text to a reused buffer; `scalar_text` is the same code for one value, and the grid's leaf text uses the same `leaf_writer` | `value.rs` |
 | `value_tree` / `decimal_f64` | A nested cell as a bounded tree for the Inspector; a decimal as a float for charts and profile means | `value.rs` |

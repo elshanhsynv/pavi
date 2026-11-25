@@ -256,7 +256,18 @@ pub struct SqlRelation {
 pub enum SqlTable {
     Named(String),
     Subquery(Box<SqlAst>),
+    /// `part UNION [ALL] part …` (ADR 0023): the parts' rows one after the
+    /// other; without `ALL`, each distinct row once.
+    Union {
+        parts: Vec<SqlAst>,
+        all: bool,
+    },
 }
+
+/// Parts one `UNION` may join.
+pub const MAX_UNION_PARTS: usize = 16;
+/// Names one `WITH` may define.
+pub const MAX_WITH_NAMES: usize = 16;
 
 /// `[INNER | LEFT] JOIN relation ON a = b [AND c = d …]`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -329,18 +340,17 @@ impl SqlAggregateExpr {
 
 impl std::fmt::Display for SqlAggregateExpr {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let function = match self.function {
-            AggregateFunction::Count | AggregateFunction::CountDistinct => "COUNT",
-            AggregateFunction::Sum => "SUM",
-            AggregateFunction::Avg => "AVG",
-            AggregateFunction::Min => "MIN",
-            AggregateFunction::Max => "MAX",
-        };
+        let function = self.function.sql_name();
         match (&self.column, self.function) {
             (None, _) => write!(formatter, "{function}(*)"),
             (Some(column), AggregateFunction::CountDistinct) => {
                 write!(formatter, "COUNT(DISTINCT {column})")
             }
+            (Some(column), AggregateFunction::Quantile(_)) => write!(
+                formatter,
+                "{function}({column}, {})",
+                self.function.quantile_fraction().unwrap_or_default()
+            ),
             (Some(column), _) => write!(formatter, "{function}({column})"),
         }
     }
@@ -590,9 +600,84 @@ impl SqlAst {
         if depth > MAX_SUBQUERY_DEPTH {
             bail!("subqueries nest at most {MAX_SUBQUERY_DEPTH} deep");
         }
-        if query.with.is_some() {
-            bail!("WITH queries are not supported");
+        // `WITH name AS (…)`: each name is a subquery, written where it is used.
+        let mut named: Vec<(String, SqlAst)> = Vec::new();
+        if let Some(with) = &query.with {
+            if with.recursive {
+                bail!("WITH RECURSIVE is not supported");
+            }
+            if with.cte_tables.len() > MAX_WITH_NAMES {
+                bail!("WITH defines at most {MAX_WITH_NAMES} names");
+            }
+            for table in &with.cte_tables {
+                if !table.alias.columns.is_empty() {
+                    bail!("WITH name(columns) is not supported; name the columns with AS inside");
+                }
+                let name = table.alias.name.value.clone();
+                if named
+                    .iter()
+                    .any(|(earlier, _)| earlier.eq_ignore_ascii_case(&name))
+                {
+                    bail!("WITH defines {name} twice");
+                }
+                let mut definition = Self::from_query(&table.query, depth + 1)?;
+                // A name can use the names defined before it.
+                definition.inline_named(&named);
+                named.push((name, definition));
+            }
         }
+        let mut ast = Self::from_query_body(query, depth)?;
+        ast.inline_named(&named);
+        Ok(ast)
+    }
+
+    /// Puts each `WITH` definition in place of the tables named after it.
+    fn inline_named(&mut self, named: &[(String, SqlAst)]) {
+        if named.is_empty() {
+            return;
+        }
+        let relations = std::iter::once(&mut self.from.first)
+            .chain(self.from.joins.iter_mut().map(|join| &mut join.relation));
+        for relation in relations {
+            match &mut relation.table {
+                SqlTable::Named(name) => {
+                    if let Some((found, definition)) = named
+                        .iter()
+                        .find(|(defined, _)| defined.eq_ignore_ascii_case(name))
+                    {
+                        if relation.alias.is_none() {
+                            relation.alias = Some(found.clone());
+                        }
+                        relation.table = SqlTable::Subquery(Box::new(definition.clone()));
+                    }
+                }
+                SqlTable::Subquery(query) => query.inline_named(named),
+                SqlTable::Union { parts, .. } => {
+                    for part in parts {
+                        part.inline_named(named);
+                    }
+                }
+            }
+        }
+        fn in_predicate(predicate: &mut SqlPredicate, named: &[(String, SqlAst)]) {
+            match predicate {
+                SqlPredicate::Compare { .. } => {}
+                SqlPredicate::InSubquery { query, .. }
+                | SqlPredicate::CompareSubquery { query, .. } => query.inline_named(named),
+                SqlPredicate::And(parts) | SqlPredicate::Or(parts) => {
+                    for part in parts {
+                        in_predicate(part, named);
+                    }
+                }
+            }
+        }
+        if let Some(predicate) = &mut self.predicate {
+            in_predicate(predicate, named);
+        }
+    }
+
+    /// The query without its `WITH`: one SELECT, or a `UNION` of them.
+    fn from_query_body(query: &Query, depth: usize) -> Result<Self> {
         if query.fetch.is_some() {
             bail!("FETCH is not supported; use LIMIT");
         }
@@ -604,8 +689,47 @@ impl SqlAst {
         let limit = parse_limit(query.limit_clause.as_ref())?;
         let mut calcs = SqlCalcs::default();
         let sort = parse_order_by(query.order_by.as_ref(), &mut calcs)?;
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            bail!("only a single SELECT is supported (no UNION)");
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            // `(SELECT …) ORDER BY …`: the brackets change nothing.
+            SetExpr::Query(inner) if query.order_by.is_none() && limit.is_none() => {
+                return Self::from_query(inner, depth);
+            }
+            SetExpr::SetOperation { .. } => {
+                let mut parts = Vec::new();
+                let mut kinds = Vec::new();
+                union_parts(query.body.as_ref(), depth, &mut parts, &mut kinds)?;
+                let all = kinds.iter().all(|all| *all);
+                if !all && kinds.iter().any(|all| *all) {
+                    bail!(
+                        "a query mixes UNION and UNION ALL; use one of them, or put brackets \
+                         around a part"
+                    );
+                }
+                if parts.len() > MAX_UNION_PARTS {
+                    bail!("UNION joins at most {MAX_UNION_PARTS} queries");
+                }
+                // The union is read like a table: `SELECT * FROM (… UNION …)`,
+                // with the query's ORDER BY and LIMIT.
+                return Ok(Self {
+                    from: SqlFrom {
+                        first: SqlRelation {
+                            table: SqlTable::Union { parts, all },
+                            alias: Some("union".to_owned()),
+                        },
+                        joins: Vec::new(),
+                    },
+                    projection: SqlProjection::All,
+                    aliases: Vec::new(),
+                    labels: Vec::new(),
+                    calcs,
+                    predicate: None,
+                    having: None,
+                    sort,
+                    limit,
+                });
+            }
+            _ => bail!("only SELECT, UNION and UNION ALL are supported"),
         };
         reject_select_clauses(select)?;
         let distinct = match &select.distinct {
@@ -704,6 +828,11 @@ impl SqlAst {
     /// tables or uses subqueries gets a prepared plan (ADR 0009); the rest read
     /// their table directly, as before.
     pub fn to_logical_plan_with(&self, tables: &Tables) -> Result<LogicalPlan> {
+        if self.from.joins.is_empty()
+            && let SqlTable::Union { parts, all } = &self.from.first.table
+        {
+            return self.union_plan(parts, *all, tables);
+        }
         let direct = self.from.joins.is_empty()
             && matches!(self.from.first.table, SqlTable::Named(_))
             && !self
@@ -716,6 +845,49 @@ impl SqlAst {
         } else {
             self.prepared_plan(tables)?
         };
+        Planner::validate(&plan).context("validate SQL query")?;
+        Ok(plan)
+    }
+
+    /// Plans `SELECT * FROM (… UNION …)`: the parts' rows into one prepared
+    /// table, with column types that hold every part's values; without ALL,
+    /// grouped by every column so each row comes once.
+    fn union_plan(&self, parts: &[SqlAst], all: bool, tables: &Tables) -> Result<LogicalPlan> {
+        let plan = union_relation(parts, all, tables)?;
+        let schema = Planner::validate(&plan)?;
+        // ORDER BY the union's columns, by name or position.
+        let mut keys = Vec::new();
+        for key in &self.sort {
+            let column = match &key.target {
+                SqlTarget::Position(position) => position
+                    .checked_sub(1)
+                    .filter(|index| *index < schema.fields().len()),
+                SqlTarget::Column(column) if column.table.is_none() => schema
+                    .fields()
+                    .iter()
+                    .position(|field| field.name().eq_ignore_ascii_case(&column.name)),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                anyhow!("ORDER BY of a UNION names one of its columns, by name or position")
+            })?;
+            keys.push(SortSpec::new(column, key.direction, key.nulls));
+        }
+        let mut plan = plan;
+        if !keys.is_empty() {
+            // A UNION without ALL is grouped: its one result batch is sorted.
+            plan = if all {
+                plan.sort_by(keys)
+            } else {
+                plan.output(crate::logical::Output {
+                    sort: keys,
+                    ..crate::logical::Output::default()
+                })
+            };
+        }
+        if let Some(limit) = self.limit {
+            plan = plan.limit(limit);
+        }
         Planner::validate(&plan).context("validate SQL query")?;
         Ok(plan)
     }
@@ -817,16 +989,7 @@ impl SqlAst {
                         let column = expression.column.as_ref().map(resolve).transpose()?;
                         Ok(match (expression.function, column) {
                             (AggregateFunction::Count, None) => AggregateExpr::count_all(),
-                            (AggregateFunction::Count, Some(column)) => {
-                                AggregateExpr::count(column)
-                            }
-                            (AggregateFunction::Sum, Some(column)) => AggregateExpr::sum(column),
-                            (AggregateFunction::Avg, Some(column)) => AggregateExpr::avg(column),
-                            (AggregateFunction::Min, Some(column)) => AggregateExpr::min(column),
-                            (AggregateFunction::Max, Some(column)) => AggregateExpr::max(column),
-                            (AggregateFunction::CountDistinct, Some(column)) => {
-                                AggregateExpr::count_distinct(column)
-                            }
+                            (function, Some(column)) => AggregateExpr::of(function, column),
                             (_, None) => bail!("only COUNT may use *"),
                         })
                     })
@@ -1334,6 +1497,14 @@ impl Relation {
                     RelationSource::Query(plan),
                 )
             }
+            SqlTable::Union { parts, all } => {
+                let plan = union_relation(parts, *all, tables)?;
+                (
+                    relation.alias.clone().unwrap_or_else(|| "union".to_owned()),
+                    Planner::validate(&plan)?,
+                    RelationSource::Query(plan),
+                )
+            }
         };
         Ok(Self {
             alias,
@@ -1355,6 +1526,128 @@ impl Relation {
             },
         }
     }
+}
+
+/// The parts of `a UNION b UNION c`, left to right, and whether each `UNION`
+/// is `ALL`.
+fn union_parts(
+    body: &SetExpr,
+    depth: usize,
+    parts: &mut Vec<SqlAst>,
+    kinds: &mut Vec<bool>,
+) -> Result<()> {
+    match body {
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if *op != sqlparser::ast::SetOperator::Union {
+                bail!("{op} is not supported; UNION and UNION ALL are");
+            }
+            let all = match set_quantifier {
+                sqlparser::ast::SetQuantifier::All => true,
+                sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct => {
+                    false
+                }
+                other => bail!("UNION {other} is not supported; use UNION or UNION ALL"),
+            };
+            union_parts(left, depth, parts, kinds)?;
+            kinds.push(all);
+            union_parts(right, depth, parts, kinds)
+        }
+        SetExpr::Select(select) => {
+            let query = Query {
+                with: None,
+                body: Box::new(SetExpr::Select(select.clone())),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: Vec::new(),
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: Vec::new(),
+            };
+            parts.push(SqlAst::from_query_body(&query, depth + 1)?);
+            Ok(())
+        }
+        // `(SELECT … ORDER BY … LIMIT 3) UNION …`: a bracketed part is its own query.
+        SetExpr::Query(query) => {
+            parts.push(SqlAst::from_query(query, depth + 1)?);
+            Ok(())
+        }
+        _ => bail!("each side of UNION is a SELECT"),
+    }
+}
+
+/// The rows of a UNION's parts as one prepared table (ADR 0023): the parts'
+/// column counts must match; each column takes a type that holds every
+/// part's values (`types::common_type`) and the first part's name.
+fn union_relation(parts: &[SqlAst], all: bool, tables: &Tables) -> Result<LogicalPlan> {
+    let plans = parts
+        .iter()
+        .map(|part| part.to_logical_plan_with(tables))
+        .collect::<Result<Vec<_>>>()?;
+    let schemas = plans
+        .iter()
+        .map(Planner::validate)
+        .collect::<Result<Vec<_>>>()?;
+    let first = schemas
+        .first()
+        .ok_or_else(|| anyhow!("UNION needs at least two queries"))?;
+    let mut fields = first
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone().with_nullable(true))
+        .collect::<Vec<_>>();
+    for (index, schema) in schemas.iter().enumerate().skip(1) {
+        if schema.fields().len() != fields.len() {
+            bail!(
+                "the queries of a UNION select the same number of columns; the first selects \
+                 {} and query {} selects {}",
+                fields.len(),
+                index + 1,
+                schema.fields().len()
+            );
+        }
+        for (position, (field, other)) in fields.iter_mut().zip(schema.fields()).enumerate() {
+            let common = parquet_reader::types::common_type(field.data_type(), other.data_type())
+                .ok_or_else(|| {
+                anyhow!(
+                    "column {} of the UNION is {} in one query and {} in another, and no \
+                         type holds both",
+                    position + 1,
+                    field.data_type(),
+                    other.data_type()
+                )
+            })?;
+            *field = field.clone().with_data_type(common);
+        }
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let columns = (0..schema.fields().len()).collect::<Vec<_>>();
+    let plan = LogicalPlan::Prepared(crate::logical::Prepared {
+        prep: Arc::new(Prep::Union {
+            plans,
+            schema: Arc::clone(&schema),
+            columns: columns.clone(),
+        }),
+        schema,
+    });
+    if all {
+        return Ok(plan);
+    }
+    // Each distinct row once: grouped by every column, as SELECT DISTINCT is.
+    if columns.len() > MAX_GROUP_COLUMNS {
+        bail!(
+            "UNION removes repeated rows by comparing at most {MAX_GROUP_COLUMNS} columns; \
+             this one has {}; use UNION ALL to keep every row",
+            columns.len()
+        );
+    }
+    plan.aggregate_grouped(columns, Vec::new())
 }
 
 /// The relation and column a name refers to.
@@ -1532,10 +1825,7 @@ fn parse_target(expression: &Expr, clause: &str, calcs: &mut SqlCalcs) -> Result
 
 /// Whether a function call is one of the aggregates.
 fn is_aggregate(function: &Function) -> bool {
-    matches!(
-        function.name.to_string().to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
-    )
+    parquet_reader::is_aggregate_name(&function.name.to_string())
 }
 
 /// Fails when a column appears twice (names compare case-insensitively).
@@ -1881,12 +2171,19 @@ fn parse_group_by(group_by: &GroupByExpr, calcs: &mut SqlCalcs) -> Result<Vec<Sq
 }
 
 fn parse_aggregate(function: &Function, calcs: &mut SqlCalcs) -> Result<SqlAggregateExpr> {
+    let function_name = function.name.to_string().to_ascii_uppercase();
+    if function.over.is_some() {
+        bail!(
+            "{function_name}(…) OVER (…): window functions are not supported yet; \
+             use GROUP BY for one row per group"
+        );
+    }
+    let within_group = function_name == "PERCENTILE_CONT";
     if function.uses_odbc_syntax
         || !matches!(function.parameters, FunctionArguments::None)
         || function.filter.is_some()
         || function.null_treatment.is_some()
-        || function.over.is_some()
-        || !function.within_group.is_empty()
+        || (!within_group && !function.within_group.is_empty())
     {
         bail!("aggregate modifiers are not supported");
     }
@@ -1897,18 +2194,47 @@ fn parse_aggregate(function: &Function, calcs: &mut SqlCalcs) -> Result<SqlAggre
         bail!("aggregate argument clauses are not supported");
     }
     let distinct = arguments.duplicate_treatment == Some(DuplicateTreatment::Distinct);
-    let function_name = function.name.to_string().to_ascii_uppercase();
     if distinct && function_name != "COUNT" {
         bail!("only COUNT supports DISTINCT");
     }
-    let function = match function_name.as_str() {
-        "COUNT" if distinct => AggregateFunction::CountDistinct,
-        "COUNT" => AggregateFunction::Count,
-        "SUM" => AggregateFunction::Sum,
-        "AVG" => AggregateFunction::Avg,
-        "MIN" => AggregateFunction::Min,
-        "MAX" => AggregateFunction::Max,
-        _ => bail!("unsupported aggregate {function_name}"),
+    // The quantiles take a fraction too: `QUANTILE_CONT(x, 0.9)`, or the
+    // standard `PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY x)`.
+    if within_group {
+        let [order] = function.within_group.as_slice() else {
+            bail!("PERCENTILE_CONT(p) needs WITHIN GROUP (ORDER BY column)");
+        };
+        let [FunctionArg::Unnamed(FunctionArgExpr::Expr(fraction))] = arguments.args.as_slice()
+        else {
+            bail!("PERCENTILE_CONT takes one fraction, e.g. PERCENTILE_CONT(0.9)");
+        };
+        let mut fraction = quantile_fraction(fraction)?;
+        if order.options.asc == Some(false) {
+            fraction = 1.0 - fraction;
+        }
+        return Ok(SqlAggregateExpr {
+            function: AggregateFunction::quantile(fraction)?,
+            column: Some(calcs.column(&order.expr, true)?),
+        });
+    }
+    if matches!(function_name.as_str(), "QUANTILE_CONT" | "QUANTILE") {
+        let [
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(column)),
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(fraction)),
+        ] = arguments.args.as_slice()
+        else {
+            bail!(
+                "{function_name} takes a column and a fraction, e.g. {function_name}(price, 0.9)"
+            );
+        };
+        return Ok(SqlAggregateExpr {
+            function: AggregateFunction::quantile(quantile_fraction(fraction)?)?,
+            column: Some(calcs.column(column, true)?),
+        });
+    }
+    let function = match parquet_reader::aggregate_by_name(&function_name) {
+        Some(AggregateFunction::Count) if distinct => AggregateFunction::CountDistinct,
+        Some(function) => function,
+        None => bail!("unsupported aggregate {function_name}"),
     };
     let column = match arguments.args.as_slice() {
         [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]
@@ -1927,6 +2253,21 @@ fn parse_aggregate(function: &Function, calcs: &mut SqlCalcs) -> Result<SqlAggre
         _ => bail!("aggregate needs exactly one column argument"),
     };
     Ok(SqlAggregateExpr { function, column })
+}
+
+/// A quantile's fraction: a number literal from 0 to 1.
+fn quantile_fraction(expression: &Expr) -> Result<f64> {
+    let text = match expression {
+        Expr::Value(value) => match &value.value {
+            sqlparser::ast::Value::Number(text, _) => text.clone(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    text.parse::<f64>()
+        .ok()
+        .filter(|fraction| (0.0..=1.0).contains(fraction))
+        .ok_or_else(|| anyhow!("a quantile's fraction is a number from 0 to 1, such as 0.5"))
 }
 
 fn comparison_op(op: &BinaryOperator) -> Result<FilterOp> {
@@ -2594,7 +2935,10 @@ mod tests {
                 "SELECT delay FROM dataset WHERE carrier * 2 > 1",
                 "arithmetic needs numbers",
             ),
-            ("SELECT NOW() FROM dataset", "unknown function NOW"),
+            (
+                "SELECT LEFT(carrier, 2) FROM dataset",
+                "unknown function LEFT",
+            ),
         ] {
             let error = SqlAst::parse(sql)
                 .and_then(|parsed| parsed.to_logical_plan(Arc::clone(&source)))
@@ -2963,7 +3307,7 @@ mod tests {
             "SELECT id FROM dataset, other",
             "SELECT a.* FROM dataset a",
             "SELECT id FROM dataset WHERE EXISTS (SELECT id FROM dataset)",
-            "SELECT id FROM dataset UNION SELECT id FROM dataset",
+            "SELECT id FROM dataset EXCEPT SELECT id FROM dataset",
             "SELECT id FROM dataset WHERE name LIKE 'a!%' ESCAPE '!'",
             "SELECT id FROM dataset WHERE name ILIKE 'a%'",
             "SELECT id FROM dataset WHERE id BETWEEN name AND 3",
@@ -3245,6 +3589,204 @@ mod tests {
         .unwrap();
         assert_eq!(names, ["o.id", "customer", "amount", "c.id", "name"]);
         assert_eq!(all, ["1,10,5,10,Ann"]);
+    }
+
+    #[test]
+    fn computes_spread_and_quantiles_in_sql() {
+        let (_directory, tables) = tables();
+        let rows = |sql: &str| run(sql, &tables).unwrap();
+        // amount: 5, 10, 15, 20, 50.
+        let (names, values) = rows(
+            "SELECT MEDIAN(amount), QUANTILE_CONT(amount, 0.25) AS q1, \
+             PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY amount) AS q3, \
+             ROUND(STDDEV(amount), 3), VAR_POP(amount), STDDEV_POP(amount) FROM orders",
+        );
+        assert_eq!(
+            names,
+            [
+                "MEDIAN(amount)",
+                "q1",
+                "q3",
+                "ROUND(STDDEV(amount), 3)",
+                "VAR_POP(amount)",
+                "STDDEV_POP(amount)"
+            ]
+        );
+        // Mean 20; the squared differences add up to 1,250.
+        assert_eq!(values, ["15,10,20,17.678,250,15.811388300841896"]);
+        // Descending order counts from the top.
+        assert_eq!(
+            rows("SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY amount DESC) FROM orders").1,
+            ["20"]
+        );
+        // Grouped, and on a calculation.
+        assert_eq!(
+            rows(
+                "SELECT customer, MEDIAN(amount * 2) FROM orders WHERE customer IS NOT NULL \
+                 GROUP BY customer ORDER BY customer"
+            )
+            .1,
+            ["10,20", "20,20", "30,100"]
+        );
+        for (sql, message) in [
+            (
+                "SELECT MEDIAN(id) FROM customers WHERE name = 'x' OR MEDIAN(name) > 1",
+                "aggregate",
+            ),
+            ("SELECT QUANTILE_CONT(amount, 2) FROM orders", "from 0 to 1"),
+            (
+                "SELECT QUANTILE_CONT(amount) FROM orders",
+                "takes a column and a fraction",
+            ),
+            ("SELECT PERCENTILE_CONT(0.5) FROM orders", "WITHIN GROUP"),
+            (
+                "SELECT MEDIAN(name) FROM customers",
+                "MEDIAN needs a number column",
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM orders",
+                "window functions",
+            ),
+            ("SELECT SUM(amount) OVER () FROM orders", "window functions"),
+        ] {
+            let error = format!("{:#}", run(sql, &tables).unwrap_err());
+            assert!(error.contains(message), "{sql}: {error}");
+        }
+    }
+
+    #[test]
+    fn calculates_with_text_and_dates() {
+        let (_directory, tables) = tables();
+        let rows = |sql: &str| run(sql, &tables).unwrap().1;
+        assert_eq!(
+            rows("SELECT REPLACE(name, 'n', 'N') FROM customers ORDER BY 1"),
+            ["ANN", "Bo", "Cy"]
+        );
+        assert_eq!(
+            rows(
+                "SELECT DATE_TRUNC('month', DATE '2024-02-29'), \
+                 DATE '2024-01-31' + INTERVAL '1 month', \
+                 DATE '2024-01-31' - INTERVAL 1 DAY, \
+                 DATE '2024-01-01' + INTERVAL '36 hours', \
+                 DATE_DIFF('month', DATE '2023-11-30', DATE '2024-02-01'), \
+                 DATE_DIFF('day', TIMESTAMP '2024-03-01 23:00:00', TIMESTAMP '2024-03-02 01:00:00') \
+                 FROM customers LIMIT 1"
+            ),
+            ["2024-02-01,2024-02-29,2024-01-30,2024-01-02T12:00:00,3,1"]
+        );
+        // NOW and CURRENT_DATE are the same for every row, and in the past of nothing here.
+        assert_eq!(
+            rows(
+                "SELECT COUNT(*) FROM orders WHERE NOW() > TIMESTAMP '2020-01-01 00:00:00' \
+                 AND CURRENT_DATE >= DATE '2020-01-01'"
+            ),
+            ["5"]
+        );
+        for (sql, message) in [
+            (
+                "SELECT DATE_TRUNC('fortnight', DATE '2024-01-01') FROM orders",
+                "not a date unit",
+            ),
+            (
+                "SELECT DATE_TRUNC(amount, DATE '2024-01-01') FROM orders",
+                "unit in quotes",
+            ),
+            (
+                "SELECT DATE_TRUNC('day', amount) FROM orders",
+                "needs a date or timestamp",
+            ),
+            (
+                "SELECT amount + INTERVAL '1 day' FROM orders",
+                "needs a date or timestamp",
+            ),
+            ("SELECT INTERVAL '1 day' FROM orders", "not on its own"),
+            (
+                "SELECT REPLACE(name, 'a') FROM customers",
+                "takes 3 arguments",
+            ),
+        ] {
+            let error = format!("{:#}", run(sql, &tables).unwrap_err());
+            assert!(error.contains(message), "{sql}: {error}");
+        }
+    }
+
+    #[test]
+    fn unions_queries_and_names_subqueries_with_with() {
+        let (_directory, tables) = tables();
+        let rows = |sql: &str| run(sql, &tables).unwrap();
+        // UNION ALL keeps every row; types are widened to hold both (Int32 and Int64).
+        let (names, all) = rows(
+            "SELECT id FROM customers UNION ALL SELECT customer FROM orders \
+             WHERE customer IS NOT NULL ORDER BY 1",
+        );
+        assert_eq!(names, ["id"]);
+        assert_eq!(all, ["10", "10", "10", "20", "20", "30", "30"]);
+        // UNION keeps each row once, and takes ORDER BY and LIMIT.
+        assert_eq!(
+            rows(
+                "SELECT id FROM customers UNION SELECT customer FROM orders \
+                 WHERE customer IS NOT NULL ORDER BY id DESC LIMIT 2"
+            )
+            .1,
+            ["30", "20"]
+        );
+        // A union can be read like a table.
+        assert_eq!(
+            rows(
+                "SELECT COUNT(*) FROM (SELECT name FROM customers UNION ALL \
+                 SELECT name FROM customers) AS both_lists"
+            )
+            .1,
+            ["6"]
+        );
+        // WITH: names used by later names and by the query, in FROM and JOIN.
+        assert_eq!(
+            rows(
+                "WITH big AS (SELECT id, customer, amount FROM orders WHERE amount >= 15), \
+                 named AS (SELECT big.id AS order_id, c.name FROM big \
+                 JOIN customers c ON big.customer = c.id) \
+                 SELECT name, order_id FROM named ORDER BY order_id"
+            )
+            .1,
+            ["Ann,3", "Cy,5"]
+        );
+        assert_eq!(
+            rows(
+                "WITH ann AS (SELECT id FROM customers WHERE name = 'Ann') \
+                 SELECT id FROM orders WHERE customer IN (SELECT id FROM ann) ORDER BY id"
+            )
+            .1,
+            ["1", "3"]
+        );
+        for (sql, message) in [
+            (
+                "SELECT id FROM orders INTERSECT SELECT id FROM customers",
+                "INTERSECT is not supported",
+            ),
+            (
+                "SELECT id, amount FROM orders UNION SELECT id FROM customers",
+                "same number of columns",
+            ),
+            (
+                "SELECT amount FROM orders UNION SELECT name FROM customers",
+                "no type holds both",
+            ),
+            (
+                "SELECT id FROM orders UNION SELECT id FROM customers UNION ALL SELECT 1 FROM orders",
+                "mixes UNION and UNION ALL",
+            ),
+            (
+                "WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t",
+                "RECURSIVE",
+            ),
+            (
+                "WITH t(a) AS (SELECT id FROM orders) SELECT * FROM t",
+                "name(columns)",
+            ),
+        ] {
+            let error = format!("{:#}", run(sql, &tables).unwrap_err());
+            assert!(error.contains(message), "{sql}: {error}");
+        }
     }
 
     #[test]

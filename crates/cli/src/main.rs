@@ -1714,7 +1714,7 @@ mod tests {
                 "--format",
                 "csv",
                 "--sql",
-                "SELECT id FROM dataset UNION SELECT id FROM dataset",
+                "SELECT id FROM dataset EXCEPT SELECT id FROM dataset",
             ],
         ] {
             let mut out = Vec::new();

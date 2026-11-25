@@ -11,6 +11,110 @@ pub enum AggregateFunction {
     /// `COUNT(DISTINCT column)`: distinct non-null values. Its values count
     /// against the group budget.
     CountDistinct,
+    /// Sample standard deviation (`STDDEV`, `STDDEV_SAMP`); null for fewer
+    /// than two values.
+    StdDev,
+    /// Population standard deviation (`STDDEV_POP`).
+    StdDevPop,
+    /// Sample variance (`VARIANCE`, `VAR_SAMP`); null for fewer than two values.
+    Variance,
+    /// Population variance (`VAR_POP`).
+    VarPop,
+    /// The middle value, as `QUANTILE_CONT(column, 0.5)`. Keeps every value
+    /// of its group (see [`MAX_QUANTILE_VALUES`]).
+    Median,
+    /// The continuous quantile at this fraction, in millionths (0 to
+    /// 1,000,000): `QUANTILE_CONT(column, p)` or `PERCENTILE_CONT(p) WITHIN
+    /// GROUP (ORDER BY column)`, interpolating between the two nearest values.
+    /// Keeps every value of its group (see [`MAX_QUANTILE_VALUES`]).
+    Quantile(u32),
+}
+
+/// Values `MEDIAN` and `QUANTILE_CONT` may keep for one query, across all its
+/// groups and quantiles (8 bytes each: 128 MB).
+pub const MAX_QUANTILE_VALUES: usize = 16 * 1024 * 1024;
+
+impl AggregateFunction {
+    /// Whether it keeps every value of its group: `MEDIAN` and `QUANTILE_CONT`.
+    pub fn keeps_values(self) -> bool {
+        matches!(self, Self::Median | Self::Quantile(_))
+    }
+
+    /// The quantile's fraction (0 to 1), for `MEDIAN` and `QUANTILE_CONT`.
+    pub fn quantile_fraction(self) -> Option<f64> {
+        match self {
+            Self::Median => Some(0.5),
+            Self::Quantile(millionths) => Some(f64::from(millionths) / 1_000_000.0),
+            _ => None,
+        }
+    }
+
+    /// The quantile at `fraction` (0 to 1, kept to millionths).
+    pub fn quantile(fraction: f64) -> Result<Self> {
+        if !(0.0..=1.0).contains(&fraction) {
+            bail!("a quantile is a fraction from 0 to 1, not {fraction}");
+        }
+        Ok(Self::Quantile((fraction * 1_000_000.0).round() as u32))
+    }
+
+    /// Whether it takes numbers and decimals only (SUM, AVG and the statistics).
+    pub fn needs_numbers(self) -> bool {
+        matches!(
+            self,
+            Self::Sum
+                | Self::Avg
+                | Self::StdDev
+                | Self::StdDevPop
+                | Self::Variance
+                | Self::VarPop
+                | Self::Median
+                | Self::Quantile(_)
+        )
+    }
+
+    /// The SQL name it is written with.
+    pub fn sql_name(self) -> &'static str {
+        match self {
+            Self::Count | Self::CountDistinct => "COUNT",
+            Self::Sum => "SUM",
+            Self::Avg => "AVG",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+            Self::StdDev => "STDDEV",
+            Self::StdDevPop => "STDDEV_POP",
+            Self::Variance => "VARIANCE",
+            Self::VarPop => "VAR_POP",
+            Self::Median => "MEDIAN",
+            Self::Quantile(_) => "QUANTILE_CONT",
+        }
+    }
+}
+
+/// The aggregate a SQL function name stands for, other than `COUNT(DISTINCT …)`
+/// and the quantiles, which take more than a column.
+pub fn aggregate_by_name(name: &str) -> Option<AggregateFunction> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "COUNT" => AggregateFunction::Count,
+        "SUM" => AggregateFunction::Sum,
+        "AVG" | "MEAN" => AggregateFunction::Avg,
+        "MIN" => AggregateFunction::Min,
+        "MAX" => AggregateFunction::Max,
+        "STDDEV" | "STDDEV_SAMP" => AggregateFunction::StdDev,
+        "STDDEV_POP" => AggregateFunction::StdDevPop,
+        "VARIANCE" | "VAR_SAMP" => AggregateFunction::Variance,
+        "VAR_POP" => AggregateFunction::VarPop,
+        "MEDIAN" => AggregateFunction::Median,
+        _ => return None,
+    })
+}
+
+/// Whether a SQL function name is an aggregate (the quantile forms included).
+pub fn is_aggregate_name(name: &str) -> bool {
+    aggregate_by_name(name).is_some()
+        || matches!(
+            name.to_ascii_uppercase().as_str(),
+            "QUANTILE_CONT" | "QUANTILE" | "PERCENTILE_CONT"
+        )
 }
 
 /// One aggregate expression over an optional source column.
@@ -59,6 +163,14 @@ impl AggregateExpr {
     pub fn max(column: usize) -> Self {
         Self {
             function: AggregateFunction::Max,
+            column: Some(column),
+        }
+    }
+
+    /// `function` over `column`.
+    pub fn of(function: AggregateFunction, column: usize) -> Self {
+        Self {
+            function,
             column: Some(column),
         }
     }

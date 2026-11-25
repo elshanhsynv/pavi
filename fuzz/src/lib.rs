@@ -340,6 +340,12 @@ pub const SQL_SEEDS: &[&str] = &[
     "SELECT CAST(score AS DECIMAL(10, 2)), TRY_CAST(name AS INT), COALESCE(amount, 0) FROM dataset",
     "SELECT ROUND(AVG(score), 2) AS mean, category, SUM(score) / COUNT(*) FROM dataset GROUP BY category HAVING mean > 1 ORDER BY 2",
     "SELECT category, MIN(wait), MAX(blob), COUNT(DISTINCT blob) FROM dataset WHERE wait > 'PT1S' GROUP BY category ORDER BY MIN(wait) DESC",
+    "SELECT category, MEDIAN(score), QUANTILE_CONT(amount, 0.9), STDDEV(id), VAR_POP(score) FROM dataset GROUP BY category",
+    "SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY score DESC) FROM dataset WHERE id > 2",
+    "SELECT DATE_TRUNC('week', day), DATE_DIFF('month', day, DATE '2024-02-29'), day + INTERVAL '1 month 2 days' FROM dataset",
+    "SELECT REPLACE(name, 'me', 'you'), ts - INTERVAL 90 MINUTE FROM dataset WHERE ts < NOW() AND day <= CURRENT_DATE",
+    "SELECT id, name FROM dataset WHERE id < 3 UNION ALL SELECT id, category FROM dataset WHERE id > 7 ORDER BY 1 DESC LIMIT 4",
+    "WITH red AS (SELECT id, score FROM dataset WHERE category = 'red') SELECT id FROM red UNION SELECT id FROM dataset WHERE score > 2",
 ];
 
 /// One runtime shared by fuzz inputs that need the query engine. It is kept in a

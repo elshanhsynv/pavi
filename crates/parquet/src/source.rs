@@ -32,8 +32,8 @@ use parquet::file::{metadata::ParquetMetaData, statistics::Statistics};
 
 use crate::{
     AggregateExpr, AggregateFunction, AggregateSpec, DataPage, DatasetMetadata, GroupBudget,
-    PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection, RowGroupInfo, RowWindow,
-    SortBudget, SortSpec,
+    MAX_QUANTILE_VALUES, PageCache, PageCacheLimits, PageCacheStats, PageKey, Projection,
+    RowGroupInfo, RowWindow, SortBudget, SortSpec,
     change::{FileChanged, FileStamp, FolderStamp},
     convert::{self, ConvertedFile, FileFormat, ImportOptions, ImportReport},
     dataset::{
@@ -2513,6 +2513,20 @@ impl Scalar {
     }
 }
 
+/// The continuous quantile at `fraction` of `values`: sorts them, then
+/// interpolates between the two values either side of the position
+/// `fraction * (n - 1)`. `None` for no values.
+fn quantile(values: &[f64], fraction: f64) -> Option<f64> {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+    let last = sorted.len().checked_sub(1)?;
+    let position = fraction.clamp(0.0, 1.0) * last as f64;
+    let below = position.floor() as usize;
+    let above = position.ceil() as usize;
+    let (low, high) = (sorted[below.min(last)], sorted[above.min(last)]);
+    Some(low + (high - low) * (position - below as f64))
+}
+
 enum Accumulator {
     Count(u64),
     SumI64(Option<i64>),
@@ -2532,6 +2546,19 @@ enum Accumulator {
     CountDistinct {
         values: HashSet<Scalar>,
         bytes: usize,
+    },
+    /// Running count, mean and sum of squared differences (Welford), for the
+    /// standard deviations and variances; values in the column's units.
+    Moments {
+        count: u64,
+        mean: f64,
+        squares: f64,
+        divisor: f64,
+    },
+    /// Every value, in the column's units, for `MEDIAN` and `QUANTILE_CONT`.
+    Quantile {
+        values: Vec<f64>,
+        divisor: f64,
     },
 }
 
@@ -2557,6 +2584,27 @@ impl Accumulator {
                 values: HashSet::new(),
                 bytes: 0,
             }),
+            AggregateFunction::StdDev
+            | AggregateFunction::StdDevPop
+            | AggregateFunction::Variance
+            | AggregateFunction::VarPop => Ok(Self::Moments {
+                count: 0,
+                mean: 0.0,
+                squares: 0.0,
+                divisor: data_type.map_or(1.0, decimal_divisor),
+            }),
+            AggregateFunction::Median | AggregateFunction::Quantile(_) => Ok(Self::Quantile {
+                values: Vec::new(),
+                divisor: data_type.map_or(1.0, decimal_divisor),
+            }),
+        }
+    }
+
+    /// Values kept for a quantile.
+    fn kept_values(&self) -> usize {
+        match self {
+            Self::Quantile { values, .. } => values.len(),
+            _ => 0,
         }
     }
 
@@ -2662,11 +2710,35 @@ impl Accumulator {
                     *bytes = bytes.saturating_add(size);
                 }
             }
+            Self::Moments {
+                count,
+                mean,
+                squares,
+                divisor,
+            } => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                let value = value.f64()? / *divisor;
+                *count = count.checked_add(1).context("STDDEV count overflow")?;
+                let delta = value - *mean;
+                *mean += delta / *count as f64;
+                *squares += delta * (value - *mean);
+                if !squares.is_finite() {
+                    bail!("STDDEV/VARIANCE overflow for numeric value");
+                }
+            }
+            Self::Quantile { values, divisor } => {
+                let Some(value) = value.filter(|value| !value.is_null()) else {
+                    return Ok(());
+                };
+                values.push(value.f64()? / *divisor);
+            }
         }
         Ok(())
     }
 
-    fn value(&self) -> Option<Scalar> {
+    fn value(&self, function: AggregateFunction) -> Option<Scalar> {
         match self {
             Self::Count(value) => Some(Scalar::U64(*value)),
             Self::SumI64(value) => value.map(Scalar::I64),
@@ -2681,6 +2753,26 @@ impl Accumulator {
             Self::Avg { .. } => None,
             Self::Min(value) | Self::Max(value) => value.clone(),
             Self::CountDistinct { values, .. } => Some(Scalar::U64(values.len() as u64)),
+            Self::Moments { count, squares, .. } => {
+                let variance = match function {
+                    AggregateFunction::StdDev | AggregateFunction::Variance if *count > 1 => {
+                        *squares / (*count - 1) as f64
+                    }
+                    AggregateFunction::StdDevPop | AggregateFunction::VarPop if *count > 0 => {
+                        *squares / *count as f64
+                    }
+                    _ => return None,
+                };
+                let value = match function {
+                    AggregateFunction::StdDev | AggregateFunction::StdDevPop => variance.sqrt(),
+                    _ => variance,
+                };
+                Some(Scalar::F64(value.to_bits()))
+            }
+            Self::Quantile { values, .. } => {
+                let fraction = function.quantile_fraction()?;
+                quantile(values, fraction).map(|value| Scalar::F64(value.to_bits()))
+            }
         }
     }
 
@@ -2738,6 +2830,11 @@ struct GroupCollector {
     /// Whether a group's size can change as rows arrive: `COUNT(DISTINCT …)`,
     /// or `MIN`/`MAX` of text or binary. Otherwise it is counted once.
     sizes_vary: bool,
+    /// Values kept by `MEDIAN` and `QUANTILE_CONT`, against
+    /// [`MAX_QUANTILE_VALUES`] (they don't count against the group budget).
+    quantile_values: usize,
+    /// Whether any aggregate keeps values, so they are counted at all.
+    keeps_values: bool,
 }
 
 impl GroupCollector {
@@ -2819,6 +2916,11 @@ impl GroupCollector {
             bytes: 0,
             budget,
             sizes_vary,
+            quantile_values: 0,
+            keeps_values: aggregate
+                .expressions()
+                .iter()
+                .any(|expression| expression.function().keeps_values()),
         };
         if collector.group_by.is_empty() {
             collector.add_group(Vec::new(), Vec::new())?;
@@ -2894,7 +2996,21 @@ impl GroupCollector {
                     .accumulators
                     .get_mut(expression_index)
                     .ok_or_else(|| anyhow!("aggregate accumulator was lost"))?;
+                if !self.keeps_values {
+                    accumulator.update(*expression, value)?;
+                    continue;
+                }
+                let kept = accumulator.kept_values();
                 accumulator.update(*expression, value)?;
+                if accumulator.kept_values() > kept {
+                    self.quantile_values += 1;
+                    if self.quantile_values > MAX_QUANTILE_VALUES {
+                        bail!(
+                            "MEDIAN and QUANTILE_CONT keep every value, and this query needs \
+                             more than {MAX_QUANTILE_VALUES}; filter the rows first"
+                        );
+                    }
+                }
             }
             if self.sizes_vary {
                 let after = self.groups[index].bytes();
@@ -2960,7 +3076,7 @@ impl GroupCollector {
                     .collect::<Vec<_>>(),
             )?);
         }
-        for (index, (_expression, output_type)) in
+        for (index, (expression, output_type)) in
             self.expressions.iter().zip(&self.output_types).enumerate()
         {
             arrays.push(build_array(
@@ -2968,7 +3084,7 @@ impl GroupCollector {
                 &self
                     .groups
                     .iter()
-                    .map(|group| group.accumulators[index].value())
+                    .map(|group| group.accumulators[index].value(expression.function()))
                     .collect::<Vec<_>>(),
             )?);
         }
@@ -3011,7 +3127,17 @@ fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) ->
             _ if input.is_some_and(is_float) => Ok(DataType::Float64),
             _ => bail!("aggregate expression has an unsupported input type"),
         },
-        AggregateFunction::Avg if input.is_some_and(is_summable) => Ok(DataType::Float64),
+        AggregateFunction::Avg
+        | AggregateFunction::StdDev
+        | AggregateFunction::StdDevPop
+        | AggregateFunction::Variance
+        | AggregateFunction::VarPop
+        | AggregateFunction::Median
+        | AggregateFunction::Quantile(_)
+            if input.is_some_and(is_summable) =>
+        {
+            Ok(DataType::Float64)
+        }
         AggregateFunction::Min | AggregateFunction::Max => {
             input.cloned().context("MIN/MAX needs a source column")
         }
@@ -3020,19 +3146,19 @@ fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) ->
 }
 
 fn aggregate_name(expression: AggregateExpr, input: &Option<String>) -> String {
-    let function = match expression.function() {
-        AggregateFunction::Count => "COUNT",
-        AggregateFunction::Sum => "SUM",
-        AggregateFunction::Avg => "AVG",
-        AggregateFunction::Min => "MIN",
-        AggregateFunction::Max => "MAX",
-        AggregateFunction::CountDistinct => "COUNT",
-    };
+    let function = expression.function().sql_name();
     match (expression.function(), expression.column(), input) {
         (AggregateFunction::Count, None, _) => "COUNT(*)".to_string(),
         (AggregateFunction::CountDistinct, Some(_), Some(column)) => {
             format!("COUNT(DISTINCT {column})")
         }
+        (AggregateFunction::Quantile(_), Some(_), Some(column)) => format!(
+            "{function}({column}, {})",
+            expression
+                .function()
+                .quantile_fraction()
+                .unwrap_or_default()
+        ),
         (_, Some(_), Some(column)) => format!("{function}({column})"),
         _ => function.to_string(),
     }
@@ -3613,24 +3739,29 @@ pub fn check_aggregate(schema: &Schema, aggregate: &AggregateSpec) -> Result<()>
             .transpose()?;
         match (expression.function(), field) {
             (AggregateFunction::Count, _) => {}
-            (AggregateFunction::Sum | AggregateFunction::Avg, Some(field))
-                if is_summable(field.data_type()) => {}
+            (function, Some(field))
+                if function.needs_numbers() && is_summable(field.data_type()) => {}
             (
                 AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::CountDistinct,
                 Some(field),
             ) if is_comparable(field.data_type()) => {}
-            (AggregateFunction::Sum | AggregateFunction::Avg, Some(field)) => bail!(
-                "{:?} is not supported for {:?} columns",
-                expression.function(),
+            (function, Some(field)) if function.needs_numbers() => bail!(
+                "{} needs a number column, not {:?}",
+                function.sql_name(),
                 field.data_type()
             ),
-            (AggregateFunction::Min | AggregateFunction::Max, Some(field)) => bail!(
-                "{:?} is not supported for {:?} columns",
-                expression.function(),
+            (_, Some(field)) if !is_comparable(field.data_type()) => bail!(
+                "{} is not supported for {:?} columns",
+                expression.function().sql_name(),
                 field.data_type()
             ),
             (AggregateFunction::CountDistinct, Some(field)) => bail!(
                 "COUNT(DISTINCT …) is not supported for {:?} columns",
+                field.data_type()
+            ),
+            (_, Some(field)) => bail!(
+                "{} is not supported for {:?} columns",
+                expression.function().sql_name(),
                 field.data_type()
             ),
             (_, None) => bail!("only COUNT may use *"),
@@ -5733,7 +5864,12 @@ mod tests {
         let aggregate_error = source
             .validate_aggregate(&AggregateSpec::new(vec![AggregateExpr::sum(0)]).unwrap())
             .unwrap_err();
-        assert!(aggregate_error.to_string().contains("not supported"));
+        assert!(
+            aggregate_error
+                .to_string()
+                .contains("SUM needs a number column"),
+            "{aggregate_error}"
+        );
     }
 
     #[test]
@@ -6747,5 +6883,102 @@ mod tests {
             .unwrap();
         // 3999, 13999, 23999, 33999 (id and name), 39990-39999.
         assert_eq!(counts.iter().sum::<u64>(), 14);
+    }
+
+    #[test]
+    fn computes_spread_and_quantiles_per_group() {
+        let directory = TempDir::new().unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "g",
+                Arc::new(StringArray::from(vec![
+                    "a", "a", "a", "a", "a", "b", "b", "c",
+                ])) as ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(10),
+                    Some(7),
+                    None,
+                    Some(5),
+                ])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        write_batch(directory.path(), "stats.parquet", &batch, 3);
+        let source = ParquetSource::open(directory.path().join("stats.parquet")).unwrap();
+        let spec = AggregateSpec::grouped(
+            0,
+            vec![
+                AggregateExpr::of(AggregateFunction::Median, 1),
+                AggregateExpr::of(AggregateFunction::quantile(0.9).unwrap(), 1),
+                AggregateExpr::of(AggregateFunction::StdDev, 1),
+                AggregateExpr::of(AggregateFunction::VarPop, 1),
+                AggregateExpr::of(AggregateFunction::Variance, 1),
+            ],
+        )
+        .unwrap();
+        let result = source
+            .read_aggregated(None, &spec, GroupBudget::default(), &|_| false)
+            .unwrap();
+        let names = result
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "g",
+                "MEDIAN(v)",
+                "QUANTILE_CONT(v, 0.9)",
+                "STDDEV(v)",
+                "VAR_POP(v)",
+                "VARIANCE(v)"
+            ]
+        );
+        let number = |column: usize, row: usize| {
+            let values = result
+                .column(column)
+                .as_any()
+                .downcast_ref::<arrow_array::Float64Array>()
+                .unwrap();
+            (!values.is_null(row)).then(|| values.value(row))
+        };
+        // Group a: 1, 2, 3, 4, 10.
+        assert_eq!(number(1, 0), Some(3.0));
+        assert!(
+            (number(2, 0).unwrap() - 7.6).abs() < 1e-9,
+            "{:?}",
+            number(2, 0)
+        );
+        assert!((number(3, 0).unwrap() - 12.5_f64.sqrt()).abs() < 1e-9);
+        assert!((number(4, 0).unwrap() - 10.0).abs() < 1e-9);
+        assert!((number(5, 0).unwrap() - 12.5).abs() < 1e-9);
+        // Group b: 7 and a null; one value has no sample spread.
+        assert_eq!(number(1, 1), Some(7.0));
+        assert_eq!(number(3, 1), None);
+        assert_eq!(number(4, 1), Some(0.0));
+        // An even count interpolates between the middle two.
+        let even =
+            AggregateSpec::new(vec![AggregateExpr::of(AggregateFunction::Median, 1)]).unwrap();
+        let filter = FilterExpr::parse("v <= 4").unwrap();
+        let median = source
+            .read_aggregated(Some(&filter), &even, GroupBudget::default(), &|_| false)
+            .unwrap();
+        assert_eq!(texts(&median, 0), ["2.5"]);
+
+        // Text is refused with a message that names the function.
+        let text =
+            AggregateSpec::new(vec![AggregateExpr::of(AggregateFunction::Median, 0)]).unwrap();
+        let error = source.validate_aggregate(&text).unwrap_err().to_string();
+        assert!(error.contains("MEDIAN needs a number column"), "{error}");
+        assert!(AggregateFunction::quantile(1.5).is_err());
     }
 }

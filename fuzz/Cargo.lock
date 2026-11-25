@@ -976,6 +976,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
+ "chrono",
  "parquet_reader",
  "pavi_runtime",
  "sqlparser",

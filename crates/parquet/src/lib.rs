@@ -22,7 +22,10 @@ mod statistics;
 pub mod types;
 pub mod value;
 
-pub use aggregate::{AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget};
+pub use aggregate::{
+    AggregateExpr, AggregateFunction, AggregateSpec, GroupBudget, MAX_QUANTILE_VALUES,
+    aggregate_by_name, is_aggregate_name,
+};
 pub use cache::{PageCache, PageCacheLimits, PageCacheStats};
 pub use change::FileChanged;
 pub use convert::{
