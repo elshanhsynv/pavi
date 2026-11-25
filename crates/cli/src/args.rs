@@ -253,7 +253,8 @@ pub struct Args {
     /// QUANTILE_CONT, STDDEV and VARIANCE, SELECT DISTINCT, AS aliases,
     /// calculations (arithmetic, CASE, CAST, UPPER, REPLACE, YEAR, DATE_TRUNC,
     /// DATE_DIFF, + INTERVAL '7 days', NOW() …), INNER and LEFT joins,
-    /// subqueries, UNION [ALL] and WITH. FILE can also be named by its
+    /// subqueries, UNION [ALL], WITH and window functions (ROW_NUMBER, RANK,
+    /// LAG, LEAD, SUM … OVER (PARTITION BY … ORDER BY …)). FILE can also be named by its
     /// file name (flights.parquet → flights). --head and --offset cut the
     /// result.
     #[arg(

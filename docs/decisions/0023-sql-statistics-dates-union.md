@@ -1,6 +1,6 @@
 # 0023. SQL gains spread and quantile aggregates, date functions, UNION and WITH
 
-- Status: accepted
+- Status: accepted; window functions are added by [0024](0024-window-functions.md)
 - Date: 2026-11-25
 - Amends: [0009](0009-joins-and-subqueries.md) (`UNION` and `WITH` were refused), [0013](0013-sql-calculations.md) (the function list)
 

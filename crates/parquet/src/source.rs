@@ -2497,11 +2497,11 @@ impl Scalar {
         }
     }
 
-    fn is_null(&self) -> bool {
+    pub(crate) fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 
-    fn f64(&self) -> Result<f64> {
+    pub(crate) fn f64(&self) -> Result<f64> {
         match self {
             Self::F64(value) => Ok(f64::from_bits(*value)),
             Self::I64(value) => Ok(*value as f64),
@@ -2527,7 +2527,7 @@ fn quantile(values: &[f64], fraction: f64) -> Option<f64> {
     Some(low + (high - low) * (position - below as f64))
 }
 
-enum Accumulator {
+pub(crate) enum Accumulator {
     Count(u64),
     SumI64(Option<i64>),
     SumU64(Option<u64>),
@@ -2563,7 +2563,7 @@ enum Accumulator {
 }
 
 impl Accumulator {
-    fn new(expression: AggregateExpr, data_type: Option<&DataType>) -> Result<Self> {
+    pub(crate) fn new(expression: AggregateExpr, data_type: Option<&DataType>) -> Result<Self> {
         match expression.function() {
             AggregateFunction::Count => Ok(Self::Count(0)),
             AggregateFunction::Sum => match data_type {
@@ -2608,7 +2608,11 @@ impl Accumulator {
         }
     }
 
-    fn update(&mut self, expression: AggregateExpr, value: Option<Scalar>) -> Result<()> {
+    pub(crate) fn update(
+        &mut self,
+        expression: AggregateExpr,
+        value: Option<Scalar>,
+    ) -> Result<()> {
         match self {
             Self::Count(count) => {
                 if expression.column().is_none()
@@ -2738,7 +2742,7 @@ impl Accumulator {
         Ok(())
     }
 
-    fn value(&self, function: AggregateFunction) -> Option<Scalar> {
+    pub(crate) fn value(&self, function: AggregateFunction) -> Option<Scalar> {
         match self {
             Self::Count(value) => Some(Scalar::U64(*value)),
             Self::SumI64(value) => value.map(Scalar::I64),
@@ -3112,7 +3116,10 @@ impl GroupCollector {
     }
 }
 
-fn aggregate_output_type(expression: AggregateExpr, input: Option<&DataType>) -> Result<DataType> {
+pub(crate) fn aggregate_output_type(
+    expression: AggregateExpr,
+    input: Option<&DataType>,
+) -> Result<DataType> {
     match expression.function() {
         AggregateFunction::Count | AggregateFunction::CountDistinct => Ok(DataType::UInt64),
         AggregateFunction::Sum if input.is_some_and(is_signed_integer) => Ok(DataType::Int64),
@@ -3493,7 +3500,7 @@ pub(crate) fn scalar_at(array: &dyn Array, row: usize, data_type: &DataType) -> 
     }
 }
 
-fn scalar_compare(left: &Scalar, right: &Scalar) -> std::cmp::Ordering {
+pub(crate) fn scalar_compare(left: &Scalar, right: &Scalar) -> std::cmp::Ordering {
     match (left, right) {
         (Scalar::Bool(left), Scalar::Bool(right)) => left.cmp(right),
         (Scalar::I64(left), Scalar::I64(right)) => left.cmp(right),
@@ -3513,7 +3520,7 @@ fn scalar_compare(left: &Scalar, right: &Scalar) -> std::cmp::Ordering {
     }
 }
 
-fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayRef> {
+pub(crate) fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayRef> {
     macro_rules! values {
         ($convert:expr) => {
             values
@@ -3700,10 +3707,10 @@ fn build_array(data_type: &DataType, values: &[Option<Scalar>]) -> Result<ArrayR
 }
 
 /// One more than the largest unscaled `Decimal128(38, _)`: 10^38.
-const DECIMAL128_LIMIT: u128 = 100_000_000_000_000_000_000_000_000_000_000_000_000;
+pub(crate) const DECIMAL128_LIMIT: u128 = 100_000_000_000_000_000_000_000_000_000_000_000_000;
 
 /// What an AVG divides its sum by to undo a decimal's scale; 1 for other types.
-fn decimal_divisor(data_type: &DataType) -> f64 {
+pub(crate) fn decimal_divisor(data_type: &DataType) -> f64 {
     match data_type {
         DataType::Decimal32(_, scale)
         | DataType::Decimal64(_, scale)
