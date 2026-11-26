@@ -6517,6 +6517,9 @@ mod tests {
         assert_eq!(changed_message(&source), None);
 
         // A new file in a partition folder changes that folder's time.
+        // File times move in clock ticks (about 16 ms on Windows), so wait for
+        // one to pass: a file added within the same tick leaves the time as it was.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         write_ids(root, "year=2024/c.parquet", 200..300, false);
         let message = changed_message(&source).unwrap();
         assert!(message.contains("added to or removed from"), "{message}");

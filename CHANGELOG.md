@@ -7,6 +7,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Fixed
+- The Windows download's `.sha256` file now works with `sha256sum -c`: it ended its line with a Windows line break, which the tool read as part of the file name.
+
 ## [0.8.0] - 2026-11-26
 
 ### Added
