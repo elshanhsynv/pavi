@@ -42,6 +42,7 @@ pub(super) struct TabState {
     sql_input: String,
     sql_error: Option<String>,
     sql_completion: Option<SqlCompletion>,
+    sql_replaced: Option<String>,
     chart: ChartState,
     profile: ProfileState,
     running_sql: Option<RunningSql>,
@@ -80,6 +81,7 @@ impl TabState {
             sql_input: String::new(),
             sql_error: None,
             sql_completion: None,
+            sql_replaced: None,
             chart: ChartState {
                 visible: chart_visible,
                 ..ChartState::default()
@@ -207,6 +209,7 @@ impl PaviApp {
         swap(&mut self.sql_input, &mut tab.sql_input);
         swap(&mut self.sql_error, &mut tab.sql_error);
         swap(&mut self.sql_completion, &mut tab.sql_completion);
+        swap(&mut self.sql_replaced, &mut tab.sql_replaced);
         swap(&mut self.chart, &mut tab.chart);
         swap(&mut self.profile, &mut tab.profile);
         swap(&mut self.running_sql, &mut tab.running_sql);

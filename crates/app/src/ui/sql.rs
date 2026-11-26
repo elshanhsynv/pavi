@@ -53,9 +53,19 @@ impl PaviApp {
                     }
                     self.history_menu(ui);
                     self.saved_menu(ui);
-                    if let Some(error) = &self.sql_error {
-                        widgets::error(ui, error);
-                    } else if self.running_sql.is_none() {
+                    if self.sql_replaced.is_some()
+                        && widgets::tool_button(
+                            ui,
+                            Some(Icon::History),
+                            "Restore previous query",
+                            false,
+                        )
+                        .on_hover_text("Put back the query that was in the editor before")
+                        .clicked()
+                    {
+                        self.restore_replaced_sql();
+                    }
+                    if self.sql_error.is_none() && self.running_sql.is_none() {
                         let tables = self
                             .sql_tables()
                             .map(|(_, names)| names)
@@ -75,6 +85,15 @@ impl PaviApp {
                         );
                     }
                 });
+                // On its own line, wrapped: a long error must not run off the window.
+                if let Some(error) = &self.sql_error {
+                    ui.add_space(Spacing::Sm.px());
+                    ui.add(
+                        egui::Label::new(RichText::new(error).color(theme::error()))
+                            .wrap()
+                            .selectable(true),
+                    );
+                }
             });
         if run {
             self.run_sql();
@@ -83,7 +102,8 @@ impl PaviApp {
     }
 
     /// The editor: highlighted SQL, with completions for column names and
-    /// keywords under the cursor (↑/↓ choose, Tab or Enter take, Esc closes).
+    /// keywords under the cursor (↑/↓ choose, Tab takes, Enter takes one chosen
+    /// with the arrows, Esc closes).
     fn sql_editor(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let id = sql_editor_id();
         let columns = self.sql_columns();
@@ -100,12 +120,17 @@ impl PaviApp {
             ui.input_mut(|input| {
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
                     completion.selected = (completion.selected + 1) % count;
+                    completion.picked = true;
                 }
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
                     completion.selected = (completion.selected + count - 1) % count;
+                    completion.picked = true;
                 }
+                // The list opens on almost every word, so Enter only takes a
+                // completion chosen with the arrows; otherwise it starts a line.
                 if input.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
-                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    || (completion.picked
+                        && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 {
                     accept = Some(completion.selected);
                 }
@@ -137,6 +162,7 @@ impl PaviApp {
         if !output.response.has_focus() {
             self.sql_completion = None;
         } else if output.response.changed() {
+            self.sql_replaced = None;
             self.sql_completion = cursor.and_then(|cursor| {
                 let (start, word) = sql_editor::word_before(&self.sql_input, cursor)?;
                 let items = sql_editor::suggestions(&word, &columns, &tables);
@@ -145,6 +171,7 @@ impl PaviApp {
                     cursor,
                     items,
                     selected: 0,
+                    picked: false,
                 })
             });
         } else if self
@@ -154,6 +181,22 @@ impl PaviApp {
         {
             // The cursor moved away from the word.
             self.sql_completion = None;
+        }
+
+        // While the list is open, Esc closes it and the editor keeps the focus
+        // (egui would otherwise drop the focus on Esc). Read at the next frame.
+        if self.sql_completion.is_some() && output.response.has_focus() {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
+            });
         }
 
         // The list, just under the cursor.
@@ -231,6 +274,8 @@ impl PaviApp {
     fn saved_menu(&mut self, ui: &mut egui::Ui) {
         let mut load = None;
         let mut remove = None;
+        let mut ask_delete = None;
+        let mut keep = false;
         let mut save = false;
         widgets::menu(
             ui,
@@ -264,13 +309,31 @@ impl PaviApp {
                     .max_height(360.0)
                     .show(ui, |ui| {
                         for (index, saved) in self.session.saved_queries.iter().enumerate() {
+                            if self.confirm_delete_saved.as_deref() == Some(saved.name.as_str()) {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(Spacing::Md.px());
+                                    ui.add(
+                                        egui::Label::new(format!("Delete \"{}\"?", saved.name))
+                                            .truncate(),
+                                    );
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.button("Keep").clicked() {
+                                            keep = true;
+                                        }
+                                        if ui.button("Delete").clicked() {
+                                            remove = Some(index);
+                                        }
+                                    });
+                                });
+                                continue;
+                            }
                             ui.horizontal(|ui| {
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     if widgets::tool_button(ui, Some(Icon::Close), "", false)
                                         .on_hover_text("Delete this saved query")
                                         .clicked()
                                     {
-                                        remove = Some(index);
+                                        ask_delete = Some(saved.name.clone());
                                     }
                                     ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
                                         let first_line =
@@ -306,12 +369,23 @@ impl PaviApp {
         }
         if let Some(saved) = load.and_then(|index| self.session.saved_queries.get(index)) {
             // Loading does not run it: the user may want to edit it first.
-            self.sql_input = saved.sql.clone();
-            self.saved_query_name = saved.name.clone();
-            self.status = format!("Loaded \"{}\"; Ctrl+Enter runs it", saved.name);
+            let (sql, name) = (saved.sql.clone(), saved.name.clone());
+            self.replace_sql_input(sql);
+            self.status = format!("Loaded \"{name}\"; Ctrl+Enter runs it");
+            self.saved_query_name = name;
+        }
+        if ask_delete.is_some() {
+            self.confirm_delete_saved = ask_delete;
+        }
+        if keep {
+            self.confirm_delete_saved = None;
         }
         if let Some(index) = remove {
+            if let Some(saved) = self.session.saved_queries.get(index) {
+                self.status = format!("Deleted the saved query \"{}\"", saved.name);
+            }
             self.session.remove_saved_query(index);
+            self.confirm_delete_saved = None;
             self.persist_session();
         }
     }
@@ -320,6 +394,8 @@ impl PaviApp {
         let mut rerun = None;
         let mut remove = None;
         let mut clear = false;
+        let mut ask_clear = false;
+        let mut keep = false;
         widgets::menu(
             ui,
             "history",
@@ -371,14 +447,38 @@ impl PaviApp {
                         }
                     });
                 ui.separator();
-                clear = widgets::menu_item(ui, "Clear history", "").clicked();
+                if self.confirm_clear_history {
+                    let count = self.session.query_history.len();
+                    ui.horizontal(|ui| {
+                        ui.add_space(Spacing::Md.px());
+                        ui.label(format!(
+                            "Clear all {} quer{}?",
+                            theme::number(count as u64),
+                            if count == 1 { "y" } else { "ies" }
+                        ));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Keep").clicked() {
+                                keep = true;
+                            }
+                            clear = ui.button("Clear").clicked();
+                        });
+                    });
+                } else {
+                    ask_clear = widgets::menu_item(ui, "Clear history…", "").clicked();
+                }
                 if rerun.is_some() || clear {
                     widgets::close_menu(ui);
                 }
             },
         );
+        if ask_clear {
+            self.confirm_clear_history = true;
+        }
+        if keep {
+            self.confirm_clear_history = false;
+        }
         if let Some(sql) = rerun {
-            self.sql_input = sql;
+            self.replace_sql_input(sql);
             self.run_sql();
         }
         if let Some(index) = remove {
@@ -387,7 +487,28 @@ impl PaviApp {
         }
         if clear {
             self.session.clear_history();
+            self.confirm_clear_history = false;
+            self.status = "Query history cleared".to_string();
             self.persist_session();
+        }
+    }
+
+    /// Puts `sql` in the editor. Text it replaces is kept for "Restore previous
+    /// query", unless it was empty or the same.
+    pub(in crate::app) fn replace_sql_input(&mut self, sql: String) {
+        let previous = std::mem::replace(&mut self.sql_input, sql);
+        if !previous.trim().is_empty() && previous != self.sql_input {
+            self.sql_replaced = Some(previous);
+        }
+        self.sql_completion = None;
+    }
+
+    /// Puts back the text a saved or past query replaced.
+    pub(in crate::app) fn restore_replaced_sql(&mut self) {
+        if let Some(previous) = self.sql_replaced.take() {
+            self.sql_input = previous;
+            self.sql_completion = None;
+            self.status = "Restored the previous query".to_string();
         }
     }
 }
