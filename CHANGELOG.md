@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-26
+
 ### Added
 - SQL window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG(x, n, default)`, `LEAD(…)` and `COUNT` / `SUM` / `AVG` / `MIN` / `MAX … OVER (PARTITION BY … ORDER BY …)`, with running totals, `ROWS BETWEEN n PRECEDING AND CURRENT ROW` moving frames and whole-partition totals (`x / SUM(x) OVER ()`). They work on files of any size: rows are sorted on disk if needed, and no partition is held in memory.
 - SQL: `MEDIAN(x)`, `QUANTILE_CONT(x, 0.9)` and `PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY x)`, and `STDDEV` / `STDDEV_POP` / `VARIANCE` / `VAR_POP`, also per group and on calculations.
@@ -224,7 +226,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/elshanhsynv/pavi/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/elshanhsynv/pavi/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/elshanhsynv/pavi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/elshanhsynv/pavi/compare/v0.5.0...v0.6.0
