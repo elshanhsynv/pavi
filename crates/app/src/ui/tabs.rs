@@ -28,6 +28,9 @@ impl PaviApp {
             return;
         }
         let labels = self.tab_labels();
+        // Once per newly opened tab, so the strip can still be scrolled by hand.
+        let reveal = self.tabs.revealed != Some(self.tab_id);
+        self.tabs.revealed = Some(self.tab_id);
         let mut action = None;
         egui::TopBottomPanel::top("tab_strip")
             .exact_height(theme::TAB_BAR_HEIGHT)
@@ -52,6 +55,10 @@ impl PaviApp {
                                 let mut dragged = None;
                                 for (index, label) in labels.iter().enumerate() {
                                     let (rect, chosen, dragging) = tab(ui, index, label);
+                                    if reveal && label.active {
+                                        // Ctrl+Tab or a new tab can land past the edge.
+                                        ui.scroll_to_rect(rect, None);
+                                    }
                                     rects.push(rect);
                                     if dragging {
                                         dragged = Some(index);

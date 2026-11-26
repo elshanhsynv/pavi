@@ -108,6 +108,8 @@ pub(super) struct Tabs {
     pub(super) parked: Vec<Option<TabState>>,
     pub(super) active: usize,
     next_id: u64,
+    /// The tab the tab strip last scrolled into view, by id.
+    pub(super) revealed: Option<u64>,
 }
 
 impl Default for Tabs {
@@ -117,6 +119,7 @@ impl Default for Tabs {
             active: 0,
             // Tab 0 is the one the app starts with.
             next_id: 1,
+            revealed: None,
         }
     }
 }

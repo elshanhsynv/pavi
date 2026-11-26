@@ -8,6 +8,13 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Fixed
+- The status bar names the selected cell's column ("Row 1,204 · ARR_TIME") instead of giving its number, and gives the size of a selected range ("3 × 2 cells").
+- "Go to row" with a number past the end of the file says how many rows the file has, as it already did for a filter or SQL result.
+- Page Up and Page Down move one screen of rows, not a fixed 20.
+- Shortcuts need exactly their keys: Ctrl+Shift+W no longer closes the tab, and Ctrl+Shift+R or Ctrl+Alt+I no longer act as Ctrl+R or Ctrl+I.
+- Switching to a tab past the edge of the tab strip (Ctrl+Tab, or a new tab) scrolls it into view.
+- When a folder fails to open, the screen offers another folder, not another file. It also offers the other kind and the recent files, like the start screen.
+- The tooltip of "Import options…" on that screen lost a run of spaces in the middle.
 - A long SQL error now wraps on its own line under the Run button, and you can select and copy it. Before, it ran off the edge of the window.
 - In the SQL editor, Enter starts a new line even while completions are listed. It takes a completion only after you pick one with ↑/↓; Tab still takes the highlighted one. Esc closes the list without leaving the editor.
 - Loading a saved query or a history entry over other text in the SQL editor can be undone with "Restore previous query". "Clear history…" and deleting a saved query ask before they remove anything.

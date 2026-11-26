@@ -123,6 +123,7 @@ impl PaviApp {
         let gutter = row_number_width(self.grid.rows);
         let selected_row = self.grid.selection.map(|(row, _)| row);
         let area = ui.available_rect_before_wrap();
+        self.note_page_rows(area.height());
         let mut jump_row = None;
         let mut reveal_row = None;
         if let Some(row) = self.reveal_row.take() {
@@ -454,6 +455,7 @@ impl PaviApp {
         let scroll_x = self.grid_scroll_x.take();
         let mut frame = PinnedFrame::default();
         let area = ui.available_rect_before_wrap();
+        self.note_page_rows(area.height());
         // A result larger than the rows held gets PAVI's scrollbar for all of
         // it, which jumps (ADR 0012).
         let bar_total = total.unwrap_or(received);
@@ -656,6 +658,12 @@ impl PaviApp {
         }
     }
 
+    /// Keeps how many rows the grid shows, less one, for Page Up and Page Down.
+    fn note_page_rows(&mut self, height: f32) {
+        let rows = ((height - HEADER_HEIGHT) / ROW_HEIGHT).floor().max(2.0) as u64;
+        self.grid_page_rows = rows - 1;
+    }
+
     /// A cell's text in its column's number format, if it has one.
     fn formatted(&self, header: &Header, text: String) -> String {
         match header
@@ -728,6 +736,15 @@ impl PaviApp {
             .failed_path
             .clone()
             .filter(|path| parquet_reader::is_remote(path) || path.extension().is_some());
+        // Without an extension it was opened as a folder (no disk check per frame).
+        let failed_folder = self.failed_path.is_some() && failed_file.is_none();
+        let recent = self
+            .session
+            .recent_files
+            .iter()
+            .take(RECENT_ON_START)
+            .cloned()
+            .collect::<Vec<_>>();
         widgets::placeholder(ui, |ui| match &self.grid.loading {
             LoadState::Opening => {
                 ui.add(egui::Spinner::new().color(theme::accent()));
@@ -753,17 +770,40 @@ impl PaviApp {
             LoadState::Error(error) => {
                 ui.heading("This could not be opened");
                 widgets::error(ui, error);
-                browse = widgets::primary_button(ui, Some(Icon::Folder), "Choose another file")
-                    .clicked();
+                ui.horizontal(|ui| {
+                    if failed_folder {
+                        browse_folder = widgets::primary_button(
+                            ui,
+                            Some(Icon::Folder),
+                            "Choose another folder",
+                        )
+                        .clicked();
+                        browse = widgets::tool_button(ui, Some(Icon::Columns), "Open file…", false)
+                            .on_hover_text("Ctrl+O")
+                            .clicked();
+                    } else {
+                        browse =
+                            widgets::primary_button(ui, Some(Icon::Columns), "Choose another file")
+                                .clicked();
+                        browse_folder =
+                            widgets::tool_button(ui, Some(Icon::Folder), "Open folder…", false)
+                                .on_hover_text("Ctrl+Shift+O")
+                                .clicked();
+                    }
+                });
                 if let Some(path) = &failed_file
                     && ui
                         .button("Import options…")
                         .on_hover_text(
-                            "Read it as CSV or JSON, with another delimiter, encoding or                              header line, or every column as text",
+                            "Read it as CSV or JSON, with another delimiter, encoding or \
+                             header line, or every column as text",
                         )
                         .clicked()
                 {
                     import_options = Some(path.clone());
+                }
+                if let Some(path) = recent_buttons(ui, &recent, self.failed_path.as_deref()) {
+                    open = Some(path);
                 }
             }
             _ => {
@@ -789,14 +829,8 @@ impl PaviApp {
                             )
                             .clicked();
                 });
-                for path in self.session.recent_files.iter().take(RECENT_ON_START) {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    if widgets::tool_button(ui, Some(Icon::History), &name, false)
-                        .on_hover_text(path.display().to_string())
-                        .clicked()
-                    {
-                        open = Some(path.clone());
-                    }
+                if let Some(path) = recent_buttons(ui, &recent, None) {
+                    open = Some(path);
                 }
             }
         });
@@ -818,15 +852,16 @@ impl PaviApp {
         if ctx.wants_keyboard_input() || self.grid.rows == 0 || self.grid.columns == 0 {
             return;
         }
+        let page = self.page_rows();
         let (row_delta, column_delta, home, end, copy) = ctx.input(|input| {
             let row_delta = if input.key_pressed(egui::Key::ArrowUp) {
                 -1
             } else if input.key_pressed(egui::Key::ArrowDown) {
                 1
             } else if input.key_pressed(egui::Key::PageUp) {
-                -20
+                -page
             } else if input.key_pressed(egui::Key::PageDown) {
-                20
+                page
             } else {
                 0
             };
@@ -1340,6 +1375,26 @@ impl PaviApp {
 }
 
 const SCROLLBAR_WIDTH: f32 = 12.0;
+
+/// One button per recent file or folder, leaving out `skip` (the one that just
+/// failed). Returns the one clicked.
+fn recent_buttons(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    skip: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let mut open = None;
+    for path in recent.iter().filter(|path| Some(path.as_path()) != skip) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if widgets::tool_button(ui, Some(Icon::History), &name, false)
+            .on_hover_text(path.display().to_string())
+            .clicked()
+        {
+            open = Some(path.clone());
+        }
+    }
+    open
+}
 /// `PaviApp::grid_table_ids` slot of the file's grid.
 const FILE_TABLE: usize = 0;
 /// `PaviApp::grid_table_ids` slot of a filter, sort or SQL result's grid.
