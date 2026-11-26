@@ -1446,6 +1446,135 @@ fn pins_columns_and_keeps_them_in_view_when_scrolled_sideways() {
     assert_eq!(app.status, "Columns unpinned");
 }
 
+/// A key press with Ctrl held, and Shift too when `shift`.
+fn ctrl_key(key: egui::Key, shift: bool) -> egui::RawInput {
+    let modifiers = egui::Modifiers {
+        shift,
+        ..egui::Modifiers::COMMAND
+    };
+    egui::RawInput {
+        modifiers,
+        events: vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn shortcuts_need_exactly_their_modifiers() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    assert!(app.new_tab());
+    assert_eq!(app.tab_count(), 2);
+    let ctx = egui::Context::default();
+
+    // Ctrl+Shift+W is not Ctrl+W.
+    let _ = ctx.run(ctrl_key(egui::Key::W, true), |ctx| {
+        app.handle_global_shortcuts(ctx)
+    });
+    assert_eq!(app.tab_count(), 2);
+    let _ = ctx.run(ctrl_key(egui::Key::W, false), |ctx| {
+        app.handle_global_shortcuts(ctx)
+    });
+    assert_eq!(app.tab_count(), 1);
+
+    // Nor is Ctrl+Shift+I Ctrl+I.
+    let shown = app.show_inspector;
+    let _ = ctx.run(ctrl_key(egui::Key::I, true), |ctx| {
+        app.handle_global_shortcuts(ctx)
+    });
+    assert_eq!(app.show_inspector, shown);
+    let _ = ctx.run(ctrl_key(egui::Key::I, false), |ctx| {
+        app.handle_global_shortcuts(ctx)
+    });
+    assert_eq!(app.show_inspector, !shown);
+}
+
+#[test]
+fn page_down_moves_one_screen_of_rows() {
+    let (_directory, source, path) = source(200);
+    let mut app = make_app(source, path);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    let mut time = 0.0;
+    let mut render = |app: &mut PaviApp, events: Vec<egui::Event>| {
+        time += 0.1;
+        let _ = ctx.run(grid_frame(time, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        });
+    };
+    render(&mut app, vec![]);
+    // A 900 px window shows over thirty rows, not the old fixed 20.
+    let page = app.grid_page_rows;
+    assert!(page > 30, "{page} rows a page");
+    assert!(app.grid.select(0, 0));
+    let page_down = egui::Event::Key {
+        key: egui::Key::PageDown,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    render(&mut app, vec![page_down]);
+    assert_eq!(app.grid.selection, Some((page, 0)));
+}
+
+#[test]
+fn go_to_row_says_how_many_rows_there_are() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    app.jump_row_input = "999".to_string();
+    app.jump_to_input();
+    assert_eq!(app.status, "The file has 8 rows");
+    app.jump_row_input = "row 3".to_string();
+    app.jump_to_input();
+    assert_eq!(app.status, "Enter a row number from 1 to 8");
+}
+
+#[test]
+fn a_folder_that_failed_offers_another_folder() {
+    let (directory, source, path) = source(8);
+    let mut app = make_app(source, path.clone());
+    app.dataset = None;
+    app.grid.loading = LoadState::Error("No Parquet files in the folder".to_string());
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    let texts = |app: &mut PaviApp| {
+        let output = ctx.run(grid_frame(0.0, vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        });
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    app.failed_path = Some(directory.path().join("partitions"));
+    let shown = texts(&mut app);
+    assert!(
+        shown.iter().any(|text| text == "Choose another folder"),
+        "{shown:?}"
+    );
+    assert!(shown.iter().any(|text| text == "Open file…"));
+    app.failed_path = Some(path);
+    let shown = texts(&mut app);
+    assert!(
+        shown.iter().any(|text| text == "Choose another file"),
+        "{shown:?}"
+    );
+    assert!(shown.iter().any(|text| text == "Open folder…"));
+}
+
 #[test]
 fn sql_editor_completes_column_names_with_the_keyboard() {
     let (_directory, source, path) = source(8);

@@ -46,6 +46,8 @@ use crate::state::{
 };
 
 const ROW_HEIGHT: f32 = 24.0;
+/// Rows Page Up and Page Down move before the grid has been drawn.
+const DEFAULT_PAGE_ROWS: u64 = 20;
 const INITIAL_COLUMN_WIDTH: f32 = 110.0;
 const CELL_LIMIT: usize = 256;
 /// Longest cell value "Filter to this value" accepts; longer ones are refused.
@@ -113,6 +115,9 @@ pub(crate) struct PaviApp {
     /// The egui table ids of the file's grid and of a result's grid, keyed by
     /// their column widths (`ui::grid::column_table_id`).
     grid_table_ids: [Option<egui::Id>; 2],
+    /// Rows of the grid on screen last frame, less one: what Page Up and Page
+    /// Down move.
+    grid_page_rows: u64,
     /// The find bar above the grid.
     find: FindState,
     filtered: Option<FilteredGrid>,
@@ -361,6 +366,7 @@ impl PaviApp {
             grid_scroll_x: None,
             grid_view_x: (0.0, 0.0),
             grid_table_ids: [None; 2],
+            grid_page_rows: DEFAULT_PAGE_ROWS,
             find: FindState::default(),
             filtered: None,
             column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
@@ -557,9 +563,10 @@ impl PaviApp {
 
     fn handle_global_shortcuts(&mut self, ctx: &egui::Context) {
         // Matched on the key event's own modifiers, so a quick Ctrl+Shift+F is not
-        // read as Ctrl+F once Shift is already up.
+        // read as Ctrl+F once Shift is already up. Exactly: egui's `consume_key`
+        // ignores an extra Shift or Alt, so Ctrl+Shift+W would close the tab.
         let find_key = |modifiers: egui::Modifiers, key: egui::Key| {
-            ctx.input_mut(|input| input.consume_key(modifiers, key))
+            ctx.input_mut(|input| consume_exact_key(input, modifiers, key))
         };
         if self.dataset.is_some()
             && find_key(
@@ -591,7 +598,7 @@ impl PaviApp {
         ) {
             self.pick_folder();
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::O)) {
+        if find_key(egui::Modifiers::COMMAND, egui::Key::O) {
             self.pick_file();
         }
         if find_key(egui::Modifiers::COMMAND, egui::Key::T) {
@@ -624,32 +631,38 @@ impl PaviApp {
                 self.switch_tab((self.tabs.active + 1) % count);
             }
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::Num1)) {
+        if find_key(egui::Modifiers::COMMAND, egui::Key::Num1) {
             self.workspace = Workspace::Grid;
         }
         if self.toolbar_availability().enabled(ToolbarCommand::Sql)
-            && ctx.input(|input| input.key_pressed(egui::Key::Num2))
+            && find_key(egui::Modifiers::COMMAND, egui::Key::Num2)
         {
             self.workspace = Workspace::Sql;
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::I)) {
+        if find_key(egui::Modifiers::COMMAND, egui::Key::I) {
             self.show_inspector = !self.show_inspector;
             self.persist_session();
         }
         if self.toolbar_availability().enabled(ToolbarCommand::Refresh)
-            && ctx.input(|input| input.key_pressed(egui::Key::R))
+            && find_key(egui::Modifiers::COMMAND, egui::Key::R)
         {
             self.reload_document();
         }
         if self.toolbar_availability().enabled(ToolbarCommand::Filter)
-            && ctx.input(|input| input.key_pressed(egui::Key::F))
+            && find_key(egui::Modifiers::COMMAND, egui::Key::F)
         {
             self.workspace = Workspace::Grid;
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("filter_search")));
         }
-        if self.dataset.is_some() && ctx.input(|input| input.key_pressed(egui::Key::G)) {
+        if self.dataset.is_some() && find_key(egui::Modifiers::COMMAND, egui::Key::G) {
             ctx.memory_mut(|memory| memory.request_focus(ui::status::jump_box_id()));
         }
+    }
+
+    /// Rows Page Up and Page Down move: one screen of the grid, less a row so
+    /// the last one stays in view.
+    fn page_rows(&self) -> i64 {
+        i64::try_from(self.grid_page_rows.max(1)).unwrap_or(1)
     }
 
     /// Opens each file or folder dropped on the window, in its own tab.
@@ -2833,7 +2846,20 @@ impl eframe::App for PaviApp {
                     has_error: matches!(self.grid.loading, LoadState::Error(_))
                         || self.filter_error.is_some()
                         || self.sql_error.is_some(),
-                    selection: self.grid.selection,
+                    selection: self.grid.selection.map(|(row, column)| {
+                        let (rows, columns) = self
+                            .grid
+                            .selection_range
+                            .map_or((1, 1), crate::state::SelectionRange::size);
+                        ui::status::SelectionSummary {
+                            row,
+                            column: self
+                                .display_column_name(column)
+                                .unwrap_or_else(|| format!("column {}", column + 1)),
+                            rows,
+                            columns,
+                        }
+                    }),
                     dataset: self.dataset.as_ref().zip(compression).map(
                         |(dataset, compression)| ui::status::DatasetSummary {
                             rows: self.filtered.as_ref().map_or(self.grid.rows, |filtered| {
@@ -2884,6 +2910,27 @@ impl eframe::App for PaviApp {
             ctx.request_repaint_after(next_check);
         }
     }
+}
+
+/// Consumes a press of `key` with exactly `modifiers` held (Ctrl or Cmd as
+/// `command`), and says whether there was one.
+fn consume_exact_key(
+    input: &mut egui::InputState,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> bool {
+    let mut found = false;
+    input.events.retain(|event| {
+        let hit = !found
+            && matches!(
+                event,
+                egui::Event::Key { key: pressed, pressed: true, modifiers: held, .. }
+                    if *pressed == key && held.matches_exact(modifiers)
+            );
+        found |= hit;
+        !hit
+    });
+    found
 }
 
 #[cfg(test)]

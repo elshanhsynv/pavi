@@ -795,7 +795,7 @@ impl PaviApp {
                 } else if row < self.grid.rows {
                     self.grid.jump_to_row(row);
                 } else {
-                    self.status = "Enter a row number within the current result set".to_string();
+                    self.status = format!("The file has {} rows", theme::number(self.grid.rows));
                     return;
                 }
                 self.jump_target = Some(row);
@@ -806,7 +806,18 @@ impl PaviApp {
                 }
                 self.status = format!("Jumped to row {one_based}");
             }
-            _ => self.status = "Enter a row number within the current result set".to_string(),
+            _ => {
+                let rows = self
+                    .filtered
+                    .as_ref()
+                    .map_or(Some(self.grid.rows), |filtered| filtered.total());
+                self.status = match rows {
+                    Some(rows) if rows > 0 => {
+                        format!("Enter a row number from 1 to {}", theme::number(rows))
+                    }
+                    _ => "Enter a row number, from 1".to_string(),
+                };
+            }
         }
     }
 }

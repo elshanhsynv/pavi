@@ -33,7 +33,7 @@ pub(crate) const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "Grid",
         &[
             ("Arrows", "Move the selection"),
-            ("Page Up / Page Down", "Move 20 rows"),
+            ("Page Up / Page Down", "Move one screen of rows"),
             ("Home / End", "First / last row"),
             ("Shift+click, Shift+arrows", "Select a range"),
             ("Ctrl+C", "Copy the selection"),

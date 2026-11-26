@@ -67,6 +67,14 @@ impl SelectionRange {
         };
         (first_row..=last_row).contains(&row) && (first_column..=last_column).contains(&column)
     }
+
+    /// Rows and columns the range covers.
+    pub fn size(self) -> (u64, usize) {
+        (
+            self.anchor.0.abs_diff(self.focus.0) + 1,
+            self.anchor.1.abs_diff(self.focus.1) + 1,
+        )
+    }
 }
 
 /// Narrowest a grid column gets.

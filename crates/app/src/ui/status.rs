@@ -9,13 +9,25 @@ pub struct DatasetSummary<'a> {
     pub compression: &'a str,
 }
 
+/// The selected cell, and how many rows and columns the selection covers.
+pub struct SelectionSummary {
+    pub row: u64,
+    /// Name of the selected cell's column.
+    pub column: String,
+    pub rows: u64,
+    pub columns: usize,
+}
+
+/// Characters of the selected column's name shown in the status bar.
+const COLUMN_NAME_CHARS: usize = 32;
+
 pub struct StatusBar<'a> {
     pub status: &'a str,
     pub activity: Option<&'static str>,
     /// How far the running scan has got, from 0 to 1.
     pub progress: Option<f32>,
     pub has_error: bool,
-    pub selection: Option<(u64, usize)>,
+    pub selection: Option<SelectionSummary>,
     pub dataset: Option<DatasetSummary<'a>>,
     pub path: Option<&'a std::path::Path>,
     pub jump_input: &'a mut String,
@@ -131,16 +143,10 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                         widgets::divider(ui);
                         ui.label(small(fact).color(theme::muted()));
                     }
-                    if let Some((row, column)) = status.selection {
+                    if let Some(selection) = status.selection {
                         widgets::divider(ui);
-                        ui.label(
-                            small(format!(
-                                "Row {}, column {}",
-                                theme::number(row + 1),
-                                column + 1
-                            ))
-                            .color(theme::text()),
-                        );
+                        ui.label(small(describe_selection(&selection)).color(theme::text()))
+                            .on_hover_text(&selection.column);
                     }
                 });
             });
@@ -148,8 +154,54 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
     jump
 }
 
+/// "Row 1,204 · ARR_TIME", and "· 3 × 2 cells" for a range.
+pub fn describe_selection(selection: &SelectionSummary) -> String {
+    let column = if selection.column.chars().count() > COLUMN_NAME_CHARS {
+        let short = selection
+            .column
+            .chars()
+            .take(COLUMN_NAME_CHARS)
+            .collect::<String>();
+        format!("{short}…")
+    } else {
+        selection.column.clone()
+    };
+    let mut text = format!("Row {} · {column}", theme::number(selection.row + 1));
+    if selection.rows > 1 || selection.columns > 1 {
+        text.push_str(&format!(
+            " · {} × {} cells",
+            theme::number(selection.rows),
+            selection.columns
+        ));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{SelectionSummary, describe_selection};
+
+    #[test]
+    fn names_the_selected_column_and_the_range_size() {
+        let mut selection = SelectionSummary {
+            row: 1_203,
+            column: "ARR_TIME".to_owned(),
+            rows: 1,
+            columns: 1,
+        };
+        assert_eq!(describe_selection(&selection), "Row 1,204 · ARR_TIME");
+        selection.rows = 3;
+        selection.columns = 2;
+        assert_eq!(
+            describe_selection(&selection),
+            "Row 1,204 · ARR_TIME · 3 × 2 cells"
+        );
+        selection.column = "x".repeat(40);
+        assert!(
+            describe_selection(&selection).starts_with(&format!("Row 1,204 · {}…", "x".repeat(32)))
+        );
+    }
+
     #[test]
     fn formats_scan_progress_as_a_whole_percentage() {
         for (fraction, expected) in [
