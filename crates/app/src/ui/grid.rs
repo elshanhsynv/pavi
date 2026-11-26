@@ -171,6 +171,11 @@ impl PaviApp {
         let pinned = self.pinned_columns();
         let scroll_x = self.grid_scroll_x.take();
         let mut frame = PinnedFrame::default();
+        let widths = visible
+            .iter()
+            .map(|(_, _, width)| *width)
+            .collect::<Vec<_>>();
+        let (table_id, stale_table) = self.column_table_id(FILE_TABLE, &widths);
         // The table's vertical scroll offset after this frame (egui applies wheel
         // movement at the end of the frame, after the rows were drawn).
         let (body, offset_x, viewport) = ui
@@ -181,16 +186,19 @@ impl PaviApp {
                 }
                 let output = sideways.show(ui, |ui| {
                     ui.set_min_width(
-                        (visible.iter().map(|(_, _, width)| width).sum::<f32>() + gutter)
-                            .max(ui.available_width()),
+                        (widths.iter().sum::<f32>() + gutter).max(ui.available_width()),
                     );
+                    if let Some(stale) = stale_table {
+                        TableBuilder::new(ui).id_salt(stale).reset();
+                    }
                     let mut table = TableBuilder::new(ui)
+                        .id_salt(table_id)
                         .striped(true)
                         .resizable(true)
                         .cell_layout(Layout::left_to_right(Align::Center))
                         .column(Column::exact(gutter));
-                    for (_, _, width) in &visible {
-                        table = table.column(Column::initial(*width).at_least(72.0));
+                    for width in &widths {
+                        table = table.column(data_column(*width));
                     }
                     // An empty last column takes the leftover width, so data
                     // columns keep their own widths.
@@ -244,6 +252,7 @@ impl PaviApp {
                                     let (gutter_rect, _) =
                                         table_row.col(|ui| row_number(ui, row_index, current_row));
                                     let mut cells = Vec::new();
+                                    let mut widths = Vec::with_capacity(columns);
                                     for (column, header) in headers.iter().enumerate() {
                                         let look = CellLook {
                                             selected: self.grid.is_selected(row_index, column),
@@ -257,6 +266,7 @@ impl PaviApp {
                                         let (rect, _) = table_row.col(|ui| {
                                             self.data_cell(ui, row_index, column, &text, look);
                                         });
+                                        widths.push(rect.width());
                                         if column < pinned {
                                             cells.push(PinnedCell { rect, text, look });
                                         }
@@ -268,6 +278,7 @@ impl PaviApp {
                                         current: current_row,
                                         gutter: gutter_rect,
                                         cells,
+                                        widths,
                                     });
                                 },
                             );
@@ -278,6 +289,7 @@ impl PaviApp {
             .inner;
         let table_offset = body.state.offset.y;
         self.grid_view_x = (offset_x, viewport.width() - gutter);
+        self.keep_dragged_widths(ui.ctx(), &headers, frame.drawn_widths());
         self.draw_pinned(ui, frame, &headers, table_area, body.inner_rect);
         if let (Some(bar), Some((first, last))) = (scrollbar, self.drawn_rows) {
             if let Some(top) = row_scrollbar(ui, bar, self.grid.rows, first, last) {
@@ -462,6 +474,8 @@ impl PaviApp {
             .and_then(|row| row.checked_sub(first_result))
             .map(ui_row_count);
         let mut drawn: Option<(u64, u64)> = None;
+        let widths = self.display_column_widths();
+        let (table_id, stale_table) = self.column_table_id(RESULT_TABLE, &widths);
         let mut sideways = egui::ScrollArea::horizontal().id_salt("filtered_grid_horizontal");
         if let Some(x) = scroll_x {
             sideways = sideways.horizontal_scroll_offset(x);
@@ -470,31 +484,19 @@ impl PaviApp {
             .scope_builder(egui::UiBuilder::new().max_rect(table_area), |ui| {
                 sideways.show(ui, |ui| {
                     ui.set_min_width(
-                        ((0..columns)
-                            .map(|column| {
-                                if aggregate {
-                                    INITIAL_COLUMN_WIDTH
-                                } else {
-                                    self.column_layout
-                                        .width(display_columns[column].0, INITIAL_COLUMN_WIDTH)
-                                }
-                            })
-                            .sum::<f32>()
-                            + gutter)
-                            .max(ui.available_width()),
+                        (widths.iter().sum::<f32>() + gutter).max(ui.available_width()),
                     );
+                    if let Some(stale) = stale_table {
+                        TableBuilder::new(ui).id_salt(stale).reset();
+                    }
                     let mut table = TableBuilder::new(ui)
+                        .id_salt(table_id)
                         .striped(true)
                         .resizable(true)
                         .cell_layout(Layout::left_to_right(Align::Center))
                         .column(Column::exact(gutter));
-                    for (source, _) in &display_columns {
-                        let width = if aggregate {
-                            INITIAL_COLUMN_WIDTH
-                        } else {
-                            self.column_layout.width(*source, INITIAL_COLUMN_WIDTH)
-                        };
-                        table = table.column(Column::initial(width).at_least(72.0));
+                    for width in &widths {
+                        table = table.column(data_column(*width));
                     }
                     table = table.column(Column::remainder());
                     if let Some(row) = jump_target {
@@ -543,6 +545,7 @@ impl PaviApp {
                                     let (gutter_rect, _) =
                                         table_row.col(|ui| row_number(ui, result_row, current_row));
                                     let mut cells = Vec::new();
+                                    let mut widths = Vec::with_capacity(columns);
                                     for (column, (_, batch_column)) in
                                         display_columns.iter().enumerate()
                                     {
@@ -558,6 +561,7 @@ impl PaviApp {
                                         let (rect, _) = table_row.col(|ui| {
                                             self.data_cell(ui, result_row, column, &text, look);
                                         });
+                                        widths.push(rect.width());
                                         if column < pinned {
                                             cells.push(PinnedCell { rect, text, look });
                                         }
@@ -569,6 +573,7 @@ impl PaviApp {
                                         current: current_row,
                                         gutter: gutter_rect,
                                         cells,
+                                        widths,
                                     });
                                 },
                             );
@@ -577,6 +582,7 @@ impl PaviApp {
             })
             .inner;
         self.grid_view_x = (output.state.offset.x, output.inner_rect.width() - gutter);
+        self.keep_dragged_widths(ui.ctx(), &headers, frame.drawn_widths());
         self.draw_pinned(ui, frame, &headers, table_area, output.inner.inner_rect);
         if let (Some(bar), Some((first, last))) = (scrollbar, drawn) {
             if let Some(top) = row_scrollbar(ui, bar, bar_total.max(1), first, last) {
@@ -595,6 +601,59 @@ impl PaviApp {
         }
         self.apply_header_action(ui.ctx());
         self.apply_cell_action(ui.ctx());
+    }
+
+    /// The egui table id for a grid with these column widths, and the id of the
+    /// table it replaces, whose state egui should forget.
+    ///
+    /// egui keeps a resizable table's widths in its own memory and, once it has
+    /// them, ignores the widths it is given. Keyed by the widths, the table
+    /// starts afresh with the column layout's widths whenever they change, so the
+    /// layout stays the one source: the Columns menu, Fit width and Reset show at
+    /// once, and a width dragged in the grid (`keep_dragged_widths`) is the
+    /// layout's from then on.
+    pub(in crate::app) fn column_table_id(
+        &mut self,
+        slot: usize,
+        widths: &[f32],
+    ) -> (egui::Id, Option<egui::Id>) {
+        let key = widths
+            .iter()
+            .map(|width| width.round() as u32)
+            .collect::<Vec<_>>();
+        let id = egui::Id::new(("grid_columns", key));
+        let previous = self.grid_table_ids[slot].replace(id);
+        (id, previous.filter(|previous| *previous != id))
+    }
+
+    /// Takes the widths the user dragged in the grid into the column layout and
+    /// saves them, once the mouse button is up.
+    fn keep_dragged_widths(
+        &mut self,
+        ctx: &egui::Context,
+        headers: &[Header],
+        drawn: Option<Vec<f32>>,
+    ) {
+        let Some(drawn) = drawn else {
+            return;
+        };
+        if ctx.input(|input| input.pointer.any_down()) {
+            return;
+        }
+        let mut changed = false;
+        for (header, width) in headers.iter().zip(drawn) {
+            // An aggregate's columns are not the file's and keep no width.
+            let Some(source) = header.source else {
+                continue;
+            };
+            if (self.column_layout.width(source, INITIAL_COLUMN_WIDTH) - width).abs() > 0.5 {
+                self.column_layout.set_width(source, width.round());
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_column_layout();
+        }
     }
 
     /// A cell's text in its column's number format, if it has one.
@@ -1281,6 +1340,19 @@ impl PaviApp {
 }
 
 const SCROLLBAR_WIDTH: f32 = 12.0;
+/// `PaviApp::grid_table_ids` slot of the file's grid.
+const FILE_TABLE: usize = 0;
+/// `PaviApp::grid_table_ids` slot of a filter, sort or SQL result's grid.
+const RESULT_TABLE: usize = 1;
+
+/// A data column of the grid: `width` wide, resizable within `ColumnLayout`'s range.
+/// Clipped, because cells cut their own text: egui would otherwise let a column
+/// shrink only a few pixels per frame while its edge is dragged.
+fn data_column(width: f32) -> Column {
+    Column::initial(width)
+        .range(MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH)
+        .clip(true)
+}
 
 /// Id of the find box, so Ctrl+Shift+F can focus it.
 pub fn find_box_id() -> egui::Id {
@@ -1303,6 +1375,17 @@ struct PinnedFrame {
     rows: Vec<PinnedRow>,
 }
 
+impl PinnedFrame {
+    /// The data columns' widths as drawn this frame, from the header or the
+    /// first row drawn.
+    fn drawn_widths(&self) -> Option<Vec<f32>> {
+        self.header
+            .as_ref()
+            .map(|header| header.cells.iter().map(egui::Rect::width).collect())
+            .or_else(|| self.rows.first().map(|row| row.widths.clone()))
+    }
+}
+
 struct PinnedRow {
     row: u64,
     /// egui striped this row.
@@ -1310,6 +1393,8 @@ struct PinnedRow {
     current: bool,
     gutter: egui::Rect,
     cells: Vec<PinnedCell>,
+    /// Width of every data column in this row, as egui laid it out.
+    widths: Vec<f32>,
 }
 
 struct PinnedCell {

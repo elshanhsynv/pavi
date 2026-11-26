@@ -138,7 +138,7 @@ sequenceDiagram
 **Memory:** at most the sort budget (1,048,576 rows / 128 MB of kept columns, plus the sorted copy) while scanning; a merge holds one 4,096-row batch per run (≤ 16 runs) plus one merged round.
 **Disk:** a spilled sort writes about its kept columns, uncompressed, once per pass (one pass up to 16 × 100k rows, one more per ×16).
 **Errors:** "this sort needs more than 32 GB of temporary disk space; filter the data or add a LIMIT"; I/O errors creating or reading spill files; a top-N whose kept rows alone exceed 128 MB. All end up in the status bar / grid error.
-"Back to file order" in the Sort menu = `clear_filter`.
+"Back to file order" in the Sort menu = `clear_sort`: a plain sort goes back to the file, a sorted filter runs the filter again without the sort. A SQL result does not offer it.
 
 ```mermaid
 sequenceDiagram

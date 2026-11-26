@@ -41,7 +41,8 @@ use crate::session::{
     SessionState, SessionStore, TabView, ThemeChoice,
 };
 use crate::state::{
-    ColumnLayout, GridState, LoadState, ToolbarAvailability, ToolbarCommand, Workspace,
+    ColumnLayout, GridState, LoadState, MAX_COLUMN_WIDTH, MIN_COLUMN_WIDTH, ToolbarAvailability,
+    ToolbarCommand, Workspace,
 };
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -109,6 +110,9 @@ pub(crate) struct PaviApp {
     /// The grid's horizontal scroll offset and visible width (right of the row
     /// numbers) last frame.
     grid_view_x: (f32, f32),
+    /// The egui table ids of the file's grid and of a result's grid, keyed by
+    /// their column widths (`ui::grid::column_table_id`).
+    grid_table_ids: [Option<egui::Id>; 2],
     /// The find bar above the grid.
     find: FindState,
     filtered: Option<FilteredGrid>,
@@ -346,6 +350,7 @@ impl PaviApp {
             grid_scroll_offset: None,
             grid_scroll_x: None,
             grid_view_x: (0.0, 0.0),
+            grid_table_ids: [None; 2],
             find: FindState::default(),
             filtered: None,
             column_layout: ColumnLayout::new(0, INITIAL_COLUMN_WIDTH),
@@ -723,7 +728,7 @@ impl PaviApp {
                 self.column_layout
                     .width(source, INITIAL_COLUMN_WIDTH)
                     .round()
-                    .clamp(72.0, 480.0) as u16,
+                    .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH) as u16,
             );
         }
         self.session.save_grid_layout(GridLayoutPreference {
@@ -1546,6 +1551,41 @@ impl PaviApp {
             _ => SortDirection::Ascending,
         };
         self.sort_column(column, direction);
+    }
+
+    /// Drops the sort and shows the rows in file order again: the whole file
+    /// for a plain sort, the filter's matches for a sorted filter. A SQL
+    /// result keeps its order, which its query decides.
+    fn clear_sort(&mut self) {
+        let (kind, filter) = match &self.filtered {
+            Some(filtered) if !filtered.sort.is_empty() => (filtered.kind, filtered.filter.clone()),
+            _ => return,
+        };
+        match kind {
+            QueryKind::Sort => {
+                self.cancel_filter();
+                self.cancel_page_work();
+                let generation = self.grid.reset();
+                if let Some(dataset) = &self.dataset {
+                    self.grid.ready(
+                        dataset.source.row_count(),
+                        self.column_layout.visible().len(),
+                    );
+                } else {
+                    self.grid.generation = generation;
+                }
+                self.refresh_grid_columns();
+                self.status = "Back to file order".to_string();
+                self.persist_session();
+            }
+            QueryKind::Filter => {
+                if let Some(filter) = filter {
+                    let text = filter.to_string();
+                    self.start_filter(filter, &text);
+                }
+            }
+            QueryKind::Sql => {}
+        }
     }
 
     /// Sorts by `column` alone.

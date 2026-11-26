@@ -473,6 +473,11 @@ impl PaviApp {
         };
         let mut toggle = None;
         let mut clear = false;
+        // A SQL result is in the order its query gives; only running it again undoes a sort.
+        let sql_result = self
+            .filtered
+            .as_ref()
+            .is_some_and(|filtered| filtered.kind == QueryKind::Sql);
         widgets::menu(
             ui,
             "sort",
@@ -482,7 +487,11 @@ impl PaviApp {
             260.0,
             |ui| {
                 if sorted.is_some() {
-                    clear = widgets::menu_item(ui, "Back to file order", "").clicked();
+                    if sql_result {
+                        widgets::menu_caption(ui, "Run the query again for its own order.");
+                    } else {
+                        clear = widgets::menu_item(ui, "Back to file order", "").clicked();
+                    }
                     ui.separator();
                 }
                 egui::ScrollArea::vertical()
@@ -511,7 +520,7 @@ impl PaviApp {
         )
         .on_hover_text(hint);
         if clear {
-            self.clear_filter();
+            self.clear_sort();
         }
         if let Some(column) = toggle {
             self.toggle_sort(column);
@@ -592,7 +601,7 @@ impl PaviApp {
                             if ui
                                 .add(
                                     egui::DragValue::new(&mut width)
-                                        .range(72.0..=480.0)
+                                        .range(MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH)
                                         .speed(2.0)
                                         .suffix(" px"),
                                 )
