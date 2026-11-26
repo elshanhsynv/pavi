@@ -83,7 +83,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Path dist\$name\* -DestinationPath dist\$name.zip -Force
           $hash = (Get-FileHash dist\$name.zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Out-File -Encoding ascii dist\$name.zip.sha256
+          # LF only: `sha256sum -c` reads a CR as part of the file name.
+          "$hash  $name.zip`n" | Out-File -Encoding ascii -NoNewline dist\$name.zip.sha256
           "ASSET=dist\$name.zip" >> $env:GITHUB_ENV
 
       - name: Release notes from CHANGELOG
