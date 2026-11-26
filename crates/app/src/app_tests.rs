@@ -1493,16 +1493,96 @@ fn sql_editor_completes_column_names_with_the_keyboard() {
         app.sql_completion.as_ref().unwrap().items[0].insert,
         "dataset"
     );
-    // Esc closes the list and leaves the text alone.
+    // Esc closes the list, leaves the text alone and keeps the editor focused.
     frame(&mut app, vec![key(egui::Key::Escape)]);
     assert!(app.sql_completion.is_none());
     assert_eq!(app.sql_input, "SELECT name FROM da");
+    assert!(ctx.memory(|memory| memory.has_focus(ui::sql::sql_editor_id())));
     // No list inside a string.
     frame(
         &mut app,
         vec![egui::Event::Text("taset WHERE name = 'na".into())],
     );
     assert!(app.sql_completion.is_none());
+
+    // Enter starts a new line while the list is open, unless a completion was
+    // chosen with the arrows.
+    frame(&mut app, vec![egui::Event::Text("' OR na".into())]);
+    assert!(app.sql_completion.is_some());
+    frame(&mut app, vec![key(egui::Key::Enter)]);
+    assert!(app.sql_input.ends_with("'na' OR na\n"), "{}", app.sql_input);
+    frame(&mut app, vec![egui::Event::Text("na".into())]);
+    assert!(app.sql_completion.is_some());
+    frame(
+        &mut app,
+        vec![key(egui::Key::ArrowDown), key(egui::Key::ArrowUp)],
+    );
+    frame(&mut app, vec![key(egui::Key::Enter)]);
+    assert!(app.sql_input.ends_with("OR na\nname"), "{}", app.sql_input);
+    assert!(app.sql_completion.is_none());
+}
+
+#[test]
+fn a_long_sql_error_wraps_inside_the_window() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    let error = format!("SQL error: {}", "a very long reason ".repeat(20));
+    app.sql_error = Some(error.clone());
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    let output = ctx.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_sql_workspace(ui));
+        },
+    );
+    let galley = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == error => Some(text),
+            _ => None,
+        })
+        .expect("the error is drawn");
+    assert!(galley.galley.rows.len() > 1, "the error wraps");
+    assert!(galley.pos.x + galley.galley.size().x <= 900.0);
+}
+
+#[test]
+fn a_loaded_query_can_be_undone() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+
+    // Nothing to restore when the editor was empty.
+    app.sql_input.clear();
+    app.replace_sql_input("SELECT id FROM dataset".to_string());
+    assert!(app.sql_replaced.is_none());
+
+    // Text that was there comes back, once.
+    app.replace_sql_input("SELECT name FROM dataset".to_string());
+    assert_eq!(app.sql_replaced.as_deref(), Some("SELECT id FROM dataset"));
+    app.restore_replaced_sql();
+    assert_eq!(app.sql_input, "SELECT id FROM dataset");
+    assert!(app.sql_replaced.is_none());
+    assert_eq!(app.status, "Restored the previous query");
+
+    // Loading the same text keeps nothing.
+    app.replace_sql_input("SELECT id FROM dataset".to_string());
+    assert!(app.sql_replaced.is_none());
+
+    // It belongs to its tab.
+    app.replace_sql_input("SELECT 1".to_string());
+    assert!(app.sql_replaced.is_some());
+    assert!(app.new_tab());
+    assert!(app.sql_replaced.is_none());
+    app.switch_tab(0);
+    assert_eq!(app.sql_replaced.as_deref(), Some("SELECT id FROM dataset"));
 }
 
 #[test]

@@ -8,6 +8,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Fixed
+- A long SQL error now wraps on its own line under the Run button, and you can select and copy it. Before, it ran off the edge of the window.
+- In the SQL editor, Enter starts a new line even while completions are listed. It takes a completion only after you pick one with ↑/↓; Tab still takes the highlighted one. Esc closes the list without leaving the editor.
+- Loading a saved query or a history entry over other text in the SQL editor can be undone with "Restore previous query". "Clear history…" and deleting a saved query ask before they remove anything.
 - The Windows download's `.sha256` file now works with `sha256sum -c`: it ended its line with a Windows line break, which the tool read as part of the file name.
 - "Back to file order" in the Sort menu works: it did nothing for a sorted file, and on a sorted filter it dropped the filter too. Now it drops only the sort and keeps the filter. A sorted SQL result says to run the query again, since its query decides its order.
 - Column widths set in the Columns menu, with Fit width or with Reset now show in the grid straight away. A width dragged in the grid is kept for the next start, and hiding or showing a column no longer resets the others. A column also shrinks smoothly while its edge is dragged.

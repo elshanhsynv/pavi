@@ -47,7 +47,8 @@ pub(crate) const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
         "SQL editor",
         &[
             ("Ctrl+Enter", "Run the query"),
-            ("Tab or Enter", "Take the completion"),
+            ("Tab", "Take the highlighted completion"),
+            ("Enter", "Take a completion chosen with Up / Down"),
             ("Up / Down", "Choose a completion"),
             ("Esc", "Close completions"),
         ],

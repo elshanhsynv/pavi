@@ -131,6 +131,13 @@ pub(crate) struct PaviApp {
     sql_error: Option<String>,
     /// Completions open under the SQL editor's cursor.
     sql_completion: Option<SqlCompletion>,
+    /// The editor's text before a saved or past query replaced it, until it is
+    /// restored or the editor is changed.
+    sql_replaced: Option<String>,
+    /// The History menu is asking whether to clear the whole history.
+    confirm_clear_history: bool,
+    /// The saved query the Saved menu is asking whether to delete, by name.
+    confirm_delete_saved: Option<String>,
     /// Name typed in the "Saved" menu for the query being saved.
     saved_query_name: String,
     chart: ChartState,
@@ -214,6 +221,9 @@ pub(crate) struct SqlCompletion {
     pub(crate) cursor: usize,
     pub(crate) items: Vec<crate::sql_editor::Suggestion>,
     pub(crate) selected: usize,
+    /// The user moved through the list with the arrow keys: Enter takes the
+    /// completion then, and otherwise starts a new line.
+    pub(crate) picked: bool,
 }
 
 /// The find bar: text to look for in the loaded rows.
@@ -367,6 +377,9 @@ impl PaviApp {
             sql_input: session.sql_input.clone(),
             sql_error: None,
             sql_completion: None,
+            sql_replaced: None,
+            confirm_clear_history: false,
+            confirm_delete_saved: None,
             saved_query_name: String::new(),
             chart: ChartState {
                 visible: chart_visible,
