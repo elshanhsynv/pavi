@@ -69,6 +69,11 @@ impl SelectionRange {
     }
 }
 
+/// Narrowest a grid column gets.
+pub const MIN_COLUMN_WIDTH: f32 = 72.0;
+/// Widest a grid column gets.
+pub const MAX_COLUMN_WIDTH: f32 = 480.0;
+
 /// Compact presentation-only mapping from display columns to source columns.
 pub struct ColumnLayout {
     order: Vec<usize>,
@@ -150,7 +155,7 @@ impl ColumnLayout {
 
     pub fn set_width(&mut self, source: usize, width: f32) {
         if let Some(stored) = self.widths.get_mut(source) {
-            *stored = width.clamp(72.0, 480.0);
+            *stored = width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH);
         }
     }
 
@@ -209,7 +214,7 @@ impl ColumnLayout {
             .collect();
         self.widths = widths
             .into_iter()
-            .map(|width| width.clamp(72.0, 480.0))
+            .map(|width| width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH))
             .collect();
         self.rebuild_visible();
     }

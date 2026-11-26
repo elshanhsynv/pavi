@@ -885,6 +885,121 @@ fn sorts_grid_headers_and_toggles_direction_without_a_second_renderer() {
 }
 
 #[test]
+fn back_to_file_order_drops_only_the_sort() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+
+    // A plain sort: the file again, as it is.
+    app.sort_column(0, SortDirection::Descending);
+    poll_until_idle(&mut app);
+    assert_eq!(app.filtered.as_ref().unwrap().kind, QueryKind::Sort);
+    app.clear_sort();
+    assert!(app.filtered.is_none());
+    assert_eq!(app.grid.rows, 8);
+    assert_eq!(app.status, "Back to file order");
+
+    // A sorted filter: the filter's matches stay, in file order.
+    app.filter_input = "id > 3".to_string();
+    app.apply_filter();
+    poll_until_idle(&mut app);
+    app.sort_column(0, SortDirection::Descending);
+    poll_until_idle(&mut app);
+    assert_eq!(filtered_ids(&app), vec!["7", "6", "5", "4"]);
+    app.clear_sort();
+    poll_until_idle(&mut app);
+    let filtered = app.filtered.as_ref().unwrap();
+    assert_eq!(filtered.kind, QueryKind::Filter);
+    assert!(filtered.sort.is_empty());
+    assert_eq!(filtered.filter.as_ref().unwrap().to_string(), "id > 3");
+    assert_eq!(app.filter_input, "id > 3");
+    assert_eq!(filtered_ids(&app), vec!["4", "5", "6", "7"]);
+}
+
+/// Where the header "name" is drawn: its left edge is the right edge of "id".
+fn header_text_pos(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+    output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.pos + egui::vec2(0.0, text.galley.size().y / 2.0))
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("Missing header: {label}"))
+}
+
+#[test]
+fn grid_columns_take_widths_from_the_layout_and_keep_dragged_ones() {
+    let (_directory, source, path) = source(8);
+    let mut app = make_app(source, path);
+    app.request_page(0);
+    poll_until_page_loaded(&mut app, 0);
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    let mut time = 0.0;
+    let mut render = |app: &mut PaviApp, events: Vec<egui::Event>| {
+        time += 0.1;
+        ctx.run(grid_frame(time, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        })
+    };
+    for _ in 0..2 {
+        render(&mut app, vec![]);
+    }
+    let before = header_text_pos(&render(&mut app, vec![]), "name");
+
+    // A width set from the Columns menu shows at once.
+    app.column_layout.set_width(0, 300.0);
+    render(&mut app, vec![]);
+    let after = header_text_pos(&render(&mut app, vec![]), "name");
+    assert!(
+        (after.x - before.x - (300.0 - INITIAL_COLUMN_WIDTH)).abs() < 1.0,
+        "moved from {before:?} to {after:?}"
+    );
+
+    // Dragging the edge of "id" back by 100 px makes the layout's width 200.
+    let edge = egui::pos2(after.x - ui::spacing::Spacing::Md.px(), after.y);
+    let target = edge - egui::vec2(100.0, 0.0);
+    let press = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    render(&mut app, vec![egui::Event::PointerMoved(edge)]);
+    render(&mut app, vec![press(edge, true)]);
+    for step in 1..=10 {
+        let x = edge.x - 10.0 * step as f32;
+        render(
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(x, edge.y))],
+        );
+    }
+    // Not taken while the button is down.
+    assert_eq!(app.column_layout.width(0, 0.0), 300.0);
+    render(&mut app, vec![press(target, false)]);
+    render(&mut app, vec![]);
+    let width = app.column_layout.width(0, 0.0);
+    assert!((width - 200.0).abs() <= 2.0, "dragged to {width}");
+    let saved = app
+        .session
+        .grid_layout(&PaviApp::schema_key(&["id".to_owned(), "name".to_owned()]).unwrap())
+        .unwrap();
+    assert_eq!(f32::from(saved.widths["id"]), width);
+
+    // Hiding and showing another column keeps it.
+    app.column_layout.set_hidden(1, true);
+    app.apply_column_layout_change();
+    render(&mut app, vec![]);
+    app.column_layout.set_hidden(1, false);
+    app.apply_column_layout_change();
+    render(&mut app, vec![]);
+    let shown = header_text_pos(&render(&mut app, vec![]), "name");
+    assert!((shown.x - (before.x + width - INITIAL_COLUMN_WIDTH)).abs() < 1.0);
+}
+
+#[test]
 fn cell_menu_filters_to_and_excludes_the_selected_value() {
     let (_directory, source, path) = source(8);
     let mut app = make_app(source, path);
