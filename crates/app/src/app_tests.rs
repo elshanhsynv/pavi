@@ -2817,6 +2817,66 @@ fn a_far_jump_in_a_result_skips_rows_in_the_workers() {
 }
 
 #[test]
+fn a_parallel_match_count_adds_up_like_one_task() {
+    use crate::results::MatchCount;
+
+    let (_directory, source, path) = source(100_000);
+    let app = make_app(Arc::clone(&source), path);
+    let handle = app.runtime.as_ref().unwrap().handle();
+    let filter = parquet_reader::FilterExpr::parse("name == 'beta' AND id >= 1500").unwrap();
+    let whole = source
+        .count_matches_by_row_group(&filter, &|_| false)
+        .unwrap();
+    // Chunks of 3,000 rows: 34 chunks over the 100 row groups.
+    let mut count =
+        MatchCount::start_chunked(handle, Arc::clone(&source), filter, GenerationId(1), 3_000)
+            .unwrap();
+    for _ in 0..5_000 {
+        count.poll();
+        if !count.running() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(count.error.is_none(), "{:?}", count.error);
+    assert_eq!(count.total(), Some(whole.iter().sum::<u64>()));
+    let row_groups = source.row_groups();
+    let mut before = 0;
+    for (group, matches) in whole.iter().enumerate() {
+        if *matches > 0 {
+            assert_eq!(
+                count.entry_for(before, row_groups),
+                Some((row_groups[group].first_row, before)),
+                "group {group}"
+            );
+        }
+        before += matches;
+    }
+}
+
+#[test]
+fn a_filter_ends_when_its_count_says_every_match_has_arrived() {
+    let (_directory, source, path) = source(100_000);
+    let mut app = make_app(source, path);
+    // `contains` can't be ruled out by statistics: every row group is read.
+    app.filter_input = "name contains zz".to_string();
+    app.apply_filter();
+    for _ in 0..5_000 {
+        app.poll_filtered();
+        if app.filtered.as_ref().unwrap().finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let filtered = app.filtered.as_ref().unwrap();
+    assert!(filtered.finished);
+    assert_eq!(filtered.total(), Some(0));
+    assert_eq!(filtered.received_rows(), 0);
+    assert!(filtered.execution.is_none());
+    assert_eq!(app.status, QueryKind::Filter.empty_message());
+}
+
+#[test]
 fn jumps_anywhere_in_filter_sql_and_sort_results() {
     // 100 row groups of 1,000 rows; every odd id is "beta".
     let rows = 100_000_u64;

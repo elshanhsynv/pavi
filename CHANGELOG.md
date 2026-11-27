@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Changed
+- Filters that match few or no rows of a large file finish much sooner. The count of matches now runs on several cores at once, and once it is in, the filter stops scanning when it has every match, or jumps straight to the part of the file where the next match is. A filter with no match in a billion rows says so after 7.5 seconds instead of 2 minutes.
 - Jumping far ahead in a sort, SQL or filter result (End, Go to row, the scrollbar) is much faster: the rows in between are skipped in the background in large steps instead of one batch per screen frame. Ctrl+End in a sorted 5-million-row file takes about half a second instead of 7.5 seconds.
 
 ### Fixed
