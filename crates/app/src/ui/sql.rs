@@ -48,7 +48,7 @@ impl PaviApp {
                         if widgets::tool_button(ui, Some(Icon::Close), "Cancel", false).clicked() {
                             self.cancel_sql();
                         }
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                        widgets::spinner(ui, Some(12.0));
                         ui.label(RichText::new("Running…").color(theme::muted()));
                     }
                     self.history_menu(ui);

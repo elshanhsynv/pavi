@@ -34,7 +34,7 @@ impl PaviApp {
                 ui.spacing_mut().item_spacing = Spacing::Md.vec(Spacing::Sm);
                 ui.horizontal(|ui| {
                     if let Some(task) = &self.profile.file.task {
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                        widgets::spinner(ui, Some(12.0));
                         let done = if rows == 0 {
                             String::new()
                         } else {

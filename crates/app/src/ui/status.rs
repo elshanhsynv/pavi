@@ -60,7 +60,7 @@ pub fn show(ctx: &egui::Context, status: StatusBar<'_>) -> bool {
                 ui.spacing_mut().interact_size.y = 20.0;
                 let small = |text: String| RichText::new(text).font(theme::small());
                 if status.activity.is_some() {
-                    ui.add(egui::Spinner::new().size(11.0).color(theme::accent()));
+                    widgets::spinner(ui, Some(11.0));
                 } else {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());

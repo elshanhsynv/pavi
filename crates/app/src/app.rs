@@ -57,6 +57,9 @@ const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
 /// for the scan to move on to it: a scan run's worth, so a nearby match is
 /// read on to rather than starting a new reader.
 const COUNT_RESUME_GAP: u64 = 1 << 20;
+/// How often the app redraws while a file opens or grid pages load: their
+/// rows show as soon as they arrive.
+const PENDING_REPAINT: Duration = Duration::from_millis(16);
 /// How often the grid redraws while only a result's match count is running.
 const COUNT_REPAINT: Duration = Duration::from_millis(250);
 
@@ -2947,15 +2950,28 @@ impl eframe::App for PaviApp {
                 });
             });
 
-        if self.opening.is_some()
-            || self.pages.is_loading()
-            || self.filtered.as_ref().is_some_and(FilteredGrid::needs_more)
+        if let Some(delay) = self.repaint_delay(next_check) {
+            ctx.request_repaint_after(delay);
+        }
+    }
+}
+
+impl PaviApp {
+    /// When to draw the next frame without input: soon when rows are about
+    /// to land in the grid, at [`ui::widgets::BUSY_REPAINT`] while only
+    /// background work runs (its spinner and progress need no more), slowly
+    /// while only a match count runs, or at the next file-change check.
+    /// `None`: wait for input.
+    pub(crate) fn repaint_delay(&self, next_check: Option<Duration>) -> Option<Duration> {
+        if self.opening.is_some() || self.pages.is_loading() {
+            Some(PENDING_REPAINT)
+        } else if self.filtered.as_ref().is_some_and(FilteredGrid::needs_more)
             || self.chart.loading()
             || self.profile.loading()
             || self.export.is_running()
             || self.find.searching.is_some()
         {
-            ctx.request_repaint_after(Duration::from_millis(16));
+            Some(ui::widgets::BUSY_REPAINT)
         } else if self
             .filtered
             .as_ref()
@@ -2964,9 +2980,9 @@ impl eframe::App for PaviApp {
         {
             // Only the match count runs: pick it up, and show its progress,
             // without redrawing every frame.
-            ctx.request_repaint_after(COUNT_REPAINT);
-        } else if let Some(next_check) = next_check {
-            ctx.request_repaint_after(next_check);
+            Some(COUNT_REPAINT)
+        } else {
+            next_check
         }
     }
 }

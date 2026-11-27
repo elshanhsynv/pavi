@@ -355,7 +355,7 @@ impl PaviApp {
                 } else if finished {
                     ui.heading(kind.empty_message());
                 } else {
-                    ui.add(egui::Spinner::new().color(theme::accent()));
+                    widgets::spinner(ui, None);
                     ui.label(
                         RichText::new(match scanned {
                             _ if pending_jump.is_some() => format!(
@@ -769,7 +769,7 @@ impl PaviApp {
             .collect::<Vec<_>>();
         widgets::placeholder(ui, |ui| match &self.grid.loading {
             LoadState::Opening => {
-                ui.add(egui::Spinner::new().color(theme::accent()));
+                widgets::spinner(ui, None);
                 ui.heading("Opening…");
                 let format = self
                     .opening_path

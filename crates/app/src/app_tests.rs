@@ -2877,6 +2877,60 @@ fn a_filter_ends_when_its_count_says_every_match_has_arrived() {
 }
 
 #[test]
+fn a_spinner_redraws_at_thirty_frames_a_second_not_every_frame() {
+    let delay = |show: &dyn Fn(&mut egui::Ui)| {
+        // A fresh context asks for a second frame of its own; the third
+        // frame says what the spinner asks for.
+        let ctx = egui::Context::default();
+        let mut delay = Duration::MAX;
+        for frame in 0..3 {
+            let output = ctx.run(grid_frame(f64::from(frame), vec![]), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui));
+            });
+            delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        }
+        delay
+    };
+    // egui reports the delay less one frame's predicted time, so the next
+    // frame is ready on time: about 33 ms apart, not the next frame.
+    let spinner = delay(&|ui| {
+        ui::widgets::spinner(ui, Some(12.0));
+    });
+    assert!(
+        spinner > Duration::from_millis(10) && spinner <= ui::widgets::BUSY_REPAINT,
+        "{spinner:?}"
+    );
+    // egui's spinner asked for the very next frame.
+    assert_eq!(
+        delay(&|ui| {
+            ui.add(egui::Spinner::new());
+        }),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn redraws_soon_only_while_rows_are_about_to_land() {
+    let (_directory, source, path) = source(100_000);
+    let mut app = make_app(source, path);
+    let check = Duration::from_secs(2);
+    // Idle: nothing until input, or the next file-change check.
+    poll_until_idle(&mut app);
+    assert_eq!(app.repaint_delay(None), None);
+    assert_eq!(app.repaint_delay(Some(check)), Some(check));
+    // Grid pages on their way: soon.
+    app.request_page(5);
+    assert!(app.pages.is_loading());
+    assert_eq!(app.repaint_delay(None), Some(PENDING_REPAINT));
+    poll_until_idle(&mut app);
+    // A filter still scanning: the spinner's pace.
+    app.filter_input = "name contains a".to_string();
+    app.apply_filter();
+    assert!(app.filtered.as_ref().unwrap().needs_more());
+    assert_eq!(app.repaint_delay(None), Some(ui::widgets::BUSY_REPAINT));
+}
+
+#[test]
 fn jumps_anywhere_in_filter_sql_and_sort_results() {
     // 100 row groups of 1,000 rows; every odd id is "beta".
     let rows = 100_000_u64;
