@@ -31,6 +31,14 @@ pub enum PageOutcome {
     /// columns searched); `None` when no cell matches (see
     /// `RuntimeHandle::submit_find_text`).
     FoundText(Option<(u64, usize)>),
+    /// Result rows dropped without being handed out, for a jump ahead (see
+    /// `RuntimeHandle::submit_cursor_skip` and `submit_sort_merge_skip`): how
+    /// many, the source row a scan resumes from, and whether the result ended.
+    Skipped {
+        rows: u64,
+        next_row: Option<u64>,
+        finished: bool,
+    },
     Cancelled,
     ReadFailed(Error),
 }

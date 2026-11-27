@@ -14,7 +14,7 @@ A result can be entered at any row; only the rows around it are held.
 - **Jumping** to result row `n` keeps `JUMP_CONTEXT_ROWS` (2,048) rows above it, and, in order of cost:
   1. the rows held: just scroll there;
   2. a counted, unsorted filter: start a new filtered scan (`QueryEngine::execute_from_row`) at the first row of the row group that holds row `n − 2,048`. Rows before that group are never read; at most one row group is read and dropped before the first row kept;
-  3. ahead of the rows read so far: keep reading and drop rows until then;
+  3. ahead of the rows read so far: keep reading and drop rows until then (since 2026-11-27 in the workers, in one task, not a batch per frame: Ctrl+End in a sorted 5M-row result takes about 0.6 s instead of 7.5 s);
   4. anything else (back in a SQL or sort result, or a filter not counted yet): run the query again and drop rows until then. A sort or a join is redone.
   A jump uses a new grid generation, so batches still arriving for the old position are dropped.
 - **In the grid**, a result larger than the rows held gets PAVI's own whole-result scrollbar (the one windowed files use, ADR 0003); dragging it jumps. Scrolling up past the first row held, the arrow keys, Page Up/Down, Home, End and "Go to row" all jump the same way. The strip above the grid says "rows a–b of N", or "of at least N · counting" until the count is in, and the status bar shows the result's size.

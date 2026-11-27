@@ -2775,6 +2775,48 @@ fn only_macos_keeps_the_system_window_frame() {
 }
 
 #[test]
+fn a_far_jump_in_a_result_skips_rows_in_the_workers() {
+    let rows = 100_000_usize;
+    let (_directory, source, path) = source(rows);
+    let mut app = make_app(source, path);
+    app.sql_input = "SELECT id FROM dataset".to_string();
+    app.run_sql();
+    poll_until_idle(&mut app);
+    assert_eq!(app.filtered.as_ref().unwrap().total(), None);
+    let reads_before = app
+        .filtered
+        .as_ref()
+        .and_then(|filtered| filtered.execution.as_ref())
+        .map(QueryExecution::scheduled_reads)
+        .unwrap();
+
+    app.jump_to_result(90_000);
+    assert!(
+        app.status.starts_with("Reading on to row 90,001"),
+        "{}",
+        app.status
+    );
+    poll_until_jumped(&mut app);
+    let filtered = app.filtered.as_ref().unwrap();
+    assert_eq!(app.grid.selection, Some((90_000, 0)));
+    assert_eq!(filtered.first_result, 90_000 - JUMP_CONTEXT_ROWS);
+    assert_eq!(
+        app.filtered_cell_text(90_000 - filtered.first_result, 0)
+            .unwrap(),
+        "90000"
+    );
+    // One read drops the rows in between; reading them was 21 reads of
+    // 4,096 rows, one a frame.
+    let reads = filtered
+        .execution
+        .as_ref()
+        .map(QueryExecution::scheduled_reads)
+        .unwrap()
+        - reads_before;
+    assert!(reads <= 4, "{reads} reads");
+}
+
+#[test]
 fn jumps_anywhere_in_filter_sql_and_sort_results() {
     // 100 row groups of 1,000 rows; every odd id is "beta".
     let rows = 100_000_u64;

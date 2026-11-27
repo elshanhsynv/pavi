@@ -4014,6 +4014,36 @@ mod tests {
     }
 
     #[test]
+    fn skips_rows_of_a_join_asked_for_while_it_is_prepared() {
+        let (_directory, tables) = tables();
+        let sql =
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer = c.id ORDER BY o.id";
+        let plan = SqlAst::parse(sql)
+            .unwrap()
+            .to_logical_plan_with(&tables)
+            .unwrap();
+        let runtime = runtime();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(4))
+            .unwrap();
+        // Asked before the join's rows are prepared; applied once they are.
+        execution.skip_rows(2);
+        let mut rows = Vec::new();
+        while let Some(batch) = execution.next_batch().unwrap() {
+            let batch = batch.batch;
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    parquet_reader::value::scalar_text(batch.column(1).as_ref(), row)
+                        .unwrap()
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        assert_eq!(rows, ["Ann", "Cy"]);
+        assert_eq!(execution.take_skipped_rows(), 2);
+    }
+
+    #[test]
     fn joins_open_tables() {
         let (_directory, tables) = tables();
         let rows = |sql: &str| run(sql, &tables).unwrap().1;

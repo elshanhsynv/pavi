@@ -113,6 +113,14 @@ enum ReadOperation {
         cursor: Arc<Mutex<ScanCursor>>,
         rows: usize,
     },
+    CursorSkip {
+        cursor: Arc<Mutex<ScanCursor>>,
+        rows: u64,
+    },
+    SortMergeSkip {
+        merge: Arc<Mutex<SortMerge>>,
+        rows: u64,
+    },
     Aggregated {
         filter: Option<FilterExpr>,
         aggregate: AggregateSpec,
@@ -428,6 +436,44 @@ impl RuntimeHandle {
     /// `ParquetSource::scan_cursor`), which keeps its reader open between
     /// reads; the outcome is [`PageOutcome::Filtered`] with the row to resume
     /// from, the row count at the end.
+    /// Drops the next `rows` rows of a scan cursor in the worker, reading a
+    /// 4,096-row batch at a time; the outcome is [`PageOutcome::Skipped`].
+    pub fn submit_cursor_skip(
+        &self,
+        source: Arc<ParquetSource>,
+        cursor: Arc<Mutex<ScanCursor>>,
+        rows: u64,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::CursorSkip { cursor, rows },
+            None,
+        )
+    }
+
+    /// Drops the next `rows` rows of a spilled sort in the worker; the outcome
+    /// is [`PageOutcome::Skipped`].
+    pub fn submit_sort_merge_skip(
+        &self,
+        source: Arc<ParquetSource>,
+        merge: Arc<Mutex<SortMerge>>,
+        rows: u64,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::SortMergeSkip { merge, rows },
+            None,
+        )
+    }
+
     pub fn submit_cursor(
         &self,
         source: Arc<ParquetSource>,
@@ -785,6 +831,35 @@ fn read_source(
             .map_err(|_| anyhow::anyhow!("scan cursor lock poisoned"))?
             .next_window(source, rows, checkpoint)
             .map(PageOutcome::Filtered),
+        ReadOperation::CursorSkip { cursor, rows } => {
+            let mut cursor = cursor
+                .lock()
+                .map_err(|_| anyhow::anyhow!("scan cursor lock poisoned"))?;
+            let mut skipped = 0_u64;
+            while skipped < rows && !cursor.is_finished() {
+                let step =
+                    usize::try_from((rows - skipped).min(parquet_reader::PAGE_ROWS)).unwrap_or(1);
+                let window = cursor.next_window(source, step, checkpoint)?;
+                skipped += window.batch.num_rows() as u64;
+            }
+            Ok(PageOutcome::Skipped {
+                rows: skipped,
+                next_row: Some(cursor.position()),
+                finished: cursor.is_finished(),
+            })
+        }
+        ReadOperation::SortMergeSkip { merge, rows } => {
+            let mut merge = merge
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sort merge lock poisoned"))?;
+            merge
+                .skip_rows(rows, &|| checkpoint(0))
+                .map(|(rows, finished)| PageOutcome::Skipped {
+                    rows,
+                    next_row: None,
+                    finished,
+                })
+        }
         ReadOperation::Aggregated {
             filter,
             aggregate,

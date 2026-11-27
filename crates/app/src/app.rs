@@ -1749,6 +1749,7 @@ impl PaviApp {
         };
         let mut status = None;
         let mut sql_history = None;
+        let mut retry_jump = None;
         if let Some(count) = &mut filtered.count {
             count.poll();
         }
@@ -1756,7 +1757,10 @@ impl PaviApp {
             let Some(execution) = &mut filtered.execution else {
                 break;
             };
-            match execution.poll_next_batch() {
+            let polled = execution.poll_next_batch();
+            // Rows the workers dropped for a jump ahead come before this poll's.
+            filtered.note_skipped();
+            match polled {
                 Ok(QueryPoll::Pending) => break,
                 Ok(QueryPoll::Finished) => {
                     filtered.execution = None;
@@ -1816,6 +1820,10 @@ impl PaviApp {
                 self.grid.select(target, filtered.pending_column);
                 self.jump_target = Some(target);
                 status = Some(format!("Row {}", ui::theme::number(target + 1)));
+            } else if target < filtered.first_result {
+                // A skip already under way when a nearer jump came went past
+                // it: read the result again up to it, as a jump back does.
+                retry_jump = Some(target);
             } else if filtered.finished {
                 filtered.pending_jump = None;
                 if filtered.error.is_none() {
@@ -1828,6 +1836,9 @@ impl PaviApp {
         }
         if let Some(status) = status {
             self.status = status;
+        }
+        if let Some(target) = retry_jump {
+            self.jump_to_result(target);
         }
         if let Some((success, row_count)) = sql_history {
             self.record_sql_history(success, row_count);

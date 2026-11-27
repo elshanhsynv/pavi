@@ -232,13 +232,35 @@ impl FilteredGrid {
     }
 
     /// Reads on with this execution, dropping rows until result row `start`.
+    /// The workers drop them in large steps (`QueryExecution::skip_rows`);
+    /// rows that still arrive before `start` are dropped by `push`.
     pub(crate) fn skip_forward(&mut self, start: u64) {
+        self.note_skipped();
         let received = self.received_rows();
         self.batches.clear();
         self.first_result = received;
         self.rows = 0;
         self.skip_until = start.max(received);
         self.target_result = self.skip_until.saturating_add(parquet_reader::PAGE_ROWS);
+        if let Some(execution) = &mut self.execution {
+            execution.skip_rows(self.skip_until - received);
+        }
+    }
+
+    /// Counts the rows the execution dropped for a jump ahead: they come right
+    /// after the rows received, so the window starts after them.
+    pub(crate) fn note_skipped(&mut self) {
+        let Some(execution) = &mut self.execution else {
+            return;
+        };
+        let skipped = execution.take_skipped_rows();
+        if skipped == 0 {
+            return;
+        }
+        let received = self.received_rows();
+        self.batches.clear();
+        self.rows = 0;
+        self.first_result = received.saturating_add(skipped);
     }
 
     /// Starts reading the result again with `execution`, whose first row is
@@ -253,6 +275,9 @@ impl FilteredGrid {
         self.target_result = self.skip_until.saturating_add(parquet_reader::PAGE_ROWS);
         self.finished = false;
         self.error = None;
+        if let Some(execution) = &mut self.execution {
+            execution.skip_rows(self.skip_until - base);
+        }
     }
 
     pub(crate) fn received_rows(&self) -> u64 {
