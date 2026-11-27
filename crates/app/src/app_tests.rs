@@ -626,6 +626,121 @@ fn reaches_every_row_of_a_billion_row_grid() {
 }
 
 #[test]
+fn fully_visible_rows_leave_out_rows_cut_by_the_edges() {
+    use ui::grid::fully_visible;
+
+    let h = ROW_HEIGHT;
+    // Ten rows exactly fill the view.
+    assert_eq!(fully_visible(0.0, 10.0 * h, 0, 100), Some((0, 9)));
+    // Half a row scrolled: the top one is cut, and so is the last.
+    assert_eq!(fully_visible(0.5 * h, 10.0 * h, 0, 100), Some((1, 9)));
+    // A header row in the body is not a data row.
+    assert_eq!(fully_visible(0.0, 10.0 * h, 1, 100), Some((0, 8)));
+    assert_eq!(fully_visible(5.0 * h, 10.0 * h, 1, 100), Some((4, 13)));
+    // The end of the data.
+    assert_eq!(fully_visible(100.0 * h, 10.0 * h, 0, 105), Some((100, 104)));
+    // Layout rounding of under half a pixel still counts as in view.
+    assert_eq!(fully_visible(0.3, 10.0 * h, 0, 100), Some((0, 9)));
+    // No room for one whole row.
+    assert_eq!(fully_visible(0.0, 0.5 * h, 0, 100), None);
+}
+
+#[test]
+fn the_last_row_is_wholly_in_view_after_end_arrows_and_the_scrollbar() {
+    const ROWS: u64 = 1_000_000;
+    let (_directory, source, path) = source(80);
+    let mut app = make_app(source, path);
+    app.grid.ready(ROWS, app.column_layout.visible().len());
+    assert!(app.grid.is_windowed());
+    let ctx = egui::Context::default();
+    ui::theme::apply(&ctx);
+    ctx.style_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+    let mut time = 0.0;
+    let mut render = |app: &mut PaviApp, events: Vec<egui::Event>| {
+        time += 0.1;
+        let _ = ctx.run(grid_frame(time, events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.show_grid(ui));
+        });
+    };
+    let key = |key: egui::Key, modifiers: egui::Modifiers| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    };
+    for _ in 0..3 {
+        render(&mut app, vec![]);
+    }
+    let (first, last) = app.visible_rows.unwrap();
+    assert_eq!(first, 0);
+    let (_, drawn_last) = app.drawn_rows.unwrap();
+    assert!(drawn_last > last, "egui draws a row below the view");
+
+    // Ctrl+End selects the last row and brings all of it into view.
+    assert!(app.grid.select(0, 0));
+    render(
+        &mut app,
+        vec![key(egui::Key::End, egui::Modifiers::COMMAND)],
+    );
+    for _ in 0..3 {
+        render(&mut app, vec![]);
+    }
+    assert_eq!(app.grid.selection, Some((ROWS - 1, 0)));
+    assert_eq!(app.visible_rows.map(|(_, last)| last), Some(ROWS - 1));
+
+    // Back to the top; the down arrow just past the view scrolls one row, so
+    // the selected row is the last one wholly shown.
+    render(
+        &mut app,
+        vec![key(egui::Key::Home, egui::Modifiers::COMMAND)],
+    );
+    for _ in 0..3 {
+        render(&mut app, vec![]);
+    }
+    let (first, last) = app.visible_rows.unwrap();
+    assert_eq!(first, 0);
+    assert!(app.grid.select(last, 0));
+    render(
+        &mut app,
+        vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    for _ in 0..3 {
+        render(&mut app, vec![]);
+    }
+    assert_eq!(app.grid.selection, Some((last + 1, 0)));
+    assert_eq!(app.visible_rows, Some((1, last + 1)));
+
+    // A click at the bottom of PAVI's scrollbar shows the last row whole.
+    let bottom = egui::pos2(1448.0 - 7.0, 896.0);
+    render(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(bottom),
+            egui::Event::PointerButton {
+                pos: bottom,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    render(
+        &mut app,
+        vec![egui::Event::PointerButton {
+            pos: bottom,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    for _ in 0..3 {
+        render(&mut app, vec![]);
+    }
+    assert_eq!(app.visible_rows.map(|(_, last)| last), Some(ROWS - 1));
+}
+
+#[test]
 fn row_scrollbar_maps_clicks_to_rows_across_the_whole_file() {
     let ctx = egui::Context::default();
     let bar = egui::Rect::from_min_max(egui::pos2(500.0, 100.0), egui::pos2(512.0, 700.0));

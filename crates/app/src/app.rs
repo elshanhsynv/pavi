@@ -99,8 +99,12 @@ pub(crate) struct PaviApp {
     opening_path: Option<PathBuf>,
     /// Source-grid page reads and the small cache of loaded pages.
     pages: SourcePages,
-    /// First and last absolute row the source grid drew this frame.
+    /// First and last absolute row the source grid drew this frame. egui draws
+    /// rows partly hidden at the top and one just below the view too.
     drawn_rows: Option<(u64, u64)>,
+    /// First and last absolute row wholly in the source grid's view after this
+    /// frame: what the scrollbar shows and what a moved selection is kept in.
+    visible_rows: Option<(u64, u64)>,
     /// What the user asked of a grid header this frame; applied after the table is drawn.
     header_action: Option<HeaderAction>,
     /// What the user chose in a cell's right-click menu this frame.
@@ -360,6 +364,7 @@ impl PaviApp {
             opening_path: None,
             pages: SourcePages::default(),
             drawn_rows: None,
+            visible_rows: None,
             header_action: None,
             cell_action: None,
             grid_scroll_offset: None,
