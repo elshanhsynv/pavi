@@ -128,12 +128,12 @@ impl PaviApp {
         let mut reveal_row = None;
         if let Some(row) = self.reveal_row.take() {
             if windowed {
-                // Scroll by as little as brings the row into view.
-                if let Some((first, last)) = self.drawn_rows {
-                    if row <= first {
+                // Scroll by as little as brings the whole row into view.
+                if let Some((first, last)) = self.visible_rows {
+                    if row < first {
                         self.scroll_grid_to(row, header_rows);
-                    } else if row >= last {
-                        self.scroll_grid_to(row.saturating_sub(last - first) + 1, header_rows);
+                    } else if row > last {
+                        self.scroll_grid_to(row.saturating_sub(last - first), header_rows);
                     }
                 }
             } else {
@@ -156,6 +156,7 @@ impl PaviApp {
         let scroll_offset = self.grid_scroll_offset.take();
         self.pages.clear_visible();
         self.drawn_rows = None;
+        self.visible_rows = None;
         // Large files: the table holds one window of rows and PAVI draws a scrollbar
         // for the whole file in a strip on the right.
         let scrollbar = windowed.then(|| {
@@ -289,14 +290,24 @@ impl PaviApp {
             })
             .inner;
         let table_offset = body.state.offset.y;
+        self.visible_rows = fully_visible(
+            table_offset,
+            body.inner_rect.height(),
+            header_rows,
+            ui_row_count(self.grid.window_rows()),
+        )
+        .map(|(first, last)| (base + first as u64, base + last as u64))
+        .or(self.drawn_rows);
         self.grid_view_x = (offset_x, viewport.width() - gutter);
         self.keep_dragged_widths(ui.ctx(), &headers, frame.drawn_widths());
         self.draw_pinned(ui, frame, &headers, table_area, body.inner_rect);
-        if let (Some(bar), Some((first, last))) = (scrollbar, self.drawn_rows) {
+        if let (Some(bar), Some((first, last)), Some((drawn_first, drawn_last))) =
+            (scrollbar, self.visible_rows, self.drawn_rows)
+        {
             if let Some(top) = row_scrollbar(ui, bar, self.grid.rows, first, last) {
                 self.scroll_grid_to(top, header_rows);
                 ui.ctx().request_repaint();
-            } else if let Some(new_base) = self.grid.recentered_base(first, last) {
+            } else if let Some(new_base) = self.grid.recentered_base(drawn_first, drawn_last) {
                 // Keep the exact view: shift the offset by however far the window moved.
                 let shift = (new_base as f64 - base as f64) * f64::from(ROW_HEIGHT);
                 self.grid.window_base = new_base;
@@ -586,11 +597,22 @@ impl PaviApp {
         self.grid_view_x = (output.state.offset.x, output.inner_rect.width() - gutter);
         self.keep_dragged_widths(ui.ctx(), &headers, frame.drawn_widths());
         self.draw_pinned(ui, frame, &headers, table_area, output.inner.inner_rect);
-        if let (Some(bar), Some((first, last))) = (scrollbar, drawn) {
+        // The rows wholly in view: the scrollbar's thumb and its end.
+        let visible = fully_visible(
+            output.inner.state.offset.y,
+            output.inner.inner_rect.height(),
+            header_rows,
+            ui_row_count(rows),
+        )
+        .map(|(first, last)| (first_result + first as u64, first_result + last as u64))
+        .or(drawn);
+        if let (Some(bar), Some((first, last)), Some((drawn_first, _))) =
+            (scrollbar, visible, drawn)
+        {
             if let Some(top) = row_scrollbar(ui, bar, bar_total.max(1), first, last) {
                 self.jump_to_result(top.saturating_add((last - first) / 2));
                 ui.ctx().request_repaint();
-            } else if first == first_result
+            } else if drawn_first == first_result
                 && first_result > 0
                 && pending_jump.is_none()
                 && ui.rect_contains_pointer(table_area)
@@ -1475,6 +1497,25 @@ fn pinned_scope(
 /// PAVI's scrollbar for windowed grids. It shows the drawn rows `first..=last`
 /// within all `total` rows and, when clicked or dragged, returns the row to show
 /// at the top of the view.
+/// The first and last data rows (counted from 0, the header row left out)
+/// wholly inside a table body `height` tall scrolled to `offset`, of `rows`
+/// data rows; `None` when no row fits. egui draws more: the row partly hidden
+/// at the top and one just below the view.
+pub(in crate::app) fn fully_visible(
+    offset: f32,
+    height: f32,
+    header_rows: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    // Layout rounding can leave a row a fraction of a pixel out.
+    const SLACK: f32 = 0.5;
+    let first = ((offset - SLACK) / ROW_HEIGHT).ceil().max(0.0) as usize;
+    let end = ((offset + height + SLACK) / ROW_HEIGHT).floor().max(0.0) as usize;
+    let first = first.saturating_sub(header_rows);
+    let end = end.saturating_sub(header_rows).min(rows);
+    (end > first).then(|| (first, end - 1))
+}
+
 pub(in crate::app) fn row_scrollbar(
     ui: &mut egui::Ui,
     rect: egui::Rect,

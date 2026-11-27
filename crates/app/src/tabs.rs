@@ -26,6 +26,7 @@ pub(super) struct TabState {
     opening_path: Option<PathBuf>,
     pages: SourcePages,
     drawn_rows: Option<(u64, u64)>,
+    visible_rows: Option<(u64, u64)>,
     grid_scroll_offset: Option<f32>,
     grid_scroll_x: Option<f32>,
     grid_view_x: (f32, f32),
@@ -65,6 +66,7 @@ impl TabState {
             opening_path: None,
             pages: SourcePages::default(),
             drawn_rows: None,
+            visible_rows: None,
             grid_scroll_offset: None,
             grid_scroll_x: None,
             grid_view_x: (0.0, 0.0),
@@ -196,6 +198,7 @@ impl PaviApp {
         swap(&mut self.opening_path, &mut tab.opening_path);
         swap(&mut self.pages, &mut tab.pages);
         swap(&mut self.drawn_rows, &mut tab.drawn_rows);
+        swap(&mut self.visible_rows, &mut tab.visible_rows);
         swap(&mut self.grid_scroll_offset, &mut tab.grid_scroll_offset);
         swap(&mut self.grid_scroll_x, &mut tab.grid_scroll_x);
         swap(&mut self.grid_view_x, &mut tab.grid_view_x);

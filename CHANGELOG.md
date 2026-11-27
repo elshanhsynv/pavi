@@ -8,6 +8,7 @@ matches the tag as the GitHub Release notes, so write entries for users.
 ## [Unreleased]
 
 ### Fixed
+- In a file of over 500,000 rows, Ctrl+End and dragging the scrollbar to the bottom show the last row whole. They stopped a row or two short, leaving the last row (selected, after Ctrl+End) under the status bar; the arrow keys could likewise leave the selected row half hidden at the bottom.
 - The status bar names the selected cell's column ("Row 1,204 · ARR_TIME") instead of giving its number, and gives the size of a selected range ("3 × 2 cells").
 - "Go to row" with a number past the end of the file says how many rows the file has, as it already did for a filter or SQL result.
 - Page Up and Page Down move one screen of rows, not a fixed 20.
