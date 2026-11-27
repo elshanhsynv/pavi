@@ -108,6 +108,7 @@ Whole-file jobs, measured the same day (no targets yet; `pavi_bench` doesn't fin
 |---|---|---|---|---|
 | Read every row and column through the query engine | bench `scan_all_ms` | 25 ms | 182 ms | — |
 | Whole-file sort by one column: first rows / all rows | bench `sort_first_batch_ms` / `sort_all_ms` | 133 / 134 ms | 991 / 1,233 ms | — |
+| Ctrl+End in the app's sorted result (rows skipped in the workers) | on screen, Ctrl+End to the last rows shown | — | 0.58 s (7.5 s before) | — |
 | Export to CSV / Parquet | `pavi-cli --format csv/parquet -o …` | 607 / 152 ms | 1,860 / 727 ms | — |
 | Profile every column | `pavi-cli --profile` | 899 ms | 1,552 ms | — |
 | Count a filter the statistics settle (half the file matches) | `pavi-cli --filter "value_int > 5000000000" --count` | — | — | 93 ms |

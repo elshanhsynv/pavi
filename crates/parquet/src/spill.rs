@@ -548,21 +548,62 @@ impl SortMerge {
             if checkpoint() {
                 return Err(Cancelled.into());
             }
-            match self.merger.round()? {
-                Some(merged) => {
-                    let projected = merged.project(&self.output_positions)?;
-                    let page = PAGE_ROWS as usize;
-                    for first in (0..projected.num_rows()).step_by(page) {
-                        self.pending.push_back(
-                            projected.slice(first, (projected.num_rows() - first).min(page)),
-                        );
-                    }
-                }
-                None => self.finished = true,
-            }
+            self.merge_round()?;
         }
         let done = self.remaining == Some(0) || (self.finished && self.pending.is_empty());
         Ok((batches, done))
+    }
+
+    /// Drops the next `rows` rows in sort order without handing them out, for
+    /// a jump ahead in the result, and says how many were dropped and whether
+    /// the sort has handed out every row. Rows past a LIMIT are not counted.
+    /// Holds at most one merge round, as [`Self::next_rows`] does.
+    pub fn skip_rows(&mut self, rows: u64, checkpoint: &dyn Fn() -> bool) -> Result<(u64, bool)> {
+        let mut skipped = 0_u64;
+        while skipped < rows && self.remaining != Some(0) {
+            if let Some(batch) = self.pending.pop_front() {
+                let count = batch.num_rows();
+                let mut take = usize::try_from(rows - skipped)
+                    .unwrap_or(usize::MAX)
+                    .min(count);
+                if let Some(remaining) = &mut self.remaining {
+                    take = take.min(*remaining);
+                    *remaining -= take;
+                }
+                skipped += take as u64;
+                if take < count {
+                    self.pending.push_front(batch.slice(take, count - take));
+                }
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            if checkpoint() {
+                return Err(Cancelled.into());
+            }
+            self.merge_round()?;
+        }
+        let done = self.remaining == Some(0) || (self.finished && self.pending.is_empty());
+        Ok((skipped, done))
+    }
+
+    /// Merges one round into `pending`, in page-sized batches of the output
+    /// columns, or marks the merge finished.
+    fn merge_round(&mut self) -> Result<()> {
+        match self.merger.round()? {
+            Some(merged) => {
+                let projected = merged.project(&self.output_positions)?;
+                let page = PAGE_ROWS as usize;
+                for first in (0..projected.num_rows()).step_by(page) {
+                    self.pending.push_back(
+                        projected.slice(first, (projected.num_rows() - first).min(page)),
+                    );
+                }
+            }
+            None => self.finished = true,
+        }
+        Ok(())
     }
 }
 
@@ -744,6 +785,65 @@ mod tests {
                 "column {column}"
             );
         }
+    }
+
+    #[test]
+    fn skips_merged_rows_exactly_and_within_a_limit() {
+        let keys = keys(SortDirection::Ascending);
+        let merged = |limit: Option<usize>, skip: u64, first_read: usize| {
+            let mut writer = RunWriter::new().unwrap();
+            let mut sequence = 0;
+            for run in 0..3_i32 {
+                let values = (0..9_000)
+                    .map(|row| Some((row * 3 + run) % 20_000))
+                    .collect::<Vec<_>>();
+                let run_batch = batch(&values, sequence);
+                sequence += values.len() as u64;
+                writer
+                    .write(&keys.sort(&[run_batch], None).unwrap())
+                    .unwrap();
+            }
+            let mut merge = writer
+                .into_merge(keys.clone(), vec![0, 1], limit, &|| false)
+                .unwrap();
+            let mut out = Vec::new();
+            if first_read > 0 {
+                let (batches, _) = merge.next_rows(first_read, &|| false).unwrap();
+                out.extend(values(&batches));
+            }
+            let (skipped, done) = merge.skip_rows(skip, &|| false).unwrap();
+            let mut rest = Vec::new();
+            loop {
+                let (batches, finished) = merge.next_rows(5_000, &|| false).unwrap();
+                rest.extend(values(&batches));
+                if finished {
+                    break;
+                }
+            }
+            (out, skipped, done, rest)
+        };
+        let (_, _, _, all) = merged(None, 0, 0);
+        assert_eq!(all.len(), 27_000);
+        for (skip, first_read) in [
+            (1, 0),
+            (4_095, 0),
+            (4_097, 0),
+            (20_000, 0),
+            (5_000, 4_096),
+            (30_000, 0),
+        ] {
+            let (out, skipped, done, rest) = merged(None, skip, first_read);
+            let start = out.len() + skipped as usize;
+            assert_eq!(skipped, skip.min(27_000 - out.len() as u64), "skip {skip}");
+            assert_eq!(rest, all[start..], "skip {skip} after {first_read}");
+            assert_eq!(done, start == 27_000);
+        }
+        // Under a LIMIT, rows past it are neither skipped nor handed out.
+        let (_, skipped, done, rest) = merged(Some(10_000), 9_000, 0);
+        assert_eq!((skipped, done), (9_000, false));
+        assert_eq!(rest, all[9_000..10_000]);
+        let (_, skipped, done, rest) = merged(Some(10_000), 20_000, 0);
+        assert_eq!((skipped, done, rest.len()), (10_000, true, 0));
     }
 
     #[test]

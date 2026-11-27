@@ -30,6 +30,8 @@ pub struct QueryExecution {
     generation_id: GenerationId,
     stage: Stage,
     cancelled: bool,
+    /// Rows to skip once joins and subqueries are prepared.
+    pending_skip: u64,
 }
 
 enum Stage {
@@ -62,6 +64,10 @@ struct Running {
     sort_submitted: bool,
     /// A sort that spilled to disk; its rows are read a page at a time.
     sort_merge: Option<Arc<Mutex<SortMerge>>>,
+    /// Result rows still to drop for a jump ahead (`skip_rows`).
+    skip: u64,
+    /// Result rows dropped and not yet reported (`take_skipped_rows`).
+    skipped: u64,
     /// The scan of a query without sort or aggregate: one open reader per run of
     /// row groups, kept between reads (made at the first read).
     scan_cursor: Option<Arc<Mutex<ScanCursor>>>,
@@ -87,6 +93,10 @@ enum InFlight {
     Sorted,
     SortMerge,
     Aggregate,
+    /// Rows of a scan dropped in the worker.
+    SkipScan,
+    /// Rows of a spilled sort dropped in the worker.
+    SkipMerge,
 }
 
 impl QueryEngine {
@@ -139,6 +149,7 @@ impl QueryEngine {
                     group_budget: self.group_budget,
                 },
                 cancelled: false,
+                pending_skip: 0,
             });
         }
         Ok(QueryExecution {
@@ -151,6 +162,7 @@ impl QueryEngine {
                 generation_id,
             )?)),
             cancelled: false,
+            pending_skip: 0,
         })
     }
 
@@ -197,6 +209,7 @@ impl QueryEngine {
             generation_id,
             stage: Stage::Running(Box::new(running)),
             cancelled: false,
+            pending_skip: 0,
         })
     }
 
@@ -263,6 +276,29 @@ impl QueryExecution {
         self.next_batch_within(None)
     }
 
+    /// Drops the next `rows` result rows, counted from the rows handed out so
+    /// far and those already dropped, without handing them out: for a jump
+    /// ahead, the workers read past them in large steps instead of one batch
+    /// per poll. It replaces a skip still under way (a newer jump). Take
+    /// [`Self::take_skipped_rows`] first, then ask; it says how many rows
+    /// were dropped (fewer at the end of the result). An aggregate's result,
+    /// one bounded batch that `HAVING` may thin, is not skipped: its rows come
+    /// as before.
+    pub fn skip_rows(&mut self, rows: u64) {
+        match &mut self.stage {
+            Stage::Running(running) => running.skip_rows(rows),
+            Stage::Preparing { .. } => self.pending_skip = rows,
+        }
+    }
+
+    /// Result rows dropped by [`Self::skip_rows`] since the last call.
+    pub fn take_skipped_rows(&mut self) -> u64 {
+        match &mut self.stage {
+            Stage::Running(running) => std::mem::take(&mut running.skipped),
+            Stage::Preparing { .. } => 0,
+        }
+    }
+
     /// The next batch as soon as it arrives, or [`QueryPoll::Pending`] after at
     /// most about `timeout`. For a background loop that also shows progress or
     /// checks for a cancel: it wakes for each batch instead of sleeping a fixed
@@ -313,13 +349,14 @@ impl QueryExecution {
             return Ok(());
         };
         let plan = template.bind(&relation)?;
-        let running = Running::start(
+        let mut running = Running::start(
             &plan,
             runtime.clone(),
             *sort_budget,
             *group_budget,
             self.generation_id,
         )?;
+        running.skip_rows(std::mem::take(&mut self.pending_skip));
         self.stage = Stage::Running(Box::new(running));
         Ok(())
     }
@@ -431,6 +468,8 @@ impl Running {
             scheduled_reads: 0,
             sort_submitted: false,
             sort_merge: None,
+            skip: 0,
+            skipped: 0,
             scan_cursor: None,
             aggregate_submitted: false,
         }
@@ -455,9 +494,11 @@ impl Running {
     pub fn scanned_rows(&self) -> Option<u64> {
         let task = self.pending.as_ref()?;
         match self.in_flight.as_ref()? {
-            InFlight::Filtered => Some(task.progress().scanned_rows().max(self.next_filter_row)),
+            InFlight::Filtered | InFlight::SkipScan => {
+                Some(task.progress().scanned_rows().max(self.next_filter_row))
+            }
             InFlight::Sorted | InFlight::Aggregate => Some(task.progress().scanned_rows()),
-            InFlight::SortMerge => None,
+            InFlight::SortMerge | InFlight::SkipMerge => None,
         }
     }
 
@@ -477,6 +518,7 @@ impl Running {
             if self.cancelled {
                 bail!("query execution was cancelled");
             }
+            self.skip_buffered();
             if let Some((task_id, batch)) = self.buffered.pop_front() {
                 let batch = shape_output(self.plan.output.as_ref(), batch)?;
                 return Ok(self.apply_limit((task_id, batch)));
@@ -515,6 +557,11 @@ impl Running {
                 PageOutcome::Filtered(window) => {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
+                PageOutcome::Skipped {
+                    rows,
+                    next_row,
+                    finished,
+                } => self.buffer_skipped(rows, next_row, finished, in_flight)?,
                 PageOutcome::Counted(_) => bail!("runtime returned match counts for a query read"),
                 PageOutcome::Checked(_) | PageOutcome::FoundText(_) => {
                     bail!("runtime returned another task's outcome for a query read")
@@ -534,6 +581,7 @@ impl Running {
             if self.cancelled {
                 bail!("query execution was cancelled");
             }
+            self.skip_buffered();
             if let Some((task_id, batch)) = self.buffered.pop_front() {
                 let batch = shape_output(self.plan.output.as_ref(), batch)?;
                 return Ok(self
@@ -605,6 +653,11 @@ impl Running {
                 PageOutcome::Filtered(window) => {
                     self.buffer_filtered(window, in_flight, response.task_id)?
                 }
+                PageOutcome::Skipped {
+                    rows,
+                    next_row,
+                    finished,
+                } => self.buffer_skipped(rows, next_row, finished, in_flight)?,
                 PageOutcome::Counted(_) => bail!("runtime returned match counts for a query read"),
                 PageOutcome::Checked(_) | PageOutcome::FoundText(_) => {
                     bail!("runtime returned another task's outcome for a query read")
@@ -633,6 +686,9 @@ impl Running {
             InFlight::Sorted | InFlight::SortMerge => {
                 bail!("runtime returned one batch for a sorted query read")
             }
+            InFlight::SkipScan | InFlight::SkipMerge => {
+                bail!("runtime returned a batch for a read that skips rows")
+            }
         }
         if batch.num_rows() > 0 {
             self.buffered.push_back((task_id, batch));
@@ -658,6 +714,81 @@ impl Running {
         }
         if window.batch.num_rows() > 0 {
             self.buffered.push_back((task_id, window.batch));
+        }
+        Ok(())
+    }
+
+    /// Drops the next `rows` result rows (see `QueryExecution::skip_rows`);
+    /// an aggregate's rows are not skipped.
+    fn skip_rows(&mut self, rows: u64) {
+        if self.plan.aggregate.is_none() {
+            self.skip = rows;
+        }
+    }
+
+    /// Drops rows still to skip from the batches already received, and from
+    /// the LIMIT they count against.
+    fn skip_buffered(&mut self) {
+        while self.skip > 0 {
+            let Some((task_id, batch)) = self.buffered.pop_front() else {
+                return;
+            };
+            let count = batch.num_rows();
+            let mut take = usize::try_from(self.skip).unwrap_or(usize::MAX).min(count);
+            if let Some(remaining) = &mut self.remaining {
+                take = take.min(*remaining);
+                *remaining -= take;
+            }
+            self.skip -= take as u64;
+            self.skipped += take as u64;
+            if self.remaining == Some(0) {
+                // Nothing lies past the LIMIT to skip to.
+                self.finished = true;
+                self.buffered.clear();
+                self.skip = 0;
+                return;
+            }
+            if take < count {
+                self.buffered
+                    .push_front((task_id, batch.slice(take, count - take)));
+            }
+        }
+    }
+
+    fn buffer_skipped(
+        &mut self,
+        rows: u64,
+        next_row: Option<u64>,
+        finished: bool,
+        in_flight: InFlight,
+    ) -> Result<()> {
+        if !matches!(in_flight, InFlight::SkipScan | InFlight::SkipMerge) {
+            bail!("runtime returned skipped rows for a read that skips none");
+        }
+        self.skip = self.skip.saturating_sub(rows);
+        self.skipped = self.skipped.saturating_add(rows);
+        if let Some(remaining) = &mut self.remaining {
+            *remaining = remaining.saturating_sub(usize::try_from(rows).unwrap_or(usize::MAX));
+            if *remaining == 0 {
+                self.finished = true;
+            }
+        }
+        if let Some(next_row) = next_row {
+            if next_row < self.next_filter_row {
+                bail!("skipped scan moved backwards");
+            }
+            self.next_filter_row = next_row;
+            if next_row >= self.plan.source.row_count() {
+                self.finished = true;
+            }
+        }
+        if finished {
+            self.finished = true;
+            // Dropping the merge deletes its spill files.
+            self.sort_merge = None;
+        }
+        if self.finished {
+            self.skip = 0;
         }
         Ok(())
     }
@@ -744,6 +875,10 @@ impl Running {
 
         let source = Arc::clone(&self.plan.source);
         let projection = self.plan.projection.clone();
+        // Rows to drop in the worker: no further than a LIMIT reaches.
+        let skip = self
+            .remaining
+            .map_or(self.skip, |remaining| self.skip.min(remaining as u64));
         let (task, in_flight) = if let Some(aggregate) = &self.plan.aggregate {
             if self.aggregate_submitted {
                 return Ok(());
@@ -764,15 +899,27 @@ impl Running {
                 let Some(merge) = &self.sort_merge else {
                     return Ok(());
                 };
-                (
-                    self.runtime.submit_sort_merge(
-                        source,
-                        Arc::clone(merge),
-                        row_count,
-                        self.generation_id,
-                    ),
-                    InFlight::SortMerge,
-                )
+                if skip > 0 {
+                    (
+                        self.runtime.submit_sort_merge_skip(
+                            source,
+                            Arc::clone(merge),
+                            skip,
+                            self.generation_id,
+                        ),
+                        InFlight::SkipMerge,
+                    )
+                } else {
+                    (
+                        self.runtime.submit_sort_merge(
+                            source,
+                            Arc::clone(merge),
+                            row_count,
+                            self.generation_id,
+                        ),
+                        InFlight::SortMerge,
+                    )
+                }
             } else {
                 (
                     self.runtime.submit_sorted(
@@ -806,11 +953,19 @@ impl Running {
                     cursor
                 }
             };
-            (
-                self.runtime
-                    .submit_cursor(source, cursor, row_count, self.generation_id),
-                InFlight::Filtered,
-            )
+            if skip > 0 {
+                (
+                    self.runtime
+                        .submit_cursor_skip(source, cursor, skip, self.generation_id),
+                    InFlight::SkipScan,
+                )
+            } else {
+                (
+                    self.runtime
+                        .submit_cursor(source, cursor, row_count, self.generation_id),
+                    InFlight::Filtered,
+                )
+            }
         };
         let task = task.context("submit query source read")?;
         if matches!(in_flight, InFlight::Sorted) {
@@ -1792,6 +1947,187 @@ mod tests {
         let mut execution = engine.execute(&plan, GenerationId(31)).unwrap();
         let batch = execution.next_batch().unwrap().unwrap().batch;
         assert_eq!(ids(&batch), vec![4, 3, 2, 1, 0]);
+    }
+
+    /// 50,000 rows in row groups of 1,000: `id` 0.., `value` id % 7.
+    fn skip_source() -> (TempDir, Arc<ParquetSource>) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("skip.parquet");
+        let ids = (0..50_000).collect::<Vec<i32>>();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int32Array::from(ids.clone())) as arrow_array::ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(Int32Array::from_iter_values(ids.iter().map(|id| id % 7))),
+            ),
+        ])
+        .unwrap();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&path).unwrap(),
+            batch.schema(),
+            Some(
+                WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(1_000))
+                    .build(),
+            ),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        (dir, Arc::new(ParquetSource::open(&path).unwrap()))
+    }
+
+    fn first_column(batch: &RecordBatch) -> Vec<i64> {
+        let column = batch.column(0);
+        if let Some(values) = column.as_any().downcast_ref::<Int32Array>() {
+            return values
+                .values()
+                .iter()
+                .map(|value| i64::from(*value))
+                .collect();
+        }
+        column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|values| values.values().to_vec())
+            .or_else(|| {
+                column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .map(|values| values.values().iter().map(|value| *value as i64).collect())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn skips_rows_in_the_workers_like_reading_them_would() {
+        let (_dir, source) = skip_source();
+        let runtime = Runtime::new(RuntimeConfig {
+            worker_count: 2,
+            queue_capacity: 8,
+        })
+        .unwrap();
+        let plain = QueryEngine::new(&runtime);
+        // A sort budget of 1,000 rows: 50,000 rows spill into runs and merge.
+        let spilling = QueryEngine::with_sort_budget(
+            &runtime,
+            SortBudget::new(1_000, SortBudget::DEFAULT_MAX_BYTES).unwrap(),
+        );
+        let sql = |text: &str| {
+            crate::SqlAst::parse(text)
+                .unwrap()
+                .to_logical_plan(Arc::clone(&source))
+                .unwrap()
+        };
+        let cases = [
+            ("scan", &plain, sql("SELECT id FROM dataset")),
+            (
+                "filter",
+                &plain,
+                sql("SELECT id FROM dataset WHERE value = 3"),
+            ),
+            (
+                "sort",
+                &plain,
+                sql("SELECT id FROM dataset ORDER BY value, id DESC"),
+            ),
+            (
+                "spilled sort",
+                &spilling,
+                sql("SELECT id FROM dataset ORDER BY value, id DESC"),
+            ),
+            ("limit", &plain, sql("SELECT id FROM dataset LIMIT 30000")),
+            (
+                "spilled limit",
+                &spilling,
+                sql("SELECT id FROM dataset ORDER BY id DESC LIMIT 30000"),
+            ),
+            (
+                "calculation",
+                &plain,
+                sql("SELECT id * 2 AS twice FROM dataset WHERE value < 3"),
+            ),
+        ];
+        for (name, engine, plan) in &cases {
+            let mut all = Vec::new();
+            let mut execution = engine.execute(plan, GenerationId(1)).unwrap();
+            while let Some(batch) = execution.next_batch().unwrap() {
+                all.extend(first_column(&batch.batch));
+            }
+            let total = all.len() as u64;
+            for (read_first, skip) in [
+                (0, 0),
+                (0, 1),
+                (0, 4_096),
+                (0, 10_001),
+                (4_096, 9_999),
+                (0, total - 1),
+                (0, total),
+                (0, total + 5),
+            ] {
+                let mut execution = engine.execute(plan, GenerationId(2)).unwrap();
+                let mut seen = Vec::new();
+                while (seen.len() as u64) < read_first {
+                    let batch = execution.next_batch().unwrap().unwrap();
+                    seen.extend(first_column(&batch.batch));
+                }
+                let before = seen.len();
+                assert_eq!(execution.take_skipped_rows(), 0);
+                execution.skip_rows(skip);
+                let mut rest = Vec::new();
+                while let Some(batch) = execution.next_batch().unwrap() {
+                    rest.extend(first_column(&batch.batch));
+                }
+                let skipped = execution.take_skipped_rows();
+                let expected_skip = skip.min(total - before as u64);
+                assert_eq!(skipped, expected_skip, "{name}: skip {skip} after {before}");
+                assert_eq!(
+                    rest,
+                    all[before + expected_skip as usize..],
+                    "{name}: rows after skipping {skip} from {before}"
+                );
+            }
+        }
+
+        // The workers drop rows in one step per skip, not one read a batch.
+        let mut execution = plain
+            .execute(&sql("SELECT id FROM dataset"), GenerationId(3))
+            .unwrap();
+        execution.skip_rows(40_000);
+        let batch = execution.next_batch().unwrap().unwrap();
+        assert_eq!(first_column(&batch.batch)[0], 40_000);
+        assert!(
+            execution.scheduled_reads() <= 3,
+            "{} reads",
+            execution.scheduled_reads()
+        );
+
+        // A newer skip replaces one still under way.
+        let mut execution = plain
+            .execute(&sql("SELECT id FROM dataset"), GenerationId(4))
+            .unwrap();
+        execution.skip_rows(40_000);
+        execution.skip_rows(100);
+        let batch = execution.next_batch().unwrap().unwrap();
+        assert_eq!(first_column(&batch.batch)[0], 100);
+
+        // An aggregate's one batch is not skipped: HAVING may thin it.
+        let mut execution = plain
+            .execute(
+                &sql("SELECT value, COUNT(*) FROM dataset GROUP BY value HAVING value > 2"),
+                GenerationId(5),
+            )
+            .unwrap();
+        execution.skip_rows(2);
+        let mut rows = 0;
+        while let Some(batch) = execution.next_batch().unwrap() {
+            rows += batch.batch.num_rows();
+        }
+        assert_eq!(rows, 4);
+        assert_eq!(execution.take_skipped_rows(), 0);
     }
 
     #[test]

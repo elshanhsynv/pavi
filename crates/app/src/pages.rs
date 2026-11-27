@@ -115,6 +115,7 @@ impl SourcePages {
                     | PageOutcome::Counted(_)
                     | PageOutcome::Checked(_)
                     | PageOutcome::FoundText(_)
+                    | PageOutcome::Skipped { .. }
                     | PageOutcome::Loaded(_) => {
                         grid.requested.remove(&page_index);
                         status = Some(format!("unexpected response for page {page_index}"));

@@ -216,6 +216,7 @@ fn read_page(
         PageOutcome::SortSpilled(_) | PageOutcome::Merged { .. } => {
             bail!("page {page} unexpectedly returned sorted rows")
         }
+        PageOutcome::Skipped { .. } => bail!("page {page} unexpectedly returned skipped rows"),
     }
 }
 

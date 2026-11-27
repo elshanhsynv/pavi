@@ -7,6 +7,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Changed
+- Jumping far ahead in a sort, SQL or filter result (End, Go to row, the scrollbar) is much faster: the rows in between are skipped in the background in large steps instead of one batch per screen frame. Ctrl+End in a sorted 5-million-row file takes about half a second instead of 7.5 seconds.
+
 ### Fixed
 - In a file of over 500,000 rows, Ctrl+End and dragging the scrollbar to the bottom show the last row whole. They stopped a row or two short, leaving the last row (selected, after Ctrl+End) under the status bar; the arrow keys could likewise leave the selected row half hidden at the bottom.
 - The status bar names the selected cell's column ("Row 1,204 · ARR_TIME") instead of giving its number, and gives the size of a selected range ("3 × 2 cells").
