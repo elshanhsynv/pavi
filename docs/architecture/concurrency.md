@@ -7,7 +7,7 @@
 1. Apply theme once; `handle_global_shortcuts` (may open a blocking rfd dialog on Ctrl+O).
 2. Poll: `poll_open`, `SourcePages::poll` (iterates all pending page tasks), `poll_filtered` (drains available batches), `poll_chart`, `poll_profile`, `poll_export`, `poll_file_watch` (picks up the change check and sends the next when due, ADR 0018). All are `try_recv` — no blocking waits.
 3. Draw top bar, chart window, status bar, inspector, central grid/SQL workspace.
-4. If anything is pending → `request_repaint_after(16 ms)`; otherwise, while a file is open, wake for its next change check (≤ 2 s, or 100 ms while one is in flight).
+4. `PaviApp::repaint_delay`: a file opening or grid pages loading → `request_repaint_after(16 ms)`; other background work (a scan, a profile, a chart, an export, a find) → 33 ms (`widgets::BUSY_REPAINT`, also what a spinner asks for); only a match count → 250 ms; otherwise, while a file is open, wake for its next change check (≤ 2 s, or 100 ms while one is in flight).
 
 **Per-frame allocations worth knowing:** `column_names.clone()` and a fresh `Vec<Header>` (with `type_label` strings and `source.schema()` `Arc` clones per column) in the grid (`ui/grid.rs:72-102`); `display_columns.clone()` for filtered grids (`ui/grid.rs:211`); one `String` per visible cell from `format_cell_with_limit` (≤256 chars) plus `on_hover_text(text)` per cell. With ~40 visible rows × ~15 columns this is a few hundred small strings per frame — fine, but formatting is not cached between frames. No large data is cloned per frame (`RecordBatch` clones are `Arc` bumps).
 

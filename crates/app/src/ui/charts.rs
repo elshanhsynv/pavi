@@ -154,7 +154,7 @@ impl PaviApp {
                         if widgets::tool_button(ui, Some(Icon::Close), "Cancel", false).clicked() {
                             cancel = true;
                         }
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                        widgets::spinner(ui, Some(12.0));
                     }
                     ui.add_enabled_ui(self.chart.model.is_some(), |ui| {
                         widgets::menu(
@@ -197,7 +197,7 @@ impl PaviApp {
                     ui.set_min_height(EMPTY_PLOT_HEIGHT);
                     widgets::placeholder(ui, |ui| {
                         if self.chart.loading() {
-                            ui.add(egui::Spinner::new().color(theme::accent()));
+                            widgets::spinner(ui, None);
                         } else {
                             ui.label(
                                 RichText::new("Pick a source and columns, then draw the chart.")

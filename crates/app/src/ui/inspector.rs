@@ -170,7 +170,7 @@ impl PaviApp {
             ui.add_space(Spacing::Sm.px());
             if self.profile.loading() && self.profile.column == Some(index) {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
+                    widgets::spinner(ui, Some(12.0));
                     ui.label(RichText::new(&self.profile.status).color(theme::muted()));
                     if ui.button("Cancel").clicked() {
                         cancel_profile = true;

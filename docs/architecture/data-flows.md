@@ -34,7 +34,7 @@ sequenceDiagram
     W->>PS: ParquetSource::open(path)
     PS-->>W: footer metadata, schema, stats
     W-->>UI: OpenResponse via sync_channel(1)
-    loop every frame (repaint 16 ms while pending)
+    loop every frame (repaint 16 ms while pages load, 33 ms while other work runs)
         UI->>UI: poll_open() try_recv
     end
     UI->>UI: gen == N? build Dataset, restore layout, grid.ready()

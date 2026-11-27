@@ -27,6 +27,41 @@ pub enum Icon {
 
 const ICON_STROKE: f32 = 1.3;
 
+/// How often the app redraws while it only waits on background work (a scan,
+/// a sort, an export, a profile) with a spinner or progress text to show:
+/// 30 frames a second. egui's own spinner asks for every frame, which on a
+/// 144 Hz screen kept one core busy for as long as the work ran.
+pub const BUSY_REPAINT: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// A loading spinner, drawn as egui's is, `size` points square (the row
+/// height when `None`). It asks for its next frame in [`BUSY_REPAINT`], not
+/// at once.
+pub fn spinner(ui: &mut egui::Ui, size: Option<f32>) -> Response {
+    let size = size.unwrap_or_else(|| ui.style().spacing.interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+    if ui.is_rect_visible(rect) {
+        ui.ctx().request_repaint_after(BUSY_REPAINT);
+        let radius = rect.height() / 2.0 - 2.0;
+        let time = ui.input(|input| input.time);
+        let start = time * std::f64::consts::TAU;
+        let end = start + 240_f64.to_radians() * time.sin();
+        const POINTS: usize = 20;
+        let points = (0..POINTS)
+            .map(|index| {
+                let angle = egui::emath::lerp(start..=end, index as f64 / POINTS as f64);
+                let (sin, cos) = angle.sin_cos();
+                rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+            })
+            .collect::<Vec<_>>();
+        ui.painter().add(egui::Shape::line(
+            points,
+            Stroke::new(3.0_f32, theme::accent()),
+        ));
+    }
+    response
+}
+
 pub fn icon(ui: &egui::Ui, center: Pos2, glyph: Icon, color: Color32) {
     let painter = ui.painter();
     let stroke = Stroke::new(ICON_STROKE, color);

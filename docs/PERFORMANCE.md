@@ -74,7 +74,7 @@ Each budget is a named constant. Change it in one place and update this table.
 - The UI thread only polls (`try_recv`). Nothing on it may scale with file size.
 - Per-frame work is limited to visible rows × visible columns.
 - Cancelled or replaced work stops within one 4,096-row batch. The one longer step is a sort sorting the rows it holds in memory (one run, ≤ 1,048,576 rows / 128 MB; about 0.1 s for flights' million rows), which finishes before the cancel is seen.
-- Repaint every 16 ms only while something is pending; idle means no repaint.
+- Repaint every 16 ms only while rows are about to land (a file opening, grid pages loading); every 33 ms while only background work runs with a spinner or progress text (a filter, sort or SQL scan, a profile, a chart, an export, a whole-file find: `widgets::BUSY_REPAINT`); every 250 ms while only a match count runs; idle means no repaint. PAVI's spinner (`widgets::spinner`) asks for its next frame in 33 ms: egui's asks for every frame, which on a 144 Hz screen kept the UI thread at 100% of a core for as long as the work ran (now about 14%).
 
 ## Targets
 
