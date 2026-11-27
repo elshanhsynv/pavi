@@ -18,6 +18,7 @@
 | Work | Thread | Cancel mechanism | Effective? |
 |---|---|---|---|
 | Open, page, window, filtered read, sort, aggregate | `pavi-page-N` pool (N = CPU count) | `CancellationToken` and the runtime's shutdown flag, combined into a `stop` check (`scheduler.rs::execute`). Checked before and after every read. Filtered/sorted/aggregated scans call the runtime's `checkpoint(scanned_rows)` before each 4,096-row batch: it stores the scan position in the task's `ScanProgress` (an `Arc<AtomicU64>`, written by the worker and read by the UI with relaxed ordering; it is a display value and guards nothing) and returns the `stop` check. A stopped scan returns `parquet_reader::Cancelled`, reported as `PageOutcome::Cancelled` | Yes; a running scan stops within one batch (sub-millisecond on the sample files) |
+| A filter's match count (ADR 0012) | `pavi-page-N` pool: chunks of row groups on all workers but two at once (`COUNT_FREE_WORKERS`), the next submitted as one finishes | the `stop` check before each batch; every chunk's task is cancelled with the result, and the rest are never submitted | Yes |
 | Whole-file find (ADR 0022) | `pavi-page-N` pool, one per tab | the `stop` check between 16,384-row windows; cancelled by a new query, closing the find bar or leaving the file | Yes |
 | Change check (ADR 0018) | `pavi-page-N` pool, one at a time for the open tab | the `stop` check between files and folders | Yes; it is a few `stat` calls |
 | Export | `pavi-export` (one per export) | token checked between batches | Yes, at batch granularity |

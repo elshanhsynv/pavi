@@ -291,6 +291,17 @@ impl QueryExecution {
         }
     }
 
+    /// Moves a plain scan (a filter, without sort or aggregate) on to source
+    /// row `row`, when the caller knows the rows before it hold no more
+    /// results: a filter's match count says so. A read under way is dropped;
+    /// its worker stops at its next batch. Does nothing for other results,
+    /// while rows are being skipped, or when the scan is already there.
+    pub fn resume_scan_at(&mut self, row: u64) {
+        if let Stage::Running(running) = &mut self.stage {
+            running.resume_scan_at(row);
+        }
+    }
+
     /// Result rows dropped by [`Self::skip_rows`] since the last call.
     pub fn take_skipped_rows(&mut self) -> u64 {
         match &mut self.stage {
@@ -716,6 +727,33 @@ impl Running {
             self.buffered.push_back((task_id, window.batch));
         }
         Ok(())
+    }
+
+    /// See `QueryExecution::resume_scan_at`.
+    fn resume_scan_at(&mut self, row: u64) {
+        if self.finished
+            || self.skip > 0
+            || self.plan.aggregate.is_some()
+            || !self.plan.sort.is_empty()
+        {
+            return;
+        }
+        let row = row.min(self.plan.source.row_count());
+        if row <= self.next_filter_row {
+            return;
+        }
+        if matches!(self.in_flight, Some(InFlight::Filtered)) {
+            if let Some(task) = self.pending.take() {
+                task.cancel();
+            }
+            self.in_flight = None;
+        }
+        // A new cursor starts at `row` with the next read.
+        self.scan_cursor = None;
+        self.next_filter_row = row;
+        if row >= self.plan.source.row_count() {
+            self.finished = true;
+        }
     }
 
     /// Drops the next `rows` result rows (see `QueryExecution::skip_rows`);
@@ -2128,6 +2166,75 @@ mod tests {
         }
         assert_eq!(rows, 4);
         assert_eq!(execution.take_skipped_rows(), 0);
+    }
+
+    #[test]
+    fn a_filtered_scan_moves_on_to_a_row_it_is_told_about() {
+        let (_dir, source) = skip_source();
+        let runtime = runtime();
+        let plan = crate::SqlAst::parse("SELECT id FROM dataset WHERE value = 3")
+            .unwrap()
+            .to_logical_plan(Arc::clone(&source))
+            .unwrap();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(1))
+            .unwrap();
+        let first = execution.next_batch().unwrap().unwrap();
+        let mut seen = first_column(&first.batch);
+        let last_seen = *seen.last().unwrap();
+        // The caller knows nothing matches before row 30,000 (it doesn't here:
+        // the rows skipped show that the scan really moved on).
+        execution.resume_scan_at(30_000);
+        assert!(execution.scanned_rows().is_none_or(|at| at >= 30_000));
+        while let Some(batch) = execution.next_batch().unwrap() {
+            seen.extend(first_column(&batch.batch));
+        }
+        let expected = (0..=last_seen)
+            .chain(30_000..50_000)
+            .filter(|id| id % 7 == 3)
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected);
+
+        // A read under way is dropped without an error.
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(2))
+            .unwrap();
+        execution.resume_scan_at(45_000);
+        let mut rest = Vec::new();
+        while let Some(batch) = execution.next_batch().unwrap() {
+            rest.extend(first_column(&batch.batch));
+        }
+        // The first read, submitted at once, was dropped: only rows from 45,000.
+        assert_eq!(
+            rest,
+            (45_000..50_000)
+                .filter(|id| id % 7 == 3)
+                .collect::<Vec<_>>()
+        );
+
+        // Past the end finishes the result; a sort is left alone.
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&plan, GenerationId(3))
+            .unwrap();
+        execution.resume_scan_at(50_000);
+        let mut rows = 0;
+        while let Some(batch) = execution.next_batch().unwrap() {
+            rows += batch.batch.num_rows();
+        }
+        assert!(rows < 4_096 * 2, "{rows} rows");
+        let sorted = crate::SqlAst::parse("SELECT id FROM dataset WHERE value = 3 ORDER BY id")
+            .unwrap()
+            .to_logical_plan(Arc::clone(&source))
+            .unwrap();
+        let mut execution = QueryEngine::new(&runtime)
+            .execute(&sorted, GenerationId(4))
+            .unwrap();
+        execution.resume_scan_at(40_000);
+        let mut count = 0;
+        while let Some(batch) = execution.next_batch().unwrap() {
+            count += batch.batch.num_rows();
+        }
+        assert_eq!(count, (0..50_000).filter(|id| id % 7 == 3).count());
     }
 
     #[test]

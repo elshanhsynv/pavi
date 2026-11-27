@@ -128,6 +128,8 @@ enum ReadOperation {
     },
     CountMatches {
         filter: FilterExpr,
+        /// The row groups to count; their counts come back in order.
+        row_groups: std::ops::Range<usize>,
     },
     CheckChanged,
     FindText {
@@ -183,6 +185,7 @@ pub struct Runtime {
 pub struct RuntimeHandle {
     submissions: Arc<Mutex<Option<SyncSender<Request>>>>,
     next_task_id: Arc<AtomicU64>,
+    worker_count: usize,
 }
 
 impl Runtime {
@@ -229,6 +232,7 @@ impl Runtime {
         RuntimeHandle {
             submissions: Arc::clone(&self.submissions),
             next_task_id: Arc::clone(&self.next_task_id),
+            worker_count: self.workers.len(),
         }
     }
 
@@ -523,13 +527,40 @@ impl RuntimeHandle {
         generation_id: GenerationId,
     ) -> Result<PageTask, SubmitError> {
         let projection = Projection::all(source.column_count());
+        let row_groups = 0..source.row_groups().len();
         self.submit_read(
             source,
             projection,
             generation_id,
-            ReadOperation::CountMatches { filter },
+            ReadOperation::CountMatches { filter, row_groups },
             None,
         )
+    }
+
+    /// Counts the rows matching `filter` in the row groups `row_groups` only;
+    /// the outcome is [`PageOutcome::Counted`] with one count per row group of
+    /// the range, in order. Disjoint ranges can be counted on several workers
+    /// at once and their counts put together.
+    pub fn submit_match_counts_in(
+        &self,
+        source: Arc<ParquetSource>,
+        filter: FilterExpr,
+        row_groups: std::ops::Range<usize>,
+        generation_id: GenerationId,
+    ) -> Result<PageTask, SubmitError> {
+        let projection = Projection::all(source.column_count());
+        self.submit_read(
+            source,
+            projection,
+            generation_id,
+            ReadOperation::CountMatches { filter, row_groups },
+            None,
+        )
+    }
+
+    /// How many workers the pool has.
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
     }
 
     /// Finds the next cell whose text contains `needle` in the whole file
@@ -867,9 +898,11 @@ fn read_source(
         } => source
             .read_aggregated(filter.as_ref(), &aggregate, budget, checkpoint)
             .map(PageOutcome::Batch),
-        ReadOperation::CountMatches { filter } => source
-            .count_matches_by_row_group(&filter, checkpoint)
-            .map(PageOutcome::Counted),
+        ReadOperation::CountMatches { filter, row_groups } => source
+            .count_matches_in_row_groups(&filter, row_groups.clone(), checkpoint)
+            .map(|counts| {
+                PageOutcome::Counted(counts.get(row_groups).unwrap_or_default().to_vec())
+            }),
         ReadOperation::CheckChanged => source
             .check_changed(&|| checkpoint(0))
             .map(PageOutcome::Checked),
@@ -930,6 +963,28 @@ mod tests {
         writer.close().unwrap();
         let source = Arc::new(ParquetSource::open(&path).unwrap());
         (dir, source, path)
+    }
+
+    #[test]
+    fn counts_matches_in_a_range_of_row_groups() {
+        // Six rows in two row groups of three; `value` is id * 10.
+        let (_dir, source, _) = test_source();
+        let runtime = runtime(3, 4);
+        assert_eq!(runtime.handle().worker_count(), 3);
+        let filter = FilterExpr::parse("value >= 20").unwrap();
+        let counts = |range: std::ops::Range<usize>| {
+            let task = runtime
+                .handle()
+                .submit_match_counts_in(Arc::clone(&source), filter.clone(), range, GenerationId(1))
+                .unwrap();
+            match task.recv().unwrap().outcome {
+                PageOutcome::Counted(counts) => counts,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        };
+        assert_eq!(counts(0..2), [1, 3]);
+        assert_eq!(counts(1..2), [3], "one count per row group of the range");
+        assert_eq!(counts(0..1), [1]);
     }
 
     fn runtime(workers: usize, capacity: usize) -> Runtime {

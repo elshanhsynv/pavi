@@ -13,7 +13,7 @@ Each budget is a named constant. Change it in one place and update this table.
 | UI loaded pages | 8 pages | `pavi::pages::MAX_LOADED_PAGES` |
 | Page size | 4,096 rows | `parquet_reader::page::PAGE_ROWS` |
 | Filter/SQL/sort result window | 8 batches (~32k rows); a jump keeps 2,048 rows above its target | `pavi::results::MAX_FILTERED_BATCHES`, `JUMP_CONTEXT_ROWS` |
-| Filter match count (ADR 0012, 0016) | One `u64` per row group of the file (the footer's list), no other buffer; row groups the statistics settle are not read | `ParquetSource::count_matches_by_row_group` |
+| Filter match count (ADR 0012, 0016) | One `u64` per row group of the file (the footer's list), no other buffer; row groups the statistics settle are not read. Counted in chunks on all workers but two at once, each task holding one reader and one batch of the filter's columns | `ParquetSource::count_matches_in_row_groups`, `results::COUNT_FREE_WORKERS`, `MIN/MAX_COUNT_CHUNK_ROWS` |
 | Sort rows in memory (larger sorts spill, ADR 0005); also the size of one spilled run | 1,048,576 rows / 128 MB (the bytes counted three times: the rows, their sorted copy and the concatenation) | `SortBudget::DEFAULT_MAX_ROWS`, `DEFAULT_MAX_BYTES` |
 | Sort spill files | 32 GiB per sort; a killed process's folder is removed at the next app or CLI start (ADR 0017) | `spill::MAX_SPILL_BYTES` |
 | Sort merge | 16 runs at once, one 4,096-row batch each | `spill::MERGE_FAN_IN` |
@@ -109,6 +109,8 @@ Whole-file jobs, measured the same day (no targets yet; `pavi_bench` doesn't fin
 | Read every row and column through the query engine | bench `scan_all_ms` | 25 ms | 182 ms | — |
 | Whole-file sort by one column: first rows / all rows | bench `sort_first_batch_ms` / `sort_all_ms` | 133 / 134 ms | 991 / 1,233 ms | — |
 | Ctrl+End in the app's sorted result (rows skipped in the workers) | on screen, Ctrl+End to the last rows shown | — | 0.58 s (7.5 s before) | — |
+| App filter with no match (`label contains zzz`) | on screen, Enter to "No rows match" | — | — | 7.5 s (126 s before) |
+| App filter whose one match is the last row | on screen, Enter to the row shown and done | — | — | 10.2 s (98.5 s before) |
 | Export to CSV / Parquet | `pavi-cli --format csv/parquet -o …` | 607 / 152 ms | 1,860 / 727 ms | — |
 | Profile every column | `pavi-cli --profile` | 899 ms | 1,552 ms | — |
 | Count a filter the statistics settle (half the file matches) | `pavi-cli --filter "value_int > 5000000000" --count` | — | — | 93 ms |

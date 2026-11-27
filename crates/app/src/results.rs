@@ -2,9 +2,12 @@
 
 use std::collections::VecDeque;
 
-use parquet_reader::{RowGroupInfo, SortSpec};
+use std::ops::Range;
+use std::sync::Arc;
+
+use parquet_reader::{FilterExpr, ParquetSource, RowGroupInfo, SortSpec};
 use pavi_query::{LogicalPlan, QueryExecution};
-use pavi_runtime::{PageOutcome, PageTask};
+use pavi_runtime::{GenerationId, PageOutcome, PageTask, RuntimeHandle, SubmitError};
 
 use crate::state::ColumnLayout;
 
@@ -15,11 +18,23 @@ pub(crate) const MAX_FILTERED_BATCHES: usize = 8;
 /// scrolled to without another jump.
 pub(crate) const JUMP_CONTEXT_ROWS: u64 = parquet_reader::PAGE_ROWS / 2;
 
+/// Rows of consecutive row groups one count task reads, at least: smaller
+/// chunks would leave workers waiting between the app's polls.
+const MIN_COUNT_CHUNK_ROWS: u64 = 1 << 20;
+/// Rows one count task reads, at most, so a cancel or a finished chunk frees
+/// its worker soon.
+const MAX_COUNT_CHUNK_ROWS: u64 = 64 << 20;
+/// Workers left free while a count runs: for the grid's pages and the
+/// result's own scan.
+const COUNT_FREE_WORKERS: usize = 2;
+
 /// The background count of a filter's matches in each row group (ADR 0012).
 /// It gives the result's size, and where in the file each result row is, so
-/// the grid can start reading anywhere in the result.
+/// the grid can start reading anywhere in the result. The row groups are cut
+/// into chunks counted on several workers at once (all but
+/// [`COUNT_FREE_WORKERS`]); a chunk is submitted as another finishes.
 pub(crate) struct MatchCount {
-    task: Option<PageTask>,
+    work: Option<CountWork>,
     /// `prefix[g]` is the number of matches before row group `g`; the last
     /// entry is the total. One entry per row group, plus one.
     prefix: Option<Vec<u64>>,
@@ -27,21 +42,103 @@ pub(crate) struct MatchCount {
     pub(crate) error: Option<String>,
 }
 
+/// A count still running: the chunks, what was counted, what is in flight.
+struct CountWork {
+    runtime: RuntimeHandle,
+    source: Arc<ParquetSource>,
+    filter: FilterExpr,
+    generation: GenerationId,
+    /// Consecutive row groups per task, in file order.
+    chunks: Vec<Range<usize>>,
+    next_chunk: usize,
+    /// At most this many chunks are counted at once.
+    parallel: usize,
+    /// Chunks being counted: the chunk, its first source row, its task.
+    running: Vec<(Range<usize>, u64, PageTask)>,
+    /// One count per row group of the file.
+    counts: Vec<u64>,
+    /// Source rows in the chunks counted so far.
+    counted_rows: u64,
+}
+
 impl MatchCount {
-    pub(crate) fn new(task: PageTask) -> Self {
-        Self {
-            task: Some(task),
+    /// Starts counting `filter`'s matches in `source`. `None` when the runtime
+    /// can't take a task now; the result then works without a count.
+    pub(crate) fn start(
+        runtime: RuntimeHandle,
+        source: Arc<ParquetSource>,
+        filter: FilterExpr,
+        generation: GenerationId,
+    ) -> Option<Self> {
+        let parallel = runtime
+            .worker_count()
+            .saturating_sub(COUNT_FREE_WORKERS)
+            .max(1);
+        // About four chunks per worker, so the workers finish together.
+        let chunk_rows = (source.row_count() / (parallel as u64 * 4))
+            .clamp(MIN_COUNT_CHUNK_ROWS, MAX_COUNT_CHUNK_ROWS);
+        Self::start_chunked(runtime, source, filter, generation, chunk_rows)
+    }
+
+    /// [`Self::start`] with chunks of about `chunk_rows` rows (at least one
+    /// row group each).
+    pub(crate) fn start_chunked(
+        runtime: RuntimeHandle,
+        source: Arc<ParquetSource>,
+        filter: FilterExpr,
+        generation: GenerationId,
+        chunk_rows: u64,
+    ) -> Option<Self> {
+        let row_groups = source.row_groups();
+        let parallel = runtime
+            .worker_count()
+            .saturating_sub(COUNT_FREE_WORKERS)
+            .max(1);
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        let mut rows = 0_u64;
+        for (index, info) in row_groups.iter().enumerate() {
+            rows += info.row_count;
+            if rows >= chunk_rows {
+                chunks.push(start..index + 1);
+                start = index + 1;
+                rows = 0;
+            }
+        }
+        if start < row_groups.len() {
+            chunks.push(start..row_groups.len());
+        }
+        let mut count = Self {
+            work: Some(CountWork {
+                runtime,
+                counts: vec![0; row_groups.len()],
+                source,
+                filter,
+                generation,
+                parallel: parallel.min(chunks.len().max(1)),
+                chunks,
+                next_chunk: 0,
+                running: Vec::new(),
+                counted_rows: 0,
+            }),
             prefix: None,
             total: None,
             error: None,
-        }
+        };
+        count.submit_more();
+        // Nothing could be submitted: the runtime is full or gone.
+        let started = count
+            .work
+            .as_ref()
+            .is_none_or(|work| !work.running.is_empty());
+        (started && count.error.is_none()).then_some(count)
     }
 
     /// A size known without counting (a sort of the whole file), with no
     /// positions to jump with.
     pub(crate) fn known(total: u64) -> Self {
         Self {
-            task: None,
+            work: None,
             prefix: None,
             total: Some(total),
             error: None,
@@ -55,40 +152,124 @@ impl MatchCount {
 
     /// Whether the count is still running.
     pub(crate) fn running(&self) -> bool {
-        self.task.is_some()
+        self.work.is_some()
     }
 
-    /// Source rows the count has passed while it runs.
+    /// Source rows the count has read so far, all chunks together.
     pub(crate) fn scanned_rows(&self) -> Option<u64> {
-        self.task
-            .as_ref()
-            .map(|task| task.progress().scanned_rows())
+        let work = self.work.as_ref()?;
+        let row_groups = work.source.row_groups();
+        let in_flight = work
+            .running
+            .iter()
+            .map(|(chunk, first_row, task)| {
+                let rows = chunk
+                    .clone()
+                    .filter_map(|index| row_groups.get(index))
+                    .map(|info| info.row_count)
+                    .sum::<u64>();
+                task.progress()
+                    .scanned_rows()
+                    .saturating_sub(*first_row)
+                    .min(rows)
+            })
+            .sum::<u64>();
+        Some(work.counted_rows.saturating_add(in_flight))
     }
 
-    /// Takes the count when it has arrived.
+    /// Takes the counts that have arrived and submits the next chunks; the
+    /// total is known once every chunk is counted.
     pub(crate) fn poll(&mut self) {
-        let Some(task) = &self.task else {
+        let Some(work) = &mut self.work else {
             return;
         };
-        let outcome = match task.try_recv() {
-            Ok(response) => response.outcome,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.task = None;
-                self.error = Some("the count stopped without a result".to_owned());
-                return;
+        let row_groups = work.source.row_groups();
+        let mut failed = None;
+        let mut index = 0;
+        while index < work.running.len() {
+            let outcome = match work.running[index].2.try_recv() {
+                Ok(response) => response.outcome,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    failed = Some("the count stopped without a result".to_owned());
+                    break;
+                }
+            };
+            let (chunk, _, _) = work.running.swap_remove(index);
+            match outcome {
+                PageOutcome::Counted(counts) if counts.len() == chunk.len() => {
+                    for (group, count) in chunk.clone().zip(counts) {
+                        if let Some(slot) = work.counts.get_mut(group) {
+                            *slot = count;
+                        }
+                    }
+                    work.counted_rows = work.counted_rows.saturating_add(
+                        chunk
+                            .filter_map(|group| row_groups.get(group))
+                            .map(|info| info.row_count)
+                            .sum::<u64>(),
+                    );
+                }
+                PageOutcome::Cancelled => failed = Some("the count was cancelled".to_owned()),
+                PageOutcome::ReadFailed(error) => failed = Some(format!("{error:#}")),
+                _ => failed = Some("the count returned something else".to_owned()),
             }
+            if failed.is_some() {
+                break;
+            }
+        }
+        if let Some(error) = failed {
+            self.error = Some(error);
+            self.cancel();
+            self.work = None;
+            return;
+        }
+        self.submit_more();
+        if let Some(work) = &self.work
+            && work.running.is_empty()
+            && work.next_chunk >= work.chunks.len()
+        {
+            let prefix = prefix_sums(&work.counts);
+            self.total = prefix.last().copied();
+            self.prefix = Some(prefix);
+            self.work = None;
+        }
+    }
+
+    /// Submits chunks until `parallel` are running; a full queue is retried
+    /// at the next poll.
+    fn submit_more(&mut self) {
+        let Some(work) = &mut self.work else {
+            return;
         };
-        self.task = None;
-        match outcome {
-            PageOutcome::Counted(counts) => {
-                let prefix = prefix_sums(&counts);
-                self.total = prefix.last().copied();
-                self.prefix = Some(prefix);
+        while work.running.len() < work.parallel {
+            let Some(chunk) = work.chunks.get(work.next_chunk).cloned() else {
+                return;
+            };
+            let first_row = work
+                .source
+                .row_groups()
+                .get(chunk.start)
+                .map_or(0, |info| info.first_row);
+            match work.runtime.submit_match_counts_in(
+                Arc::clone(&work.source),
+                work.filter.clone(),
+                chunk.clone(),
+                work.generation,
+            ) {
+                Ok(task) => {
+                    work.running.push((chunk, first_row, task));
+                    work.next_chunk += 1;
+                }
+                Err(SubmitError::QueueFull) => return,
+                Err(error) => {
+                    self.error = Some(format!("count the matches: {error}"));
+                    return;
+                }
             }
-            PageOutcome::Cancelled => self.error = Some("the count was cancelled".to_owned()),
-            PageOutcome::ReadFailed(error) => self.error = Some(format!("{error:#}")),
-            _ => self.error = Some("the count returned something else".to_owned()),
         }
     }
 
@@ -107,8 +288,10 @@ impl MatchCount {
     }
 
     fn cancel(&self) {
-        if let Some(task) = &self.task {
-            task.cancel();
+        if let Some(work) = &self.work {
+            for (_, _, task) in &work.running {
+                task.cancel();
+            }
         }
     }
 }
@@ -370,7 +553,7 @@ mod tests {
             .collect::<Vec<_>>();
         // Matches per group: 5, none, 5, 2.
         let count = MatchCount {
-            task: None,
+            work: None,
             prefix: Some(prefix_sums(&[5, 0, 5, 2])),
             total: Some(12),
             error: None,

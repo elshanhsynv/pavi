@@ -53,6 +53,10 @@ const CELL_LIMIT: usize = 256;
 /// Longest cell value "Filter to this value" accepts; longer ones are refused.
 const MAX_FILTER_VALUE_BYTES: usize = 1024;
 const MAX_CLIPBOARD_BYTES: usize = 16 * 1024 * 1024;
+/// How far ahead of a filter's scan the next match must be, in source rows,
+/// for the scan to move on to it: a scan run's worth, so a nearby match is
+/// read on to rather than starting a new reader.
+const COUNT_RESUME_GAP: u64 = 1 << 20;
 /// How often the grid redraws while only a result's match count is running.
 const COUNT_REPAINT: Duration = Duration::from_millis(250);
 
@@ -65,11 +69,12 @@ fn match_count(
     filter: &FilterExpr,
     generation: GenerationId,
 ) -> Option<MatchCount> {
-    runtime
-        .handle()
-        .submit_match_counts(Arc::clone(source), filter.clone(), generation)
-        .ok()
-        .map(MatchCount::new)
+    MatchCount::start(
+        runtime.handle(),
+        Arc::clone(source),
+        filter.clone(),
+        generation,
+    )
 }
 
 fn ui_row_count(rows: u64) -> usize {
@@ -1752,6 +1757,44 @@ impl PaviApp {
         let mut retry_jump = None;
         if let Some(count) = &mut filtered.count {
             count.poll();
+        }
+        // A filter's count says where its results are (ADR 0012): once every
+        // match has arrived the scan stops, and with the next match far ahead
+        // it moves on to that row group instead of reading the rows between.
+        if filtered.kind == QueryKind::Filter
+            && filtered.sort.is_empty()
+            && !filtered.finished
+            && filtered.pending_jump.is_none()
+            && let Some(count) = &filtered.count
+            && let Some(total) = count.total()
+        {
+            let received = filtered.received_rows();
+            if received >= total {
+                if let Some(execution) = &mut filtered.execution {
+                    execution.cancel();
+                }
+                filtered.execution = None;
+                filtered.finished = true;
+                filtered.completed_once = true;
+                status = Some(if received == 0 {
+                    filtered.kind.empty_message().to_string()
+                } else {
+                    format!(
+                        "{} result: {} rows",
+                        filtered.kind.label(),
+                        ui::theme::number(received)
+                    )
+                });
+            } else if let (Some(dataset), Some(execution)) =
+                (&self.dataset, &mut filtered.execution)
+                && let Some((source_row, _)) =
+                    count.entry_for(received, dataset.source.row_groups())
+                && execution
+                    .scanned_rows()
+                    .is_none_or(|at| source_row > at.saturating_add(COUNT_RESUME_GAP))
+            {
+                execution.resume_scan_at(source_row);
+            }
         }
         while filtered.needs_more() {
             let Some(execution) = &mut filtered.execution else {
