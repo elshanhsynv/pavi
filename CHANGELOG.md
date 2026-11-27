@@ -7,6 +7,8 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-27
+
 ### Changed
 - While a long job runs (a filter, sort or SQL scan, a profile, an export), the app redraws its spinner 30 times a second instead of at the screen's full refresh rate. On a 144 Hz screen that took a whole CPU core for as long as the job ran; now it takes about a seventh of one.
 - Filters that match few or no rows of a large file finish much sooner. The count of matches now runs on several cores at once, and once it is in, the filter stops scanning when it has every match, or jumps straight to the part of the file where the next match is. A filter with no match in a billion rows says so after 7.5 seconds instead of 2 minutes.
@@ -247,7 +249,8 @@ First tracked version.
 - Updated zstd to fix advisories reachable from crafted Parquet files; dependency checks with `cargo deny`.
 - Worker threads survive decoder panics; inputs are fuzzed.
 
-[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/elshanhsynv/pavi/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/elshanhsynv/pavi/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/elshanhsynv/pavi/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/elshanhsynv/pavi/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/elshanhsynv/pavi/compare/v0.6.0...v0.7.0
