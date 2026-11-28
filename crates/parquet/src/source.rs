@@ -1455,6 +1455,23 @@ impl ParquetSource {
                 .collect::<Result<Vec<_>>>()?,
             sequence: kept_columns.len(),
         };
+        let key_types = sort
+            .iter()
+            .map(|key| {
+                self.dataset_metadata
+                    .schema
+                    .fields()
+                    .get(key.column)
+                    .map(|field| field.data_type())
+                    .ok_or_else(|| anyhow!("sort column {} out of range", key.column))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let by_rows = crate::spill::sorts_by_rows(&key_types);
+        let encoding_per_row = if by_rows {
+            (sort.len() + 1) * crate::spill::ROW_ENCODING_BYTES_PER_KEY
+        } else {
+            0
+        };
         let output_positions = projection
             .as_slice()
             .iter()
@@ -1506,10 +1523,12 @@ impl ParquetSource {
                     bytes = kept.get_array_memory_size();
                     retained = vec![kept];
                 }
+                // Rows, their sorted copy and the concatenation, the indices,
+                // and for keys sorted through the row format their encoding.
                 let over_budget = (top.is_none() && rows > budget.max_rows())
                     || bytes
-                        .saturating_mul(3)
-                        .saturating_add(rows.saturating_mul(8))
+                        .saturating_mul(3 + usize::from(by_rows))
+                        .saturating_add(rows.saturating_mul(8 + encoding_per_row))
                         > budget.max_bytes();
                 if over_budget {
                     // Too many rows to sort in memory: write them out as a sorted

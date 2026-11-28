@@ -21,6 +21,7 @@ use arrow_ord::{
     ord::make_comparator,
     sort::{SortColumn, lexsort_to_indices},
 };
+use arrow_row::{RowConverter, SortField};
 use arrow_schema::{SchemaRef, SortOptions};
 use arrow_select::{concat::concat_batches, take::take_record_batch};
 use parquet::{
@@ -29,7 +30,7 @@ use parquet::{
         arrow_reader::ParquetRecordBatchReaderBuilder,
     },
     basic::Compression,
-    file::properties::WriterProperties,
+    file::properties::{EnabledStatistics, WriterProperties},
 };
 
 use crate::{Cancelled, NullOrder, SortDirection, SortSpec, page::PAGE_ROWS};
@@ -103,8 +104,27 @@ impl SortKeys {
     }
 
     /// Row order of `batch`, keeping only the first `limit` rows if given.
+    ///
+    /// One key, or keys that are all plain numbers, dates or times, are
+    /// sorted column-wise (`lexsort_to_indices`, with typed comparisons,
+    /// faster for them). Two or more keys with one of text, binary or another
+    /// non-primitive type are first encoded into Arrow's row format, whose rows compare as bytes in exactly the keys'
+    /// order (the sequence number last), so each comparison is one `memcmp`
+    /// instead of a call per key column. A type the row format can't encode
+    /// falls back to the column-wise sort.
     pub(crate) fn indices(&self, batch: &RecordBatch, limit: Option<usize>) -> Result<UInt32Array> {
-        lexsort_to_indices(&self.columns(batch), limit).context("sort supported Arrow values")
+        let columns = self.columns(batch);
+        let key_types = self
+            .keys
+            .iter()
+            .map(|(position, _)| batch.column(*position).data_type())
+            .collect::<Vec<_>>();
+        if sorts_by_rows(&key_types)
+            && let Some(order) = row_order(&columns, limit)?
+        {
+            return Ok(order);
+        }
+        lexsort_to_indices(&columns, limit).context("sort supported Arrow values")
     }
 
     /// Sorts `batches` into one batch, keeping only the first `limit` rows if given.
@@ -125,6 +145,63 @@ fn concat(batches: &[RecordBatch]) -> Result<RecordBatch> {
         [batch] => Ok(batch.clone()),
         _ => Ok(concat_batches(&batches[0].schema(), batches)?),
     }
+}
+
+/// Whether keys of these types are sorted through the row format (see
+/// [`SortKeys::indices`]): two or more keys, one of them text, binary or
+/// another type that isn't a plain number, date or time. Measured on a
+/// million rows, the row format sorts a text key then a number in 250 ms
+/// against 392; a single key, or plain ones only, compare faster typed (a
+/// float 116 ms against 307, four-valued text 174 against 325).
+pub(crate) fn sorts_by_rows(key_types: &[&arrow_schema::DataType]) -> bool {
+    key_types.len() > 1 && key_types.iter().any(|data_type| !data_type.is_primitive())
+}
+
+/// Memory the row format takes per row and key, besides the keys' own bytes:
+/// a null marker, a value's fixed width or a string's block padding.
+pub(crate) const ROW_ENCODING_BYTES_PER_KEY: usize = 16;
+
+/// The order of the rows of `columns` (all keys, the sequence number last,
+/// so no two rows are equal) by their row-format encoding, keeping only the
+/// first `limit` if given; `None` when the row format can't encode a type.
+fn row_order(columns: &[SortColumn], limit: Option<usize>) -> Result<Option<UInt32Array>> {
+    let fields = columns
+        .iter()
+        .map(|column| {
+            SortField::new_with_options(
+                column.values.data_type().clone(),
+                column.options.unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !RowConverter::supports_fields(&fields) {
+        return Ok(None);
+    }
+    let converter = RowConverter::new(fields).context("encode sort keys")?;
+    let rows = converter
+        .convert_columns(
+            &columns
+                .iter()
+                .map(|column| Arc::clone(&column.values))
+                .collect::<Vec<_>>(),
+        )
+        .context("encode sort keys")?;
+    let count = u32::try_from(rows.num_rows()).context("sort run has too many rows")?;
+    let mut order = (0..count).collect::<Vec<u32>>();
+    let compare =
+        |left: &u32, right: &u32| rows.row(*left as usize).cmp(&rows.row(*right as usize));
+    // Every row is unique, so an unstable sort gives the one order.
+    match limit {
+        Some(limit) if limit < order.len() => {
+            if limit > 0 {
+                order.select_nth_unstable_by(limit - 1, compare);
+            }
+            order.truncate(limit);
+            order.sort_unstable_by(compare);
+        }
+        _ => order.sort_unstable_by(compare),
+    }
+    Ok(Some(UInt32Array::from(order)))
 }
 
 /// A folder in the temp directory for one sort's runs or one converted file,
@@ -283,8 +360,12 @@ impl RunWriter {
         self.next += 1;
         let file = File::create(&path)
             .with_context(|| format!("create sort spill file {}", path.display()))?;
+        // A run is read once, in order: no dictionaries or statistics to
+        // build, which made writing it about 2.5x slower.
         let properties = WriterProperties::builder()
             .set_compression(Compression::UNCOMPRESSED)
+            .set_dictionary_enabled(false)
+            .set_statistics_enabled(EnabledStatistics::None)
             .set_max_row_group_row_count(Some(64 * PAGE_ROWS as usize))
             .build();
         Ok((path, ArrowWriter::try_new(file, schema, Some(properties))?))
@@ -844,6 +925,80 @@ mod tests {
         assert_eq!(rest, all[9_000..10_000]);
         let (_, skipped, done, rest) = merged(Some(10_000), 20_000, 0);
         assert_eq!((skipped, done, rest.len()), (10_000, true, 0));
+    }
+
+    #[test]
+    fn row_format_sorts_like_the_column_sort_for_every_type() {
+        use arrow_ord::sort::lexsort_to_indices;
+        use arrow_select::take::take;
+
+        // Every scalar type, each with a null; repeated so ties need the next key.
+        let arrays = crate::value::tests::scalar_arrays()
+            .into_iter()
+            .map(|array| {
+                let data_type = crate::types::read_type(array.data_type());
+                arrow_cast::cast(array.as_ref(), &data_type).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let pick = UInt32Array::from_iter_values((0..60_u32).map(|row| (row * 7 + row / 5) % 3));
+        let columns = arrays
+            .iter()
+            .map(|array| take(array.as_ref(), &pick, None).unwrap())
+            .collect::<Vec<_>>();
+        let sequence = Arc::new(UInt64Array::from_iter_values(0..60)) as ArrayRef;
+        let mut checked = 0;
+        for (first, second) in (0..columns.len()).map(|index| (index, (index + 5) % columns.len()))
+        {
+            for (direction, nulls) in [
+                (SortDirection::Ascending, NullOrder::Last),
+                (SortDirection::Descending, NullOrder::First),
+            ] {
+                let batch = RecordBatch::try_from_iter(vec![
+                    ("a", Arc::clone(&columns[first])),
+                    ("b", Arc::clone(&columns[second])),
+                    ("__pavi_sequence", Arc::clone(&sequence)),
+                ])
+                .unwrap();
+                for keys in [vec![0], vec![0, 1], vec![1, 0]] {
+                    let keys = SortKeys {
+                        keys: keys
+                            .into_iter()
+                            .map(|position| (position, SortSpec::new(position, direction, nulls)))
+                            .collect(),
+                        sequence: 2,
+                    };
+                    let columns = keys.columns(&batch);
+                    for limit in [None, Some(7)] {
+                        let expected = lexsort_to_indices(&columns, limit).unwrap();
+                        let Some(rows) = row_order(&columns, limit).unwrap() else {
+                            continue;
+                        };
+                        assert_eq!(
+                            rows,
+                            expected,
+                            "{:?} then {:?}, {direction:?}, limit {limit:?}",
+                            batch.column(0).data_type(),
+                            batch.column(1).data_type()
+                        );
+                        assert_eq!(keys.indices(&batch, limit).unwrap(), expected);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 200, "{checked} orders checked by the row format");
+        // One key, or plain numeric keys, keep the typed column sort; text
+        // with another key doesn't.
+        assert!(!sorts_by_rows(&[&arrow_schema::DataType::Float64]));
+        assert!(!sorts_by_rows(&[&arrow_schema::DataType::Utf8]));
+        assert!(!sorts_by_rows(&[
+            &arrow_schema::DataType::Int32,
+            &arrow_schema::DataType::Date32
+        ]));
+        assert!(sorts_by_rows(&[
+            &arrow_schema::DataType::Int32,
+            &arrow_schema::DataType::Utf8
+        ]));
     }
 
     #[test]

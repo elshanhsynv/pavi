@@ -15,6 +15,7 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 bytes.workspace = true
 arrow-ord.workspace = true
+arrow-row.workspace = true
 parquet.workspace = true
 ring.workspace = true
 # JSON Lines export (moved from the app, which already used it).
