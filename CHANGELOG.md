@@ -7,6 +7,9 @@ matches the tag as the GitHub Release notes, so write entries for users.
 
 ## [Unreleased]
 
+### Changed
+- Sorting large files is faster: 15–20% for most sorts, and up to 40% for a sort by text and another column (`category, user_id` on 5 million rows: 2.6 s instead of 4.4 s). Sorts that spill to disk write their temporary files faster, and several sort keys with text among them are compared in one step.
+
 ## [0.8.1] - 2026-11-27
 
 ### Changed

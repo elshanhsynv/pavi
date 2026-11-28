@@ -33,6 +33,7 @@ bytes = "1"
 arrow-schema = "60"
 arrow-select = "60"
 arrow-ord = "60"
+arrow-row = "60"
 parquet = { version = "60", features = ["arrow"] }
 eframe = "0.31"
 egui_extras = "0.31"
